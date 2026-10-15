@@ -142,6 +142,11 @@ void UnreadUserWordsKeepTheStage(bool verify) {
     Append(commands, 0x2d, {3, 2});
     auto counters = Submit(std::move(commands));
     Require(counters.lookups == 1 && counters.dataHits == 0, "the first draw: " + Counts(counters));
+    commands.clear();
+    PixelUserData(commands, first, 0x11);
+    Append(commands, 0x2d, {3, 2});
+    counters = Submit(std::move(commands));
+    Require(counters.inserts != 0, "the repeated register key was not admitted: " + Counts(counters));
 
     commands.clear();
     PixelUserData(commands, first, 0x22);
