@@ -17,6 +17,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -705,8 +706,10 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
     std::vector<std::uint64_t> key;
     const bool keyed = ValidationKey(context, shaders, state, key);
     static std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>> memo;
-    thread_local std::vector<std::uint64_t> lastKey;
-    thread_local std::set<std::uint32_t> lastOutputs;
+    struct LastKeyStorage {};
+    struct LastOutputsStorage {};
+    auto& lastKey = HostThreadLocal<std::vector<std::uint64_t>, LastKeyStorage>();
+    auto& lastOutputs = HostThreadLocal<std::set<std::uint32_t>, LastOutputsStorage>();
     thread_local bool lastValid = false;
     const bool trims = keyed && CommitTrims();
     if (trims && lastValid && key == lastKey) {

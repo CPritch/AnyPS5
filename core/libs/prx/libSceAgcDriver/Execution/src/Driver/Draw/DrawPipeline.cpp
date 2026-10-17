@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -143,7 +144,8 @@ void DrawFinisher::Enqueue(Job job) {
 void DrawFinisher::Enqueue(Job job, Pending held) {
     finisherProducer = true;
     constexpr std::size_t depth = 16;
-    thread_local std::vector<Job> reclaim;
+    struct ReclaimStorage {};
+    auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
     reclaim.clear();
     std::unique_lock lock(mutex);
     if (!ran.empty()) std::swap(ran, reclaim);
@@ -257,7 +259,8 @@ void DrawPipeline::rethrowFailure() {
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, bool draw) {
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    thread_local std::vector<Item> reclaim;
+    struct ReclaimStorage {};
+    auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
     reclaim.clear();
     const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::unique_lock lock(mutex);

@@ -5061,7 +5061,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<std::size_t, 2> described{};
-    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2> counts;
+    struct CountsStorage {};
+    auto& counts = HostThreadLocal<std::array<std::vector<VkDescriptorPoolSize>, 2>, CountsStorage>();
     for (auto& set : counts) set.clear();
     for (const auto& binding : bindings) {
         const auto set = setOf(binding);

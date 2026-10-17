@@ -3,6 +3,7 @@
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -244,7 +245,8 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
                 AgcDriver::GuestMemory::Read(base + static_cast<std::uint64_t>(entry) * stride, std::as_writable_bytes(std::span(words).subspan(static_cast<std::size_t>(entry - first) * wordsPer, wordsPer)), 4);
             }
         };
-        thread_local std::vector<std::uint32_t> table;
+        struct TableStorage {};
+        auto& table = HostThreadLocal<std::vector<std::uint32_t>, TableStorage>();
         readWords(attribTableAddr, 4u, firstSemantic, lastSemantic, table, [&](std::uint32_t semantic) { return std::any_of(semantics.begin(), semantics.begin() + shader.num_input_semantics, [&](const ShaderSemantic& candidate) { return candidate.semantic == semantic; }); });
         std::uint32_t firstIndex = ~0u, lastIndex = 0;
         for (std::uint32_t i = 0; i < shader.num_input_semantics; ++i) {
@@ -255,7 +257,8 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
             lastIndex = std::max(lastIndex, index);
         }
         if (shader.num_input_semantics != 0) {
-            thread_local std::vector<std::uint32_t> sharps;
+            struct SharpsStorage {};
+            auto& sharps = HostThreadLocal<std::vector<std::uint32_t>, SharpsStorage>();
             readWords(bufferTableAddr, 16u, firstIndex, lastIndex, sharps, [&](std::uint32_t index) { return std::any_of(attribWords.begin(), attribWords.begin() + shader.num_input_semantics, [&](std::uint32_t word) { return (word & 0x1fu) == index; }); });
             for (std::uint32_t i = 0; i < shader.num_input_semantics; ++i) {
                 const auto index = attribWords[i] & 0x1fu;
