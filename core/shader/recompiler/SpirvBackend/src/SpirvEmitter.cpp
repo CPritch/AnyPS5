@@ -116,7 +116,6 @@ std::uint32_t SpirvValueEmitContext::HalfArg(const IrValue& inst, std::size_t in
 
 std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
     const auto ballotType = TypeU32Vector(state, 4u);
-    const auto scope = ConstantU32(state, spv::ScopeSubgroup);
     const auto low = state.module.AllocateId();
     EmitSubgroupBallot(state, low, otherHalf == nullptr || half == 0u ? Def(predicate) : otherHalf->Def(predicate));
     if (otherHalf == nullptr) {
@@ -126,7 +125,7 @@ std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
     const auto lowWord = state.module.AllocateId();
     const auto highWord = state.module.AllocateId();
     const auto ballot = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformBallot, ballotType, high, scope, half == 1u ? Def(predicate) : otherHalf->Def(predicate));
+    EmitSubgroupBallot(state, high, half == 1u ? Def(predicate) : otherHalf->Def(predicate));
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), lowWord, low, 0u);
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), highWord, high, 0u);
     state.module.AddFunction(spv::OpCompositeConstruct, ballotType, ballot, lowWord, highWord, ConstantU32(state, 0u), ConstantU32(state, 0u));
@@ -283,6 +282,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         state.requirements.subgroupShuffle = true;
     }
     if (state.laneCount == 2u) state.sharedLaneValues = WaveUniformValues(program);
+    if ((state.laneCount == 2u || state.requirements.subgroupBallot) && HostSubgroupBallotsByReduction(state)) state.requirements.subgroupLocalInvocationId = true;
     if (program.Resources().stage == IrShaderStage::Compute && workgroup != nullptr) {
         // The key comes from a subgroup ballot (ReadFirstLane), so the slot is uniform over the
         // workgroup only when the workgroup is one wave held by one host subgroup; a wave64 program
