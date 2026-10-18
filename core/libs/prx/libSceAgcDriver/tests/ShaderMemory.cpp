@@ -5000,6 +5000,47 @@ void verifyUnnormalizedSamplers() {
     require(proven(pixelOffsetNormalized, false) && implicitMasks.size() == 1u && (implicitMasks[0] & (spv::ImageOperandsConstOffsetMask | spv::ImageOperandsOffsetMask)) != 0u, "unnormalized texel offsets: a normalized pixel image_sample_o is not an implicit-LOD sample with its offset");
 }
 
+void verifyNullVolumeUnnormalizedSampler() {
+    using namespace ShaderRecompiler;
+    ImageResource volume{};
+    volume.resourceClass = ImageResourceClass::Sampled;
+    volume.numericClass = IrTextureNumericClass::Float;
+    volume.dimension = RdnaImageDimension::Dim3D;
+    volume.read = true;
+    ImageResource plane = volume;
+    plane.dimension = RdnaImageDimension::Dim2D;
+    SamplerResource sampler{};
+    sampler.uses = SamplerUseExplicitLod;
+    const DescriptorValue nullDescriptor{{0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u}, 8u};
+    const DescriptorValue volumeDescriptor{{0x00001000u, 0x03800000u, 0x0000c000u, 0xa0000facu, 3u, 0u, 0u, 0u}, 8u};
+    const DescriptorValue planeDescriptor{{0x00002000u, 0x03800000u, 0x0000c000u, 0x90000facu, 0u, 0u, 0u, 0u}, 8u};
+    const DescriptorValue unnormalized{{0x00008092u, 0x00fff000u, 0x02500000u, 0u}, 4u};
+    const auto populate = [&](std::vector<ImageResource> images, std::vector<DescriptorValue> descriptors) {
+        ShaderInfo info;
+        info.images = images;
+        info.samplers = {sampler};
+        for (std::uint32_t index = 0; index < images.size(); ++index) {
+            info.sampledPairs.push_back({index, 0u, 0u});
+            info.runtimeImageModes.push_back(ResourceMaterializer::RuntimeImageModes(images[index]));
+        }
+        ResourceSnapshot snapshot;
+        snapshot.images = descriptors;
+        snapshot.samplers = {unnormalized};
+        BindingAllocationResult allocation;
+        for (std::uint32_t index = 0; index < images.size(); ++index) allocation.layout.descriptors.push_back({DescriptorBindingForImage(images[index]), {index}});
+        allocation.layout.descriptors.push_back({DescriptorBindingKind::Samplers, {0u}});
+        DescriptorBindingBuilder{}.Populate(allocation, info, IrShaderStage::Compute, 0u, snapshot, {});
+        return allocation.bindings.back();
+    };
+    const auto nullOnly = populate({volume}, {nullDescriptor});
+    require(nullOnly.samplerUnnormalized == std::vector<bool>{false} && nullOnly.samplerCoordinatesIgnored == std::vector<bool>{true}, "unnormalized samplers: an S# paired only with a null 3D T# was refused or kept its unnormalized coordinates");
+    const DescriptorValue zeroSwizzle{{0x00003000u, 0x00100000u, 0u, 0xa0000000u, 0u, 0u, 0u, 0u}, 8u};
+    const auto constantAndNull = populate({volume, volume}, {zeroSwizzle, nullDescriptor});
+    require(constantAndNull.samplerUnnormalized == std::vector<bool>{false} && constantAndNull.samplerCoordinatesIgnored == std::vector<bool>{true}, "unnormalized samplers: an S# paired with a null 3D T# and a 3D T# whose channels all select constants was refused or kept its unnormalized coordinates");
+    expectFailure([&] { static_cast<void>(populate({volume}, {volumeDescriptor})); }, "samples a 1D-array, 2D-array, 3D, cube or multisampled image", "unnormalized samplers: a 3D T# was accepted");
+    expectFailure([&] { static_cast<void>(populate({volume, plane}, {nullDescriptor, planeDescriptor})); }, "samples a 1D-array, 2D-array, 3D, cube or multisampled image", "unnormalized samplers: an S# shared by a null 3D T# and a 2D T# was accepted");
+}
+
 void verifyUnusedUnnormalizedSampler() {
     using namespace ShaderRecompiler;
     ImageResource image{};
@@ -6199,6 +6240,7 @@ int main(int argc, char** argv) {
         verifyCoherentBufferAccesses();
         verifyUnnormalizedSamplers();
         verifyUnusedUnnormalizedSampler();
+        verifyNullVolumeUnnormalizedSampler();
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
         verifyBdaReadFallbackFunctions();

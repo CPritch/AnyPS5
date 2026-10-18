@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cerrno>
 #include <cfenv>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -392,6 +393,9 @@ float APS5_VABI log1pf_nid_postfix(float x) { return std::log1p(x); }
 double APS5_VABI expm1_nid_postfix(double x) { return std::expm1(x); }
 float APS5_VABI expm1f_nid_postfix(float x) { return std::expm1(x); }
 float APS5_VABI erff_nid_postfix(float x) { return std::erf(x); }
+double APS5_VABI erf_nid_postfix(double x) { return std::erf(x); }
+double APS5_VABI erfc_nid_postfix(double x) { return std::erfc(x); }
+float APS5_VABI erfcf_nid_postfix(float x) { return std::erfc(x); }
 int signgam_nid_postfix = 0;
 
 double APS5_VABI lgamma_nid_postfix(double x) {
@@ -547,6 +551,16 @@ long double APS5_VABI powl_nid_postfix(long double base, long double exp) { retu
 long double APS5_VABI ldexpl_nid_postfix(long double x, int exp) { return std::ldexp(x, exp); }
 long double APS5_VABI truncl_nid_postfix(long double x) { return std::trunc(x); }
 double APS5_VABI logb_nid_postfix(double x) { return std::logb(x); }
+int APS5_VABI ilogb_nid_postfix(double x) {
+    if (x == 0.0) {
+        return INT_MIN;
+    }
+    if (!std::isfinite(x)) {
+        return INT_MAX;
+    }
+    return std::ilogb(x);
+}
+int APS5_VABI ilogbf_nid_postfix(float x) { return ilogb_nid_postfix(static_cast<double>(x)); }
 double APS5_VABI remainder_nid_postfix(double x, double y) { return std::remainder(x, y); }
 float APS5_VABI _FSinh_nid_postfix(float x, float y) { return y * std::sinh(x); }
 float APS5_VABI _FCosh_nid_postfix(float x, float y) { return y * std::cosh(x); }
