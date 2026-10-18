@@ -35,6 +35,7 @@
 #include <future>
 #include <memory>
 #include <new>
+#include <set>
 #include <stdexcept>
 #include <span>
 #include <string>
@@ -2912,6 +2913,27 @@ void verifyLanesOutsideHostSubgroup() {
     require(pixel(permlanex16, 32u) && pixel(permlane16, 8u), "host lanes: a v_permlane16_b32 row that the host subgroup may hold did not build");
 }
 
+std::uint32_t LaneReductions(std::span<const std::uint32_t> spirv, spv::Op opcode, bool ofLaneBits) {
+    std::set<std::uint32_t> laneIdVariables;
+    std::set<std::uint32_t> laneIds;
+    std::set<std::uint32_t> shifts;
+    std::set<std::uint32_t> laneBits;
+    std::uint32_t count = 0;
+    for (std::size_t cursor = 5; cursor < spirv.size() && (spirv[cursor] >> 16u) != 0u; cursor += spirv[cursor] >> 16u) {
+        const auto op = spirv[cursor] & 0xffffu;
+        if (op == spv::OpDecorate && (spirv[cursor] >> 16u) == 4u && spirv[cursor + 2u] == spv::DecorationBuiltIn && spirv[cursor + 3u] == spv::BuiltInSubgroupLocalInvocationId) laneIdVariables.insert(spirv[cursor + 1u]);
+        if (op == spv::OpLoad && laneIdVariables.contains(spirv[cursor + 3u])) laneIds.insert(spirv[cursor + 2u]);
+        if (op == spv::OpShiftLeftLogical && laneIds.contains(spirv[cursor + 4u])) shifts.insert(spirv[cursor + 2u]);
+        if ((op == spv::OpSelect && shifts.contains(spirv[cursor + 4u])) || (op == spv::OpCopyObject && shifts.contains(spirv[cursor + 3u]))) laneBits.insert(spirv[cursor + 2u]);
+        if (op == static_cast<std::uint32_t>(opcode) && (spirv[cursor] >> 16u) == 6u && spirv[cursor + 4u] == spv::GroupOperationReduce && laneBits.contains(spirv[cursor + 5u]) == ofLaneBits) ++count;
+    }
+    return count;
+}
+
+std::uint32_t ValueReductions(std::span<const std::uint32_t> spirv, spv::Op opcode) {
+    return LaneReductions(spirv, opcode, false);
+}
+
 void verifyHalfWaveReduction() {
     using namespace ShaderRecompiler;
     static constexpr std::array<std::uint32_t, 5> capabilities{spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilityClipDistance};
@@ -2933,13 +2955,7 @@ void verifyHalfWaveReduction() {
         request.useCache = false;
         return Recompile(request).spirv;
     };
-    const auto reductions = [](std::span<const std::uint32_t> spirv, spv::Op opcode) {
-        std::uint32_t count = 0;
-        for (std::size_t cursor = 5; cursor < spirv.size() && (spirv[cursor] >> 16u) != 0u; cursor += spirv[cursor] >> 16u) {
-            if ((spirv[cursor] & 0xffffu) == static_cast<std::uint32_t>(opcode) && (spirv[cursor] >> 16u) == 6u && spirv[cursor + 4u] == spv::GroupOperationReduce) ++count;
-        }
-        return count;
-    };
+    const auto reductions = [](std::span<const std::uint32_t> spirv, spv::Op opcode) { return ValueReductions(spirv, opcode); };
     const auto halves = [](std::span<const std::uint32_t> spirv, spv::Op opcode, std::uint32_t identity) {
         std::map<std::uint32_t, std::size_t> definitions;
         std::vector<std::size_t> reduces;
@@ -3179,13 +3195,7 @@ void verifyNarrowVertexWave() {
     const auto prepares = [&prepared](std::span<const std::uint32_t> code, std::uint32_t subgroupSize, std::uint32_t userDataBase = 8u) {
         return !prepared(code, subgroupSize, userDataBase).empty();
     };
-    const auto reductions = [](std::span<const std::uint32_t> spirv) {
-        std::uint32_t count = 0;
-        for (std::size_t cursor = 5; cursor < spirv.size() && (spirv[cursor] >> 16u) != 0u; cursor += spirv[cursor] >> 16u) {
-            if ((spirv[cursor] & 0xffffu) == spv::OpGroupNonUniformBitwiseOr && (spirv[cursor] >> 16u) == 6u && spirv[cursor + 4u] == spv::GroupOperationReduce) ++count;
-        }
-        return count;
-    };
+    const auto reductions = [](std::span<const std::uint32_t> spirv) { return ValueReductions(spirv, spv::OpGroupNonUniformBitwiseOr); };
     const std::vector<std::uint32_t> culling{
         0xd7650015u, 0x000100c1u, 0xd7660015u, 0x00022ac1u, 0x7e0e0280u, 0x7da206f9u, 0x81060015u, 0x360e0a81u,
         0xbefe04c1u, 0xd4c50002u, 0x00020e80u, 0xd763000fu, 0x00022a81u, 0xd5010000u, 0x000a1e80u,
@@ -5939,10 +5949,13 @@ void verifyQuadMaskNeighbourReads() {
         const auto masked = compile(code, true, true);
         require(declares(masked, spv::OpDemoteToHelperInvocation) && declares(masked, spv::OpGroupNonUniformShuffle), "a quad mask with demote did not preserve its cross-lane shuffle path");
     }
-    require(declares(compile(comparisonBallot, false, false), spv::OpGroupNonUniformBallot), "the comparison test did not retain its subgroup ballot");
+    const auto ballots = [&declares](const RecompileResult& result) {
+        return declares(result, spv::OpGroupNonUniformBallot) || LaneReductions(result.spirv.Words(), spv::OpGroupNonUniformBitwiseOr, true) > 0u;
+    };
+    require(ballots(compile(comparisonBallot, false, false)), "the comparison test did not retain its subgroup ballot");
     expectFailure([&] { static_cast<void>(compile(comparisonBallot, true, false)); }, "shaderDemoteToHelperInvocation", "a quad mask killed helper lanes before a ballot with EXEC enabled for those lanes");
     const auto maskedBallot = compile(comparisonBallot, true, true);
-    require(declares(maskedBallot, spv::OpDemoteToHelperInvocation) && declares(maskedBallot, spv::OpGroupNonUniformBallot), "a quad mask with demote did not preserve its ballot path");
+    require(declares(maskedBallot, spv::OpDemoteToHelperInvocation) && ballots(maskedBallot), "a quad mask with demote did not preserve its ballot path");
 }
 
 void verifyCubeDepthCompareMode() {

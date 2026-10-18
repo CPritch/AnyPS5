@@ -3,6 +3,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <SpirvBackend/SpirvEmitterInstructions.hpp>
@@ -85,6 +86,12 @@ namespace ShaderRecompiler
         return state.hostSubgroupSize == 1u;
     }
 
+    bool HostSubgroupBallotsByReduction(const SpirvEmitterState& state) {
+        const auto& capabilities = state.supportedCapabilities;
+        return state.hostSubgroupSize == 32u &&
+               std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityGroupNonUniformArithmetic)) != capabilities.end();
+    }
+
     void EmitSubgroupBallot(SpirvEmitterState& state, std::uint32_t result, std::uint32_t predicate) {
         if (state.spannedWave) {
             SpannedBallot(state, result, predicate);
@@ -98,6 +105,16 @@ namespace ShaderRecompiler
             const auto zero = ConstantU32(state, 0u);
             const auto own = Select(state, TypeU32(state), predicate, ConstantU32(state, 1u), zero);
             state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), result, own, zero, zero, zero);
+            return;
+        }
+        if (HostSubgroupBallotsByReduction(state)) {
+            const auto zero = ConstantU32(state, 0u);
+            const auto bit = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1u), HostInvocationId(state));
+            const auto own = Select(state, TypeU32(state), predicate, bit, zero);
+            const auto mask = state.module.AllocateId();
+            state.module.EmitCapability(spv::CapabilityGroupNonUniformArithmetic);
+            state.module.AddFunction(spv::OpGroupNonUniformBitwiseOr, TypeU32(state), mask, ConstantU32(state, spv::ScopeSubgroup), static_cast<std::uint32_t>(spv::GroupOperationReduce), own);
+            state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), result, mask, zero, zero, zero);
             return;
         }
         state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4u), result, ConstantU32(state, spv::ScopeSubgroup), predicate);
