@@ -78,6 +78,16 @@ int APS5_VABI chdir_nid_postfix(const char*);
 void* APS5_VABI opendir_nid_postfix(const char*);
 FileStream* APS5_VABI fopen_nid_postfix(const char*, const char*);
 FileStream* APS5_VABI freopen_nid_postfix(const char*, const char*, FileStream*);
+std::size_t APS5_VABI fread_nid_postfix(void*, std::size_t, std::size_t, FileStream*);
+int APS5_VABI fclose_nid_postfix(FileStream*);
+int APS5_VABI fgetc_nid_postfix(FileStream*);
+int APS5_VABI feof_nid_postfix(FileStream*);
+int APS5_VABI ferror_nid_postfix(FileStream*);
+int APS5_VABI setvbuf_nid_postfix(FileStream*, char*, int, std::size_t);
+int APS5_VABI fflush_nid_postfix(FileStream*);
+void APS5_VABI flockfile_nid_postfix(FileStream*);
+void APS5_VABI funlockfile_nid_postfix(FileStream*);
+int APS5_VABI ftrylockfile_nid_postfix(FileStream*);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI pipe_nid_postfix(int*);
 int APS5_VABI dup2_nid_postfix(int, int);
@@ -615,6 +625,63 @@ int main() {
         Require(rename_nid_postfix(name(targetFile).c_str(), name(targetFile).c_str()) == 0);
         Require(rename_nid_postfix(name(sourceDirectory).c_str(), name(emptyDirectory).c_str()) == 0);
         Require(!std::filesystem::exists(sourceDirectory) && std::filesystem::is_directory(emptyDirectory / "child"));
+        const auto kernelSource = area / "kernel_source";
+        const auto kernelTarget = area / "kernel_target";
+        Require(std::filesystem::create_directories(kernelSource / "child"));
+        Require(std::filesystem::create_directory(kernelTarget));
+        { std::ofstream stream(kernelSource / "marker"); stream << "kernel directory contents"; }
+        const int directoryResult = sceKernelRename(name(kernelSource).c_str(), name(kernelTarget).c_str());
+        if (directoryResult != 0)
+            std::fprintf(stderr, "kernel empty-directory replacement result=0x%08x, expected=0\n", static_cast<unsigned>(directoryResult));
+        Require(directoryResult == 0);
+        Require(!std::filesystem::exists(kernelSource) && std::filesystem::is_directory(kernelTarget / "child"));
+        { std::ifstream stream(kernelTarget / "marker"); std::string contents; std::getline(stream, contents);
+          Require(contents == "kernel directory contents"); }
+        const int parentResult = sceKernelRename(name(targetFile).c_str(), absentParent.c_str());
+        Require(parentResult == static_cast<int>(0x80020002u));
+        Require(std::filesystem::is_regular_file(targetFile) && !std::filesystem::exists(area / "absent"));
+        const int prefixResult = sceKernelRename(name(targetFile).c_str(), name(targetFile / "target").c_str());
+        Require(prefixResult == static_cast<int>(0x80020014u));
+        Require(std::filesystem::is_regular_file(targetFile));
+        const int fileDirectoryResult = sceKernelRename(name(targetFile).c_str(), name(fullDirectory).c_str());
+        Require(fileDirectoryResult == static_cast<int>(0x80020015u));
+        Require(std::filesystem::is_regular_file(targetFile) && std::filesystem::is_regular_file(fullDirectory / "entry"));
+        const int directoryFileResult = sceKernelRename(name(kernelTarget).c_str(), name(targetFile).c_str());
+        Require(directoryFileResult == static_cast<int>(0x80020014u));
+        Require(std::filesystem::is_regular_file(kernelTarget / "marker") && std::filesystem::is_regular_file(targetFile));
+        const int nonemptyResult = sceKernelRename(name(kernelTarget).c_str(), name(fullDirectory).c_str());
+        Require(nonemptyResult == static_cast<int>(0x80020042u));
+        Require(std::filesystem::is_regular_file(kernelTarget / "marker") && std::filesystem::is_regular_file(fullDirectory / "entry"));
+        const auto descendant = kernelTarget / "child" / "moved";
+        const int descendantResult = sceKernelRename(name(kernelTarget).c_str(), name(descendant).c_str());
+        Require(descendantResult == static_cast<int>(0x80020016u));
+        Require(std::filesystem::is_directory(kernelTarget / "child") && !std::filesystem::exists(descendant));
+        { std::ifstream stream(targetFile); std::string contents; std::getline(stream, contents); Require(contents == "source"); }
+        { std::ifstream stream(fullDirectory / "entry"); std::string contents; std::getline(stream, contents); Require(contents == "entry"); }
+        { std::ifstream stream(kernelTarget / "marker"); std::string contents; std::getline(stream, contents);
+          Require(contents == "kernel directory contents"); }
+#ifdef _WIN32
+        for (const bool kernel : {true, false}) {
+            const auto lockedSource = area / (kernel ? "locked_kernel_source" : "locked_libc_source");
+            const auto preservedTarget = area / (kernel ? "preserved_kernel_target" : "preserved_libc_target");
+            Require(std::filesystem::create_directory(lockedSource));
+            Require(std::filesystem::create_directory(preservedTarget));
+            const auto marker = lockedSource / "marker";
+            { std::ofstream stream(marker); stream << "preserved source contents"; }
+            const HANDLE held = CreateFileW(marker.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            Require(held != INVALID_HANDLE_VALUE);
+            const int result = kernel ? sceKernelRename(name(lockedSource).c_str(), name(preservedTarget).c_str()) :
+                rename_nid_postfix(name(lockedSource).c_str(), name(preservedTarget).c_str());
+            Require(CloseHandle(held) != 0);
+            Require(result != 0 && std::filesystem::is_regular_file(marker));
+            if (!std::filesystem::is_directory(preservedTarget))
+                std::fprintf(stderr, "failed %s directory rename removed its destination\n", kernel ? "kernel" : "libc");
+            Require(std::filesystem::is_directory(preservedTarget) && std::filesystem::is_empty(preservedTarget));
+            { std::ifstream stream(marker); std::string contents; std::getline(stream, contents);
+              Require(contents == "preserved source contents"); }
+        }
+#endif
         for (const bool kernel : {false, true}) {
             const auto incoming = name(area / "incoming.txt");
             const auto occupied = name(area / "occupied.txt");
@@ -1088,6 +1155,38 @@ int main() {
         Require(read_nid_postfix(random, second, 3) == 3);
         Require(std::memcmp(first, second, sizeof(first)) != 0 && second[3] == 0);
         Require(close_nid_postfix(random) == 0);
+        auto* stream = fopen_nid_postfix(device, "rb");
+        Require(stream != nullptr);
+        Require(setvbuf_nid_postfix(stream, nullptr, 2, 0) == 0);
+        std::memset(first, 0, sizeof(first));
+        std::memset(second, 0, sizeof(second));
+        Require(fread_nid_postfix(first, 1, sizeof(first), stream) == sizeof(first));
+        Require(fread_nid_postfix(second, 8, 8, stream) == 8);
+        Require(std::memcmp(first, second, sizeof(first)) != 0);
+        Require(feof_nid_postfix(stream) == 0 && ferror_nid_postfix(stream) == 0);
+        flockfile_nid_postfix(stream);
+        Require(fread_nid_postfix(first, 1, 4, stream) == 4);
+        funlockfile_nid_postfix(stream);
+        Require(ftrylockfile_nid_postfix(stream) == 0);
+        funlockfile_nid_postfix(stream);
+        Require(fflush_nid_postfix(stream) == 0);
+        bool unsupported = false;
+        try {
+            fgetc_nid_postfix(stream);
+        } catch (const std::runtime_error&) {
+            unsupported = true;
+        }
+        Require(unsupported);
+        Require(fclose_nid_postfix(stream) == 0);
+        for (const char* mode : {"wb", "ab", "r+b"}) {
+            bool rejected = false;
+            try {
+                fopen_nid_postfix(device, mode);
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+            Require(rejected);
+        }
     }
     Require(unlink_nid_postfix(presentName.c_str()) == 0 && !std::filesystem::exists(present));
     const auto empty = root / "empty";

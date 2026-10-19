@@ -43,7 +43,7 @@ struct TextureCacheUse {
 };
 TextureCacheUse TextureCacheUsage();
 std::uint64_t SampledTextureCacheBudget(const Context& context);
-std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);
+std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
 bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words);
@@ -68,6 +68,13 @@ struct PipelineSetLayouts {
     std::span<const std::uint32_t> fragmentKey;
 };
 
+struct TableDescriptors {
+    std::uint32_t binding = 0;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> runs;
+    std::vector<VkDescriptorImageInfo> images;
+    std::shared_ptr<const std::vector<std::shared_ptr<Texture>>> textures;
+};
+
 class DescriptorCache {
 public:
     explicit DescriptorCache(const Context& context);
@@ -83,9 +90,13 @@ public:
         VkDescriptorPool pool = VK_NULL_HANDLE;
         std::size_t poolIndex = 0;
         bool updateAfterBind = false;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        std::vector<VkDescriptorPoolSize> sizes;
+        std::optional<std::uint32_t> variableCount;
+        std::shared_ptr<const TableDescriptors> table;
     };
     SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt);
-    void Free(const SetAllocation& allocation) noexcept;
+    void Free(const SetAllocation& allocation, std::shared_ptr<const TableDescriptors> table = {}) noexcept;
     SetAllocation AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt);
     void Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
@@ -95,6 +106,8 @@ public:
         std::uint64_t sets = 0;
         std::uint64_t pools = 0;
         std::uint64_t dedicatedPools = 0;
+        std::uint64_t keptSets = 0;
+        std::uint64_t reusedSets = 0;
     };
     Stats Counters() const;
 
@@ -114,7 +127,8 @@ private:
     std::vector<Pool> pools;
     std::vector<Pool> updateAfterBindPools;
     std::vector<VkDescriptorPool> dedicated;
-    std::unordered_map<VkDescriptorSetLayout, std::vector<SetAllocation>> recycled;
+    std::map<std::pair<VkDescriptorSetLayout, std::uint32_t>, std::vector<SetAllocation>> recycled;
+    std::vector<SetAllocation> kept;
     Stats stats;
 };
 
@@ -125,6 +139,9 @@ using ContentKeyDiff = std::array<bool, static_cast<std::size_t>(ContentKeyCompo
 struct ImageTableReuseCounts {
     std::uint64_t reused = 0;
     std::uint64_t resolved = 0;
+    std::uint64_t replayed = 0;
+    std::uint64_t writesKept = 0;
+    std::uint64_t writesMade = 0;
 };
 ImageTableReuseCounts ImageTableReuses();
 
@@ -181,7 +198,7 @@ public:
         std::size_t allocation;
         std::uint64_t address;
         std::size_t size;
-        std::vector<std::uint32_t> words;
+        std::span<const std::uint32_t> words;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
@@ -408,7 +425,7 @@ private:
     // `written` is the element's DescriptorBinding::bufferWritten: a read-only element binds the
     // same way but is left out of the write set (no write-back, no pending-write note). `atomic`
     // is its bufferAtomic (see GuestBufferMemory::AddWritable).
-    std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read);
+    std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read, std::uint32_t extent);
     std::uint64_t guestBufferBytes(std::span<const std::uint32_t> words) const;
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
@@ -445,6 +462,7 @@ private:
     struct PreviousSampled {
         std::array<std::uint32_t, 8> words{};
         bool depthCompare = false;
+        VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D;
         std::shared_ptr<Texture> texture;
     };
     PreviousSampled previousSampled;
@@ -543,6 +561,16 @@ private:
     bool splitSets = false;
     std::vector<std::uint32_t> fragmentLayoutKey;
     SetObjects fragment;
+    struct TableWrites {
+        bool recorded = false;
+        bool written = false;
+        std::uint32_t binding = 0;
+        std::size_t firstImage = 0;
+        std::size_t images = 0;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> runs;
+    };
+    std::array<TableWrites, 2> tableWrites;
+    std::shared_ptr<const TableDescriptors> keptTable(std::size_t set, std::shared_ptr<const std::vector<std::shared_ptr<Texture>>>& held) noexcept;
     std::uint32_t setOf(const Binding& binding) const;
     std::vector<Allocation> allocations;
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;

@@ -198,6 +198,29 @@ if(APS5_ENABLE_TRACY)
     list(APPEND PATCHED_OUTPUTS ${TRACY_CLIENT_COPIED})
 endif()
 
+if(TARGET mimalloc)
+    add_executable(pe_import_first ${CMAKE_CURRENT_SOURCE_DIR}/allocator/PeImportFirstMain.cpp ${CMAKE_CURRENT_SOURCE_DIR}/allocator/PeImportFirst.cpp)
+    target_compile_features(pe_import_first PRIVATE cxx_std_20)
+    if(MINGW)
+        target_compile_options(pe_import_first PRIVATE -fasynchronous-unwind-tables)
+        target_link_options(pe_import_first PRIVATE -static -static-libgcc -static-libstdc++)
+    endif()
+    add_custom_command(
+            OUTPUT ${PATCHED_DIR}/mimalloc.dll
+            COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:mimalloc> ${PATCHED_DIR}/mimalloc.dll
+            COMMAND $<TARGET_FILE:pe_import_first> ${PATCHED_DIR}/mimalloc.dll mimalloc-redirect.dll
+            DEPENDS mimalloc pe_import_first
+            COMMENT "Copying mimalloc.dll beside the libraries, its redirection module imported first"
+    )
+    add_custom_command(
+            OUTPUT ${PATCHED_DIR}/mimalloc-redirect.dll
+            COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE_DIR:mimalloc>/mimalloc-redirect.dll ${PATCHED_DIR}/mimalloc-redirect.dll
+            DEPENDS mimalloc
+            COMMENT "Copying mimalloc-redirect.dll beside the libraries"
+    )
+    list(APPEND PATCHED_OUTPUTS ${PATCHED_DIR}/mimalloc.dll ${PATCHED_DIR}/mimalloc-redirect.dll)
+endif()
+
 add_custom_target(libs DEPENDS ${PATCHED_OUTPUTS})
 
 if(BUILD_TESTING)
@@ -218,6 +241,15 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME nid_buffer_validation COMMAND nid_buffer_validation_tests)
     set_tests_properties(nid_buffer_validation PROPERTIES TIMEOUT 10)
+
+    add_test_executable(pe_import_first_tests allocator/tests/PeImportFirstTests.cpp allocator/PeImportFirst.cpp)
+    target_include_directories(pe_import_first_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(pe_import_first_tests PRIVATE cxx_std_20)
+    if(MINGW)
+        target_compile_options(pe_import_first_tests PRIVATE -fasynchronous-unwind-tables)
+    endif()
+    add_test(NAME pe_import_first COMMAND pe_import_first_tests)
+    set_tests_properties(pe_import_first PROPERTIES TIMEOUT 10)
 
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
@@ -346,6 +378,16 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSigninDialog>")
     endif()
 
+    add_test_executable(guest_usb_storage_dialog_tests tests/GuestUsbStorageDialog.cpp)
+    target_include_directories(guest_usb_storage_dialog_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_usb_storage_dialog_tests PRIVATE libSceUsbStorageDialog libc)
+    configure_windows_unwind(guest_usb_storage_dialog_tests)
+    add_test(NAME guest_usb_storage_dialog COMMAND guest_usb_storage_dialog_tests)
+    if(WIN32)
+        set_tests_properties(guest_usb_storage_dialog PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceUsbStorageDialog>")
+    endif()
+
     add_test_executable(guest_netctl_ap_dialog_tests tests/GuestNetCtlApDialog.cpp)
     target_include_directories(guest_netctl_ap_dialog_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_netctl_ap_dialog_tests PRIVATE libSceNetCtlApDialog libc)
@@ -456,6 +498,18 @@ if(BUILD_TESTING)
         set_tests_properties(savedata_memory_growth savedata_memory_growth_read_failure PROPERTIES
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSaveData.native>")
     endif()
+    add_test_executable(savedata_memory_journal_tests tests/SaveDataMemoryJournal.cpp)
+    target_include_directories(savedata_memory_journal_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(savedata_memory_journal_tests PRIVATE libSceSaveData.native)
+    configure_windows_unwind(savedata_memory_journal_tests)
+    if(MINGW)
+        target_compile_options(savedata_memory_journal_tests PRIVATE -fasynchronous-unwind-tables)
+    endif()
+    add_test(NAME savedata_memory_journal COMMAND savedata_memory_journal_tests)
+    if(WIN32)
+        set_tests_properties(savedata_memory_journal PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSaveData.native>")
+    endif()
     add_library(host_thread_local_test_library SHARED tests/HostThreadLocalLibrary.cpp)
     set_target_properties(host_thread_local_test_library PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
     target_include_directories(host_thread_local_test_library PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -541,5 +595,15 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(guest_acm PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAcm>")
+    endif()
+
+    add_test_executable(guest_voice_chat_tests tests/GuestVoiceChat.cpp)
+    target_include_directories(guest_voice_chat_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_voice_chat_tests PRIVATE libSceVoiceChat libc)
+    configure_windows_unwind(guest_voice_chat_tests)
+    add_test(NAME guest_voice_chat COMMAND guest_voice_chat_tests)
+    if(WIN32)
+        set_tests_properties(guest_voice_chat PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceVoiceChat>")
     endif()
 endif()

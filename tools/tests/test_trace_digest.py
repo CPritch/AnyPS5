@@ -280,6 +280,26 @@ class TraceDigestTests(unittest.TestCase):
         self.assertAlmostEqual(waits[0]["ms"], 14.5)
         self.assertEqual(waits[1]["name"], "Driver.WorkerWait")
 
+    def test_wait_subscope_without_parent_is_not_busy(self):
+        events = [EVENTS[1], complete(1, "Driver.WorkerWait.dequeue_order", 0, 4000),
+                  complete(1, "Driver.Packet", 4000, 5000), EVENTS[-3], EVENTS[-2]]
+        result = trace_digest.digest(trace_digest.Trace({"traceEvents": events}))
+        worker = result["threads"][0]
+        self.assertAlmostEqual(worker["wait_pct"], 40.0)
+        self.assertAlmostEqual(worker["busy_pct"], 50.0)
+        self.assertEqual(result["longest_waits"][0]["name"], "Driver.WorkerWait.dequeue_order")
+        self.assertEqual(worker["top"][0]["name"], "Driver.Packet")
+
+    def test_nested_wait_subscope_does_not_double_count(self):
+        events = [EVENTS[1], complete(1, "Driver.WorkerWait", 0, 4000),
+                  complete(1, "Driver.WorkerWait.dequeue_order", 1000, 2000),
+                  complete(1, "Driver.Packet", 4000, 5000), EVENTS[-3], EVENTS[-2]]
+        result = trace_digest.digest(trace_digest.Trace({"traceEvents": events}))
+        worker = result["threads"][0]
+        self.assertAlmostEqual(worker["wait_pct"], 40.0)
+        self.assertAlmostEqual(worker["busy_pct"], 50.0)
+        self.assertEqual(len(result["longest_waits"]), 1)
+
     def test_gpu_mutex_waits_with_site_names(self):
         for site in ("other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try"):
             with self.subTest(site=site):
@@ -479,6 +499,25 @@ class IntervalDigestTests(unittest.TestCase):
         self.assertEqual(trace_digest.sparkline([0.0, 5.0, 10.0]), ".+@")
         self.assertEqual(trace_digest.sparkline([0.0, 0.0]), "..")
         self.assertEqual(trace_digest.sparkline([]), "")
+
+    def test_largest_phase_does_not_depend_on_json_key_order(self):
+        phases = [("Driver.Completion", 1.0), ("Driver.Packet", 7.0), ("Driver.Present", 2.0)]
+        for offset in range(len(phases)):
+            for sort_keys in (False, True):
+                with self.subTest(offset=offset, sort_keys=sort_keys):
+                    line = interval_line(0.0, 30.0, 20.0, 5.0,
+                                         top_phases_ms_per_frame=dict(phases[offset:] + phases[:offset]))
+                    self.path.write_text(json.dumps(line, sort_keys=sort_keys) + "\n", encoding="utf-8")
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        self.assertEqual(trace_digest.main([str(self.path), "--json"]), 0)
+                    result = json.loads(output.getvalue())
+                    self.assertEqual(result["intervals"][0]["top_phase"],
+                                     {"name": "Driver.Packet", "ms_per_frame": 7.0})
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        self.assertEqual(trace_digest.main([str(self.path)]), 0)
+                    self.assertIn("| Driver.Packet 7.0 |", output.getvalue())
 
     def test_command_line_table_and_json(self):
         output = io.StringIO()

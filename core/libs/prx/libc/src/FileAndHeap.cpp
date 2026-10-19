@@ -9,6 +9,7 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <cerrno>
 #include <cstring>
@@ -29,6 +30,7 @@
 #include "prx/libc/include/HostErrno.hpp"
 #include "prx/libc/include/AppArchive.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/HostEntropy.hpp"
 
 #ifdef __linux__
 #include <stdio_ext.h>
@@ -60,11 +62,16 @@ static std::optional<GuestFileMode> ParseFileMode(const char* mode) {
     return result;
 }
 
+#ifdef _WIN32
+static constexpr DWORD AppendOnlyAccess = FILE_GENERIC_WRITE & ~FILE_WRITE_DATA;
+#endif
+
 static std::FILE* OpenNative(const std::filesystem::path& path, const std::string& nativeMode) {
 #ifdef _WIN32
     const char access = nativeMode[0];
     const bool update = nativeMode.find('+') != std::string::npos;
-    const DWORD desired = update ? GENERIC_READ | GENERIC_WRITE : access == 'r' ? GENERIC_READ : GENERIC_WRITE;
+    const DWORD writes = access == 'a' ? AppendOnlyAccess : GENERIC_WRITE;
+    const DWORD desired = update ? GENERIC_READ | writes : access == 'r' ? GENERIC_READ : writes;
     const DWORD disposition = access == 'r' ? OPEN_EXISTING
         : nativeMode.find('x') != std::string::npos ? CREATE_NEW : access == 'w' ? CREATE_ALWAYS : OPEN_ALWAYS;
     SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
@@ -100,14 +107,11 @@ static std::FILE* OpenNative(const std::filesystem::path& path, const std::strin
 }
 
 #ifdef _WIN32
-static bool AppendThroughDescriptor(int descriptor) {
-    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
-    if (handle == INVALID_HANDLE_VALUE) return false;
-    if (descriptor <= 2 || GetFileType(handle) != FILE_TYPE_DISK) return true;
+static bool MoveAppendingHandle(int descriptor, HANDLE handle, DWORD access, DWORD options) {
     const int translation = ::_setmode(descriptor, _O_BINARY);
     if (translation == -1 || ::_setmode(descriptor, translation) == -1) return false;
     HANDLE copy = nullptr;
-    if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &copy, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+    if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &copy, access, TRUE, options)) {
         errno = EBADF;
         return false;
     }
@@ -116,11 +120,29 @@ static bool AppendThroughDescriptor(int descriptor) {
         CloseHandle(copy);
         return false;
     }
+    auto* const standard = HostStandardHandle_nid_no_patch(descriptor);
     const int moved = ::_dup2(appending, descriptor);
     const int error = errno;
     ::_close(appending);
+    KeepStandardHandle_nid_no_patch(descriptor, standard);
     errno = error;
     return moved == 0;
+}
+
+static bool AppendThroughDescriptor(int descriptor) {
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    if (descriptor <= 2 || GetFileType(handle) != FILE_TYPE_DISK) return true;
+    return MoveAppendingHandle(descriptor, handle, 0, DUPLICATE_SAME_ACCESS);
+}
+
+static bool AppendOnlyDescriptor(int descriptor) {
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    if (GetFileType(handle) != FILE_TYPE_DISK) return true;
+    const ACCESS_MASK access = WindowsHandleAccess_nid_no_patch(handle, descriptor, "freopen");
+    if (WindowsHandleOnlyAppends_nid_no_patch(access)) return true;
+    return MoveAppendingHandle(descriptor, handle, ((access & FILE_READ_DATA) != 0 ? FILE_GENERIC_READ : 0) | AppendOnlyAccess, 0);
 }
 
 static bool IsPipeStream(std::FILE* native) {
@@ -291,6 +313,15 @@ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode
             }
         }
         if (stream->Reopen(path, parsed->native.c_str())) {
+#ifdef _WIN32
+            if (parsed->append && !AppendOnlyDescriptor(_fileno(stream->GetHandle()))) {
+                const int error = errno;
+                stream->Close();
+                if (stream->IsDynamic()) delete stream;
+                errno = error;
+                return nullptr;
+            }
+#endif
             if (parsed->append) static_cast<void>(std::fseek(stream->GetHandle(), 0, SEEK_END));
             if (!path.empty() && parsed->writes) RecordWrittenPath_nid_no_patch(path);
             return stream;
@@ -309,6 +340,19 @@ FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) 
     if (!parsed) {
         errno = EINVAL;
         return nullptr;
+    }
+    if (const std::string_view path(filename); path == "/dev/random" || path == "/dev/urandom") {
+        if (parsed->writes) throw std::runtime_error(std::string(__func__) + ": writing to " + filename + " is not implemented");
+#ifdef _WIN32
+        std::unique_ptr<std::FILE, int (*)(std::FILE*)> device(std::fopen("NUL", "rb"), std::fclose);
+#else
+        std::unique_ptr<std::FILE, int (*)(std::FILE*)> device(std::fopen("/dev/null", "rb"), std::fclose);
+#endif
+        if (!device) return nullptr;
+        auto stream = std::make_unique<FileStream>(device.get(), true);
+        device.release();
+        stream->MarkRandomDevice();
+        return stream.release();
     }
     std::filesystem::path fpath;
     if (const int error = ResolvePathError_nid_no_patch(filename, fpath)) { errno = error; return nullptr; }
@@ -340,7 +384,7 @@ int APS5_VABI fclose_nid_postfix(FileStream* stream) {
         errno = 9;
         return -1;
     }
-    GetNativeStream(stream);
+    GetStreamHandle(stream);
     std::unique_ptr<FileStream> owner(stream->IsDynamic() ? stream : nullptr);
     return stream->Close();
 }
@@ -372,7 +416,7 @@ FileStream* APS5_VABI _ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi_nid_postfix(const 
 
 size_t APS5_VABI fread_nid_postfix(void* buffer, size_t size, size_t count, FileStream* stream) {
     if (stream && !stream->IsOpen()) { errno = 9; return 0; }
-    auto* handle = GetNativeStream(stream);
+    auto* handle = GetStreamHandle(stream);
     if (size == 0 || count == 0) return 0;
     if (!buffer) throw std::runtime_error("fread: null buffer");
     if (count > std::numeric_limits<std::size_t>::max() / size) throw std::overflow_error("fread: buffer size overflow");
@@ -380,6 +424,11 @@ size_t APS5_VABI fread_nid_postfix(void* buffer, size_t size, size_t count, File
     if (bytes > std::numeric_limits<std::uintptr_t>::max() - reinterpret_cast<std::uintptr_t>(buffer)) throw std::overflow_error("fread: buffer address overflow");
     const GuestArena::HostWrite destination(buffer, bytes);
     if (!destination.Open()) throw std::runtime_error("fread: buffer is not writable");
+    if (stream->IsRandomDevice()) {
+        HostEntropy_nid_no_patch(buffer, bytes);
+        stream->SyncStatus();
+        return count;
+    }
     const auto result = std::fread(buffer, size, count, handle);
     stream->SyncStatus();
     return result;
@@ -390,6 +439,10 @@ size_t APS5_VABI fwrite_nid_postfix(const void* buffer, size_t size, size_t coun
     auto* handle = GetNativeStream(stream);
     if (size == 0 || count == 0) return 0;
     if (!buffer) throw std::runtime_error("fwrite: null buffer");
+    if (count > std::numeric_limits<std::size_t>::max() / size) throw std::overflow_error("fwrite: buffer size overflow");
+    const auto bytes = size * count;
+    if (bytes > std::numeric_limits<std::uintptr_t>::max() - reinterpret_cast<std::uintptr_t>(buffer)) throw std::overflow_error("fwrite: buffer address overflow");
+    GuestArena::GuestArenaPrepareHostRead_nid_no_patch(buffer, bytes);
     const auto result = std::fwrite(buffer, size, count, handle);
     stream->SyncStatus();
     return result;
@@ -461,7 +514,8 @@ int APS5_VABI fputs_nid_postfix(const char* str, FileStream* stream) {
 
 int APS5_VABI fflush_nid_postfix(FileStream* stream) {
     if (stream && !stream->IsOpen()) { errno = 9; return -1; }
-    std::FILE* native = stream ? GetNativeStream(stream) : nullptr;
+    std::FILE* native = stream ? GetStreamHandle(stream) : nullptr;
+    if (stream && stream->IsRandomDevice()) return 0;
 #ifdef __linux__
     if (native && !__fwriting(native)) return 0;
 #endif
