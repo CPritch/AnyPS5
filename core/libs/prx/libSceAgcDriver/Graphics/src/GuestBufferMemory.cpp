@@ -3917,6 +3917,11 @@ const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address,
 
 namespace {
 
+bool bdaStagingEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_BDA_STAGING") != nullptr;
+    return !disabled;
+}
+
 template<typename Regions>
 bool mirrorOverlaps(const Regions& base, std::uint64_t begin, std::uint64_t end) {
     auto found = std::upper_bound(base.begin(), base.end(), begin, [](std::uint64_t value, const auto& region) { return value < region.begin; });
@@ -3934,12 +3939,18 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     const auto begin = address & ~std::uint64_t{3};
     const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
     const Region* inside = nullptr;
+    bool overlay = false;
     switch (baseOverlap(begin, end, &inside)) {
         case BaseOverlap::Inside:
             if (!servesView(*inside, begin)) {
                 dissolveSpace(false);
                 break;
             }
+            if (overlayCandidate(*inside, readOnly) && GuestMemory::DescribeCommitted(begin, static_cast<std::size_t>(end - begin)).whole) {
+                overlay = true;
+                break;
+            }
+            if (bdaStagingEnabled() && stagingAllowed) servedInsideBase.emplace_back(begin, end);
             return;
         case BaseOverlap::Partial:
             if (readOnly && !mirrorOverlaps(space->base, begin, end) && !WritesOverlap(begin, static_cast<std::size_t>(end - begin))) {
@@ -3958,6 +3969,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     region.atomic = atomic;
     region.swept = swept;
     region.lastView = begin;
+    region.overlay = overlay;
     auto committed = GuestMemory::DescribeCommitted(begin, static_cast<std::size_t>(end - begin));
     if (!committed.whole) {
         // A GPU heap bound whole while the guest commits its pages on demand, or a descriptor left
@@ -4142,28 +4154,6 @@ VkBufferUsageFlags gpuCopyUsage(bool addressable) {
     return VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | (addressable ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
 }
 
-// Device-local staging. A written V# element bound in place makes the shader store into host
-// memory over PCIe: the froxel culling kernel's ~248K scattered 4-byte stores took 2.8 ms per
-// dispatch and the histogram kernels' ~60K atomics on a 1 KB bin table 1.4 ms, on a GPU that is
-// otherwise idle. Instead an element the recompiler marks written (DescriptorBinding::bufferWritten,
-// within a size window) or atomic (bufferAtomic, up to its own cap) that lies inside a host import
-// takes the gpuCopy path above with a DEVICE_LOCAL buffer: copied in from the import before the
-// work (never skipped for a write-only element: the copy-back is the whole written range, so every
-// byte the shader leaves alone must hold the import's bytes), bound in the import's place, and
-// copied back by RecordCopyBacks after the work, with the pending-write note and the direct-write
-// marks of an in-place write. Only builds whose every use records the work and calls
-// RecordCopyBacks take it (dispatches, see AllowDeviceStaging; a synchronous draw would store the
-// staging bytes from the CPU, which a device-local buffer cannot serve), and never address-based
-// ones (their pointers read the import in place, and AddressRanges needs a device address). The
-// shadow is per use, not resident: a reused build records its copy-in anew (RecordStagingCopies).
-// Accepted trade-off, as for the misaligned copies above: a CPU write into a staged range between
-// the copy-in and the copy-back is rolled back by the copy-back (the whole written element range,
-// since store extents are not known), for the batch's latency; the staging window keeps the
-// exposure to the elements named on the [buffers] staging line and APS5_TRACE_STAGING.
-// APS5_NO_WRITTEN_SHADOW=1 and APS5_NO_ATOMIC_STAGING=1 bind those elements in place as before;
-// APS5_WRITTEN_SHADOW_MIN_KIB / APS5_WRITTEN_SHADOW_MAX_KIB (16 / 2048) bound the written window
-// (a kernel streaming once through a large buffer, the engine's memcpy kernel over 4-8 MiB video
-// frames, would only gain the two copies), APS5_ATOMIC_STAGE_MAX_KIB (1024) the atomic one.
 constexpr std::uint64_t SweptShadowMax = std::uint64_t{16} << 20u;
 
 bool writtenShadowEnabled() {
@@ -4302,16 +4292,56 @@ bool GuestBufferMemory::bindableInPlace(std::uint64_t offset, bool addressable) 
 }
 
 bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) const {
-    if (!stagingAllowed || addressable || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
+    if (!stagingAllowed || (addressable && !region.overlay) || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;
     if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
     return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(), SweptShadowMax) : writtenShadowMax());
 }
 
+bool GuestBufferMemory::overlayCandidate(const Region& inside, bool readOnly) const {
+    return !readOnly && bdaStagingEnabled() && stagingAllowed && addressStaging && gpuCopiesEnabled() && writtenShadowEnabled() && inside.direct != nullptr && inside.mirror == nullptr && !inside.sparse && Recorder::Active() != nullptr;
+}
+
+void GuestBufferMemory::resolveOverlays() {
+    std::vector<std::size_t> members;
+    for (std::size_t index = 0; index < regions.size(); ++index) {
+        if (regions[index].overlay) members.push_back(index);
+    }
+    if (members.empty()) return;
+    std::vector<bool> drop(regions.size(), space == nullptr);
+    std::sort(members.begin(), members.end(), [&](std::size_t left, std::size_t right) { return regions[left].begin < regions[right].begin; });
+    for (std::size_t first = 0; space != nullptr && first < members.size();) {
+        Region cluster{regions[members[first]].begin, regions[members[first]].end, true, {}, nullptr};
+        cluster.overlay = true;
+        auto last = first;
+        for (; last < members.size() && (last == first || regions[members[last]].begin < cluster.end); ++last) {
+            cluster.end = std::max(cluster.end, regions[members[last]].end);
+            cluster.atomic = cluster.atomic || regions[members[last]].atomic;
+            cluster.swept = cluster.swept || regions[members[last]].swept;
+        }
+        const auto crosses = [&](std::uint64_t begin, std::uint64_t end) { return begin < cluster.end && cluster.begin < end && (begin < cluster.begin || end > cluster.end); };
+        const Region* inside = nullptr;
+        bool keep = baseOverlap(cluster.begin, cluster.end, &inside) == BaseOverlap::Inside && inside != nullptr && inside->direct != nullptr && inside->mirror == nullptr && stagingEligible(cluster, true);
+        keep = keep && std::none_of(servedInsideBase.begin(), servedInsideBase.end(), [&](const auto& range) { return crosses(range.first, range.second); });
+        keep = keep && std::none_of(regions.begin(), regions.end(), [&](const Region& region) { return !region.overlay && region.begin < cluster.end && cluster.begin < region.end; });
+        for (auto member = first; member < last; ++member) drop[members[member]] = !keep;
+        first = last;
+    }
+    std::size_t kept = 0;
+    for (std::size_t index = 0; index < regions.size(); ++index) {
+        if (drop[index]) continue;
+        if (kept != index) regions[kept] = std::move(regions[index]);
+        ++kept;
+    }
+    regions.erase(regions.begin() + static_cast<std::ptrdiff_t>(kept), regions.end());
+}
+
 void GuestBufferMemory::UploadPrepare(bool addressable) {
     Require(!prepared && !uploaded, "guest memory was already uploaded");
     prepared = true;
+    resolveOverlays();
+    servedInsideBase.clear();
     std::vector<std::uint32_t> order(regions.size());
     std::iota(order.begin(), order.end(), 0u);
     std::sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) { return regions[left].begin < regions[right].begin; });
@@ -5075,12 +5105,20 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     std::vector<ShaderRecompiler::BdaAbi::Range> result;
     if (space != nullptr) {
         std::vector<ShaderRecompiler::BdaAbi::Range> own;
+        std::vector<ShaderRecompiler::BdaAbi::Range> overlays;
         own.reserve(regions.size());
-        for (const auto& region : regions) own.push_back(addressRange(region));
+        for (const auto& region : regions) (region.overlay ? overlays : own).push_back(addressRange(region));
         std::vector<ShaderRecompiler::BdaAbi::Range> uncovered;
         uncovered.reserve(own.size());
         AppendUncovered(own, space->ranges, uncovered);
         result = MergeByBegin(space->ranges, uncovered);
+        if (!overlays.empty()) {
+            std::sort(overlays.begin(), overlays.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+            std::vector<ShaderRecompiler::BdaAbi::Range> cut;
+            cut.reserve(result.size() + overlays.size());
+            AppendUncovered(result, overlays, cut);
+            result = MergeByBegin(cut, overlays);
+        }
     } else if (regionsOverlap) {
         std::vector<ShaderRecompiler::BdaAbi::Range> live;
         std::vector<ShaderRecompiler::BdaAbi::Range> copies;
