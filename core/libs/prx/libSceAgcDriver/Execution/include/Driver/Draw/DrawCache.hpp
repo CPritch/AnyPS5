@@ -165,9 +165,12 @@ struct DrawRelocationPending {
     std::uint64_t key = 0, alias = 0, identity = 0;
 };
 
+// Under APS5_POOL_RELOCATION a window also spans WindowFlips presents: a shader set drawn thousands of times a frame
+// would otherwise judge a window that ended before its first relocated draws had donors.
 struct DrawRelocationTrial {
-    static constexpr std::uint32_t Window = 1024, MinimumHitShare = 16, IdleDraws = 16384, ProbationAdmissions = 2;
+    static constexpr std::uint32_t Window = 1024, MinimumHitShare = 16, IdleDraws = 16384, ProbationAdmissions = 2, WindowFlips = 4;
     std::uint32_t lookups = 0, hits = 0, idle = 0, admissions = 0;
+    std::uint64_t windowFlip = 0;
     bool productive = false;
 };
 
