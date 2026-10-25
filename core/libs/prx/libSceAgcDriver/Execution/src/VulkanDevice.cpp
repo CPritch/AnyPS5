@@ -1472,7 +1472,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->capabilities.push_back(spv::CapabilityDenormPreserve);
     }
     const char* fastFloat16 = std::getenv("APS5_FAST_F16");
-    state->fastFloat16 = float16Rte && fastFloat16 != nullptr && std::strcmp(fastFloat16, "1") == 0;
+    state->fastFloat16 = float16Rte && (fastFloat16 == nullptr || std::strcmp(fastFloat16, "0") != 0);
     state->float16DenormPreserve = floatControls.shaderDenormPreserveFloat16 == VK_TRUE &&
         floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
     const auto float32Flush = Float32FlushControlFor(driverId, floatControls.shaderDenormFlushToZeroFloat32, floatControls.denormBehaviorIndependence);

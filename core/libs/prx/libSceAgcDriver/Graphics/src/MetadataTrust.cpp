@@ -25,7 +25,7 @@ MetadataTrust::MetadataTrust(std::uint32_t auditEvery) : auditEvery(auditEvery !
 bool MetadataTrust::Enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_TRUST_METADATA_WRITERS");
-        return value != nullptr && std::strcmp(value, "1") == 0;
+        return value == nullptr || std::strcmp(value, "0") != 0;
     }();
     return enabled;
 }
