@@ -12188,6 +12188,11 @@ int main(int argc, char** argv) {
             DepthClipTests();
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--pending-metadata-trust") {
+            RunPendingMetadataTrustTests();
+            std::cout << "pending metadata trust tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--unused-stencil-reference") {
             stencilReferenceUnusedTests();
             return 0;
@@ -12632,6 +12637,7 @@ int main(int argc, char** argv) {
         RunTextureTilingTests();
         RunGuestTextureResourceTests();
         RunDepthSurfaceReuseTests();
+        RunPendingMetadataTrustTests();
         RunGuestSamplerResourceTests();
         RunLastRecordIndicesTests();
         mock = MockVulkan{};
