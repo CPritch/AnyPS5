@@ -265,13 +265,19 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 }
                 return true;
             };
+            const auto sameAddresses = [](const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b) {
+                const auto sameAttribute = [](const ShaderRecompiler::VertexAttribute& x, const ShaderRecompiler::VertexAttribute& y) { return x.location == y.location && x.resource.fields == y.resource.fields; };
+                const auto sameBuffers = [](const ShaderRecompiler::DescriptorBinding& x, const ShaderRecompiler::DescriptorBinding& y) { return x.role != ShaderRecompiler::DescriptorRole::GuestBuffers || (y.role == x.role && y.guestDescriptor == x.guestDescriptor); };
+                return std::ranges::equal(a.vertexAttributes, b.vertexAttributes, sameAttribute) && std::ranges::equal(a.bindings, b.bindings, sameBuffers);
+            };
             if (verifyHit && matched[i] != nullptr) {
                 const auto& words = stageData[i].compiled != nullptr ? stageData[i].words : matched[i]->words;
                 const auto& compiled = stageData[i].compiled != nullptr ? *stageData[i].compiled : *matched[i]->compiled;
-                if (!sameContent(*matched[i], words, *variant) || !sameForwardedWords(compiled, *variant->compiled, programs[i].hiddenUserWords)) {
+                const char* what = !sameContent(*matched[i], words, *variant) ? "captured words" : !sameForwardedWords(compiled, *variant->compiled, programs[i].hiddenUserWords) ? "forwarded user words" : !sameAddresses(compiled, *variant->compiled) ? "bound buffers or vertex inputs" : nullptr;
+                if (what != nullptr) {
                     ++mismatches;
                     static std::atomic<std::uint64_t> reports{0};
-                    if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), words.size(), variant->runs.size(), variant->words.size());
+                    if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently in its %s: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what, matched[i]->runs.size(), words.size(), variant->runs.size(), variant->words.size());
                 }
             }
             if (insertCompare()) {
