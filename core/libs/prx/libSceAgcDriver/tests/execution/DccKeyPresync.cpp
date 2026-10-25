@@ -266,6 +266,23 @@ void RunMixedWordKeys(AgcDriver::VulkanDevice& device, const Scenario& scenario)
     }
 }
 
+void RunWordFillKeyBytes(AgcDriver::VulkanDevice& device, const Scenario& scenario) {
+    Reset(scenario);
+    constexpr std::uint32_t word = 0x33221100u;
+    const std::array<std::uint32_t, 4> pattern{word, word, word, word};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Require(device.FillBuffer(AddressOf(scenario.keys), KeyBytes, pattern), "the word fill of the keys was not recorded");
+    for (std::uint64_t offset = 0; offset < 8u; ++offset) {
+        const auto key = AgcDriver::Graphics::CurrentUniformMetadataByte(AddressOf(scenario.keys) + offset, 1);
+        const auto expected = static_cast<std::uint8_t>(word >> (8u * (offset % 4u)));
+        char message[160];
+        std::snprintf(message, sizeof(message), "key byte %llu behind a pending fill of the word 0x%08x is %d, expected 0x%02x", static_cast<unsigned long long>(offset), word, key.has_value() ? static_cast<int>(*key) : -1, expected);
+        Require(key == expected, message);
+    }
+    Require(!AgcDriver::Graphics::CurrentUniformMetadataByte(AddressOf(scenario.keys) + 1, 2).has_value(), "two key bytes of different values behind a pending word fill read as one key");
+    device.WaitIdle();
+}
+
 void RunOneKeyReadPerLookup(AgcDriver::VulkanDevice& device, const Scenario& scenario, const char* what) {
     Reset(scenario);
     const auto sample = Compile(device, SampleSecondTexelCode, scenario.sampleData);
@@ -328,6 +345,7 @@ int main() {
         RunOneKeyReadPerLookup(*device, reads, "a dispatch's repeated lookup");
         RunKnownKeys(*device, fills);
         RunMixedWordKeys(*device, fills);
+        RunWordFillKeyBytes(*device, fills);
         std::puts("DCC key pre-sync tests passed");
         return 0;
     } catch (const std::exception& error) {
