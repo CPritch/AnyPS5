@@ -204,7 +204,7 @@ int main() {
         };
         const bool nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
         const char* switchText = std::getenv("APS5_FAST_F16");
-        const bool switchOn = switchText != nullptr && std::strcmp(switchText, "1") == 0;
+        const bool switchOn = switchText == nullptr || std::strcmp(switchText, "0") != 0;
         Require(target.fastFloat16 == (switchOn && nativeFloat16), std::string("fast f16: the device target has the switch ") + (target.fastFloat16 ? "on" : "off") + " with APS5_FAST_F16 " + (switchText == nullptr ? "unset" : switchText));
         if (!nativeFloat16) {
             std::puts("fast f16: skipped, the device has no native f16 with RTE rounding and kept denormals");
