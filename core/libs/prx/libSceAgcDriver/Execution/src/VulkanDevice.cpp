@@ -34,6 +34,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MetadataTrust.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -4791,6 +4792,10 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
         if (nowMs - last >= 10000 && counters.lastReport.compare_exchange_strong(last, nowMs)) {
             const auto keyWaitCounts = Graphics::KeyWaitCounts();
             AgcDriver::ProfilePrint_nid_no_patch("[presync] %llu dispatches checked, %llu pre-syncs waited %.0f ms (cumulative); key ranges %llu checked, %llu pre-syncs that only the keys required; WaitForKeyWriters %llu calls: %llu without a pending writer, %llu known keys, %llu fills leaving uncompressed, %llu synced\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.presyncs.load()), counters.waitedUs.load() / 1000.0, static_cast<unsigned long long>(counters.keyChecks.load()), static_cast<unsigned long long>(counters.keyWaits.load()), static_cast<unsigned long long>(keyWaitCounts.calls), static_cast<unsigned long long>(keyWaitCounts.noPending), static_cast<unsigned long long>(keyWaitCounts.known), static_cast<unsigned long long>(keyWaitCounts.fillsUncompressed), static_cast<unsigned long long>(keyWaitCounts.synced));
+            if (Graphics::MetadataTrust::Enabled()) {
+                const auto trust = Graphics::MetadataTrust::Process().Totals();
+                AgcDriver::ProfilePrint_nid_no_patch("[trust-meta] %llu trusted skips, %llu audits, %llu confirmations, %llu revocations, %llu keys trusted (cumulative)\n", static_cast<unsigned long long>(trust.skips), static_cast<unsigned long long>(trust.audits), static_cast<unsigned long long>(trust.confirmations), static_cast<unsigned long long>(trust.revocations), static_cast<unsigned long long>(trust.trusted));
+            }
         }
     }
     return serial;
