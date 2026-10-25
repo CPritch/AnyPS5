@@ -445,8 +445,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
             if (relocation != nullptr) {
                 auto& trial = drawRelocationTrials[drawIdentity];
-                ++trial.lookups;
-                if (trial.lookups >= DrawRelocationTrial::Window) {
+                const auto flips = flipsCounted.load(std::memory_order_relaxed);
+                if (trial.lookups++ == 0) trial.windowFlip = flips;
+                if (trial.lookups >= DrawRelocationTrial::Window && (!poolRelocationEnabled() || flips - trial.windowFlip >= DrawRelocationTrial::WindowFlips)) {
                     trial.productive = trial.hits * DrawRelocationTrial::MinimumHitShare >= trial.lookups;
                     if (!trial.productive) trial.idle = DrawRelocationTrial::IdleDraws;
                     trial.lookups = trial.hits = 0;
