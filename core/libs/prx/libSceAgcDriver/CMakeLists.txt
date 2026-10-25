@@ -2020,6 +2020,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/GuestSamplerResource.cpp
         tests/TextureDetiler.cpp
         tests/DepthSurfaceReuse.cpp
+        tests/PendingMetadataTrust.cpp
         tests/LastRecordIndices.cpp
 )
 
@@ -2062,6 +2063,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_command_batch_fence_failure PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_command_batch_fence_failure PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_pending_metadata_trust COMMAND agc_driver_graphics_tests --pending-metadata-trust)
+    set_tests_properties(agc_pending_metadata_trust PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_pending_metadata_trust PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

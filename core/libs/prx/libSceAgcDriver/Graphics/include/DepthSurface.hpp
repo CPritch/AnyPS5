@@ -2,6 +2,8 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DEPTHSURFACE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MetadataTrust.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <array>
@@ -71,6 +73,13 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
 VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile);
 std::uint64_t HtileMetadataBytes(VkExtent2D extent);
 bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t address, std::size_t bytes);
+struct PendingHtile {
+    std::optional<std::uint32_t> word;
+    std::uint32_t predicted = 0;
+    std::vector<MetadataTrust::Key> checks;
+};
+PendingHtile ResolvePendingHtile(std::span<const Recorder::PendingWrite> writes, std::uint64_t address, std::size_t bytes, MetadataTrust* trust);
+void CheckPendingHtile(MetadataTrust& trust, const PendingHtile& resolved, std::span<const std::uint32_t> words);
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
 std::size_t DepthPlaneCopyCount();
 VkFormat HostDepthFormat(const Context& context, VkFormat format);
