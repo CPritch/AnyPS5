@@ -1,4 +1,5 @@
 #include "GraphicsTests.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MetadataTrust.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -70,8 +71,45 @@ void testPendingHtile() {
     Require(!resolved.word.has_value() && resolved.checks.empty(), "a revoked writer's unknown write must be read and is never checked again");
 }
 
+void testPendingKeys() {
+    std::vector<std::uint32_t> metadata(0x1000 / 4u, Expanded);
+    const auto address = reinterpret_cast<std::uint64_t>(metadata.data());
+    const auto count = metadata.size() * sizeof(std::uint32_t);
+    const auto end = address + count;
+    const MetadataTrust::Key key{Writer, address, count};
+    std::uint64_t note = 0;
+    const auto written = [&](std::uint64_t by, bool open) { return std::vector<Recorder::PendingWrite>{{address, end, ++note, -1, -1, by, open}}; };
+
+    MetadataTrust trust(4);
+    Require(!TrustedPendingKeys(written(Writer, true), address, count, trust).has_value(), "an untrusted writer's unknown write over DCC keys must be waited for");
+    Require(!PredictPendingKeys(written(Writer, false), address, count, trust).has_value(), "keys under a submitted write are no prediction");
+    for (std::uint32_t check = 0; check < MetadataTrust::Confirmations; ++check) {
+        const auto predicted = PredictPendingKeys(written(Writer, true), address, count, trust);
+        Require(predicted.has_value() && predicted->value < 0 && predicted->writers == std::vector<std::uint64_t>{Writer}, "keys under an unsubmitted write predict the mixed keys they hold");
+        CheckPendingKeys(trust, *predicted);
+    }
+    Require(trust.Trusted(key), "three waits that found the keys as predicted must trust the writer");
+    Require(TrustedPendingKeys(written(Writer, false), address, count, trust) == DccKeys::Mixed, "a trusted writer's unknown write over DCC keys must leave the keys it found");
+    Require(!TrustedPendingKeys(written(Other, false), address, count, trust).has_value(), "another writer's unknown write over the keys must still be waited for");
+    Require(TrustedPendingKeys(written(Writer, false), address, count, trust) == DccKeys::Mixed && TrustedPendingKeys(written(Writer, false), address, count, trust) == DccKeys::Mixed, "the second and third uses are skipped");
+    Require(!TrustedPendingKeys(written(Writer, false), address, count, trust).has_value(), "every fourth use of the keys must wait");
+
+    std::vector<std::uint8_t> uniform(256, 0xff);
+    const auto keys = reinterpret_cast<std::uint64_t>(uniform.data());
+    const MetadataTrust::Key uniformKey{Writer, keys, uniform.size()};
+    const std::vector<Recorder::PendingWrite> over{{keys, keys + uniform.size(), 1, -1, -1, Writer, true}};
+    const auto predicted = PredictPendingKeys(over, keys, uniform.size(), trust);
+    Require(predicted.has_value() && predicted->value == 0xff, "uniform keys under an unsubmitted write predict their key");
+    CheckPendingKeys(trust, *predicted);
+    Require(!trust.Revoked(uniformKey), "keys found as predicted confirm the writer");
+    uniform[3] = 0x00;
+    CheckPendingKeys(trust, *predicted);
+    Require(trust.Revoked(uniformKey) && !trust.Revoked(key), "keys found changed revoke the writer for that range only");
+}
+
 }
 
 void RunPendingMetadataTrustTests() {
     testPendingHtile();
+    testPendingKeys();
 }

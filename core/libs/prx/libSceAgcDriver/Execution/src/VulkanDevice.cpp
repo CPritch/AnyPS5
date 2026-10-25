@@ -4767,6 +4767,7 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
     }
     std::uint64_t serial = 0;
     bool texelsPending = false;
+    std::vector<Graphics::DccKeyCheck> keyChecks;
     if (overlaps) {
         // No reap here (SubmitAndEpoch's would run completions, which a compute worker must not do
         // on queue 0's behalf, see SubmitRecorded): the dispatch reaps after the wait.
@@ -4781,6 +4782,8 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
                 open = open || info->open;
                 serial = std::max(serial, info->serial);
                 texelsPending = texelsPending || !surface.dccKeys;
+                if (!surface.dccKeys || std::any_of(keyChecks.begin(), keyChecks.end(), [&](const Graphics::DccKeyCheck& check) { return check.begin == surface.address && check.count == bytes; })) continue;
+                if (auto check = Graphics::PrepareDccKeyCheck(surface.address, bytes)) keyChecks.push_back(std::move(*check));
             }
             if (open) serial = state->recorder->SubmitAndEpoch();
         }
@@ -4791,6 +4794,13 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
         counters.presyncs.fetch_add(1, std::memory_order_relaxed);
         if (!texelsPending) counters.keyWaits.fetch_add(1, std::memory_order_relaxed);
         counters.waitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitStart).count()), std::memory_order_relaxed);
+        if (!keyChecks.empty()) {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            for (const auto& check : keyChecks) {
+                const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{check.begin, check.begin + check.count}}};
+                Graphics::FinishDccKeyCheck(check, state->recorder && RecordedWritesSettled(check.begin, check.count) && !state->CopiedWriterOverlaps(check.begin, check.count) && !Graphics::StorageTexture::AnyPendingOverlaps(range));
+            }
+        }
     }
     if (profile) {
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();

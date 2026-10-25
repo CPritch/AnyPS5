@@ -6,10 +6,13 @@
 #endif
 #include <vulkan/vulkan.h>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MetadataTrust.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -113,6 +116,18 @@ void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys);
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes);
 bool DccKeyWritersPending(std::uint64_t metaAddress, std::size_t count);
 bool DccKeyWriterNeedsSync(std::uint64_t metaAddress, std::size_t count);
+struct DccKeyCheck {
+    std::uint64_t begin = 0;
+    std::size_t count = 0;
+    int value = -1;
+    std::uint64_t generation = 0;
+    std::vector<std::uint64_t> writers;
+};
+std::optional<DccKeys> TrustedPendingKeys(std::span<const Recorder::PendingWrite> writes, std::uint64_t begin, std::size_t count, MetadataTrust& trust);
+std::optional<DccKeyCheck> PredictPendingKeys(std::span<const Recorder::PendingWrite> writes, std::uint64_t begin, std::size_t count, const MetadataTrust& trust);
+void CheckPendingKeys(MetadataTrust& trust, const DccKeyCheck& check);
+std::optional<DccKeyCheck> PrepareDccKeyCheck(std::uint64_t metaAddress, std::size_t count);
+void FinishDccKeyCheck(const DccKeyCheck& check, bool settled);
 struct DccKeyWaitCounts {
     std::uint64_t calls;
     std::uint64_t noPending;

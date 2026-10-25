@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MetadataTrust.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -294,12 +295,15 @@ struct LandedKeys {
     int value = -1;
     bool mixed = false;
     bool unknown = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> passed;
+    bool settled = true;
 };
 
-LandedKeys KeysAfterPendingWrites(const Recorder& recorder, std::uint64_t begin, std::size_t count) {
-    auto writes = recorder.PendingWritesOver(begin, count);
+LandedKeys KeysAfterPendingWrites(std::vector<Recorder::PendingWrite> writes, std::uint64_t begin, std::size_t count, std::span<const std::uint64_t> skipped) {
     std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, begin + count}};
+    const auto reaches = [&](const Recorder::PendingWrite& write) { return std::any_of(unwritten.begin(), unwritten.end(), [&](const auto& range) { return write.begin < range.second && range.first < write.end; }); };
+    std::vector<const Recorder::PendingWrite*> passed;
     LandedKeys landed;
     const auto see = [&](int key) {
         if (landed.value < 0) landed.value = key;
@@ -307,6 +311,10 @@ LandedKeys KeysAfterPendingWrites(const Recorder& recorder, std::uint64_t begin,
     };
     for (const auto& write : writes) {
         if (landed.mixed || unwritten.empty()) break;
+        if (write.writer != 0 && std::binary_search(skipped.begin(), skipped.end(), write.writer)) {
+            if (reaches(write)) passed.push_back(&write);
+            continue;
+        }
         std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
         bool covered = false;
         for (const auto& [from, to] : unwritten) {
@@ -334,7 +342,23 @@ LandedKeys KeysAfterPendingWrites(const Recorder& recorder, std::uint64_t begin,
         if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
         else landed.mixed = true;
     }
+    for (const auto* write : passed) {
+        if (!write->open && reaches(*write)) landed.settled = false;
+        const auto found = std::find_if(landed.passed.begin(), landed.passed.end(), [&](const auto& entry) { return entry.first == write->writer; });
+        if (found == landed.passed.end()) landed.passed.emplace_back(write->writer, write->note);
+        else found->second = std::max(found->second, write->note);
+    }
     return landed;
+}
+
+LandedKeys KeysAfterPendingWrites(const Recorder& recorder, std::uint64_t begin, std::size_t count) {
+    return KeysAfterPendingWrites(recorder.PendingWritesOver(begin, count), begin, count, {});
+}
+
+std::vector<std::uint64_t> PendingWriters(std::span<const Recorder::PendingWrite> writes) {
+    std::vector<std::uint64_t> writers(writes.size());
+    std::transform(writes.begin(), writes.end(), writers.begin(), [](const Recorder::PendingWrite& write) { return write.writer; });
+    return writers;
 }
 
 std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin, std::size_t count) {
@@ -360,8 +384,16 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count)) return std::nullopt;
     const auto landed = KeysAfterPendingWrites(recorder, begin, count);
     if (landed.mixed) return DccKeys::Mixed;
+    if (landed.unknown && MetadataTrust::Enabled()) return TrustedPendingKeys(recorder.PendingWritesOver(begin, count), begin, count, MetadataTrust::Process());
     if (landed.unknown || landed.value < 0) return std::nullopt;
     return ByteKeys(static_cast<std::uint8_t>(landed.value));
+}
+
+void SyncKeyWriters(Recorder& recorder, std::uint64_t begin, std::size_t count) {
+    const auto check = PrepareDccKeyCheck(begin, count);
+    Recorder::CountSync(2);
+    recorder.SyncThrough(begin, count);
+    if (check.has_value()) FinishDccKeyCheck(*check, !recorder.PendingWriteOverlaps(begin, count));
 }
 
 // Whether the keys already read as uncompressed: scans the same bytes as ReadDccKeys, so it counts
@@ -546,8 +578,7 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoi
                 memoized = true;
                 return *keys;
             }
-            Recorder::CountSync(2);
-            recorder->SyncThrough(metaAddress, count);
+            SyncKeyWriters(*recorder, metaAddress, count);
         }
     }
     return readDccKeys(metaAddress, count, memoized);
@@ -897,9 +928,55 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
         return DccKeys::Uncompressed;
     }
     waits.synced.fetch_add(1, std::memory_order_relaxed);
-    Recorder::CountSync(2);
-    recorder->SyncThrough(metaAddress, count);
+    SyncKeyWriters(*recorder, metaAddress, count);
     return std::nullopt;
+}
+
+std::optional<DccKeys> TrustedPendingKeys(std::span<const Recorder::PendingWrite> writes, std::uint64_t begin, std::size_t count, MetadataTrust& trust) {
+    const auto trusted = trust.Writers(PendingWriters(writes), begin, count, false);
+    if (trusted.empty()) return std::nullopt;
+    const auto landed = KeysAfterPendingWrites(std::vector<Recorder::PendingWrite>(writes.begin(), writes.end()), begin, count, trusted);
+    if (landed.unknown || (!landed.mixed && landed.value < 0)) return std::nullopt;
+    bool audit = false;
+    for (const auto& [writer, note] : landed.passed) audit = trust.Consult({writer, begin, count}, note) != MetadataTrust::Use::Skip || audit;
+    if (audit) return std::nullopt;
+    return landed.mixed ? DccKeys::Mixed : ByteKeys(static_cast<std::uint8_t>(landed.value));
+}
+
+std::optional<DccKeyCheck> PredictPendingKeys(std::span<const Recorder::PendingWrite> writes, std::uint64_t begin, std::size_t count, const MetadataTrust& trust) {
+    const auto learned = trust.Writers(PendingWriters(writes), begin, count, true);
+    if (learned.empty()) return std::nullopt;
+    const auto landed = KeysAfterPendingWrites(std::vector<Recorder::PendingWrite>(writes.begin(), writes.end()), begin, count, learned);
+    if (landed.unknown || !landed.settled || landed.passed.empty() || (!landed.mixed && landed.value < 0)) return std::nullopt;
+    DccKeyCheck check{begin, count, landed.mixed ? -1 : landed.value, 0, {}};
+    for (const auto& [writer, note] : landed.passed) check.writers.push_back(writer);
+    return check;
+}
+
+void CheckPendingKeys(MetadataTrust& trust, const DccKeyCheck& check) {
+    if (check.count == 0) return;
+    const auto* keys = reinterpret_cast<const std::uint8_t*>(check.begin);
+    const int value = AllKeysEqual(keys + 1, check.count - 1, keys[0]) ? keys[0] : -1;
+    for (const auto writer : check.writers) trust.Check({writer, check.begin, check.count}, value == check.value);
+}
+
+std::optional<DccKeyCheck> PrepareDccKeyCheck(std::uint64_t metaAddress, std::size_t count) {
+    if (!MetadataTrust::Enabled() || metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return std::nullopt;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || !GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count) || AnyShadowedOverlaps(metaAddress, count)) return std::nullopt;
+    const auto writes = recorder->PendingWritesOver(metaAddress, count);
+    const auto& trust = MetadataTrust::Process();
+    if (trust.Writers(PendingWriters(writes), metaAddress, count, true).empty()) return std::nullopt;
+    const auto generation = GuestMemory::CollectWrites(metaAddress, count);
+    if (generation == 0) return std::nullopt;
+    auto check = PredictPendingKeys(writes, metaAddress, count, trust);
+    if (check.has_value()) check->generation = generation;
+    return check;
+}
+
+void FinishDccKeyCheck(const DccKeyCheck& check, bool settled) {
+    if (!settled || AnyShadowedOverlaps(check.begin, check.count) || !GuestMemory::UnchangedSince(check.begin, check.count, check.generation)) return;
+    CheckPendingKeys(MetadataTrust::Process(), check);
 }
 
 }
