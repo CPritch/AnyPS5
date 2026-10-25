@@ -11,6 +11,34 @@ void TranslateFloatInstruction(IrBuilder& builder, const RdnaInstruction& instru
 }
 
 bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opcode, bool accumulator, bool quietSnan) {
+    if (fastFloat16Mode() && !quietSnan && inst.destination.omod == 0u && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32 || opcode == IrOpcode::FPFma32)) {
+        const auto lanes = [&](const RdnaOperand& operand) {
+            const IrU32 source = readF16SourceBits(operand);
+            const auto lane = [&](bool high) {
+                IrU32 bits(ir.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&source.Value(), &ir.Constant((high ? operand.opSelHi : operand.opSel) ? 16u : 0u), &ir.Constant(16u)}));
+                if (operand.absolute) bits = IrU32(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu)));
+                if (high ? operand.negateHi : operand.negate) bits = IrU32(ir.BitwiseXor(bits.Value(), ir.Constant(0x8000u)));
+                return bits;
+            };
+            return packU16Lanes(lane(false), lane(true));
+        };
+        const IrU32 lhs = lanes(sourceAt(inst, 0u));
+        const IrU32 rhs = lanes(sourceAt(inst, 1u));
+        IrU32 result;
+        if (opcode == IrOpcode::FPFma32) {
+            const IrU32 addend = lanes(accumulator ? accumulatorOperand(inst) : sourceAt(inst, 2u));
+            result = IrU32(ir.Emit(IrOpcode::FPFma16x2, IrType::U32, {&lhs.Value(), &rhs.Value(), &addend.Value()}));
+        } else {
+            result = IrU32(ir.Emit(opcode == IrOpcode::FPAdd32 ? IrOpcode::FPAdd16x2 : IrOpcode::FPMul16x2, IrType::U32, {&lhs.Value(), &rhs.Value()}));
+        }
+        if (inst.destination.clamp) {
+            const IrU32 low(ir.BitwiseAnd(result.Value(), ir.Constant(0xffffu)));
+            const IrU32 high(ir.ShiftRightLogical(result.Value(), ir.Constant(16u)));
+            result = packU16Lanes(clampF16Bits(inst.destination, low), clampF16Bits(inst.destination, high));
+        }
+        writeRawU32(inst.destination, result);
+        return true;
+    }
     if (floatMode.has_value() && (floatMode->floatMode & 0x0cu) != 0u) {
         throw std::runtime_error("packed f16 at pc " + std::to_string(inst.programCounter) + " in FLOAT_MODE " + std::to_string(floatMode->floatMode) + " (f16 rounding not to nearest even) is not implemented");
     }
@@ -250,7 +278,7 @@ bool TranslationContext::vDivFixupF16(const RdnaInstruction& inst) {
 }
 
 bool TranslationContext::float16Binary(const RdnaInstruction& inst, IrOpcode opcode, bool reverse) {
-    if (nativeFloat16Mode()) return float16Native(inst, opcode, sourceAt(inst, reverse ? 1u : 0u), sourceAt(inst, reverse ? 0u : 1u));
+    if (fastFloat16Mode() || nativeFloat16Mode()) return float16Native(inst, opcode, sourceAt(inst, reverse ? 1u : 0u), sourceAt(inst, reverse ? 0u : 1u));
     const bool measured = (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPSub32 || opcode == IrOpcode::FPMul32) && floatMode.has_value() && (floatMode->floatMode & 0x0cu) == 0u;
     const auto read = [&](const RdnaOperand& operand) {
         const IrF32 value = readF16AsF32(operand);
@@ -265,6 +293,14 @@ bool TranslationContext::float16Binary(const RdnaInstruction& inst, IrOpcode opc
 }
 
 bool TranslationContext::float16Ternary(const RdnaInstruction& inst, IrOpcode opcode, bool accumulator, bool mix) {
+    if (fastFloat16Mode() && opcode == IrOpcode::FPFma32 && !mix) {
+        const IrU32 lhs = readF16Bits(sourceAt(inst, 0u));
+        const IrU32 rhs = readF16Bits(sourceAt(inst, 1u));
+        const IrU32 addend = readF16Bits(accumulator ? accumulatorOperand(inst) : sourceAt(inst, 2u));
+        const IrU32 result(ir.Emit(IrOpcode::FPFma16x2, IrType::U32, {&lhs.Value(), &rhs.Value(), &addend.Value()}));
+        write16Bits(inst.destination, clampF16Bits(inst.destination, IrU32(ir.BitwiseAnd(result.Value(), ir.Constant(0xffffu)))));
+        return true;
+    }
     if (mix && floatMode.has_value() && (floatMode->floatMode & 0xc0u) != 0xc0u) {
         throw std::runtime_error("v_fma_mixlo/mixhi_f16 at pc " + std::to_string(inst.programCounter) + " in FLOAT_MODE " + std::to_string(floatMode->floatMode) + " (f16 denormals not kept) is not implemented");
     }
@@ -304,7 +340,7 @@ bool TranslationContext::float16Native(const RdnaInstruction& inst, IrOpcode opc
         const IrU32 addend = opcode == IrOpcode::FPSub32 ? IrU32(ir.BitwiseXor(rhs.Value(), ir.Constant(0x8000u))) : rhs;
         result = IrU32(ir.Emit(IrOpcode::FPAdd16x2, IrType::U32, {&lhs.Value(), &addend.Value()}));
     }
-    if (fp16Overflow()) {
+    if (fp16Overflow() && !fastFloat16Mode()) {
         const auto infinite = [&](const IrU32& value) { return IrU1(ir.IEqual(ir.BitwiseAnd(value.Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u))); };
         const IrU1 overflow(ir.LogicalAnd(infinite(result).Value(), ir.LogicalNot(ir.LogicalOr(infinite(lhs).Value(), infinite(rhs).Value()))));
         result = IrU32(ir.Select(overflow.Value(), ir.BitwiseOr(ir.BitwiseAnd(result.Value(), ir.Constant(0x8000u)), ir.Constant(0x7bffu)), result.Value()));

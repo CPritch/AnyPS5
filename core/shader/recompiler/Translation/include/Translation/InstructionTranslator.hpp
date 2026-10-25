@@ -35,6 +35,7 @@ struct TranslateOptions {
     bool fragmentShaderBarycentricEnabled = false;
     bool interpolationFunctions = false;
     bool nativeFloat16 = false;
+    bool fastFloat16 = false;
     bool float32FlushToZero = false;
     bool float32DenormPreserve = false;
     bool gcnLegacyVertexInputs = false;
