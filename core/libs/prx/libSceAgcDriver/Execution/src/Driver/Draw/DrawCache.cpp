@@ -107,7 +107,11 @@ bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape) {
     if (pending.key == key && pending.identity != 0) {
         if (pending.alias != 0) {
             const auto trial = drawRelocationTrials.find(pending.identity);
-            if (drawKeySightings->SeenBefore(pending.alias ^ 0x9e3779b97f4a7c15ull) && trial != drawRelocationTrials.end()) {
+            // Under APS5_POOL_RELOCATION an alias admits a draw only while no cached draw holds it: one donor serves
+            // every relocation of the alias, and each further draw it admitted would be cached for nothing.
+            const auto donor = poolRelocationEnabled() ? drawAliases.find(pending.alias) : drawAliases.end();
+            const bool donorHeld = donor != drawAliases.end() && drawCache.contains(donor->second);
+            if (!donorHeld && drawKeySightings->SeenBefore(pending.alias ^ 0x9e3779b97f4a7c15ull) && trial != drawRelocationTrials.end()) {
                 auto& state = trial->second;
                 if (state.productive || state.hits != 0 || state.admissions < DrawRelocationTrial::ProbationAdmissions) {
                     if (!state.productive && state.hits == 0) ++state.admissions;
