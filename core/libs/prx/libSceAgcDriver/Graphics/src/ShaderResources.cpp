@@ -5882,10 +5882,12 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder, std::uint64_t writer) {
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
     // and the note and mark below cover them like direct writes.
     guestMemory.RecordCopyBacks(recorder);
+    const auto passes = writer != 0 && MetadataTrust::Level() >= 2 ? TrustedHtilePasses(MetadataTrust::Process(), writer, guestMemory.Writes()) : std::vector<KnownHtilePass>{};
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes(), writer);
     guestMemory.MarkDirectWrites();
+    PassTrustedHtiles(passes);
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

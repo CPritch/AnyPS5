@@ -1,9 +1,26 @@
 #include "GraphicsTests.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MetadataTrust.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstdio>
+#include <optional>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -107,9 +124,138 @@ void testPendingKeys() {
     Require(trust.Revoked(uniformKey) && !trust.Revoked(key), "keys found changed revoke the writer for that range only");
 }
 
+void trust(MetadataTrust& registry, const MetadataTrust::Key& key) {
+    for (std::uint32_t check = 0; check < MetadataTrust::Confirmations; ++check) registry.Check(key, true);
+    Require(registry.Trusted(key), "three confirmations must trust the writer");
+}
+
+void testKnownHtile() {
+    std::vector<std::uint32_t> words(0x2000 / 4u, 0u);
+    const auto address = reinterpret_cast<std::uint64_t>(words.data());
+    const auto bytes = words.size() * sizeof(std::uint32_t);
+    const auto end = address + bytes;
+    const MetadataTrust::Key key{Writer, address, bytes};
+    std::uint64_t note = 0;
+    const auto alone = [&](std::uint64_t by, bool open) { return std::vector<Recorder::PendingWrite>{{address, end, ++note, -1, -1, by, open}}; };
+
+    MetadataTrust registry(4);
+    trust(registry, key);
+    Require(!ResolvePendingHtile(alone(Writer, false), address, bytes, &registry).word.has_value(), "a trusted writer's write alone, with no word known before it, must be read");
+    auto resolved = ResolvePendingHtile(alone(Writer, false), address, bytes, &registry, Expanded);
+    Require(resolved.word == Expanded && resolved.checks.empty(), "a trusted writer's write alone must resolve to the word known before it, whatever the memory holds");
+    resolved = ResolvePendingHtile(alone(Other, false), address, bytes, &registry, Expanded);
+    Require(!resolved.word.has_value(), "another writer's write must still be read");
+    auto mixed = alone(Writer, false);
+    mixed.push_back({address, address + 64, ++note, -1, -1, 0, false});
+    Require(!ResolvePendingHtile(mixed, address, bytes, &registry, Expanded).word.has_value(), "an unknown write without a writer beside the trusted one must still be read");
+    auto filled = alone(Writer, false);
+    filled.insert(filled.begin(), Recorder::PendingWrite{address, end, note - 1, 0, 0, 0, false});
+    Require(ResolvePendingHtile(filled, address, bytes, &registry, Expanded).word == 0u, "a known write after the remembered word must win over it");
+    Require(ResolvePendingHtile(alone(Writer, true), address, bytes, &registry, Expanded).word == Expanded, "the third use before the audit is skipped");
+    resolved = ResolvePendingHtile(alone(Writer, false), address, bytes, &registry, Expanded);
+    Require(!resolved.word.has_value() && resolved.checks.size() == 1 && resolved.checks[0] == key && resolved.predicted == Expanded, "the audit must read the HTILE and check it against the remembered word");
+    std::vector<std::uint32_t> read(words.size(), Expanded);
+    CheckPendingHtile(registry, resolved, read);
+    Require(registry.Trusted(key), "an audit that finds the remembered word keeps the writer trusted");
+    for (std::uint32_t use = 1; use < registry.AuditEvery(); ++use) Require(ResolvePendingHtile(alone(Writer, false), address, bytes, &registry, Expanded).word == Expanded, "the uses up to the next audit are skipped");
+    resolved = ResolvePendingHtile(alone(Writer, false), address, bytes, &registry, Expanded);
+    Require(!resolved.checks.empty() && resolved.predicted == Expanded, "the next audit must check the remembered word");
+    read[3] = 0x1234u;
+    CheckPendingHtile(registry, resolved, read);
+    Require(registry.Revoked(key) && !ResolvePendingHtile(alone(Writer, false), address, bytes, &registry, Expanded).word.has_value(), "an audit that finds the HTILE changed from the remembered word revokes the writer");
+}
+
+void* allocateWatched(std::size_t bytes) {
+    if (!AgcDriver::GuestMemory::WriteWatched()) return nullptr;
+    constexpr std::size_t alignment = 65536;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, alignment);
+    if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+#else
+    void* raw = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) return nullptr;
+    const auto begin = reinterpret_cast<std::uintptr_t>(raw);
+    const auto aligned = (begin + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
+    if (aligned != begin) munmap(raw, aligned - begin);
+    if (aligned + bytes != begin + bytes + alignment) munmap(reinterpret_cast<void*>(aligned + bytes), begin + alignment - aligned);
+    void* block = reinterpret_cast<void*>(aligned);
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
+#endif
+    return block;
+}
+
+void releaseWatched(void* block, std::size_t bytes) {
+#ifdef _WIN32
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+#else
+    munmap(block, bytes);
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, bytes);
+#endif
+}
+
+void testKnownHtileWords() {
+    constexpr std::size_t bytes = 0x20000;
+    auto* words = static_cast<std::uint32_t*>(allocateWatched(bytes));
+    if (words == nullptr) {
+        std::puts("guest memory has no write watch: the known HTILE word cases are skipped");
+        return;
+    }
+    GuestAllocations::Mutation().Add(words, bytes, true, true, false);
+    struct Cleanup {
+        std::uint32_t* words;
+        ~Cleanup() {
+            NoteKnownHtileWord(reinterpret_cast<std::uint64_t>(words), bytes, std::nullopt, 0);
+            GuestAllocations::Mutation().Remove(words);
+            releaseWatched(words, bytes);
+        }
+    } cleanup{words};
+    std::fill(words, words + bytes / 4u, Expanded);
+    const auto address = reinterpret_cast<std::uint64_t>(words);
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> writes{{{address, address + bytes}}};
+    const auto remember = [&] {
+        NoteKnownHtileWord(address, bytes, Expanded, AgcDriver::GuestMemory::CollectWritesUncached(address, bytes));
+        Require(KnownHtileWord(address, bytes) == Expanded, "the word just noted for an HTILE must be known");
+    };
+    const auto known = [&] {
+        AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+        return KnownHtileWord(address, bytes);
+    };
+    const auto writeBy = [&](const MetadataTrust& registry, std::uint64_t writer) {
+        const auto passes = TrustedHtilePasses(registry, writer, writes);
+        AgcDriver::GuestMemory::MarkPossiblyWritten(address, bytes);
+        PassTrustedHtiles(passes);
+    };
+    MetadataTrust registry(4);
+    trust(registry, {Writer, address, bytes});
+
+    remember();
+    writeBy(registry, Writer);
+    Require(known() == Expanded, "a trusted writer's write over the HTILE must leave its word known");
+    writeBy(registry, Writer);
+    Require(known() == Expanded, "a second trusted write must leave its word known");
+    writeBy(registry, Other);
+    Require(!known().has_value(), "another writer's write since must force the read");
+
+    remember();
+    words[5] = 0u;
+    Require(!known().has_value(), "a CPU store since must force the read");
+    words[5] = Expanded;
+
+    remember();
+    AgcDriver::GuestMemory::MarkWritten(address + 64, 64);
+    writeBy(registry, Writer);
+    Require(!known().has_value(), "a trusted writer's write after another store must not hide that store");
+
+    remember();
+    Require(KnownHtileWord(address, bytes / 2u) == std::nullopt, "a word known for one HTILE extent says nothing about another");
+}
+
 }
 
 void RunPendingMetadataTrustTests() {
     testPendingHtile();
     testPendingKeys();
+    testKnownHtile();
+    testKnownHtileWords();
 }

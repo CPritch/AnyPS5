@@ -78,8 +78,17 @@ struct PendingHtile {
     std::uint32_t predicted = 0;
     std::vector<MetadataTrust::Key> checks;
 };
-PendingHtile ResolvePendingHtile(std::span<const Recorder::PendingWrite> writes, std::uint64_t address, std::size_t bytes, MetadataTrust* trust);
+PendingHtile ResolvePendingHtile(std::span<const Recorder::PendingWrite> writes, std::uint64_t address, std::size_t bytes, MetadataTrust* trust, std::optional<std::uint32_t> known = std::nullopt);
 void CheckPendingHtile(MetadataTrust& trust, const PendingHtile& resolved, std::span<const std::uint32_t> words);
+void NoteKnownHtileWord(std::uint64_t address, std::size_t bytes, std::optional<std::uint32_t> word, std::uint64_t generation);
+std::optional<std::uint32_t> KnownHtileWord(std::uint64_t address, std::size_t bytes);
+struct KnownHtilePass {
+    std::uint64_t address;
+    std::size_t bytes;
+    std::uint64_t generation;
+};
+std::vector<KnownHtilePass> TrustedHtilePasses(const MetadataTrust& trust, std::uint64_t writer, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes);
+void PassTrustedHtiles(std::span<const KnownHtilePass> passes);
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
 std::size_t DepthPlaneCopyCount();
 VkFormat HostDepthFormat(const Context& context, VkFormat format);

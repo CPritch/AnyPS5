@@ -34,6 +34,7 @@ public:
     MetadataTrust(const MetadataTrust&) = delete;
     MetadataTrust& operator=(const MetadataTrust&) = delete;
     static bool Enabled();
+    static std::uint32_t Level();
     static MetadataTrust& Process();
     std::uint32_t AuditEvery() const { return auditEvery; }
     bool Trusted(const Key& key) const;
