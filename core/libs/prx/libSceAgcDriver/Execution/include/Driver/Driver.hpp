@@ -98,6 +98,7 @@ public:
     static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
     static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied = {}, const PoolRelocation* pool = nullptr);
     static bool poolRelocationEnabled();
+    static void bufferBaseRelocation(const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::RecompileResult& compiled, std::uint32_t hiddenWords, PoolRelocation& pool);
     static bool vertexTableRelocation(const DrawProgram& program, const ShaderRecompiler::ShaderVertexStageInfo& info, std::span<const Graphics::DecodeRead> reads, const ShaderRecompiler::RecompileResult& compiled, const ShaderRecompiler::SrtUserDataUse& use, PoolRelocation& pool);
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, std::string_view suffix = {});
     DrawEntryCounters DrawCacheCounters();

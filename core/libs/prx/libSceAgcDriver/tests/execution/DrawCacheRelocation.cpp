@@ -41,6 +41,10 @@ alignas(256) constexpr std::array<std::uint32_t, 16> ForwardedPixelCode{
 // s_swappc_b64 s[10:11], s[8:9] (the fetch call, through user words 0 and 1), exp pos0 v8..v11: the position is
 // the vertex attribute the header's one input semantic places in v8.
 alignas(256) constexpr std::array<std::uint32_t, 4> FetchVertexCode{0xbe8a2108u, 0xf80008cfu, 0x0b0a0908u, 0xbf810000u};
+// buffer_load_dword v0 through the V# in user words 0-3, exported as red and alpha.
+alignas(256) constexpr std::array<std::uint32_t, 8> BoundPixelCode{0xe0300000u, 0x80000000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+// The same load through that V# with 16 added to its base word.
+alignas(256) constexpr std::array<std::uint32_t, 12> OffsetPixelCode{0x80049000u, 0xbe850301u, 0xbe860302u, 0xbe870303u, 0xe0300000u, 0x80010000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
 alignas(16) std::array<float, 4> Other{0.5f, 0.0f, 0.0f, 0.0f};
 alignas(16) std::array<float, 4> ForwardedData{};
 alignas(32) std::array<std::array<std::uint64_t, 4>, 6> AlignedTables{};
@@ -57,6 +61,8 @@ alignas(8) Header PixelHeader{};
 alignas(8) Header SecondVertexHeader{};
 alignas(8) Header TriangleVertexHeader{};
 alignas(8) Header ForwardedPixelHeader{};
+alignas(8) Header BoundPixelHeader{};
+alignas(8) Header OffsetPixelHeader{};
 
 struct FetchHeader {
     Shader shader{};
@@ -110,7 +116,7 @@ void RegisterFetchVertex() {
     AgcDriverRegisterShader_nid_postfix(&header.shader);
 }
 
-std::vector<std::uint32_t> DrawFrom(std::initializer_list<const void*> sources, const std::uint32_t* vertexCode = VertexCode.data(), const std::uint32_t* pixelCode = PixelCode.data(), std::span<const std::uint32_t> vertexWords = {}) {
+std::vector<std::uint32_t> DrawFrom(std::initializer_list<const void*> sources, const std::uint32_t* vertexCode = VertexCode.data(), const std::uint32_t* pixelCode = PixelCode.data(), std::span<const std::uint32_t> vertexWords = {}, std::span<const std::uint32_t> pixelWords = {}) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
     const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode);
@@ -137,9 +143,10 @@ std::vector<std::uint32_t> DrawFrom(std::initializer_list<const void*> sources, 
     };
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
         {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(vertexWords.size())) << 1u}, {0x8c, 0},
-        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 2u << 1u},
+        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, std::max<std::uint32_t>(2u, static_cast<std::uint32_t>(pixelWords.size())) << 1u},
     };
     for (std::uint32_t word = 0; word < vertexWords.size(); ++word) shader.emplace_back(0x8cu + word, vertexWords[word]);
+    for (std::uint32_t word = 0; word < pixelWords.size(); ++word) shader.emplace_back(0x00cu + word, pixelWords[word]);
     std::vector<std::uint32_t> commands;
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
@@ -150,6 +157,7 @@ std::vector<std::uint32_t> DrawFrom(std::initializer_list<const void*> sources, 
         Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(address >> 32u)});
         Append(commands, 0x2d, {3, 2});
     }
+    if (sources.size() == 0) Append(commands, 0x2d, {3, 2});
     return commands;
 }
 
@@ -387,6 +395,57 @@ void MovedVertexTableHitsTheCache(bool libraries) {
     Require(counters.lookups == before.lookups + 1 && counters.hits == before.hits, mode + ": a draw whose attribute word changed where its table stayed reused the cached draw");
 }
 
+std::array<std::uint32_t, 4> ConstantSharp(const void* data, std::uint32_t bytes = 64u) {
+    const auto address = reinterpret_cast<std::uintptr_t>(data);
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
+}
+
+// Draws whose pixel shader loads from the buffer of the V# in its user words, a buffer that moves every draw and
+// holds another value; `moved` is false for a shader that adds to the V# base, which then stays in the key.
+void MovedConstantBufferHitsTheCache(bool libraries, Header& header, const std::uint32_t* code, std::size_t bytes, bool moved) {
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(header, code, bytes, 1);
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries" + (moved ? "" : ", a base the shader adds to");
+    alignas(256) static std::array<std::array<float, 16>, 12> buffers{};
+    const auto draw = [&](std::size_t index, float value) {
+        buffers[index].fill(value);
+        const auto sharp = ConstantSharp(buffers[index].data());
+        ColorMemory.fill(std::byte {0x40});
+        auto commands = DrawFrom({}, TriangleVertexCode.data(), code, {}, sharp);
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
+        return AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    };
+    const auto red = [&](std::uint8_t expected) {
+        std::size_t drawn = 0;
+        for (std::size_t at = 0; at < ColorMemory.size(); at += 4) {
+            if (ColorMemory[at] == std::byte {0x40} && ColorMemory[at + 1] == std::byte {0x40}) continue;
+            if (ColorMemory[at] != std::byte {expected}) return false;
+            ++drawn;
+        }
+        return drawn != 0;
+    };
+    const auto start = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    AgcDriver::DriverDetail::DrawEntryCounters counters{};
+    for (std::size_t i = 0; i < 4; ++i) counters = draw(i, 1.0f);
+    Require(counters.lookups == start.lookups + 4 && counters.hits == start.hits && (!moved || counters.inserts == start.inserts + 2), mode + ": the draws that teach the moved buffer made " + std::to_string(counters.hits - start.hits) + " hits and " + std::to_string(counters.inserts - start.inserts) + " inserts, expected 0 and 2");
+    Require(red(255), mode + ": the taught draw did not draw the buffer's value");
+    auto before = counters;
+    counters = draw(4, 0.25f);
+    if (!moved) {
+        Require(counters.lookups == before.lookups + 1 && counters.hits == before.hits, mode + ": a draw whose shader adds to a moved V# base reused the cached draw");
+        Require(red(64), mode + ": a draw whose shader adds to a moved V# base did not draw the moved buffer's value");
+        return;
+    }
+    Require(counters.hits == before.hits + 1, mode + ": a draw whose V# moved to a buffer with another value did not reuse the cached draw (" + std::to_string(counters.hits - before.hits) + " hits)");
+    Require(red(64), mode + ": a relocated draw did not bind the buffer its V# moved to");
+    before = counters;
+    counters = draw(5, 1.0f);
+    Require(counters.hits == before.hits + 1 && red(255), mode + ": a draw whose V# moved again did not reuse the cached draw with the buffer it moved to");
+}
+
 void UnrelocatedAliasesStayOut(bool libraries) {
     Registered(SecondVertexHeader, SecondVertexCode.data(), sizeof(SecondVertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
@@ -484,6 +543,8 @@ int main(int argc, char** argv) {
         if (pool) {
             Require(AgcDriver::DriverDetail::Driver::poolRelocationEnabled(), "run with APS5_POOL_RELOCATION=1");
             MovedVertexTableHitsTheCache(libraries);
+            MovedConstantBufferHitsTheCache(libraries, BoundPixelHeader, BoundPixelCode.data(), sizeof(BoundPixelCode), true);
+            MovedConstantBufferHitsTheCache(libraries, OffsetPixelHeader, OffsetPixelCode.data(), sizeof(OffsetPixelCode), false);
             AgcDriverShutdown_nid_postfix();
             std::cout << "Draws whose guest pool addresses moved reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
             return 0;

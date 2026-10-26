@@ -237,6 +237,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             bool eligible = decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0);
             PoolRelocation pool;
             if (poolRelocationEnabled() && !eligible && vertexInfos[i]) eligible = vertexTableRelocation(programs[i], *vertexInfos[i], decodeReads[i], *stageCapture.compiled, stageCapture.userDataUse, pool);
+            if (poolRelocationEnabled() && eligible && stageCapture.capture != nullptr) bufferBaseRelocation(*stageCapture.capture, *stageCapture.compiled, programs[i].hiddenUserWords, pool);
             tagVariantRuns(*variant, regions, stageCapture.userDataUse, eligible, programs[i].hiddenUserWords, stageCapture.supplied, poolRelocationEnabled() ? &pool : nullptr);
             if (drawStageDataHits() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *stageCapture.capture, decodeReads[i]);
             if (traceDrawCache() && entry != nullptr && matched[i] == nullptr && i < entry->stages.size()) {
