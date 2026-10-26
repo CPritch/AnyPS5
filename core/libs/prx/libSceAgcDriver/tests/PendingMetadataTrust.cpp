@@ -251,6 +251,34 @@ void testKnownHtileWords() {
     Require(KnownHtileWord(address, bytes / 2u) == std::nullopt, "a word known for one HTILE extent says nothing about another");
 }
 
+void testWordFillKeys() {
+    std::vector<std::uint32_t> metadata(0x1000 / 4u, 0u);
+    const auto address = reinterpret_cast<std::uint64_t>(metadata.data());
+    const auto count = metadata.size() * sizeof(std::uint32_t);
+    const auto end = address + count;
+    const MetadataTrust::Key key{Writer, address, count};
+    std::uint64_t note = 0;
+    const auto behindFill = [&](std::int64_t word, bool open) {
+        const auto fill = ++note;
+        return std::vector<Recorder::PendingWrite>{{address, end, ++note, -1, -1, Writer, open}, {address, end, fill, -1, word, 0, false}};
+    };
+
+    MetadataTrust registry(4);
+    Require(!TrustedPendingKeys(behindFill(Expanded, false), address, count, registry).has_value(), "an untrusted writer behind a word fill must be waited for");
+    for (std::uint32_t check = 0; check < MetadataTrust::Confirmations; ++check) {
+        const auto predicted = PredictPendingKeys(behindFill(Expanded, false), address, count, registry);
+        Require(predicted.has_value() && predicted->value < 0 && predicted->writers == std::vector<std::uint64_t>{Writer}, "a fill of a word with different bytes predicts mixed keys under a submitted write, without reading the keys");
+        std::fill(metadata.begin(), metadata.end(), Expanded);
+        CheckPendingKeys(registry, *predicted);
+        std::fill(metadata.begin(), metadata.end(), 0u);
+    }
+    Require(registry.Trusted(key), "three waits that found the word fill's keys must trust the writer");
+    Require(TrustedPendingKeys(behindFill(Expanded, false), address, count, registry) == DccKeys::Mixed, "a trusted writer behind a fill of a word with different bytes must leave mixed keys, whatever the memory holds");
+    Require(TrustedPendingKeys(behindFill(0xffffffff, false), address, count, registry) == DccKeys::Uncompressed, "a trusted writer behind a fill of a word with equal bytes must leave that byte's keys");
+    Require(TrustedPendingKeys(behindFill(0x10101010, true), address, count, registry) == DccKeys::ClearSingle, "a word fill's bytes are the keys over the whole range");
+    Require(!TrustedPendingKeys(behindFill(Expanded, false), address, count, registry).has_value(), "every fourth use of the keys must wait");
+}
+
 }
 
 void RunPendingMetadataTrustTests() {
@@ -258,4 +286,5 @@ void RunPendingMetadataTrustTests() {
     testPendingKeys();
     testKnownHtile();
     testKnownHtileWords();
+    testWordFillKeys();
 }
