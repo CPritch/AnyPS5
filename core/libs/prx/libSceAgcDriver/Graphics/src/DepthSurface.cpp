@@ -1641,10 +1641,29 @@ std::map<std::uint64_t, std::uint64_t>& htileReads() {
     return *reads;
 }
 
+struct KnownHtile {
+    std::size_t bytes;
+    std::uint32_t word;
+    std::uint64_t generation;
+};
+
+std::map<std::uint64_t, KnownHtile>& knownHtiles() {
+    static auto* known = new std::map<std::uint64_t, KnownHtile>();
+    return *known;
+}
+
+void noteKnownHtileLocked(std::uint64_t address, std::size_t bytes, std::optional<std::uint32_t> word, std::uint64_t generation) {
+    auto& known = knownHtiles();
+    if (!word.has_value() || generation == 0) known.erase(address);
+    else known[address] = {bytes, *word, generation};
+}
+
 void forgetHtileReads(std::uint64_t address, std::size_t bytes) {
     std::lock_guard lock(htileReadsMutex());
     auto& reads = htileReads();
     reads.erase(reads.lower_bound(address), reads.lower_bound(address + bytes));
+    auto& known = knownHtiles();
+    known.erase(known.lower_bound(address), known.lower_bound(address + bytes));
 }
 
 bool RoutesToNativeDepthOwner(const DepthTarget& target) {
@@ -1661,7 +1680,7 @@ struct HtileLanding {
     bool settled = true;
 };
 
-HtileLanding htileAfterPendingWrites(std::span<const Recorder::PendingWrite> writes, std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> skipped) {
+HtileLanding htileAfterPendingWrites(std::span<const Recorder::PendingWrite> writes, std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> skipped, std::optional<std::uint32_t> known = std::nullopt) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{address, address + bytes}};
     const auto reaches = [&](const Recorder::PendingWrite& write) { return std::any_of(unwritten.begin(), unwritten.end(), [&](const auto& range) { return write.begin < range.second && range.first < write.end; }); };
     std::vector<const Recorder::PendingWrite*> passed;
@@ -1689,7 +1708,10 @@ HtileLanding htileAfterPendingWrites(std::span<const Recorder::PendingWrite> wri
         if (write.word < 0 || (landed.has_value() && *landed != static_cast<std::uint32_t>(write.word))) return landing;
         landed = static_cast<std::uint32_t>(write.word);
     }
+    const bool remembered = !landed.has_value() && known.has_value();
+    if (remembered) landed = known;
     if (!landed.has_value()) return landing;
+    if (remembered) unwritten.clear();
     for (const auto& [from, to] : unwritten) {
         if (from % 4u != 0 || to % 4u != 0) return landing;
         const auto* words = reinterpret_cast<const volatile std::uint32_t*>(from);
@@ -1741,21 +1763,26 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
         if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return 0;
     }
     static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
+    const bool remember = MetadataTrust::Level() >= 2;
     PendingHtile resolved;
     if (pending && pendingFills) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
-        resolved = ResolvePendingHtile(recorder->PendingWritesOver(target.htileAddress, bytes), target.htileAddress, bytes, MetadataTrust::Enabled() ? &MetadataTrust::Process() : nullptr);
+        const auto known = remember ? KnownHtileWord(target.htileAddress, bytes) : std::nullopt;
+        resolved = ResolvePendingHtile(recorder->PendingWritesOver(target.htileAddress, bytes), target.htileAddress, bytes, MetadataTrust::Enabled() ? &MetadataTrust::Process() : nullptr, known);
         if (const auto landed = resolved.word) {
             const VkImageAspectFlags cleared = (VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u)) & HtileFillClears(*landed, target.htileStencil);
             if (cleared == 0) {
                 std::lock_guard lock(htileReadsMutex());
                 htileReads()[target.htileAddress] = collected;
+                if (remember) noteKnownHtileLocked(target.htileAddress, bytes, *landed, collected);
                 return 0;
             }
-            if (storeHtileOnGpu(context, *recorder, target.htileAddress, bytes, expandedHtileWord(*landed, target.htileStencil, cleared))) {
+            const auto expanded = expandedHtileWord(*landed, target.htileStencil, cleared);
+            if (storeHtileOnGpu(context, *recorder, target.htileAddress, bytes, expanded)) {
                 const auto generation = GuestMemory::CollectWrites(target.htileAddress, bytes);
                 std::lock_guard lock(htileReadsMutex());
                 htileReads()[target.htileAddress] = generation;
+                if (remember) noteKnownHtileLocked(target.htileAddress, bytes, expanded, generation);
                 return cleared;
             }
         }
@@ -1771,8 +1798,10 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
         GuestMemory::Write(target.htileAddress, std::as_bytes(std::span(words)), 4);
         generation = GuestMemory::CollectWrites(target.htileAddress, bytes);
     }
+    const bool uniform = remember && !words.empty() && std::all_of(words.begin(), words.end(), [&](std::uint32_t word) { return word == words.front(); });
     std::lock_guard lock(htileReadsMutex());
     htileReads()[target.htileAddress] = generation;
+    if (remember) noteKnownHtileLocked(target.htileAddress, bytes, uniform ? std::optional<std::uint32_t>(words.front()) : std::nullopt, generation);
     return cleared;
 }
 
@@ -2489,7 +2518,7 @@ bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t addre
     return address + bytes - htile >= HtileMetadataBytes(extent);
 }
 
-PendingHtile ResolvePendingHtile(std::span<const Recorder::PendingWrite> pending, std::uint64_t address, std::size_t bytes, MetadataTrust* trust) {
+PendingHtile ResolvePendingHtile(std::span<const Recorder::PendingWrite> pending, std::uint64_t address, std::size_t bytes, MetadataTrust* trust, std::optional<std::uint32_t> known) {
     std::vector<Recorder::PendingWrite> writes(pending.begin(), pending.end());
     std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
     PendingHtile resolved;
@@ -2498,7 +2527,7 @@ PendingHtile ResolvePendingHtile(std::span<const Recorder::PendingWrite> pending
     std::vector<std::uint64_t> writers(writes.size());
     std::transform(writes.begin(), writes.end(), writers.begin(), [](const Recorder::PendingWrite& write) { return write.writer; });
     if (const auto trusted = trust->Writers(writers, address, bytes, false); !trusted.empty()) {
-        const auto landing = htileAfterPendingWrites(writes, address, bytes, trusted);
+        const auto landing = htileAfterPendingWrites(writes, address, bytes, trusted, known);
         if (landing.word.has_value()) {
             bool audit = false;
             for (const auto& [writer, note] : landing.passed) audit = trust->Consult({writer, address, bytes}, note) != MetadataTrust::Use::Skip || audit;
@@ -2510,7 +2539,7 @@ PendingHtile ResolvePendingHtile(std::span<const Recorder::PendingWrite> pending
     }
     const auto learned = trust->Writers(writers, address, bytes, true);
     if (learned.empty()) return resolved;
-    const auto landing = htileAfterPendingWrites(writes, address, bytes, learned);
+    const auto landing = htileAfterPendingWrites(writes, address, bytes, learned, known);
     if (!landing.word.has_value() || !landing.settled) return resolved;
     resolved.predicted = *landing.word;
     for (const auto& [writer, note] : landing.passed) resolved.checks.push_back({writer, address, bytes});
@@ -2521,6 +2550,53 @@ void CheckPendingHtile(MetadataTrust& trust, const PendingHtile& resolved, std::
     if (resolved.checks.empty()) return;
     const bool predicted = std::all_of(words.begin(), words.end(), [&](std::uint32_t word) { return word == resolved.predicted; });
     for (const auto& key : resolved.checks) trust.Check(key, predicted);
+}
+
+void NoteKnownHtileWord(std::uint64_t address, std::size_t bytes, std::optional<std::uint32_t> word, std::uint64_t generation) {
+    std::lock_guard lock(htileReadsMutex());
+    noteKnownHtileLocked(address, bytes, word, generation);
+}
+
+std::optional<std::uint32_t> KnownHtileWord(std::uint64_t address, std::size_t bytes) {
+    std::lock_guard lock(htileReadsMutex());
+    const auto& known = knownHtiles();
+    const auto found = known.find(address);
+    if (found == known.end() || found->second.bytes != bytes || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) return std::nullopt;
+    return found->second.word;
+}
+
+std::vector<KnownHtilePass> TrustedHtilePasses(const MetadataTrust& trust, std::uint64_t writer, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes) {
+    std::vector<KnownHtilePass> passes;
+    if (writer == 0) return passes;
+    std::vector<KnownHtilePass> candidates;
+    {
+        std::lock_guard lock(htileReadsMutex());
+        const auto& known = knownHtiles();
+        if (known.empty()) return passes;
+        for (const auto& [begin, end] : writes) {
+            auto it = known.lower_bound(begin);
+            if (it != known.begin() && std::prev(it)->first + std::prev(it)->second.bytes > begin) --it;
+            for (; it != known.end() && it->first < end; ++it) {
+                if (std::none_of(candidates.begin(), candidates.end(), [&](const KnownHtilePass& candidate) { return candidate.address == it->first; })) candidates.push_back({it->first, it->second.bytes, it->second.generation});
+            }
+        }
+    }
+    for (const auto& candidate : candidates) {
+        if (!trust.Trusted({writer, candidate.address, candidate.bytes})) continue;
+        GuestMemory::CollectWritesUncached(candidate.address, candidate.bytes);
+        if (GuestMemory::UnchangedSince(candidate.address, candidate.bytes, candidate.generation)) passes.push_back(candidate);
+    }
+    return passes;
+}
+
+void PassTrustedHtiles(std::span<const KnownHtilePass> passes) {
+    for (const auto& pass : passes) {
+        const auto generation = GuestMemory::CollectWrites(pass.address, pass.bytes);
+        std::lock_guard lock(htileReadsMutex());
+        const auto found = knownHtiles().find(pass.address);
+        if (found == knownHtiles().end() || found->second.bytes != pass.bytes || found->second.generation != pass.generation) continue;
+        found->second.generation = generation;
+    }
 }
 
 bool PlaneFillCovers(std::uint64_t plane, std::uint64_t planeBytes, std::uint64_t address, std::size_t bytes) {

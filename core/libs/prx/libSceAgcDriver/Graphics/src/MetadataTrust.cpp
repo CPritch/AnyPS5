@@ -23,11 +23,17 @@ std::uint32_t AuditFromEnvironment() {
 MetadataTrust::MetadataTrust(std::uint32_t auditEvery) : auditEvery(auditEvery != 0 ? auditEvery : DefaultAudit) {}
 
 bool MetadataTrust::Enabled() {
-    static const bool enabled = [] {
+    return Level() != 0;
+}
+
+std::uint32_t MetadataTrust::Level() {
+    static const std::uint32_t level = [] {
         const char* value = std::getenv("APS5_TRUST_METADATA_WRITERS");
-        return value == nullptr || std::strcmp(value, "0") != 0;
+        if (value == nullptr) return 1u;
+        if (std::strcmp(value, "0") == 0) return 0u;
+        return std::strcmp(value, "2") == 0 ? 2u : 1u;
     }();
-    return enabled;
+    return level;
 }
 
 MetadataTrust& MetadataTrust::Process() {
