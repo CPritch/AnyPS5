@@ -105,7 +105,7 @@ bool RayTracingMiss() {
 bool ExactF32Arithmetic() {
     static const bool exact = [] {
         const char* text = std::getenv("APS5_FAST_F32");
-        return text == nullptr || *text == '\0' || std::strcmp(text, "0") == 0;
+        return text != nullptr && std::strcmp(text, "0") == 0;
     }();
     return exact;
 }
