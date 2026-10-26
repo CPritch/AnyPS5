@@ -23,6 +23,26 @@ namespace AgcDriver::DriverDetail {
 
 inline constexpr std::size_t MaxDispatchVariants = 8;
 
+// A field of a variant's result that holds a guest address the committer binds by address (APS5_POOL_RELOCATION):
+// a vertex attribute's buffer base, from the V# whose base word is words[source], or a word of a GuestBuffers
+// binding, from words[source] or from user word `source`. A relocated hit rebases the field when its source moved.
+struct VariantRebase {
+    enum class Kind : std::uint8_t { VertexBase, BufferWord };
+    Kind kind = Kind::VertexBase;
+    bool userWord = false;
+    std::uint32_t target = 0;
+    std::uint32_t word = 0;
+    std::uint64_t source = 0;
+};
+
+// A rebased field's new value: fields[word] of vertex attribute `target`, or guestDescriptor[word] of binding `target`.
+struct RebasedWord {
+    VariantRebase::Kind kind = VariantRebase::Kind::VertexBase;
+    std::uint32_t target = 0;
+    std::uint32_t word = 0;
+    std::uint32_t value = 0;
+};
+
 struct DispatchVariant {
 
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
@@ -45,6 +65,11 @@ struct DispatchVariant {
     std::vector<std::int8_t> runBases;
     std::uint64_t relocatableWords = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
+    // Positions in words, sorted, of V# base words that a relocated hit reads again at the run's new address
+    // instead of comparing with the captured value, and the result fields they feed.
+    std::vector<std::uint32_t> movableWords;
+    std::vector<VariantRebase> rebases;
+    std::vector<RebasedWord> rebasedWords;
     std::uint64_t userDataMask = ~std::uint64_t{0};
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 

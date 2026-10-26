@@ -651,8 +651,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
     }
+    bool rebasedStages = false;
     for (std::size_t i = 0; i < matched.size(); ++i) {
-        if (matched[i] == nullptr || matched[i]->shaderDataPatches.empty()) continue;
+        if (matched[i] == nullptr || (matched[i]->shaderDataPatches.empty() && matched[i]->rebasedWords.empty())) continue;
+        rebasedStages = rebasedStages || !matched[i]->rebasedWords.empty();
         applyShaderDataPatches(*matched[i]);
         if (stageData[i].compiled != nullptr) stageData[i].compiled = patchDataWords(*matched[i], stageData[i].words);
     }
@@ -661,6 +663,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::lock_guard cacheLock(drawCacheMutex);
         if (drawHit || verifyHit) {
             ++drawRelocationCounters.hits;
+            if (rebasedStages) ++drawRelocationCounters.rebasedHits;
             ++drawRelocationTrials[drawIdentity].hits;
             if (const auto alias = drawAliases.find(drawAlias); alias != drawAliases.end()) {
                 const auto donor = drawCache.find(alias->second);
@@ -671,7 +674,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
             }
         }
-        if (profile && drawRelocationCounters.lookups >= 100000) reportDrawRelocation();
     }
     if (!userPatches.empty() && !drawHit) {
         auto current = std::make_shared<DrawDecode>(*decode);

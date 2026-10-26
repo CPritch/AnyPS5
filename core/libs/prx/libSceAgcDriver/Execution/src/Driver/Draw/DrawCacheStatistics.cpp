@@ -38,6 +38,7 @@ void Driver::reportDrawCache(DrawEntryCounters& counters, bool profile) {
     }
     if (profile) text += profileDrawCacheLines(counters);
     AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());
+    if (profile && drawRelocationEnabled()) reportDrawRelocation();
     counters = DrawEntryCounters{};
 }
 

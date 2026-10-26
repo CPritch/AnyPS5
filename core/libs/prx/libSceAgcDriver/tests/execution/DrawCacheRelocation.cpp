@@ -3,13 +3,16 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "VulkanTestDevice.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <initializer_list>
 #include <iostream>
@@ -35,6 +38,9 @@ alignas(256) constexpr std::array<std::uint32_t, 16> ForwardedPixelCode{
     0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xf4000101u, 0xfa000000u, 0xbf8cc07fu, 0x7e000204u, 0xd5480001u,
     0x02050800u, 0x7e020d01u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
 };
+// s_swappc_b64 s[10:11], s[8:9] (the fetch call, through user words 0 and 1), exp pos0 v8..v11: the position is
+// the vertex attribute the header's one input semantic places in v8.
+alignas(256) constexpr std::array<std::uint32_t, 4> FetchVertexCode{0xbe8a2108u, 0xf80008cfu, 0x0b0a0908u, 0xbf810000u};
 alignas(16) std::array<float, 4> Other{0.5f, 0.0f, 0.0f, 0.0f};
 alignas(16) std::array<float, 4> ForwardedData{};
 alignas(32) std::array<std::array<std::uint64_t, 4>, 6> AlignedTables{};
@@ -51,6 +57,19 @@ alignas(8) Header PixelHeader{};
 alignas(8) Header SecondVertexHeader{};
 alignas(8) Header TriangleVertexHeader{};
 alignas(8) Header ForwardedPixelHeader{};
+
+struct FetchHeader {
+    Shader shader{};
+    ShaderUserData userData{};
+    std::array<std::uint16_t, ShaderRegs::AGC_DIRECT_RESOURCE_TYPE_COUNT> direct{};
+    ShaderSemantic semantic{};
+};
+
+alignas(8) FetchHeader FetchVertexHeader{};
+
+// The vertex buffer table pointer is in user words 4 and 5, the attribute table pointer in 6 and 7.
+constexpr std::uint32_t VertexTableWord = 4;
+constexpr std::uint32_t AttributeTableWord = 6;
 
 const Shader* Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -69,7 +88,29 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-std::vector<std::uint32_t> DrawFrom(std::initializer_list<const void*> sources, const std::uint32_t* vertexCode = VertexCode.data(), const std::uint32_t* pixelCode = PixelCode.data()) {
+void RegisterFetchVertex() {
+    auto& header = FetchVertexHeader;
+    header.direct.fill(ShaderRegs::AGC_ILLEGAL_DIRECT_OFFSET);
+    header.direct[static_cast<std::size_t>(ShaderRegs::AgcDirectResourceType::PtrVertexBufferTable)] = VertexTableWord;
+    header.direct[static_cast<std::size_t>(ShaderRegs::AgcDirectResourceType::PtrVertexAttribDescTable)] = AttributeTableWord;
+    header.userData.direct_resource_offset = header.direct.data();
+    header.userData.direct_resource_count = static_cast<std::uint16_t>(header.direct.size());
+    header.semantic = {};
+    header.semantic.hardware_mapping = 8;
+    header.semantic.size_in_elements = 4;
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18u;
+    header.shader.header_size = sizeof(FetchHeader);
+    header.shader.shader_size = sizeof(FetchVertexCode);
+    header.shader.code = FetchVertexCode.data();
+    header.shader.type = 2;
+    header.shader.user_data = &header.userData;
+    header.shader.input_semantics = &header.semantic;
+    header.shader.num_input_semantics = 1;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+}
+
+std::vector<std::uint32_t> DrawFrom(std::initializer_list<const void*> sources, const std::uint32_t* vertexCode = VertexCode.data(), const std::uint32_t* pixelCode = PixelCode.data(), std::span<const std::uint32_t> vertexWords = {}) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
     const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode);
@@ -94,10 +135,11 @@ std::vector<std::uint32_t> DrawFrom(std::initializer_list<const void*> sources, 
         {0x113, std::bit_cast<std::uint32_t>(1.0f)}, {0x114, 0},
         {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)},
     };
-    const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
-        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 1u << 1u}, {0x8c, 0},
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
+        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(vertexWords.size())) << 1u}, {0x8c, 0},
         {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 2u << 1u},
     };
+    for (std::uint32_t word = 0; word < vertexWords.size(); ++word) shader.emplace_back(0x8cu + word, vertexWords[word]);
     std::vector<std::uint32_t> commands;
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
@@ -219,6 +261,132 @@ void SplitRunsNameTheirSharedWords() {
     Require(shared.region < variant.runs.size() && variant.runs[shared.region].first == tableAddress && first == shared.first, "the shared words of a variant whose runs were split for relocation name run " + std::to_string(shared.region) + " of " + std::to_string(variant.runs.size()) + ", not the table's run " + std::to_string(variant.runs.size() - 1u));
 }
 
+std::uint32_t Low(const void* pointer) {
+    return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(pointer));
+}
+
+std::uint32_t High(const void* pointer) {
+    return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(pointer) >> 32u);
+}
+
+std::array<std::uint32_t, 4> VertexBufferSharp(const void* data, std::uint32_t stride = 16u, std::uint32_t records = 3u, std::uint32_t format = 77u) {
+    const auto address = reinterpret_cast<std::uintptr_t>(data);
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), records, 0x01000facu | (format << 12u)};
+}
+
+void VertexTableRunsMoveWithTheirPointer() {
+    using namespace AgcDriver::DriverDetail;
+    alignas(16) static std::array<float, 12> data{};
+    alignas(16) static std::array<std::uint32_t, 4> table = VertexBufferSharp(data.data());
+    alignas(16) static std::array<std::uint32_t, 1> attributes{0u};
+    DrawProgram program{};
+    program.binary.stage = ShaderRecompiler::ShaderStage::Vertex;
+    program.userData = {0x10000000u, 1u, 0u, 0u, Low(table.data()), High(table.data()), Low(attributes.data()), High(attributes.data())};
+    ShaderRecompiler::ShaderVertexStageInfo info{};
+    info.fetchEmbedded = true;
+    info.resourcesNum = 1;
+    info.fetchBufferReg = VertexTableWord;
+    info.fetchAttribReg = AttributeTableWord;
+    info.resources[0].fields = table;
+    std::vector<AgcDriver::Graphics::DecodeRead> reads(2);
+    reads[0].address = reinterpret_cast<std::uintptr_t>(attributes.data());
+    reads[0].size = 4;
+    reads[1].address = reinterpret_cast<std::uintptr_t>(table.data());
+    reads[1].size = 16;
+    std::memcpy(reads[1].data.data(), table.data(), 16);
+    ShaderRecompiler::RecompileResult compiled;
+    compiled.vertexAttributes = {{0u, 4u, {table}, 0u}};
+    const ShaderRecompiler::SrtUserDataUse use;
+    PoolRelocation pool;
+    Require(Driver::vertexTableRelocation(program, info, reads, compiled, use, pool), "a vertex stage whose decode read only its two tables was not relocatable");
+    Require(pool.words == std::uint64_t {1} << VertexTableWord && pool.movable.size() == 1u && pool.rebases.size() == 1u && pool.reads.size() == 4u, "the vertex buffer table pointer did not move with its V#'s four words, one base read again and one vertex attribute rebased");
+    std::vector<ShaderRecompiler::MemoryRegion> regions{{reads[0].address, reads[0].Bytes()}, {reads[1].address, reads[1].Bytes()}};
+    std::stable_sort(regions.begin(), regions.end(), [](const auto& a, const auto& b) { return a.guestAddress < b.guestAddress; });
+    DispatchVariant variant;
+    Driver::tagVariantRuns(variant, regions, use, true, 0, {}, &pool);
+    Require(variant.relocatableWords == std::uint64_t {1} << VertexTableWord, "the tagged vertex stage does not relocate exactly its vertex buffer table pointer");
+    std::size_t position = 0, sharpPosition = ~std::size_t {0};
+    for (std::size_t run = 0; run < variant.runs.size(); ++run) {
+        const bool sharp = variant.runs[run].first == reads[1].address;
+        Require(run < variant.runBases.size() && variant.runBases[run] == (sharp ? static_cast<std::int8_t>(VertexTableWord) : std::int8_t {-1}), "a run of the vertex stage has the wrong relocation base");
+        if (sharp) sharpPosition = position;
+        position += static_cast<std::size_t>((variant.runs[run].second - variant.runs[run].first) / sizeof(std::uint32_t));
+    }
+    Require(variant.movableWords == std::vector<std::uint32_t>{static_cast<std::uint32_t>(sharpPosition)}, "the V#'s base word is not the one word a relocated hit reads again");
+    Require(variant.rebases.size() == 1u && variant.rebases[0].kind == VariantRebase::Kind::VertexBase && variant.rebases[0].target == 0u && variant.rebases[0].source == sharpPosition, "the vertex attribute is not rebased from the V#'s base word");
+
+    auto other = compiled;
+    other.vertexAttributes[0].resource.fields[2] = 4u;
+    PoolRelocation refused;
+    Require(!Driver::vertexTableRelocation(program, info, reads, other, use, refused), "a vertex stage whose result was built from another V# was relocatable");
+    auto outside = reads;
+    outside[1].address += 8u;
+    Require(!Driver::vertexTableRelocation(program, info, outside, compiled, use, refused), "a vertex stage whose V# read is not a table entry was relocatable");
+    ShaderRecompiler::SrtUserDataUse valued;
+    valued.asValue = std::uint64_t {1} << VertexTableWord;
+    PoolRelocation kept;
+    Require(Driver::vertexTableRelocation(program, info, reads, compiled, valued, kept) && kept.words == 0u && kept.movable.empty(), "a vertex buffer table pointer the SRT walk used as a value moved");
+}
+
+void MovedVertexTableHitsTheCache(bool libraries) {
+    RegisterFetchVertex();
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    alignas(16) static std::array<float, 4> color{1.0f, 0.0f, 0.0f, 0.0f};
+    alignas(256) static std::array<float, 32> whole{-1.0f, -1.0f, 0.0f, 1.0f, 3.0f, -1.0f, 0.0f, 1.0f, -1.0f, 3.0f, 0.0f, 1.0f};
+    alignas(256) static std::array<float, 32> left{-1.0f, -1.0f, 0.0f, 1.0f, 0.0f, -1.0f, 0.0f, 1.0f, -1.0f, 3.0f, 0.0f, 1.0f};
+    alignas(16) static std::array<std::uint32_t, 1> attributes{0u};
+    alignas(16) static std::array<std::array<std::uint32_t, 4>, 12> tables{};
+    const auto draw = [&](std::size_t index, std::array<std::uint32_t, 4> sharp) {
+        tables[index] = sharp;
+        const std::array<std::uint32_t, 8> words{0x10000000u, 1u, 0u, 0u, Low(tables[index].data()), High(tables[index].data()), Low(attributes.data()), High(attributes.data())};
+        ColorMemory.fill(std::byte {0x40});
+        auto commands = DrawFrom({color.data()}, FetchVertexCode.data(), PixelCode.data(), words);
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
+        return AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    };
+    const auto drawn = [&] {
+        std::size_t pixels = 0;
+        for (std::size_t at = 0; at < ColorMemory.size(); at += 4) pixels += ColorMemory[at] != std::byte {0x40} ? 1u : 0u;
+        return pixels;
+    };
+    const auto all = ColorMemory.size() / 4u;
+    const auto start = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    AgcDriver::DriverDetail::DrawEntryCounters counters{};
+    for (std::size_t i = 0; i < 4; ++i) counters = draw(i, VertexBufferSharp(whole.data()));
+    Require(counters.lookups == start.lookups + 4 && counters.hits == start.hits && counters.inserts == start.inserts + 2, mode + ": the draws that teach the moved vertex buffer table made " + std::to_string(counters.hits - start.hits) + " hits and " + std::to_string(counters.inserts - start.inserts) + " inserts, expected 0 and 2");
+    Require(drawn() == all, mode + ": the taught draw did not cover the target");
+    auto before = counters;
+    counters = draw(4, VertexBufferSharp(left.data()));
+    Require(counters.hits == before.hits + 1, mode + ": a draw whose vertex buffer table moved, with another vertex buffer in it, did not reuse the cached draw (" + std::to_string(counters.hits - before.hits) + " hits)");
+    const auto half = drawn();
+    Require(half != 0 && half < all, mode + ": a relocated draw did not draw from the vertex buffer of its moved table (" + std::to_string(half) + " of " + std::to_string(all) + " pixels)");
+    before = counters;
+    counters = draw(5, VertexBufferSharp(whole.data()));
+    Require(counters.hits == before.hits + 1 && drawn() == all, mode + ": a draw whose table moved back to the first vertex buffer did not reuse the cached draw with it");
+    const std::array<std::pair<std::array<std::uint32_t, 4>, const char*>, 3> changed{{
+        {VertexBufferSharp(whole.data(), 32u), "stride"},
+        {VertexBufferSharp(whole.data(), 16u, 2u), "record count"},
+        {VertexBufferSharp(whole.data(), 16u, 3u, 74u), "format"},
+    }};
+    for (std::size_t i = 0; i < changed.size(); ++i) {
+        before = counters;
+        counters = draw(6 + i, changed[i].first);
+        Require(counters.lookups == before.lookups + 1 && counters.hits == before.hits, mode + ": a draw whose moved vertex buffer table has another V# " + changed[i].second + " reused the cached draw");
+    }
+    before = counters;
+    counters = draw(9, VertexBufferSharp(left.data()));
+    Require(counters.hits == before.hits + 1, mode + ": a draw whose table moved again after V#s that differed did not reuse the cached draw");
+    attributes[0] = 16u << 14u;
+    before = counters;
+    counters = draw(10, VertexBufferSharp(whole.data()));
+    attributes[0] = 0u;
+    Require(counters.lookups == before.lookups + 1 && counters.hits == before.hits, mode + ": a draw whose attribute word changed where its table stayed reused the cached draw");
+}
+
 void UnrelocatedAliasesStayOut(bool libraries) {
     Registered(SecondVertexHeader, SecondVertexCode.data(), sizeof(SecondVertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
@@ -295,7 +463,11 @@ int main(int argc, char** argv) {
     try {
         const bool evicted = argc == 2 && std::string(argv[1]) == "--evicted";
         const bool kept = argc == 2 && std::string(argv[1]) == "--kept";
-        if (!evicted && !kept) SplitRunsNameTheirSharedWords();
+        const bool pool = argc == 2 && std::string(argv[1]) == "--pool";
+        if (!evicted && !kept && !pool) {
+            SplitRunsNameTheirSharedWords();
+            VertexTableRunsMoveWithTheirPointer();
+        }
         bool libraries = false;
         {
             const auto device = OpenVulkanTestDevice();
@@ -307,6 +479,13 @@ int main(int argc, char** argv) {
             EvictedEntriesServeNoRelocation(libraries);
             AgcDriverShutdown_nid_postfix();
             std::cout << "An evicted draw served no relocation " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
+            return 0;
+        }
+        if (pool) {
+            Require(AgcDriver::DriverDetail::Driver::poolRelocationEnabled(), "run with APS5_POOL_RELOCATION=1");
+            MovedVertexTableHitsTheCache(libraries);
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "Draws whose guest pool addresses moved reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
             return 0;
         }
         if (kept) {
