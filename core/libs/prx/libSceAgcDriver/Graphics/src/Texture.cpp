@@ -118,6 +118,7 @@ std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 std::atomic<std::uint64_t> storeSerials{0};
+std::atomic<std::uint64_t> orderedFlushes{0}, orderedWaits{0};
 
 struct StorageTraffic {
     AgcDriver::Mutex mutex;
@@ -158,7 +159,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted));
+    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing, %llu flushes behind earlier GPU-direct stores (%llu waited for them); block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), take(orderedFlushes), take(orderedWaits), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -3902,6 +3903,23 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 
 namespace {
 
+bool OrderedWriteBacks() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ORDERED_WRITEBACKS");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+void waitForWriters(Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+    if (const auto writer = recorder.PendingWriterSerial(address, bytes); writer == recorder.OpenSerial()) {
+        Recorder::CountSync(recorder.OpenWriteOverlaps(address, bytes) ? 1 : 3);
+        recorder.Sync();
+    } else if (writer != 0) {
+        recorder.FinishUpTo(writer);
+    }
+}
+
 void waitForIdlePublish(const char* reason) {
     if (reason == nullptr || std::strcmp(reason, "idle") != 0 || Recorder::InCompletion()) return;
     if (auto* recorder = Recorder::Active()) {
@@ -3911,6 +3929,25 @@ void waitForIdlePublish(const char* reason) {
 }
 
 }
+
+class StorageTexture::EarlierStores {
+public:
+    EarlierStores(Recorder& recorder, std::uint64_t address, std::size_t bytes) : recorder(recorder), address(address), bytes(bytes) {}
+    bool Pending() const { return pending; }
+    void Wait() {
+        if (!pending) return;
+        pending = false;
+        orderedWaits.fetch_add(1, std::memory_order_relaxed);
+        recorder.Reap();
+        waitForWriters(recorder, address, bytes);
+    }
+
+private:
+    Recorder& recorder;
+    std::uint64_t address;
+    std::size_t bytes;
+    bool pending = true;
+};
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool waited) {
     static_cast<void>(FlushDepthPlanes(address, bytes));
@@ -3974,14 +4011,17 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::optional<EarlierStores> earlier;
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
         try {
             recorder->Reap();
-            if (const auto writer = recorder->PendingWriterSerial(address, bytes); writer == recorder->OpenSerial()) {
-                Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
-                recorder->Sync();
-            } else if (writer != 0) {
-                recorder->FinishUpTo(writer);
+            std::vector<std::uint64_t> stores(flush.size());
+            std::transform(flush.begin(), flush.end(), stores.begin(), [](const std::shared_ptr<StorageTexture>& texture) { return texture->storeSerial; });
+            if (OrderedWriteBacks() && recorder->PendingWritesOnlyStores(address, bytes, stores)) {
+                earlier.emplace(*recorder, address, bytes);
+                orderedFlushes.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                waitForWriters(*recorder, address, bytes);
             }
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();
@@ -3994,7 +4034,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         try {
             // Only the pending layers the access overlaps are stored; the others stay pending (the
             // store re-registers the image for them).
-            texture->writeBack(address, bytes);
+            texture->writeBack(address, bytes, earlier.has_value() ? &*earlier : nullptr);
         } catch (...) {
             if (!failure) failure = std::current_exception();
         }
@@ -5408,7 +5448,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     return bytes;
 }
 
-void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
+void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes, EarlierStores* earlier) {
     // Block units are stored per access; an image whose units keep being asked for in pieces (a
     // consumer touching it through many small ranges, each piece re-arming the pending memos of
     // the next dispatch) stores every pending unit once more than `pieces` partial stores fall
@@ -5447,7 +5487,7 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
             coalescedWriteBacks.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    writeBackLayers(layers);
+    writeBackLayers(layers, earlier);
 }
 
 bool StorageTexture::guestBytesSettled() const {
@@ -5464,7 +5504,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
     return GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(baseline).subspan(offset, static_cast<std::size_t>(to - from)));
 }
 
-void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+void StorageTexture::writeBackLayers(const std::vector<bool>& layers, EarlierStores* earlier) {
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -5498,19 +5538,51 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     constexpr std::uint64_t block = 65536;
     const auto spanBegin = firstStored & ~(block - 1);
     const auto spanBlocks = static_cast<std::size_t>((lastStored - spanBegin + block - 1) / block);
+    std::vector<ImportSegment> segments;
+    bool segmented = false;
+    const auto findSegments = [&] {
+        segments.clear();
+        if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) segments.push_back({import, descriptor.baseAddress, descriptor.baseAddress + guestBytes});
+        else segments = importSegments();
+    };
+    if (earlier != nullptr && earlier->Pending()) {
+        findSegments();
+        segmented = !segments.empty();
+        if (!segmented) earlier->Wait();
+    }
     // The keep-blocks decision must see every CPU write to the stored span up to now, so it
     // bypasses the per-packet collect memo (a Refresh collect earlier in the same packet would
     // satisfy it); the unselected layers keep their own generations and are collected by their
     // own refreshes. One tracker lock then reads the span's stamps against the layers' generations.
-    GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
     std::vector<std::uint64_t> generations(spanBlocks, 0);
-    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-        if (!layers[layer]) continue;
-        const auto end = layerBegin(layer) + layerBytes(layer);
-        for (auto at = layerBegin(layer) & ~(block - 1); at < end; at += block) generations[static_cast<std::size_t>((at - spanBegin) / block)] = layerGeneration[layer];
-    }
     std::vector<std::uint8_t> changedBlocks(spanBlocks);
-    const bool tracked = GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks);
+    const auto collectChanges = [&] {
+        GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+        std::fill(generations.begin(), generations.end(), 0);
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+            if (!layers[layer]) continue;
+            const auto end = layerBegin(layer) + layerBytes(layer);
+            for (auto at = layerBegin(layer) & ~(block - 1); at < end; at += block) generations[static_cast<std::size_t>((at - spanBegin) / block)] = layerGeneration[layer];
+        }
+        return GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks);
+    };
+    bool tracked = collectChanges();
+    const auto readsGuestBytes = [&] {
+        if (!tracked) return true;
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+            if (!layers[layer] || layerGeneration[layer] == 0) continue;
+            const auto end = layerBegin(layer) + layerBytes(layer);
+            for (auto at = layerBegin(layer) & ~(block - 1); at < end; at += block) {
+                if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten) return true;
+            }
+        }
+        return false;
+    };
+    if (earlier != nullptr && earlier->Pending() && readsGuestBytes()) {
+        earlier->Wait();
+        segmented = false;
+        tracked = collectChanges();
+    }
     std::vector<bool> compared(trackedLayers, false);
     if (!tracked) {
         awaitStoredSave(&layers);
@@ -5577,7 +5649,6 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // own stamps, so every later import writer stamps newer.
     std::vector<ShadowedRange> shadowed;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imported;
-    std::vector<ImportSegment> segments;
     const auto markShadowed = [&](std::uint64_t generation) {
         for (const auto& segment : segments) {
             std::vector<ShadowedRange> ranges;
@@ -5613,8 +5684,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         settle(true);
         return;
     }
-    if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) segments.push_back({import, descriptor.baseAddress, descriptor.baseAddress + guestBytes});
-    else segments = importSegments();
+    if (!segmented) findSegments();
     if (!segments.empty()) {
         Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
         // Outside the write watch the stored bytes are what the next store compares with.
@@ -5707,7 +5777,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
         {
             const auto scratchDone = WholeBufferBarrier(tiledScratch->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &scratchDone, 0, nullptr);
+            const bool behind = earlier != nullptr && earlier->Pending();
+            const VkMemoryBarrier storedBefore{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | (behind ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0u), VK_PIPELINE_STAGE_TRANSFER_BIT, 0, behind ? 1u : 0u, &storedBefore, 1, &scratchDone, 0, nullptr);
             for (const auto& segment : segments) {
                 std::vector<VkBufferCopy> copies;
                 for (const auto& [from, to] : keep) {
@@ -5757,6 +5829,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         ++Profile().storageDirectWriteBacks;
         return;
     }
+    Require(earlier == nullptr || !earlier->Pending(), "a storage write-back through the CPU did not wait for the earlier stores of its range");
     // A surface whose memory is no longer registered (freed, or re-registered under another
     // allocation: no readable registered range contains it) has nothing to receive its results;
     // the round trip through the CPU below would store stale texels over whatever the memory

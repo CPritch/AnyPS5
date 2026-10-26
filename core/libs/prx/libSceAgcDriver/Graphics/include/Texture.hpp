@@ -403,8 +403,9 @@ private:
     // units asked for in pieces too often are all stored at once for a while (the hysteresis:
     // APS5_BLOCK_WRITEBACK_PIECES within APS5_BLOCK_WRITEBACK_FRAMES presents, defaults 4 and 8;
     // APS5_BLOCK_WRITEBACK_EACH=1 stores the touched units only).
-    void writeBack(std::uint64_t address, std::size_t bytes);
-    void writeBackLayers(const std::vector<bool>& layers);
+    class EarlierStores;
+    void writeBack(std::uint64_t address, std::size_t bytes, EarlierStores* earlier = nullptr);
+    void writeBackLayers(const std::vector<bool>& layers, EarlierStores* earlier = nullptr);
     bool unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const;
     void saveBeforeUnwatch();
     void forgetKeptAtUnwatch(std::uint32_t unit);
