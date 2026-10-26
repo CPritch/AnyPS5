@@ -3178,6 +3178,8 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_draw_data_hit_user_words_verify PROPERTIES ENVIRONMENT "APS5_VERIFY_DRAW_DATA_HITS=1" SKIP_RETURN_CODE 77)
     add_test(NAME agc_driver_draw_data_hit_user_words_refresh COMMAND agc_driver_draw_data_hit_user_words_tests)
     set_tests_properties(agc_driver_draw_data_hit_user_words_refresh PROPERTIES ENVIRONMENT "APS5_DRAW_PIPELINE=1" SKIP_RETURN_CODE 77)
+    # Counts the data-only hits of draws that pool relocation would admit through their alias and reuse instead.
+    set_property(TEST agc_driver_draw_data_hit_user_words agc_driver_draw_data_hit_user_words_draw_pipeline agc_driver_draw_data_hit_user_words_verify agc_driver_draw_data_hit_user_words_refresh APPEND PROPERTY ENVIRONMENT "APS5_POOL_RELOCATION=0")
     if(WIN32)
         set_tests_properties(agc_driver_draw_cache_reuse_off agc_driver_draw_cache_reuse_verify agc_driver_draw_cache_reuse_inline agc_driver_draw_data_hit_user_words_verify agc_driver_draw_data_hit_user_words_refresh PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
