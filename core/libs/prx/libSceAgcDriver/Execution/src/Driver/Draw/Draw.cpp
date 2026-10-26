@@ -185,6 +185,42 @@ struct DrawTail {
     GpuLock ownLock{GuestMemory::GpuMutex(), std::defer_lock};
 };
 
+struct DrawAheadSlot {
+    enum Phase : std::uint8_t { Queued, Running, Ready, Failed, Dropped };
+    std::atomic<std::uint8_t> phase{Queued};
+    std::shared_ptr<VulkanDevice> device;
+    std::shared_ptr<const DrawDecode> decode;
+    Pm4::DrawParameters draw{};
+    std::uint64_t shape = 0;
+    std::vector<Graphics::CompiledShader> stages;
+    Graphics::DrawAhead result;
+
+    void Prepare() {
+        std::uint8_t expected = Queued;
+        if (!phase.compare_exchange_strong(expected, Running, std::memory_order_acq_rel)) return;
+        bool prepared = false;
+        try {
+            device->PrepareDrawAhead(decode->state, draw, stages, shape, result);
+            prepared = true;
+        } catch (...) {
+        }
+        Graphics::CountDrawAhead(prepared ? Graphics::DrawAheadEvent::Prepared : Graphics::DrawAheadEvent::Thrown);
+        expected = Running;
+        phase.compare_exchange_strong(expected, prepared ? Ready : Failed, std::memory_order_acq_rel);
+    }
+
+    Graphics::DrawAhead* Claim() {
+        auto seen = phase.load(std::memory_order_acquire);
+        while (seen == Queued || seen == Running) {
+            if (phase.compare_exchange_weak(seen, Dropped, std::memory_order_acq_rel)) {
+                Graphics::CountDrawAhead(seen == Queued ? Graphics::DrawAheadEvent::NotStarted : Graphics::DrawAheadEvent::Unfinished);
+                return nullptr;
+            }
+        }
+        return seen == Ready ? &result : nullptr;
+    }
+};
+
 namespace {
 
 void noteFinisherHandOff(bool handed) {
@@ -1275,13 +1311,25 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto commitPacket = tail.packetOpcode;
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
+        std::shared_ptr<DrawAheadSlot> ahead;
+        if (recipe == nullptr && DrawPipeline::PreparesAhead()) {
+            ahead = std::make_shared<DrawAheadSlot>();
+            ahead->device = localDevice;
+            ahead->decode = decode;
+            ahead->draw = drawParameters;
+            ahead->shape = tail.shapeKey;
+            ahead->stages = stages;
+            Graphics::CountDrawAhead(Graphics::DrawAheadEvent::Offered);
+        }
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, ahead, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, shape);
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, shape, ahead.get());
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true);
+        DrawPipeline::Prepare prepare;
+        if (ahead != nullptr) prepare = [held, ahead] { ahead->Prepare(); };
+        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(prepare));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();
@@ -1307,8 +1355,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, std::uint64_t shape) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, std::uint64_t shape, DrawAheadSlot* ahead) {
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
+    auto* prepared = ahead != nullptr ? ahead->Claim() : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
@@ -1326,7 +1375,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, prepared);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 

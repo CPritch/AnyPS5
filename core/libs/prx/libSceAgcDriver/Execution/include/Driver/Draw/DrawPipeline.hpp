@@ -58,6 +58,7 @@ public:
 class DrawPipeline {
 public:
     using Commit = std::function<void()>;
+    using Prepare = std::function<void()>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     struct Watch {
         std::uint64_t retired = 0;
@@ -74,8 +75,10 @@ public:
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
+    static unsigned PrepareThreads();
+    static bool PreparesAhead();
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other);
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void WaitWritten(std::uint64_t address, std::size_t bytes, DrainReason reason, std::uint32_t opcode = 0x100);
     void WaitWrittenAny(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode = 0x100);
@@ -112,6 +115,8 @@ private:
     };
     DrawPipeline() = default;
     void run();
+    void prepareAhead();
+    void queuePrepare(Prepare prepare);
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
     void countWrites(const std::vector<Range>& writes, bool added);
@@ -158,6 +163,14 @@ private:
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    std::mutex prepareMutex;
+    std::condition_variable prepareWake;
+    std::deque<Prepare> prepares;
+    std::vector<Prepare> spentPrepares;
+    std::vector<std::thread> preparers;
+    std::atomic<std::size_t> queuedPrepares{0};
+    unsigned sleepingPreparers = 0;
+    bool preparersClosing = false;
 };
 
 class DrawFinisher {

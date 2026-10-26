@@ -936,7 +936,7 @@ std::vector<std::uint64_t>& validationKeyScratch() {
     return key;
 }
 
-std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
+std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit, bool recordFailure = true) {
     memoized = false;
     hit = false;
     auto& key = validationKeyScratch();
@@ -972,7 +972,7 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
             outputs |= 1u << location;
         }
     } catch (const std::exception& error) {
-        if (keyed) {
+        if (keyed && recordFailure) {
             std::lock_guard lock(validationMutex());
             auto& failures = validationFailures();
             if (failures.size() >= 1024) failures.clear();
@@ -1316,6 +1316,59 @@ struct DrawInputs {
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
 
+constexpr std::size_t DrawAheadEvents = static_cast<std::size_t>(DrawAheadEvent::Count);
+std::array<std::atomic<std::uint64_t>, DrawAheadEvents> drawAheadTotals{};
+std::atomic<bool> drawAheadDisabled{false};
+std::atomic<bool> drawAheadThrows{false};
+
+std::uint64_t VerifyDrawAheadEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_PREPARE_AHEAD");
+        return text == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(text, nullptr, 10));
+    }();
+    return every;
+}
+
+struct AheadUse {
+    DrawAhead* ahead = nullptr;
+    bool verify = false;
+    bool Takes() const { return ahead != nullptr && !verify; }
+    bool Checks() const { return ahead != nullptr && verify; }
+};
+
+AheadUse aheadFor(const Context& context, DrawAhead* ahead) {
+    if (ahead == nullptr || drawAheadDisabled.load(std::memory_order_relaxed)) return {};
+    if (ahead->device != context.device || ahead->pool != context.bufferPool) {
+        CountDrawAhead(DrawAheadEvent::Device);
+        return {};
+    }
+    CountDrawAhead(DrawAheadEvent::Used);
+    static std::atomic<std::uint64_t> used{0};
+    const auto every = VerifyDrawAheadEvery();
+    const bool verify = every != 0 && (used.fetch_add(1, std::memory_order_relaxed) + 1) % every == 0;
+    if (verify) CountDrawAhead(DrawAheadEvent::Verified);
+    return {ahead, verify};
+}
+
+void checkAhead(bool same, const char* what) {
+    if (same) return;
+    CountDrawAhead(DrawAheadEvent::Mismatch);
+    drawAheadDisabled.store(true, std::memory_order_relaxed);
+    static AgcDriver::Mutex reportMutex;
+    static std::set<std::string> reported;
+    std::lock_guard lock(reportMutex);
+    if (reported.insert(what).second) std::fprintf(stderr, "[prepare-ahead] mismatch: %s; prepare-ahead is off for the rest of the process\n", what);
+}
+
+bool SameVertexLayout(const VertexInputLayout& first, const VertexInputLayout& second) {
+    const auto same = [](const auto& a, const auto& b) { return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(a.front())) == 0); };
+    return same(first.bindings, second.bindings) && same(first.attributes, second.attributes);
+}
+
+bool SameSetLayouts(const DescribedSetLayouts& described, const PipelineSetLayouts& built) {
+    return described.layouts.main == built.main && described.layouts.fragment == built.fragment && described.layouts.split == built.split && std::ranges::equal(described.mainKey, built.mainKey) && std::ranges::equal(described.fragmentKey, built.fragmentKey);
+}
+
 bool StripPatches(const State& state, std::span<const CompiledShader> shaders) {
     return state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP && BarycentricPatches(state, shaders);
 }
@@ -1329,7 +1382,7 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const AheadUse& ahead = {}) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1375,9 +1428,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
+    } else if (ahead.Takes() && ahead.ahead->validated) {
+        inputs.fragmentOutputs = ahead.ahead->fragmentOutputs;
+        inputs.shaderStages = ahead.ahead->shaderStages;
+        outcome.validateMemoized = true;
+        outcome.validateHit = true;
     } else {
         inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
         inputs.shaderStages = PipelineStages(shaders);
+        if (ahead.Checks() && ahead.ahead->validated) {
+            checkAhead(inputs.fragmentOutputs == ahead.ahead->fragmentOutputs, "fragment outputs");
+            checkAhead(inputs.shaderStages == ahead.ahead->shaderStages, "pipeline stages");
+        }
     }
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders OK");
     APS5_LOG_OUT_DEBUG("PipelineStages=0x%x", static_cast<unsigned>(inputs.shaderStages));
@@ -1581,10 +1643,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) {
         inputs.vertexInput = recipe->vertexInput;
+    } else if (ahead.Takes() && ahead.ahead->laidOut) {
+        inputs.retainedVertexInput = std::move(ahead.ahead->retainedVertexInput);
+        if (inputs.retainedVertexInput == nullptr) inputs.vertexInput = std::move(ahead.ahead->vertexInput);
     } else if (!attributes.empty()) {
         if (context.vertexInputs != nullptr) inputs.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
         if (inputs.retainedVertexInput == nullptr) inputs.vertexInput = BuildVertexInputLayout(context, attributes);
     }
+    if (ahead.Checks() && ahead.ahead->laidOut) checkAhead(SameVertexLayout(inputs.VertexLayout(), ahead.ahead->VertexLayout()), "vertex input layout");
     inputs.vertexOffsets.assign(attributes.size(), 0);
     inputs.vertexHandles.reserve(attributes.size());
     // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
@@ -1726,7 +1792,7 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const AheadUse& ahead) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1742,7 +1808,12 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        if (ahead.Takes() && !ahead.ahead->contentKey.empty()) {
+            resolved.contentKey = std::move(ahead.ahead->contentKey);
+        } else {
+            resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+            if (ahead.Checks() && !ahead.ahead->contentKey.empty()) checkAhead(resolved.contentKey == ahead.ahead->contentKey, "resource-cache key");
+        }
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
             const bool valid = cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
@@ -2582,6 +2653,7 @@ struct PreparedDraw {
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
     std::uint64_t shape = 0;
+    AheadUse ahead;
     std::vector<std::uint32_t> stencilReferences;
     std::optional<PerformanceTimer> timing;
     DrawTimer timer;
@@ -2793,7 +2865,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
-    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared.ahead);
     if (inputs.nothing) return false;
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -2930,7 +3002,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
-    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.ahead);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {
@@ -3131,7 +3203,29 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             noteShapeMemoVerified(true);
         }
         const bool repeated = pipeline != nullptr;
-        if (!repeated) pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
+        // A pipeline prepared ahead stands in for the store's lookup when the shape memo has none.
+        std::shared_ptr<Pipeline> aheadPipeline;
+        if (!repeated && prepared.ahead.ahead != nullptr && prepared.ahead.ahead->pipeline != nullptr) {
+            const auto& ahead = *prepared.ahead.ahead;
+            std::uint32_t proxied = 0;
+            for (std::size_t index = 0; index < targets.size() && index < 32; ++index) proxied |= targets[index].proxied ? 1u << index : 0u;
+            if (!lean) CountDrawAhead(DrawAheadEvent::NotLean);
+            else if (!ahead.validated || ahead.fragmentOutputs != inputs.fragmentOutputs || ahead.proxied != proxied || !SameSetLayouts(ahead.layouts, layouts)) CountDrawAhead(DrawAheadEvent::PipelineInputs);
+            else aheadPipeline = ahead.pipeline;
+        }
+        if (aheadPipeline != nullptr && !prepared.ahead.verify) {
+            pipeline = aheadPipeline;
+            storeHash = prepared.ahead.ahead->storeHash;
+        } else if (!repeated) {
+            pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
+        }
+        if (aheadPipeline != nullptr && pipeline != aheadPipeline) {
+            std::vector<std::byte> aheadKey;
+            std::vector<std::byte> builtKey;
+            BuildPipelineStoreKey(aheadKey, context, pipelineState, prepared.ahead.ahead->VertexLayout(), prepared.ahead.ahead->layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL);
+            BuildPipelineStoreKey(builtKey, context, pipelineState, inputs.VertexLayout(), layouts, shaders, VK_IMAGE_LAYOUT_GENERAL);
+            checkAhead(aheadKey == builtKey, "pipeline");
+        }
         if (memoized) rememberShape(context, prepared.shape, targets, repeated ? nullptr : &pipeline, storeHash, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
     }
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
@@ -3641,7 +3735,7 @@ std::string TakeDrawSplitText() {
     return result;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape) {
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, DrawAhead* ahead) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (state.stages.tessellationGeometry) {
         if (DrawSplitCounted()) DrawSplit().tessellation.fetch_add(1, std::memory_order_relaxed);
@@ -3653,6 +3747,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
     prepared.shape = shape;
+    prepared.ahead = aheadFor(context, ahead);
     const bool counted = DrawSplitCounted();
     if (counted) {
         prepared.timer.counted = true;
@@ -3670,6 +3765,81 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     for (std::size_t i = 0; i < PhaseCount; ++i) {
         if (prepared.timer.us[i] > 0) split.phaseNs[i].fetch_add(static_cast<std::uint64_t>(prepared.timer.us[i] * 1000.0), std::memory_order_relaxed);
     }
+}
+
+void PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t shape, DrawAhead& ahead) {
+    if (drawAheadThrows.load(std::memory_order_relaxed)) throw std::runtime_error("prepare-ahead fault injected by the test");
+    ahead.device = context.device;
+    ahead.pool = context.bufferPool;
+    if (state.stages.tessellationGeometry || shaders.empty() || std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr; })) return;
+    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
+    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    const bool keyed = !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    if (keyed) ahead.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
+    bool memoized = false;
+    bool hit = false;
+    ahead.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, memoized, hit, false);
+    ahead.shaderStages = PipelineStages(shaders);
+    ahead.validated = true;
+    const auto& attributes = shaders.front().program->vertexAttributes;
+    if (!attributes.empty()) {
+        if (context.vertexInputs != nullptr) ahead.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+        if (ahead.retainedVertexInput == nullptr) ahead.vertexInput = BuildVertexInputLayout(context, attributes);
+    }
+    ahead.laidOut = true;
+    const bool stencilReplay = std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.program->stencilReferences.empty(); });
+    if (context.descriptorCache == nullptr || stencilReplay) return;
+    // The commit takes a shaped draw's pipeline from the shape memo, which keeps the committer's
+    // own choices; one with a proxied or multisampled target is not memoized, so its pipeline is
+    // still prepared here.
+    if (shape != 0 && ShapeMemoEnabled() && std::none_of(state.colors.begin(), state.colors.end(), [&](const ColorTarget& color) { return color.samples > 1 || AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED; })) {
+        CountDrawAhead(DrawAheadEvent::ShapeMemo);
+        return;
+    }
+    ahead.layouts = DescribeSetLayouts(context, shaders);
+    auto masked = maskedState(state, ahead.fragmentOutputs);
+    for (std::size_t index = 0; index < state.colors.size(); ++index) {
+        const auto& color = state.colors[index];
+        if (color.samples > 1 || AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED) continue;
+        if (index < 32) ahead.proxied |= 1u << index;
+        if (!masked.has_value()) masked = state;
+        masked->colors[index].format = AttachmentProxyFormat(context, color.format);
+        masked->blends.at(color.exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
+    }
+    ahead.pipeline = CachedPipeline(context, masked.has_value() ? *masked : state, ahead.VertexLayout(), ahead.layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL, nullptr, &ahead.storeHash);
+}
+
+void CountDrawAhead(DrawAheadEvent event) {
+    drawAheadTotals[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, DrawAheadEvents> DrawAheadTotals() {
+    std::array<std::uint64_t, DrawAheadEvents> totals{};
+    for (std::size_t index = 0; index < totals.size(); ++index) totals[index] = drawAheadTotals[index].load(std::memory_order_relaxed);
+    return totals;
+}
+
+std::string DrawAheadReport() {
+    static AgcDriver::Mutex reportMutex;
+    static std::array<std::uint64_t, DrawAheadEvents> reported{};
+    std::lock_guard lock(reportMutex);
+    const auto totals = DrawAheadTotals();
+    std::array<unsigned long long, DrawAheadEvents> window{};
+    for (std::size_t index = 0; index < totals.size(); ++index) window[index] = static_cast<unsigned long long>(totals[index] - reported[index]);
+    reported = totals;
+    const auto at = [&](DrawAheadEvent event) { return window[static_cast<std::size_t>(event)]; };
+    char line[512];
+    std::snprintf(line, sizeof(line), "[prepare-ahead] (10 s): %llu offered, %llu prepared, %llu used; not used: %llu not started, %llu unfinished, %llu exception, %llu device; pipeline redone: %llu not lean, %llu pipeline inputs; %llu pipelines left to the shape memo; %llu verified, %llu mismatches%s", at(DrawAheadEvent::Offered), at(DrawAheadEvent::Prepared), at(DrawAheadEvent::Used), at(DrawAheadEvent::NotStarted), at(DrawAheadEvent::Unfinished), at(DrawAheadEvent::Thrown), at(DrawAheadEvent::Device), at(DrawAheadEvent::NotLean), at(DrawAheadEvent::PipelineInputs), at(DrawAheadEvent::ShapeMemo), at(DrawAheadEvent::Verified), at(DrawAheadEvent::Mismatch), DrawAheadDisabled() ? " (off after a mismatch)" : "");
+    return line;
+}
+
+bool DrawAheadDisabled() {
+    return drawAheadDisabled.load(std::memory_order_relaxed);
+}
+
+void ThrowInDrawAheadForTest(bool enabled) {
+    drawAheadThrows.store(enabled, std::memory_order_relaxed);
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {

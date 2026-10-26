@@ -435,6 +435,57 @@ unsigned DrawPipeline::Committers() {
     return runningCommitters.load(std::memory_order_acquire);
 }
 
+unsigned DrawPipeline::PrepareThreads() {
+    static const unsigned threads = [] {
+        const char* text = std::getenv("APS5_PREPARE_AHEAD");
+        if (text == nullptr || Depth() == 0) return 0u;
+        return static_cast<unsigned>(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 8));
+    }();
+    return threads;
+}
+
+bool DrawPipeline::PreparesAhead() {
+    return PrepareThreads() != 0 && !Graphics::DrawAheadDisabled();
+}
+
+void DrawPipeline::queuePrepare(Prepare prepare) {
+    struct ReclaimStorage {};
+    auto& reclaim = HostThreadLocal<std::vector<Prepare>, ReclaimStorage>();
+    reclaim.clear();
+    std::lock_guard lock(prepareMutex);
+    if (!spentPrepares.empty()) std::swap(spentPrepares, reclaim);
+    if (preparersClosing) return;
+    prepares.push_back(std::move(prepare));
+    queuedPrepares.fetch_add(1, std::memory_order_release);
+    while (preparers.size() < PrepareThreads()) preparers.emplace_back([this] { prepareAhead(); });
+    if (sleepingPreparers != 0) prepareWake.notify_one();
+}
+
+void DrawPipeline::prepareAhead() {
+    PinPreparerThread("draw preparer");
+    PerformanceTrace::BindThread("draw preparer", std::size_t{1} << 17u);
+    for (;;) {
+        Prepare prepare;
+        SpinUntil(HandoffSpinWindow(), [&] { return queuedPrepares.load(std::memory_order_acquire) != 0; });
+        {
+            std::unique_lock lock(prepareMutex);
+            ++sleepingPreparers;
+            prepareWake.wait(lock, [&] { return !prepares.empty() || preparersClosing; });
+            --sleepingPreparers;
+            if (preparersClosing) return;
+            prepare = std::move(prepares.front());
+            prepares.pop_front();
+            queuedPrepares.fetch_sub(1, std::memory_order_release);
+        }
+        try {
+            prepare();
+        } catch (...) {
+        }
+        std::lock_guard lock(prepareMutex);
+        spentPrepares.push_back(std::move(prepare));
+    }
+}
+
 void DrawPipeline::rethrowFailure() {
     if (failure == nullptr) return;
     auto error = std::exchange(failure, nullptr);
@@ -461,7 +512,7 @@ bool ItemsThroughFinisher() {
 
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, ItemKind kind) {
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, ItemKind kind, Prepare prepare) {
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
         const bool forward = ItemsThroughFinisher() && DrawFinisher::Overlap() && !draw && reads.empty();
         DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Enqueue, !forward);
@@ -479,6 +530,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         }
         DrawFinisher::Get().Drain(QueueWaits::Site::FinisherEnqueue);
     }
+    if (prepare) queuePrepare(std::move(prepare));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
@@ -588,6 +640,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     reportedDecodeDrains = decodeDrainCount;
     drainText += reads;
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
+    if (PrepareThreads() != 0) AgcDriver::ProfilePrint_nid_no_patch("%s with %u threads\n", Graphics::DrawAheadReport().c_str(), PrepareThreads());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};
     drainWaitNs = {};
@@ -678,6 +731,17 @@ void DrawPipeline::run() {
 
 void DrawPipeline::Stop() {
     std::thread committer;
+    std::vector<std::thread> stopped;
+    {
+        std::lock_guard lock(prepareMutex);
+        preparersClosing = true;
+        stopped = std::move(preparers);
+    }
+    prepareWake.notify_all();
+    for (auto& preparer : stopped) {
+        if (preparer.get_id() == std::this_thread::get_id()) preparer.detach();
+        else preparer.join();
+    }
     {
         std::lock_guard lock(mutex);
         closing = true;

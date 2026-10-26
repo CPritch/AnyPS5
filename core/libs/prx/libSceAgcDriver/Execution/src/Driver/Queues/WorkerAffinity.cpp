@@ -66,6 +66,16 @@ std::uint64_t CommitterAffinityMask() {
     return mask;
 }
 
+std::uint64_t PreparerAffinityMask() {
+    static const std::uint64_t mask = [] {
+        const auto requested = CpuTopology::MaskFromEnvironment("APS5_PREPARE_AHEAD_AFFINITY_MASK");
+        if (requested != 0) return requested;
+        const auto& placement = CpuTopology::GetPlacement();
+        return placement.Active() ? placement.shared : CpuTopology::Get().process;
+    }();
+    return mask;
+}
+
 void PinWorkerThread(const char* role) {
     NameThread(role);
     if (PinPlaced(role, &CpuTopology::Placement::shared)) return;
@@ -88,6 +98,12 @@ void PinCommitterThread(const char* role) {
     NameThread(role);
     if (PinPlaced(role, &CpuTopology::Placement::committer)) return;
     PinThread(role, CommitterAffinityMask(), committerSummary, "draw committer and finisher");
+}
+
+void PinPreparerThread(const char* role) {
+    NameThread(role);
+    static std::once_flag summary;
+    PinThread(role, PreparerAffinityMask(), summary, "draw preparers");
 }
 
 }

@@ -4,9 +4,11 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -22,10 +24,35 @@ struct DrawTraceContext {
     std::uint64_t target = 0;
 };
 
+struct DrawAhead {
+    VkDevice device = VK_NULL_HANDLE;
+    std::shared_ptr<BufferPool> pool;
+    ResourceCache::Key contentKey;
+    bool validated = false;
+    std::uint32_t fragmentOutputs = 0;
+    VkPipelineStageFlags shaderStages = 0;
+    bool laidOut = false;
+    VertexInputLayout vertexInput;
+    std::shared_ptr<const VertexInputLayout> retainedVertexInput;
+    DescribedSetLayouts layouts;
+    std::uint32_t proxied = 0;
+    std::shared_ptr<Pipeline> pipeline;
+    std::uint64_t storeHash = 0;
+    const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
+};
+
+enum class DrawAheadEvent : std::uint8_t { Offered, Prepared, Thrown, NotStarted, Unfinished, Device, Used, NotLean, PipelineInputs, ShapeMemo, Verified, Mismatch, Count };
+void PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t shape, DrawAhead& ahead);
+void CountDrawAhead(DrawAheadEvent event);
+std::array<std::uint64_t, static_cast<std::size_t>(DrawAheadEvent::Count)> DrawAheadTotals();
+std::string DrawAheadReport();
+bool DrawAheadDisabled();
+void ThrowInDrawAheadForTest(bool enabled);
+
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0);
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, DrawAhead* ahead = nullptr);
 std::string TakeDrawSplitText();
 
 struct PixelFunctionLdsLayouts {
