@@ -43,6 +43,11 @@ public:
             if (source.dwordCount > source.dwords.size()) return false;
             for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) tape.sourceDwords[index][dword] = compile(source.dwords[dword], MainContext, 0);
         }
+        tape.bufferBaseDwords.assign(plan.info.buffers.size(), SrtTape::NoNode);
+        for (std::size_t position = 0; position < plan.info.buffers.size() && position < plan.materializationSources.size(); ++position) {
+            const auto& source = plan.descriptorSources[plan.materializationSources[position]];
+            if (source.dwordCount != 0) tape.bufferBaseDwords[position] = compileBufferBase(source.dwords[0], static_cast<std::uint32_t>(position));
+        }
         tape.flatRoots.resize(plan.srtReads.size());
         for (std::size_t slot = 0; slot < plan.srtReads.size(); ++slot) {
             const auto& read = plan.srtReads[slot];
@@ -110,6 +115,39 @@ private:
         built.emplace(key, Building);
         const auto index = build(value, context, depth);
         built[key] = index;
+        return index;
+    }
+
+    // A buffer's base dword compiled apart from `built`, so its evaluation is its own: a user word or a raw read
+    // recorded as a buffer base. NoNode for any other value, which keeps the shared node.
+    std::uint32_t compileBufferBase(IrValue* raw, std::uint32_t resource) {
+        if (raw == nullptr) return SrtTape::NoNode;
+        IrValue* value = raw->Resolve();
+        if (value->HasImmediate()) return SrtTape::NoNode;
+        if (value->Opcode() == IrOpcode::GetUserData) {
+            if (value->ArgumentCount() < 1 || value->Argument(0) == nullptr) return SrtTape::NoNode;
+            const auto reg = RegIndex(static_cast<ScalarReg>(value->Argument(0)->Register().index));
+            if (reg < plan.userDataBase || reg - plan.userDataBase >= SrtUserDataUse::TrackedWords) return SrtTape::NoNode;
+            Node node;
+            node.op = Op::UserData;
+            node.immediate = reg - plan.userDataBase;
+            node.bufferBase = resource;
+            return emit(node);
+        }
+        std::int32_t slot = -1;
+        if (value->Opcode() == IrOpcode::ReadConst) {
+            if (value->ArgumentCount() < 2) return SrtTape::NoNode;
+            IrValue* index = value->Argument(1)->Resolve();
+            if (!index->HasImmediate() || index->Type() != IrType::U32 || index->ImmediateU32() >= plan.srtReads.size()) return SrtTape::NoNode;
+            slot = static_cast<std::int32_t>(index->ImmediateU32());
+            if (static_cast<std::size_t>(slot) < plan.cleanFlatSlots.size() && plan.cleanFlatSlots[static_cast<std::size_t>(slot)] != 0u) return SrtTape::NoNode;
+            value = plan.srtReads[static_cast<std::size_t>(slot)].value->Resolve();
+        }
+        if ((value->Opcode() != IrOpcode::LoadAddressU32 && value->Opcode() != IrOpcode::ReadConstBuffer) || !IsRawRead(plan, *value)) return SrtTape::NoNode;
+        const auto index = build(value, MainContext, 0);
+        if (index == failNode || (tape.nodes[index].op != Op::Read && tape.nodes[index].op != Op::ReadConstBuffer)) return SrtTape::NoNode;
+        tape.nodes[index].bufferBase = resource;
+        tape.nodes[index].slot = slot;
         return index;
     }
 
@@ -193,7 +231,12 @@ private:
                 if (!slot->HasImmediate() || slot->Type() != IrType::U32 || slot->ImmediateU32() >= plan.srtReads.size()) return fail();
                 const auto index = slot->ImmediateU32();
                 const bool clean = current.cleanSlots && index < plan.cleanFlatSlots.size() && plan.cleanFlatSlots[index] != 0u;
-                return compile(plan.srtReads[index].value, clean ? CleanContext : context, depth + 1);
+                Node node;
+                node.op = Op::Slot;
+                node.immediate = index;
+                node.argumentCount = 1;
+                node.arguments[0] = compile(plan.srtReads[index].value, clean ? CleanContext : context, depth + 1);
+                return emit(node);
             }
             case IrOpcode::LoadAddressU32:
             case IrOpcode::ReadConstBuffer: {
@@ -403,7 +446,10 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
         case Op::Const: result = node.immediate; return true;
         case Op::UserData:
             if (node.immediate >= frame.runtime.userData.size()) return false;
-            if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->asValue |= node.immediate < SrtUserDataUse::TrackedWords ? std::uint64_t {1} << node.immediate : ~std::uint64_t {0};
+            if (frame.runtime.userDataUse != nullptr && node.bufferBase != NoNode) {
+                frame.runtime.userDataUse->asBufferBase |= std::uint64_t {1} << node.immediate;
+                frame.runtime.userDataUse->bufferBases.push_back({node.bufferBase, static_cast<std::int32_t>(node.immediate), 0, -1});
+            } else if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->asValue |= node.immediate < SrtUserDataUse::TrackedWords ? std::uint64_t {1} << node.immediate : ~std::uint64_t {0};
             result = frame.runtime.userData[static_cast<std::size_t>(node.immediate)];
             return true;
         case Op::ShaderBase: result = frame.runtime.shaderBase; return true;
@@ -431,7 +477,8 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
                 frame.nullRoot = true;
                 return false;
             }
-            if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
+            if (frame.runtime.userDataUse != nullptr && node.bufferBase != NoNode) frame.runtime.userDataUse->bufferBases.push_back({node.bufferBase, -1, address, origin, node.slot});
+            else if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
             if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
                 if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
@@ -531,6 +578,10 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
         case Op::LogicalOr: return false;
         case Op::LogicalXor: result = (a != 0u) != (b != 0u) ? 1u : 0u; return true;
         case Op::LogicalNot: result = a == 0u ? 1u : 0u; return true;
+        case Op::Slot:
+            if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->valueSlots.push_back(static_cast<std::uint32_t>(node.immediate));
+            result = a;
+            return true;
     }
     return false;
 }
@@ -545,6 +596,9 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     const auto baseBefore = use != nullptr ? use->asBase : 0;
     const auto valueBefore = use != nullptr ? use->asValue : 0;
     const auto useReadsBefore = use != nullptr ? use->reads.size() : 0;
+    const auto bufferBaseBefore = use != nullptr ? use->asBufferBase : 0;
+    const auto bufferBasesBefore = use != nullptr ? use->bufferBases.size() : 0;
+    const auto valueSlotsBefore = use != nullptr ? use->valueSlots.size() : 0;
     const auto refuse = [&] {
         if (trace != nullptr) {
             trace->leaves.resize(leavesBefore);
@@ -555,6 +609,9 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             use->asBase = baseBefore;
             use->asValue = valueBefore;
             use->reads.resize(useReadsBefore);
+            use->asBufferBase = bufferBaseBefore;
+            use->bufferBases.resize(bufferBasesBefore);
+            use->valueSlots.resize(valueSlotsBefore);
         }
         return false;
     };
@@ -633,15 +690,17 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     auto& evaluated = scratch.evaluated;
     evaluated.clear();
     evaluated.reserve(plan.materializationSources.size());
-    for (const auto sourceIndex : plan.materializationSources) {
+    for (std::size_t position = 0; position < plan.materializationSources.size(); ++position) {
+        const auto sourceIndex = plan.materializationSources[position];
         if (sourceIndex >= plan.descriptorSources.size()) return refuse();
         const auto& source = plan.descriptorSources[sourceIndex];
         DescriptorValue value;
         value.dwordCount = source.dwordCount;
+        const auto base = use != nullptr && position < bufferBaseDwords.size() ? bufferBaseDwords[position] : NoNode;
         if (active[sourceIndex]) {
             for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) {
                 std::uint64_t word = 0;
-                if (!evaluate(frame, sourceDwords[sourceIndex][dword], word)) return refuse();
+                if (!evaluate(frame, dword == 0 && base != NoNode ? base : sourceDwords[sourceIndex][dword], word)) return refuse();
                 value.dwords[dword] = static_cast<std::uint32_t>(word);
             }
         }

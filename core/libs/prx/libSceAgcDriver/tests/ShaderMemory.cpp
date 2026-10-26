@@ -1617,6 +1617,10 @@ void verifySrtTape() {
         std::uint64_t asBase = 0;
         std::uint64_t asValue = 0;
         std::vector<std::pair<std::uint64_t, std::int32_t>> userDataReads;
+        std::uint64_t asBufferBase = 0;
+        std::vector<SrtBufferBase> bufferBases;
+        std::vector<std::uint32_t> valueSlots;
+        std::size_t readsAt = 0;
         bool operator==(const Walk&) const = default;
     };
     const auto walk = [](const IrResourcePlan& plan, SrtRuntime runtime, bool tape) {
@@ -1642,6 +1646,15 @@ void verifySrtTape() {
         out.userDataReads = use.reads;
         std::sort(out.userDataReads.begin(), out.userDataReads.end());
         out.userDataReads.erase(std::unique(out.userDataReads.begin(), out.userDataReads.end()), out.userDataReads.end());
+        out.asBufferBase = use.asBufferBase;
+        out.bufferBases = use.bufferBases;
+        std::sort(out.bufferBases.begin(), out.bufferBases.end());
+        out.valueSlots = use.valueSlots;
+        std::sort(out.valueSlots.begin(), out.valueSlots.end());
+        out.valueSlots.erase(std::unique(out.valueSlots.begin(), out.valueSlots.end()), out.valueSlots.end());
+        for (const auto& base : out.bufferBases) {
+            if (base.word < 0) out.readsAt += static_cast<std::size_t>(std::ranges::count(use.reads, base.address, &std::pair<std::uint64_t, std::int32_t>::first));
+        }
         return out;
     };
     const auto answers = [](const IrResourcePlan& plan, const SrtRuntime& runtime) {
@@ -1706,6 +1719,10 @@ void verifySrtTape() {
         require(tape == walk(*guardedPlan, runtime, false), "SRT tape: the tape's walk differs from the Evaluator's on the guarded program");
         require(tape.ok && tape.active.size() == imageActivity + 1u && tape.active[imageActivity] == mode, "SRT tape: the image behind the branch has the wrong activity");
         require(tape.asBase != 0u && tape.asValue != 0u && !tape.userDataReads.empty(), "SRT tape: the guarded program's walk reported no user-data use");
+        const auto storeBase = srtAddress + 64u;
+        const auto stored = std::ranges::find_if(tape.bufferBases, [&](const SrtBufferBase& base) { return base.word < 0 && base.address == storeBase && base.origin == 0; });
+        require(stored != tape.bufferBases.end() && stored->slot >= 0 && std::ranges::find(tape.valueSlots, static_cast<std::uint32_t>(stored->slot)) == tape.valueSlots.end() && tape.readsAt == 1u, "SRT tape: the stored buffer's base dword, a flat slot of the table, was not recorded as a buffer base with only its flat copy read besides");
+        require(!tape.valueSlots.empty(), "SRT tape: the guarded program's branch word was not recorded as a slot used as a value");
     }
 
     const auto nullRuntime = runtimeFor(nullUserData);
@@ -1725,6 +1742,29 @@ void verifySrtTape() {
     const auto runtime = runtimeFor(userData);
     require(answers(*outOfRangePlan, runtime), "SRT tape: the tape refused a constant read past its V#");
     require(walk(*outOfRangePlan, runtime, true) == walk(*outOfRangePlan, runtime, false), "SRT tape: a constant read past its V# differs from the Evaluator's");
+
+    // A V# in user words 0-3: stored through directly, its base word is a buffer base only; stored through after
+    // an add, it is a value; read through as well (a nonzero word, so the store behind the branch on it is active),
+    // it is a read base and a buffer base.
+    output.fill(1u);
+    const std::array<std::uint32_t, 4> inlineWords = outputV;
+    const auto inlineWalk = [&](std::uint64_t address, const std::vector<std::uint32_t>& code) {
+        auto request = requestFor(address, code);
+        request.context.userData = inlineWords;
+        const auto plan = GetResourcePlan(request);
+        const auto inlineRuntime = runtimeFor(inlineWords);
+        require(answers(*plan, inlineRuntime), "SRT tape: the tape refused a program storing through a V# in user data");
+        const auto tape = walk(*plan, inlineRuntime, true);
+        require(tape == walk(*plan, inlineRuntime, false), "SRT tape: a program storing through a V# in user data walks differently on the tape");
+        return tape;
+    };
+    const auto direct = inlineWalk(0x26000u, {0x7e000280u, 0xe0700000u, 0x80000000u, 0xbf810000u});
+    require(direct.asBufferBase == 1u && (direct.asValue & 1u) == 0u && direct.bufferBases.size() == 1u && direct.bufferBases[0].word == 0 && direct.bufferBases[0].resource == 0u, "SRT tape: the base word of a V# in user data was not recorded as a buffer base only");
+    require((direct.asValue & 0xeu) == 0xeu, "SRT tape: the other words of a V# in user data were not recorded as values");
+    const auto added = inlineWalk(0x27000u, {0x80049000u, 0xbe850301u, 0xbe860302u, 0xbe870303u, 0x7e000280u, 0xe0700000u, 0x80010000u, 0xbf810000u});
+    require(added.asBufferBase == 0u && (added.asValue & 1u) != 0u && added.bufferBases.empty(), "SRT tape: a V# base computed from a user word was recorded as a buffer base");
+    const auto read = inlineWalk(0x28000u, {0xf4000200u, 0xfa000000u, 0xbf8cc07fu, 0xbf068008u, 0xbf850003u, 0x7e000280u, 0xe0700000u, 0x80000000u, 0xbf810000u});
+    require(read.asBufferBase == 1u && (read.asBase & 1u) != 0u && (read.asValue & 1u) == 0u, "SRT tape: a V# base the walk also reads through was not a read base and a buffer base");
 }
 
 struct alignas(256) TableTexture {

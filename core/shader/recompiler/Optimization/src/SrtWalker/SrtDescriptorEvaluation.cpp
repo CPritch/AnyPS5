@@ -127,7 +127,9 @@ bool evaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::
     std::vector<std::pair<std::uint32_t, InaccessibleRead>> zeroedSources;
     std::vector<DescriptorValue> evaluated;
     evaluated.reserve(sources.size());
-    for (const auto sourceIndex : sources) {
+    const bool bufferPositions = std::ranges::equal(sources, program.materializationSources);
+    for (std::size_t position = 0; position < sources.size(); ++position) {
+        const auto sourceIndex = sources[position];
         const auto* source = Source(program, sourceIndex);
         if (source == nullptr) {
             return Fail("descriptor source " + std::to_string(sourceIndex) + " does not exist");
@@ -137,7 +139,9 @@ bool evaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::
         if (!evaluateFlat || active[sourceIndex]) {
             for (std::uint32_t index = 0; index < source->dwordCount; index++) {
                 inaccessible = {};
-                if (!evaluator.Evaluate(TNode::SourceDword(program, sourceIndex, index), value.dwords[index])) {
+                const auto node = TNode::SourceDword(program, sourceIndex, index);
+                const bool base = bufferPositions && index == 0 && position < program.info.buffers.size();
+                if (!(base ? evaluator.EvaluateBufferBase(node, static_cast<std::uint32_t>(position), value.dwords[index]) : evaluator.Evaluate(node, value.dwords[index]))) {
                     if (inaccessible.read != nullptr) {
                         if (debug) std::fprintf(stderr, "[srt] descriptor source %u reads inaccessible 0x%llx at pc 0x%x: zero words\n", sourceIndex, static_cast<unsigned long long>(inaccessible.address), inaccessible.read->Flags<MemoryFlags>().pc);
                         value.dwords.fill(0u);
@@ -257,14 +261,24 @@ bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std:
 }
 
 bool sameUserDataUse(const SrtUserDataUse& tape, const SrtUserDataUse& interpreted) {
-    if (tape.asBase != interpreted.asBase || tape.asValue != interpreted.asValue) return false;
+    if (tape.asBase != interpreted.asBase || tape.asValue != interpreted.asValue || tape.asBufferBase != interpreted.asBufferBase) return false;
     auto tapeReads = tape.reads;
     auto interpretedReads = interpreted.reads;
     for (auto* reads : {&tapeReads, &interpretedReads}) {
         std::sort(reads->begin(), reads->end());
         reads->erase(std::unique(reads->begin(), reads->end()), reads->end());
     }
-    return tapeReads == interpretedReads;
+    auto tapeBases = tape.bufferBases;
+    auto interpretedBases = interpreted.bufferBases;
+    std::sort(tapeBases.begin(), tapeBases.end());
+    std::sort(interpretedBases.begin(), interpretedBases.end());
+    auto tapeSlots = tape.valueSlots;
+    auto interpretedSlots = interpreted.valueSlots;
+    for (auto* slots : {&tapeSlots, &interpretedSlots}) {
+        std::sort(slots->begin(), slots->end());
+        slots->erase(std::unique(slots->begin(), slots->end()), slots->end());
+    }
+    return tapeReads == interpretedReads && tapeBases == interpretedBases && tapeSlots == interpretedSlots;
 }
 
 void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads, std::size_t leavesBefore, std::size_t readsBefore, const SrtUserDataUse* useBefore) {

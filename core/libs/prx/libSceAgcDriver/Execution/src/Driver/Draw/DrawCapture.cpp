@@ -160,7 +160,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         throw named(error, request.context.memory);
     }
     timing.Mark("materialize");
-    const auto walked = capture->userDataUse.asValue | capture->userDataUse.asBase;
+    const auto walked = capture->userDataUse.asValue | capture->userDataUse.asBase | capture->userDataUse.asBufferBase;
     auto mask = walked == 0 ? ~std::uint64_t{0} : walked | stageCapture.compiled->userDataRegisterReads;
     if (vertexInfos[i]) {
         for (const auto reg : {static_cast<std::uint32_t>(vertexInfos[i]->fetchAttribReg), static_cast<std::uint32_t>(vertexInfos[i]->fetchBufferReg)}) {

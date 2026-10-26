@@ -183,6 +183,9 @@ public:
     static EvaluatorReads Reads(const IrResourcePlan& program, const IrValue& value);
     bool Evaluate(TNode value, std::uint32_t& result);
     bool EvaluateWide(TNode value, std::uint64_t& result);
+    // Dword 0 of buffer descriptor `resource`: a user word or a raw read there is evaluated apart from the value
+    // cache and recorded as a buffer base (SrtUserDataUse::bufferBases), not as a value use or a read.
+    bool EvaluateBufferBase(TNode value, std::uint32_t resource, std::uint32_t& result);
     void ReportInaccessibleReads(InaccessibleRead* sink) { _inaccessible = sink; }
     void ReportNullRootReads(std::uint32_t* sink) { _nullRoots = sink; }
 
@@ -194,7 +197,7 @@ private:
     bool Arg(const TNode& inst, std::size_t index, std::uint64_t& result);
     bool EvaluatePhi(const TNode& inst, std::uint64_t& result);
     bool EvaluateExtract(const TNode& inst, std::uint64_t& result);
-    bool EvaluateRawRead(const TNode& inst, std::uint64_t& result);
+    bool EvaluateRawRead(const TNode& inst, std::uint64_t& result, const SrtBufferBase* bufferBase = nullptr);
     bool EvaluateInst(const TNode& inst, std::uint64_t& result);
 
     const IrResourcePlan& _program;
