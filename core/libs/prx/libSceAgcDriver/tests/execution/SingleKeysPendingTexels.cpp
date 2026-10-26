@@ -66,6 +66,13 @@ alignas(256) constexpr std::array<std::uint32_t, 8> WriteCode{
     0x7e020280, 0x7e0402f2, 0x7e0602f2, 0x7e0802f2, 0x7e0a02f2, 0xf0201f08, 0x00010200, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 11> SampleSecondTexelCode{
+    0x34060084, 0x7e2802ff, 0x3c400000, 0x7e2a02ff, 0x3b800000, 0xf09c0f08, 0x00610a14, 0xbf8c3f70,
+    0xe0781000, 0x80000a03, 0xbf810000,
+};
+
+constexpr std::array<std::uint32_t, 4> PointSampler{0x00000092u, 0x00fff000u, 0u, 0u};
+
 std::uint64_t AddressOf(const void* data) {
     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
 }
@@ -258,6 +265,59 @@ void RunUpload(AgcDriver::VulkanDevice& device, std::uint8_t* block, Texels texe
     Require(wrong == 0, message);
 }
 
+void RunSampled(AgcDriver::VulkanDevice& device, std::uint8_t* block, std::uint8_t* outputBlock, const char* what) {
+    auto* surface = block;
+    auto* keys = block + KeysOffset;
+    auto* output = reinterpret_cast<std::uint32_t*>(outputBlock);
+    const auto address = AddressOf(surface);
+    const AgcDriver::Graphics::ColorTargetLayout layout(Side, Side, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4);
+    const auto first = layout.Offset(1, 0) / 256 * 256;
+    Require(layout.Offset(1, 0) != first, "comp-to-single keys sampled over pending texels: the sampled texel is its block's first");
+    std::memset(surface, 0x00, SurfaceBytes);
+    std::memset(keys, 0x10, KeyBytes);
+    const auto texture = TextureDescriptor(surface, keys);
+    const auto results = BufferDescriptor(output, Threads * 16u);
+    std::vector<std::uint32_t> userData(24, 0u);
+    std::copy(results.begin(), results.end(), userData.begin());
+    std::copy(texture.begin(), texture.end(), userData.begin() + 4);
+    std::copy(PointSampler.begin(), PointSampler.end(), userData.begin() + 12);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    Require(recorder != nullptr, "comp-to-single keys sampled over pending texels: no active recorder");
+    const auto requireOutput = [&](std::uint32_t expected, const char* when) {
+        for (std::uint32_t index = 0; index < Threads * 4u; ++index) {
+            char message[256];
+            std::snprintf(message, sizeof(message), "%s %s: component %u of thread %u is 0x%08x, expected 0x%08x", what, when, index % 4u, index / 4u, output[index], expected);
+            Require(output[index] == expected, message);
+        }
+    };
+    if (!FillTexels(device, surface + first, 0xffffffffu)) {
+        std::printf("%s: the texels have no host import, so a pending write over them is not tested\n", what);
+        return;
+    }
+    Require(recorder->PendingWriteOverlaps(address + first, 16), "comp-to-single keys sampled over pending texels: the texel fill is not pending");
+    std::fill(output, output + Threads * 4u, 0xdeadbeefu);
+    const bool tracked = AgcDriver::GuestMemory::Watched(address, SurfaceBytes);
+    if (!tracked) std::printf("%s: the texels are compared, not watched, so their image keeps a copy of them and waits for their writer\n", what);
+    const auto before = Outcomes();
+    const auto hookWaits = AgcDriver::Graphics::Recorder::ThreadHookWaits();
+    Dispatch(device, SampleSecondTexelCode, userData, false);
+    char message[256];
+    std::snprintf(message, sizeof(message), "%s: the sampled read under comp-to-single keys waited for the recorded write of the texels (%llu hook waits)", what, static_cast<unsigned long long>(AgcDriver::Graphics::Recorder::ThreadHookWaits() - hookWaits));
+    Require(!tracked || (recorder->PendingWriteOverlaps(address + first, 16) && AgcDriver::Graphics::Recorder::ThreadHookWaits() == hookWaits), message);
+    const auto after = Outcomes();
+    std::snprintf(message, sizeof(message), "%s: the sampled read made %llu views and %llu snapshots, expected one view of the storage image", what, static_cast<unsigned long long>(after[LookupOutcomes::SampledMadeView] - before[LookupOutcomes::SampledMadeView]), static_cast<unsigned long long>(after[LookupOutcomes::SampledMadeSnapshot] - before[LookupOutcomes::SampledMadeSnapshot]));
+    Require(after[LookupOutcomes::SampledMadeView] == before[LookupOutcomes::SampledMadeView] + 1 && after[LookupOutcomes::SampledMadeSnapshot] == before[LookupOutcomes::SampledMadeSnapshot], message);
+    device.WaitIdle();
+    requireOutput(0x3f800000u, "behind the pending write of its block's first texel");
+    std::memset(surface + first, 0x00, 4);
+    std::fill(output, output + Threads * 4u, 0xdeadbeefu);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Dispatch(device, SampleSecondTexelCode, userData);
+    requireOutput(0u, "after the CPU cleared its block's first texel");
+}
+
 }
 
 int main() {
@@ -297,6 +357,10 @@ int main() {
             run(Texels::PerBlock, true, "per-block comp-to-single texels under a pending write");
             run(Texels::PerBlock, false, "per-block comp-to-single texels nothing writes");
             run(Texels::Uniform, false, "uniform comp-to-single texels nothing writes");
+            blocks.push_back(std::make_unique<GuestBlock>(watched));
+            blocks.push_back(std::make_unique<GuestBlock>(false));
+            const auto name = std::string("comp-to-single texels sampled under a pending write (") + memory + ")";
+            RunSampled(*device, blocks[blocks.size() - 2]->Data(), blocks.back()->Data(), name.c_str());
         }
         std::puts("comp-to-single keys over pending texels tests passed");
         return 0;
