@@ -1352,7 +1352,7 @@ bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, Dc
 bool NoDrawReadbackWaits() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_NO_DRAW_READBACK_WAITS");
-        return value != nullptr && std::strcmp(value, "0") != 0;
+        return value == nullptr || std::strcmp(value, "0") != 0;
     }();
     return enabled;
 }
