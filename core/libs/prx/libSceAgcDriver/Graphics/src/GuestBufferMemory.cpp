@@ -5732,6 +5732,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
 }
 
 void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable) {
+    const Recorder::GpuSiteTag siteTag(Recorder::GpuSitesEnabled() && !copies.empty() ? "in " + Recorder::SiteHex(copies.front()->begin) + "+" + std::to_string((copies.front()->end - copies.front()->begin) >> 10) + "K n" + std::to_string(copies.size()) + (copies.front()->deviceLocal ? " dl" : " host") + (copies.front()->atomic ? " atomic" : "") : std::string{});
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool capture = std::getenv("APS5_CAPTURE_GPU_COPIES") != nullptr;
     Require(!capture || CaptureTrace::Enabled(), "GPU copy capture requires APS5_CAPTURE_TRACE");
@@ -5843,6 +5844,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
 
 void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     if (!uploaded || committed) return;
+    const Recorder::GpuSiteTag siteTag(Recorder::GpuSitesEnabled() && !writes.empty() ? "out " + Recorder::SiteHex(writes.front().first) + "+" + std::to_string((writes.front().second - writes.front().first) >> 10) + "K n" + std::to_string(writes.size()) : std::string{});
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // The written ranges, merged: a V# bound twice would otherwise copy the same bytes twice.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;

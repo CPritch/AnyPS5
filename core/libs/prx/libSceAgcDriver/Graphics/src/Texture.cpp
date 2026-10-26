@@ -2686,6 +2686,7 @@ std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units
 }
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
+    const Recorder::GpuSiteTag siteTag(Recorder::GpuSitesEnabled() ? "upload " + Recorder::SiteHex(descriptor.baseAddress) + " " + std::to_string(descriptor.width) + "x" + std::to_string(descriptor.height) : std::string{});
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -5580,6 +5581,7 @@ const char* StorageTexture::CopyRefusal(const Context& context, const StorageTex
 }
 
 bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
+    const Recorder::GpuSiteTag siteTag(Recorder::GpuSitesEnabled() ? "copyfrom " + Recorder::SiteHex(source.descriptor.baseAddress) + "->" + Recorder::SiteHex(descriptor.baseAddress) : std::string{});
     refusal = CopyRefusal(context, this, source, descriptor.baseAddress);
     if (refusal != nullptr) return false;
     auto* recorder = Recorder::Active();
@@ -5905,6 +5907,7 @@ void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
 }
 
 std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vector<bool>& units) {
+    const Recorder::GpuSiteTag siteTag(Recorder::GpuSitesEnabled() ? "borrow " + Recorder::SiteHex(source.descriptor.baseAddress) + "->" + Recorder::SiteHex(descriptor.baseAddress) : std::string{});
     const auto runs = unitRuns(units);
     const auto windows = sliceWindows(runs);
     Require(!windows.empty(), "storage image borrows no unit");
@@ -6026,6 +6029,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers, EarlierStores* earlier) {
+    const Recorder::GpuSiteTag siteTag(Recorder::GpuSitesEnabled() ? std::string("wb ") + (flushReason != nullptr ? flushReason : "?") + " " + Recorder::SiteHex(descriptor.baseAddress) + " " + std::to_string(descriptor.width) + "x" + std::to_string(descriptor.height) : std::string{});
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;

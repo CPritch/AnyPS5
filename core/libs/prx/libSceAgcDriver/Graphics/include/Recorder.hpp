@@ -18,7 +18,9 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <span>
+#include <string>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -499,7 +501,20 @@ public:
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
     enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
-    std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
+    std::uint32_t BeginGpuTiming(CommandClass which, std::source_location site = std::source_location::current());
+    // APS5_PROFILE_GPU_SITES (with APS5_PROFILE_GPU): the class ranges are also totalled by call
+    // site and by the calling thread's site tag ([gpusite] lines every 10 s). A tag names the
+    // driver action a range serves (a flush reason, a staged region, a publish reason).
+    static bool GpuSitesEnabled();
+    static std::string SiteHex(std::uint64_t value);
+    struct GpuSiteTag {
+        explicit GpuSiteTag(std::string tag);
+        ~GpuSiteTag();
+        GpuSiteTag(const GpuSiteTag&) = delete;
+        GpuSiteTag& operator=(const GpuSiteTag&) = delete;
+        std::string previous;
+        bool active;
+    };
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
     // A leading barrier a command left out because the previous trailing barrier covered its
     // accesses (see Commands), on the [barriers] line as 'merged'. Debug aid: APS5_FULL_BARRIERS=1
@@ -611,6 +626,7 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        std::vector<std::uint32_t> timedSites;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
@@ -753,7 +769,7 @@ private:
     VkPipeline dispatchArgumentPipeline = VK_NULL_HANDLE;
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
     // Commands() would close).
-    std::uint32_t beginTiming(std::uint64_t key);
+    std::uint32_t beginTiming(std::uint64_t key, std::source_location site = std::source_location::current());
     // Vulkan entry points resolved once (constructor): the loader's vkGetDeviceProcAddr is a name
     // lookup per call, paid by every reap, store and submit otherwise. APS5_NO_PROC_TABLE=1 leaves
     // them null and resolves per call as before; vkWaitSemaphoresKHR stays a lazy lookup (timeline

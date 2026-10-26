@@ -2031,7 +2031,54 @@ std::uint32_t Recorder::BeginInPassGpuTiming(std::uint64_t key) {
     return beginTiming(key);
 }
 
-std::uint32_t Recorder::beginTiming(std::uint64_t key) {
+std::uint32_t Recorder::BeginGpuTiming(CommandClass which, std::source_location site) {
+    if (!GpuTimingEnabled()) return NoTiming;
+    Commands();
+    return beginTiming(ClassKey(which), site);
+}
+
+namespace {
+thread_local std::string gpuSiteTag;
+AgcDriver::Mutex siteMutex;
+std::map<std::string, std::uint32_t> siteIds;
+std::vector<std::string> siteNames{""};
+std::map<std::uint32_t, TimingTotals> timingBySite;
+
+std::uint32_t internSite(std::uint64_t key, const std::source_location& site) {
+    if (key < Recorder::ClassKey(Recorder::CommandClass::DispatchLeading) || key >= Recorder::ClassKey(Recorder::CommandClass::Count)) return 0;
+    std::string file = site.file_name();
+    if (const auto slash = file.find_last_of('/'); slash != std::string::npos) file.erase(0, slash + 1);
+    std::string name = std::string(CommandClassNames[key - Recorder::ClassKey(Recorder::CommandClass::DispatchLeading)]) + "@" + file + ":" + std::to_string(site.line());
+    if (!gpuSiteTag.empty()) name += "[" + gpuSiteTag + "]";
+    std::lock_guard lock(siteMutex);
+    const auto [it, inserted] = siteIds.emplace(name, static_cast<std::uint32_t>(siteNames.size()));
+    if (inserted) siteNames.push_back(name);
+    return it->second;
+}
+}
+
+bool Recorder::GpuSitesEnabled() {
+    static const bool enabled = GpuTimingEnabled() && std::getenv("APS5_PROFILE_GPU_SITES") != nullptr;
+    return enabled;
+}
+
+std::string Recorder::SiteHex(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
+Recorder::GpuSiteTag::GpuSiteTag(std::string tag) : active(GpuSitesEnabled() && !tag.empty()) {
+    if (!active) return;
+    previous = gpuSiteTag;
+    gpuSiteTag = previous.empty() ? std::move(tag) : previous + "/" + tag;
+}
+
+Recorder::GpuSiteTag::~GpuSiteTag() {
+    if (active) gpuSiteTag = std::move(previous);
+}
+
+std::uint32_t Recorder::beginTiming(std::uint64_t key, std::source_location site) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && BatchStampsEnabled())) return NoTiming;
     const auto commands = open->commands;
@@ -2058,6 +2105,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    open->timedSites.push_back(GpuSitesEnabled() ? internSite(key, site) : 0u);
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2672,6 +2720,12 @@ void Recorder::readGpuTiming(Batch& batch) {
         totals.ms += ns / 1e6;
         totals.bytes += batch.timedBytes[i];
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
+        if (i < batch.timedSites.size() && batch.timedSites[i] != 0) {
+            auto& site = timingBySite[batch.timedSites[i]];
+            ++site.count;
+            site.ms += ns / 1e6;
+            site.bytes += batch.timedBytes[i];
+        }
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
     }
     std::sort(intervals.begin(), intervals.end());
@@ -2705,6 +2759,16 @@ void Recorder::readGpuTiming(Batch& batch) {
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" %s x%llu %.0fms", Recorder::TimingKeyLabel(hot[i].first).c_str(), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();
+    if (GpuSitesEnabled()) {
+        std::vector<std::pair<std::uint32_t, TimingTotals>> sites(timingBySite.begin(), timingBySite.end());
+        std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+        std::lock_guard siteLock(siteMutex);
+        for (std::size_t i = 0; i < sites.size() && i < 80; ++i) {
+            const auto& [id, totals] = sites[i];
+            AgcDriver::ProfilePrint_nid_no_patch("[gpusite] %s x%llu %.1fms %.2fMiB (per present x%.2f %.3fms %.3fMiB)\n", siteNames[id].c_str(), static_cast<unsigned long long>(totals.count), totals.ms, totals.bytes / 1048576.0, static_cast<double>(totals.count) * perPresent, totals.ms * perPresent, totals.bytes / 1048576.0 * perPresent);
+        }
+        timingBySite.clear();
+    }
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
     lock.unlock();
