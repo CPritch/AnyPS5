@@ -135,6 +135,20 @@ struct StageCapture {
 struct RelocatableUserWord {
     std::uint32_t reg;
     std::vector<std::pair<std::int64_t, std::uint32_t>> reads;
+    // Indexes into the words of `reads`, in order and sorted, that the content key leaves out: V# bases a relocated
+    // hit reads again (DispatchVariant::movableWords).
+    std::vector<std::uint32_t> masked{};
+};
+
+// What APS5_POOL_RELOCATION adds to a stage's relocation (tagVariantRuns): user words that may move besides the
+// SRT walk's own read bases, the captured words read through them, the captured V# base words a relocated hit reads
+// again at their new address instead of comparing, and the result fields those feed (a rebase's source is a guest
+// address here, or a user word).
+struct PoolRelocation {
+    std::uint64_t words = 0;
+    std::vector<std::pair<std::uint64_t, std::int32_t>> reads;
+    std::vector<std::uint64_t> movable;
+    std::vector<VariantRebase> rebases;
 };
 
 struct DrawRelocation {
@@ -158,7 +172,7 @@ struct DrawRelocationTrial {
 };
 
 struct DrawRelocationCounters {
-    std::uint64_t lookups = 0, donors = 0, refused = 0, hits = 0, evicted = 0;
+    std::uint64_t lookups = 0, donors = 0, refused = 0, hits = 0, evicted = 0, unreadBases = 0, rebasedHits = 0;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
