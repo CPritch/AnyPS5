@@ -397,8 +397,10 @@ std::list<CachedTexture>::iterator findSampledEntry(TextureCache& cache, VkDevic
 // [hooksync] line attributes the actual waits).
 struct TextureCounters {
     std::atomic<std::uint64_t> fromStorage{0};
+    std::atomic<std::uint64_t> singleViews{0};
     std::atomic<std::uint64_t> snapshots{0};
     std::atomic<std::uint64_t> pendingReads{0};
+    std::atomic<std::uint64_t> singlePendingReads{0};
     std::atomic<std::uint64_t> storageFallbacks{0};
     std::atomic<std::uint64_t> records{0};
     std::atomic<std::uint64_t> fastHits{0};
@@ -435,7 +437,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images (%llu under comp-to-single keys), %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu more under comp-to-single keys, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.singleViews), count(counters.snapshots), count(counters.pendingReads), count(counters.singlePendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -530,6 +532,12 @@ bool SampledFromStorageEligible(const Context& context, const GuestTextureResour
 bool ClearedViewEnabled() {
     static const bool disabled = std::getenv("APS5_NO_CLEARED_VIEW") != nullptr;
     return !disabled;
+}
+
+bool ClearedViewServes(const Context& context, std::uint32_t format, DccKeys keys) {
+    if (!ClearedViewEnabled()) return false;
+    if (keys == DccKeys::ClearSingle) return NoDrawReadbackWaits();
+    return StorageClearAvailable(context, format, keys);
 }
 
 std::uint64_t DepthCopyMinBytes() {
@@ -720,6 +728,16 @@ void reportStaleAliasProof(std::uint64_t address, std::uint64_t bytes) {
     std::fprintf(stderr, "[alias-watch] stale proof 0x%llx+0x%llx: bytes differ\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
 }
 
+void reportSinglePendingRead(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes, bool depthCompare) {
+    static AgcDriver::Mutex mutex;
+    static std::set<std::uint64_t> reported;
+    {
+        std::lock_guard lock(mutex);
+        if (reported.size() >= 8 || !reported.insert(resource.baseAddress).second) return;
+    }
+    std::fprintf(stderr, "[textures] sampled texture 0x%llx (%ux%u format %u, %llu bytes, dcc 0x%llx) reads a CPU snapshot under comp-to-single keys while recorded work writes it: depth compare %d, storage-eligible %d, comp-to-single view %d\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(resource.dccAddress), depthCompare ? 1 : 0, SampledFromStorageEligible(context, resource, guestBytes) ? 1 : 0, ClearedViewServes(context, resource.format, DccKeys::ClearSingle) ? 1 : 0);
+}
+
 bool auditedSnapshotEqual(std::uint64_t address, std::span<const std::byte> snapshot, DccKeys keys, GuestMemory::AliasAudit& audit) {
     if (snapshot.empty() || keys != DccKeys::Uncompressed || Recorder::SnapshotWriteOverlaps(address, snapshot.size())) {
         audit = GuestMemory::AliasAudit::Unavailable;
@@ -864,7 +882,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             source = sampledStorageSource(context, resource, guestBytes);
             if (source != nullptr && depthCompare && !Texture::CanDepthCopyFrom(*source, resource)) source.reset();
             if (source != nullptr && srgbExpand && !Texture::CanSrgbExpandFrom(context, *source, resource)) source.reset();
-        } else if (!depthCompare && ClearedViewEnabled() && StorageClearAvailable(context, resource.format, *keys)) {
+        } else if (!depthCompare && ClearedViewServes(context, resource.format, *keys)) {
             // A fast-cleared surface is viewed as well, through its image cleared on the GPU (the
             // lookup's Refresh, see StorageTexture::upload), when the image's own descriptor names
             // the same DCC metadata so the refresh sees the keys. A snapshot of the clear texels
@@ -1048,10 +1066,15 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         entry.accounted = source->Cached() ? 0u : heldBytes(*source);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
+        if (*keys == DccKeys::ClearSingle) counters.singleViews.fetch_add(1, std::memory_order_relaxed);
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         const bool pending = *keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes);
         if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
+        if (*keys == DccKeys::ClearSingle && Recorder::SnapshotWriteOverlaps(address, bytes)) {
+            counters.singlePendingReads.fetch_add(1, std::memory_order_relaxed);
+            reportSinglePendingRead(context, resource, guestBytes, depthCompare);
+        }
         ReadTextureSurface(resource, *keys, entry.bytes);
         if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
@@ -3179,7 +3202,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // the surface's metadata (the lookup views the cleared image then). The identity is
             // asked whatever the registry's serial did: the keys may have moved since the last
             // proof while the registry did not.
-            if (keys != DccKeys::Uncompressed && !(own.dccAddress == surface.resource.dccAddress && ClearedViewEnabled() && StorageClearAvailable(context, surface.resource.format, keys))) query(address, address + bytes, source, source, {i, false, false});
+            if (keys != DccKeys::Uncompressed && !(own.dccAddress == surface.resource.dccAddress && ClearedViewServes(context, surface.resource.format, keys))) query(address, address + bytes, source, source, {i, false, false});
             else if (!unchanged) query(address, address + bytes, source, nullptr, {i, false, keys == DccKeys::Uncompressed});
             if (surface.resource.dccAddress != 0 || own.dccAddress != 0) countKeysProven(false);
         } else {
