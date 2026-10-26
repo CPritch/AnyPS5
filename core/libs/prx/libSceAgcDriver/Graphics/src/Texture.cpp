@@ -3906,7 +3906,7 @@ namespace {
 bool OrderedWriteBacks() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_ORDERED_WRITEBACKS");
-        return value != nullptr && std::strcmp(value, "0") != 0;
+        return value == nullptr || std::strcmp(value, "0") != 0;
     }();
     return enabled;
 }

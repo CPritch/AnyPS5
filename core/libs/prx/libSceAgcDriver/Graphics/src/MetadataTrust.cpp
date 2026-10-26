@@ -29,9 +29,9 @@ bool MetadataTrust::Enabled() {
 std::uint32_t MetadataTrust::Level() {
     static const std::uint32_t level = [] {
         const char* value = std::getenv("APS5_TRUST_METADATA_WRITERS");
-        if (value == nullptr) return 1u;
+        if (value == nullptr) return 2u;
         if (std::strcmp(value, "0") == 0) return 0u;
-        return std::strcmp(value, "2") == 0 ? 2u : 1u;
+        return std::strcmp(value, "1") == 0 ? 1u : 2u;
     }();
     return level;
 }
