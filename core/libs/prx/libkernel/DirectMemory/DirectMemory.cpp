@@ -474,6 +474,8 @@ struct ProtectedRange {
 struct DirectMemoryState {
 #if defined(__linux__)
     std::vector<bool> physicalUsed = std::vector<bool>(DIRECT_MEMORY_SIZE / PS5_PAGE_SIZE);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> aliasedPhys;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> removedViews;
 #endif
     std::map<std::uint64_t, PhysicalSpan> physicalSpans;
     std::mutex directLock;
@@ -502,6 +504,15 @@ auto& g_protectionLock = MemoryState().protectionLock;
 auto& g_protections = MemoryState().protections;
 auto& g_reservationLock = MemoryState().reservationLock;
 auto& g_reservations = MemoryState().reservations;
+#if defined(__linux__)
+auto& g_aliasedPhys = MemoryState().aliasedPhys;
+auto& g_removedViews = MemoryState().removedViews;
+
+bool AliasWatched() {
+    static const bool enabled = GuestWriteWatch::GuestWriteWatchAliasesEnabled_nid_postfix();
+    return enabled;
+}
+#endif
 
 void SplitPhysicalSpan(std::uint64_t at) {
     auto span = g_physicalSpans.upper_bound(at);
@@ -526,6 +537,9 @@ std::map<std::uintptr_t, DirectMapping>::iterator InsertMapping(std::uintptr_t b
         bases.insert(std::upper_bound(bases.begin(), bases.end(), base), base);
         cursor = span->second.end;
     }
+#if defined(__linux__)
+    if (AliasWatched()) g_aliasedPhys.emplace_back(first, last);
+#endif
     return inserted;
 }
 
@@ -533,6 +547,12 @@ std::map<std::uintptr_t, DirectMapping>::iterator RemoveMapping(std::map<std::ui
     const auto base = mapping->first;
     const auto first = mapping->second.phys;
     const auto last = first + (mapping->second.end - base);
+#if defined(__linux__)
+    if (AliasWatched()) {
+        g_aliasedPhys.emplace_back(first, last);
+        g_removedViews.emplace_back(base, mapping->second.end);
+    }
+#endif
     for (auto span = g_physicalSpans.lower_bound(first); span != g_physicalSpans.end() && span->first < last;) {
         auto& bases = span->second.bases;
         bases.erase(std::lower_bound(bases.begin(), bases.end(), base));
@@ -603,8 +623,62 @@ void ValidatePhysicalRange(std::uint64_t phys, std::size_t len) {
 }
 
 #if defined(__linux__)
+void PublishAliases() {
+    if (g_aliasedPhys.empty() && g_removedViews.empty()) return;
+    const std::vector<std::uintptr_t> none;
+    const auto setAliases = [](std::uintptr_t address, std::uintptr_t end, const std::vector<std::uintptr_t>& others) {
+        GuestWriteWatch::GuestWriteWatchSetAliases_nid_postfix(address, end - address, others.data(), others.size());
+    };
+    for (const auto& [begin, end] : g_removedViews) {
+        auto it = g_directMappings.upper_bound(begin);
+        if (it != g_directMappings.begin()) --it;
+        for (auto cursor = begin; cursor < end;) {
+            while (it != g_directMappings.end() && it->second.end <= cursor) ++it;
+            if (it != g_directMappings.end() && it->first <= cursor) {
+                cursor = it->second.end;
+                continue;
+            }
+            const auto stop = it != g_directMappings.end() ? std::min(end, it->first) : end;
+            setAliases(cursor, stop, none);
+            cursor = stop;
+        }
+    }
+    std::sort(g_aliasedPhys.begin(), g_aliasedPhys.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
+    for (const auto& [first, last] : g_aliasedPhys) {
+        if (!changed.empty() && changed.back().second >= first) changed.back().second = std::max(changed.back().second, last);
+        else changed.emplace_back(first, last);
+    }
+    std::vector<std::uintptr_t> views;
+    std::vector<const PhysicalBacking*> backings;
+    std::vector<std::uintptr_t> others;
+    for (const auto& [first, last] : changed) {
+        auto span = g_physicalSpans.upper_bound(first);
+        if (span != g_physicalSpans.begin() && std::prev(span)->second.end > first) --span;
+        for (; span != g_physicalSpans.end() && span->first < last; ++span) {
+            views.clear();
+            backings.clear();
+            for (const auto base : span->second.bases) {
+                const auto& mapping = g_directMappings.at(base);
+                views.push_back(base + (span->first - mapping.phys));
+                backings.push_back(mapping.backing.get());
+            }
+            for (std::size_t view = 0; view < views.size(); ++view) {
+                others.clear();
+                for (std::size_t other = 0; other < views.size(); ++other) {
+                    if (other != view && backings[other] == backings[view]) others.push_back(views[other]);
+                }
+                setAliases(views[view], views[view] + (span->second.end - span->first), others);
+            }
+        }
+    }
+    g_aliasedPhys.clear();
+    g_removedViews.clear();
+}
+
 void WatchMapping(std::uintptr_t address, std::size_t len) {
     GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(address), len);
+    if (AliasWatched()) return;
     const auto end = address + len;
     for (auto added = g_directMappings.lower_bound(address); added != g_directMappings.end() && added->first < end; ++added) {
         const auto addedPhys = added->second.phys;
@@ -697,6 +771,7 @@ void AddMapping(std::uintptr_t address, std::size_t len, std::uint64_t phys, int
     }
 #if defined(__linux__)
     WatchMapping(address, len);
+    PublishAliases();
 #endif
 }
 
@@ -754,6 +829,7 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
 #else
             if (::mmap(addr, len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
             GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(addr, len);
+            PublishAliases();
 #endif
         }
     });
@@ -984,6 +1060,7 @@ void UnmapRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t le
         EraseMappings(reinterpret_cast<std::uintptr_t>(piece), reinterpret_cast<std::uintptr_t>(piece) + pieceBytes);
 #if defined(__linux__)
         Unmap(pieceAddress, pieceBytes);
+        PublishAliases();
 #else
         if (KernelArena::Get().Contains(pieceAddress, pieceBytes)) munmap(pieceAddress, pieceBytes);
         else if (last) munmap_release(const_cast<void*>(allocation));
@@ -1038,6 +1115,9 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     } catch (...) {
         EraseMappings(reinterpret_cast<std::uintptr_t>(mapped), reinterpret_cast<std::uintptr_t>(mapped) + len);
         Unmap(mapped, len);
+#if defined(__linux__)
+        PublishAliases();
+#endif
         throw;
     }
     *addr = mapped;
@@ -1405,6 +1485,9 @@ int DoMtypeprotect(const void* addr, size_t len, int type, int prot) {
             physical.emplace_back(mapping.phys + low - base, high - low);
             if (mapping.end > end) it = InsertMapping(end, DirectMapping{mapping.end, mapping.phys + end - base, mapping.memoryType, mapping.backing});
         }
+#if defined(__linux__)
+        PublishAliases();
+#endif
     }
     for (const auto& [phys, bytes] : physical) DirectMemoryRetype(static_cast<int64_t>(phys), bytes, type);
     return result;
@@ -1474,6 +1557,9 @@ void ForgetDirectMemory(int64_t start, size_t len) {
     ValidatePhysicalRange(first, len);
     g_physPages.erase(g_physPages.lower_bound(first), g_physPages.lower_bound(first + len));
     ErasePhysMappings(first, first + len);
+#if defined(__linux__)
+    PublishAliases();
+#endif
     Trace("release physical 0x%llx+0x%zx", static_cast<unsigned long long>(first), len);
 }
 

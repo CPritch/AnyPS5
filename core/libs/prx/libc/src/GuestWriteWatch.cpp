@@ -1,8 +1,10 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -87,7 +89,10 @@ public:
     bool Covers(std::uintptr_t begin, std::uintptr_t end) {
         if (!Available()) return false;
         std::shared_lock lock(_lock);
-        return covers(begin, end);
+        if (!covers(begin, end)) return false;
+        bool aliasesCovered = true;
+        forAliases(begin, end, [&](std::uintptr_t from, std::uintptr_t to, std::uintptr_t delta) { aliasesCovered = aliasesCovered && covers(from + delta, to + delta); });
+        return aliasesCovered;
     }
 
     bool Overlaps(std::uintptr_t begin, std::uintptr_t end) {
@@ -95,6 +100,58 @@ public:
         std::shared_lock lock(_lock);
         const auto next = _ranges.upper_bound(begin);
         return (next != _ranges.begin() && std::prev(next)->second > begin) || (next != _ranges.end() && next->first < end);
+    }
+
+    bool AliasesEnabled() const {
+        return _aliasWatch;
+    }
+
+    void SetAliases(std::uintptr_t begin, std::uintptr_t end, const std::uintptr_t* others, std::size_t count) {
+        if (!_aliasWatch || end <= begin) return;
+        std::vector<std::uintptr_t> deltas;
+        deltas.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            if (others[i] != begin) deltas.push_back(others[i] - begin);
+        }
+        std::sort(deltas.begin(), deltas.end());
+        deltas.erase(std::unique(deltas.begin(), deltas.end()), deltas.end());
+        std::unique_lock lock(_lock);
+        bool changed = false;
+        auto cursor = begin;
+        auto it = _aliases.upper_bound(begin);
+        if (it != _aliases.begin()) --it;
+        for (; it != _aliases.end() && it->first < end; ++it) {
+            const auto from = std::max(it->first, begin);
+            const auto to = std::min(it->second.end, end);
+            if (from >= to) continue;
+            if (from > cursor) changed = changed || !deltas.empty();
+            cursor = to;
+            if (it->second.deltas == deltas) continue;
+            changed = true;
+            const auto& before = it->second.deltas;
+            if (std::any_of(before.begin(), before.end(), [&](std::uintptr_t delta) { return !std::binary_search(deltas.begin(), deltas.end(), delta); })) freshen(from, to);
+        }
+        if (cursor < end) changed = changed || !deltas.empty();
+        if (!changed) return;
+        removeAliases(begin, end);
+        if (!deltas.empty()) insertAliases(begin, end, std::move(deltas));
+        _aliasRuns.store(_aliases.size(), std::memory_order_release);
+        _aliasSerial.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    std::size_t Aliases(std::uintptr_t begin, std::uintptr_t end, void (*alias)(void*, std::uintptr_t, std::uintptr_t, std::uintptr_t), void* context) {
+        if (_aliasRuns.load(std::memory_order_acquire) == 0 || end <= begin) return 0;
+        std::vector<std::array<std::uintptr_t, 3>> found;
+        {
+            std::shared_lock lock(_lock);
+            forAliases(begin, end, [&](std::uintptr_t from, std::uintptr_t to, std::uintptr_t delta) { found.push_back({from, to, from + delta}); });
+        }
+        for (const auto& [from, to, other] : found) alias(context, from, to, other);
+        return found.size();
+    }
+
+    std::uint64_t AliasSerial() const {
+        return _aliasWatch ? _aliasSerial.load(std::memory_order_acquire) : 0;
     }
 
     bool Collect(std::uintptr_t begin, std::uintptr_t end, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context) {
@@ -205,6 +262,8 @@ private:
 private:
     Watch() {
         if (std::getenv("APS5_NO_WRITE_WATCH") == nullptr) open();
+        const char* aliasWatch = std::getenv("APS5_ALIAS_WATCH");
+        _aliasWatch = Available() && aliasWatch != nullptr && std::strcmp(aliasWatch, "0") != 0;
     }
 
     void open() {
@@ -316,11 +375,76 @@ private:
         return removed;
     }
 
+    struct AliasRun {
+        std::uintptr_t end;
+        std::vector<std::uintptr_t> deltas;
+    };
+
+    template <typename TFunction>
+    void forAliases(std::uintptr_t begin, std::uintptr_t end, TFunction function) const {
+        auto it = _aliases.upper_bound(begin);
+        if (it != _aliases.begin()) --it;
+        for (; it != _aliases.end() && it->first < end; ++it) {
+            const auto from = std::max(it->first, begin);
+            const auto to = std::min(it->second.end, end);
+            if (from >= to) continue;
+            for (const auto delta : it->second.deltas) function(from, to, delta);
+        }
+    }
+
+    void freshen(std::uintptr_t begin, std::uintptr_t end) {
+        auto it = _ranges.upper_bound(begin);
+        if (it != _ranges.begin()) --it;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> watched;
+        for (; it != _ranges.end() && it->first < end; ++it) {
+            const auto from = std::max(it->first, begin);
+            const auto to = std::min(it->second, end);
+            if (from < to) watched.emplace_back(from, to);
+        }
+        for (const auto& [from, to] : watched) {
+            remove(_fresh, from, to);
+            insert(_fresh, from, to);
+        }
+    }
+
+    void removeAliases(std::uintptr_t begin, std::uintptr_t end) {
+        auto it = _aliases.upper_bound(begin);
+        if (it != _aliases.begin()) --it;
+        while (it != _aliases.end() && it->first < end) {
+            if (it->second.end <= begin) {
+                ++it;
+                continue;
+            }
+            const auto runBegin = it->first;
+            auto run = std::move(it->second);
+            it = _aliases.erase(it);
+            if (runBegin < begin) _aliases.emplace(runBegin, AliasRun{begin, run.deltas});
+            if (run.end > end) it = _aliases.emplace(end, AliasRun{run.end, std::move(run.deltas)}).first;
+        }
+    }
+
+    void insertAliases(std::uintptr_t begin, std::uintptr_t end, std::vector<std::uintptr_t> deltas) {
+        auto next = _aliases.upper_bound(begin);
+        if (next != _aliases.begin() && std::prev(next)->second.end == begin && std::prev(next)->second.deltas == deltas) {
+            begin = std::prev(next)->first;
+            _aliases.erase(std::prev(next));
+        }
+        if (next != _aliases.end() && next->first == end && next->second.deltas == deltas) {
+            end = next->second.end;
+            _aliases.erase(next);
+        }
+        _aliases.emplace(begin, AliasRun{end, std::move(deltas)});
+    }
+
     int _uffd = -1;
     int _pagemap = -1;
+    bool _aliasWatch = false;
     std::shared_mutex _lock;
     std::map<std::uintptr_t, std::uintptr_t> _ranges;
     std::map<std::uintptr_t, std::uintptr_t> _fresh;
+    std::map<std::uintptr_t, AliasRun> _aliases;
+    std::atomic<std::size_t> _aliasRuns{0};
+    std::atomic<std::uint64_t> _aliasSerial{1};
 };
 
 const bool g_opened = (Watch::Get(), true);
@@ -772,6 +896,47 @@ bool GuestWriteWatchCollectFresh_nid_postfix(std::uintptr_t address, std::size_t
     static_cast<void>(written);
     static_cast<void>(context);
     return false;
+#endif
+}
+
+bool GuestWriteWatchAliasesEnabled_nid_postfix() {
+#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
+    return Watch::Get().AliasesEnabled();
+#else
+    return false;
+#endif
+}
+
+void GuestWriteWatchSetAliases_nid_postfix(std::uintptr_t address, std::size_t bytes, const std::uintptr_t* others, std::size_t count) {
+#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
+    if (bytes == 0 || address + bytes < address) return;
+    Watch::Get().SetAliases(address, address + bytes, others, count);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    static_cast<void>(others);
+    static_cast<void>(count);
+#endif
+}
+
+std::size_t GuestWriteWatchAliases_nid_postfix(std::uintptr_t address, std::size_t bytes, void (*alias)(void* context, std::uintptr_t begin, std::uintptr_t end, std::uintptr_t other), void* context) {
+#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
+    if (bytes == 0 || address + bytes < address) return 0;
+    return Watch::Get().Aliases(address, address + bytes, alias, context);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    static_cast<void>(alias);
+    static_cast<void>(context);
+    return 0;
+#endif
+}
+
+std::uint64_t GuestWriteWatchAliasSerial_nid_postfix() {
+#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
+    return Watch::Get().AliasSerial();
+#else
+    return 0;
 #endif
 }
 
