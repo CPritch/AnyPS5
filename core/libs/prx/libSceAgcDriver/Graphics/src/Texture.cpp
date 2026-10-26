@@ -117,6 +117,7 @@ std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, sta
 std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
+std::atomic<std::uint64_t> storeSerials{0};
 
 struct StorageTraffic {
     AgcDriver::Mutex mutex;
@@ -1397,7 +1398,7 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     return texture;
 }
 
-StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor) {
+StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor), storeSerial(storeSerials.fetch_add(1, std::memory_order_relaxed) + 1) {
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
         Require(mipLevel < descriptor.mipCount, "storage texture mip level is outside the texture");
@@ -3662,7 +3663,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         recorder->MarkCovered(storedAccess);
         // Only the pieces written into the import are stores a CPU reader must wait for; the
         // shadowed ones reach it through a publish, which notes its own.
-        if (!imported.empty()) recorder->NotePendingWrites(imported);
+        if (!imported.empty()) recorder->NotePendingStores(imported, storeSerial);
     }
     partialWriteBacks.fetch_add(1, std::memory_order_relaxed);
     partialWriteBackBytes.fetch_add(storedBytes, std::memory_order_relaxed);
@@ -5734,7 +5735,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         } else {
             recorder->EndGpuTiming(timing, storedBytes);
             recorder->MarkShaderReadsCovered();
-            recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> stored{{{firstStored, lastStored}}};
+            recorder->NotePendingStores(stored, storeSerial);
         }
         countStorageWriteBack(storedBytes, true);
         if (profile) Profile().storageGpu += timer.lap();

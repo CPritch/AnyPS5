@@ -127,6 +127,7 @@ public:
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t writer = 0);
+    void NotePendingStores(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t store);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
@@ -142,8 +143,10 @@ public:
         std::int64_t word = -1;
         std::uint64_t writer = 0;
         bool open = false;
+        std::uint64_t store = 0;
     };
     std::vector<PendingWrite> PendingWritesOver(std::uint64_t address, std::size_t bytes) const;
+    bool PendingWritesOnlyStores(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> stores) const;
     void PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
     // Batch read tracking: the guest ranges the recorded work reads IN PLACE through a host import
     // and the GPU has not executed yet (a V# element bound in place, a region the GPU copies out of
@@ -565,6 +568,7 @@ private:
         std::vector<std::int16_t> writeValues;
         std::vector<std::int64_t> writeWords;
         std::vector<std::uint64_t> writeWriters;
+        std::vector<std::uint64_t> writeStores;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {
             std::uint64_t begin;
@@ -800,7 +804,7 @@ private:
     // Appends one range to the open batch; returns whether the snapshot must be rebuilt for it.
     // `ownLabel`: the range is a label's own store (NoteLabel, AfterCompletions), which does not
     // overwrite the table entries it covers; any other range flags them (table mutex, briefly).
-    bool noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel = false, int value = -1, std::int64_t word = -1, std::uint64_t writer = 0);
+    bool noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel = false, int value = -1, std::int64_t word = -1, std::uint64_t writer = 0, std::uint64_t store = 0);
     // Appends one range to `batch` (open or in flight) and publishes the snapshot if needed.
     void noteWriteOn(Batch& batch, std::uint64_t address, std::size_t bytes, bool ownLabel = false);
     void noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion = false);
