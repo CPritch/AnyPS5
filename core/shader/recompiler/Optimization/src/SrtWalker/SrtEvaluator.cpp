@@ -182,7 +182,38 @@ bool BasicEvaluator<TNode>::EvaluateExtract(const TNode& inst, std::uint64_t& re
 }
 
 template<typename TNode>
-bool BasicEvaluator<TNode>::EvaluateRawRead(const TNode& inst, std::uint64_t& result) {
+bool BasicEvaluator<TNode>::EvaluateBufferBase(TNode value, std::uint32_t resource, std::uint32_t& result) {
+    auto* use = _runtime.userDataUse;
+    if (use == nullptr || value.HasImmediate()) return Evaluate(value, result);
+    if (value.Opcode() == IrOpcode::GetUserData) {
+        const auto reg = RegIndex(static_cast<ScalarReg>(value.Argument(0).RegisterIndex()));
+        if (reg < _program.userDataBase || reg - _program.userDataBase >= _runtime.userData.size() || reg - _program.userDataBase >= SrtUserDataUse::TrackedWords) return Evaluate(value, result);
+        const auto word = reg - _program.userDataBase;
+        use->asBufferBase |= std::uint64_t {1} << word;
+        use->bufferBases.push_back({resource, static_cast<std::int32_t>(word), 0, -1});
+        result = _runtime.userData[word];
+        return true;
+    }
+    SrtBufferBase site{resource, -1, 0, -1, -1};
+    auto read = value;
+    if (value.Opcode() == IrOpcode::ReadConst && value.ArgumentCount() == 2) {
+        const TNode slotValue = value.Argument(1);
+        const auto slot = static_cast<std::uint32_t>(slotValue.ImmediateBits());
+        if (!slotValue.HasImmediate() || slotValue.Type() != IrType::U32 || slot >= _program.srtReads.size() || (slot < _cleanFlatSlots.size() && _cleanFlatSlots[slot] != 0u)) return Evaluate(value, result);
+        site.slot = static_cast<std::int32_t>(slot);
+        read = TNode::SrtRead(_program, slot);
+    }
+    if ((read.Opcode() == IrOpcode::LoadAddressU32 || read.Opcode() == IrOpcode::ReadConstBuffer) && IsRawRead(_program, read.Opcode(), read.template Flags<MemoryFlags>().index)) {
+        std::uint64_t wide = 0;
+        if (!EvaluateRawRead(read, wide, &site)) return false;
+        result = static_cast<std::uint32_t>(wide);
+        return true;
+    }
+    return Evaluate(value, result);
+}
+
+template<typename TNode>
+bool BasicEvaluator<TNode>::EvaluateRawRead(const TNode& inst, std::uint64_t& result, const SrtBufferBase* bufferBase) {
     const auto flags = inst.template Flags<MemoryFlags>();
     if (flags.index >= _program.memoryInfo.size()) {
         return false;
@@ -241,7 +272,8 @@ bool BasicEvaluator<TNode>::EvaluateRawRead(const TNode& inst, std::uint64_t& re
         result = 0;
         return true;
     }
-    if (_runtime.userDataUse != nullptr) _runtime.userDataUse->reads.emplace_back(address, origin);
+    if (_runtime.userDataUse != nullptr && bufferBase != nullptr) _runtime.userDataUse->bufferBases.push_back({bufferBase->resource, -1, address, origin, bufferBase->slot});
+    else if (_runtime.userDataUse != nullptr) _runtime.userDataUse->reads.emplace_back(address, origin);
     if (_inaccessible != nullptr && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t)) && LoadedFromMemory(*handle.Value())) {
         *_inaccessible = {inst.Value(), address};
         return false;
@@ -541,6 +573,7 @@ bool BasicEvaluator<TNode>::EvaluateInst(const TNode& inst, std::uint64_t& resul
             if (!slotValue.HasImmediate() || slotValue.Type() != IrType::U32 || slot >= _program.srtReads.size()) {
                 return false;
             }
+            if (_runtime.userDataUse != nullptr) _runtime.userDataUse->valueSlots.push_back(slot);
             if (slot < _cleanFlatSlots.size() && _cleanFlatSlots[slot] != 0u && _cleanEvaluator != nullptr) {
                 return _cleanEvaluator->EvaluateWide(TNode::SrtRead(_program, slot), result);
             }

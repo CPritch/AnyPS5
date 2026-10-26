@@ -98,7 +98,7 @@ bool Driver::vertexTableRelocation(const DrawProgram& program, const ShaderRecom
     for (const auto& attribute : compiled.vertexAttributes) {
         if (attribute.location >= info.resourcesNum || attribute.resource.fields != info.resources[attribute.location].fields) return false;
     }
-    if ((use.asValue >> table & 1u) != 0) return true;
+    if (((use.asValue | use.asBufferBase) >> table & 1u) != 0) return true;
     for (std::uint32_t resource = 0; resource < info.resourcesNum; ++resource) {
         const auto& sharp = reads[2u * resource + 1u];
         for (std::uint32_t word = 0; word < 4u; ++word) pool.reads.emplace_back(sharp.address + word * sizeof(std::uint32_t), static_cast<std::int32_t>(table));
@@ -144,7 +144,7 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
 }
 
 void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied, const PoolRelocation* pool) {
-    std::uint64_t relocatable = eligible && drawRelocationEnabled() ? use.asBase & ~use.asValue : 0;
+    std::uint64_t relocatable = eligible && drawRelocationEnabled() ? use.asBase & ~(use.asValue | use.asBufferBase) : 0;
     if (pool != nullptr && eligible && drawRelocationEnabled()) relocatable |= pool->words;
     if (hiddenWords != 0) relocatable &= hiddenWords >= 64 ? 0 : ~((std::uint64_t {1} << hiddenWords) - 1);
     std::vector<std::pair<std::uint64_t, std::int32_t>> reads;
@@ -153,6 +153,9 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
     };
     if (relocatable != 0) {
         reads = use.reads;
+        for (const auto& base : use.bufferBases) {
+            if (base.word < 0) reads.emplace_back(base.address, base.origin);
+        }
         if (pool != nullptr) reads.insert(reads.end(), pool->reads.begin(), pool->reads.end());
         std::sort(reads.begin(), reads.end());
         reads.erase(std::unique(reads.begin(), reads.end()), reads.end());

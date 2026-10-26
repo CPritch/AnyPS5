@@ -30,7 +30,7 @@ private:
         IAdd32, IAdd64, ISub32, ISub64, IMul32, IMul64, SMin32, UMin32, BitwiseAnd32, BitwiseAnd64, BitwiseOr32, BitwiseXor32, BitwiseNot32,
         ShiftLeftLogical32, ShiftLeftLogical64, ShiftRightLogical32, ShiftRightLogical64, ShiftRightArithmetic32, ShiftRightArithmetic64,
         BitFieldUExtract, BitFieldSExtract, BitFieldInsert, Select, IEqual32, INotEqual32, SLessThan32, ULessThan32, UGreaterThan32,
-        LogicalAnd, LogicalOr, LogicalXor, LogicalNot
+        LogicalAnd, LogicalOr, LogicalXor, LogicalNot, Slot
     };
     static constexpr std::uint32_t NoNode = 0xffffffffu;
     struct Node {
@@ -40,6 +40,10 @@ private:
         std::uint8_t component = 0;
         std::uint8_t argumentCount = 0;
         std::int32_t baseWord = -1;
+        // The buffer resource whose base dword this user word or read is (SrtUserDataUse::bufferBases), or NoNode,
+        // and the flat SRT slot of that read, or -1.
+        std::uint32_t bufferBase = NoNode;
+        std::int32_t slot = -1;
         std::array<std::uint32_t, 5> arguments{};
         std::uint64_t immediate = 0;
         const IrValue* source = nullptr;
@@ -50,6 +54,8 @@ private:
 
     std::vector<Node> nodes;
     std::vector<std::array<std::uint32_t, 8>> sourceDwords;
+    // Per buffer resource, the node of its base dword as a buffer base, or NoNode to evaluate sourceDwords.
+    std::vector<std::uint32_t> bufferBaseDwords;
     std::vector<std::uint32_t> flatRoots;
     std::vector<std::uint32_t> conditionRoots;
 };
