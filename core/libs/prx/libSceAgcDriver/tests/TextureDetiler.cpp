@@ -30,6 +30,7 @@ struct Push {
     std::uint32_t columnBegin;
     std::uint32_t rowBegin;
     std::uint32_t pipeBankXor;
+    std::uint32_t sourceMask;
 };
 
 Push decodePush(const std::vector<std::byte>& bytes) {
@@ -172,6 +173,10 @@ void RunTextureDetilerTests(const Context& context, const TextureDetilerTestAcce
     Require(decodePush(access.lastDispatch().pushConstants).pipeBankXor == 0u, "a dispatch without a window passed a pipe/bank XOR");
     detiler.Dispatch(commands, TextureTileMode::kD4KBX, 4, source, 0, destination, 0, layout, false, 0, false, {.pipeBankXor = 0xa00u});
     Require(decodePush(access.lastDispatch().pushConstants).pipeBankXor == 0xa00u, "the window's pipe/bank XOR did not reach the detiling shader");
+    Require(decodePush(access.lastDispatch().pushConstants).sourceMask == 0xffffffffu, "a detile of uncompressed texels masked the offsets it reads");
+    detiler.Dispatch(commands, TextureTileMode::kD4KBX, 4, source, 0, destination, 0, layout, false, 0, false, {.pipeBankXor = 0xa00u, .singleBlocks = true});
+    push = decodePush(access.lastDispatch().pushConstants);
+    Require(push.sourceMask == 0xffffff00u && push.pipeBankXor == 0xa00u, "a detile under comp-to-single keys must read every element from its 256-byte block's first element");
     Require(equationSpecialization[0] == 4 && equationSpecialization[1] == 4096 && equationSpecialization[2] == 2, "SW_4KB_D_X detiling must select the equation family over 4 KiB blocks");
 
     {

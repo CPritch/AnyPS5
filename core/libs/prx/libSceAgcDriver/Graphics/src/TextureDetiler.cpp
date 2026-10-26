@@ -37,7 +37,14 @@ struct Push {
     std::uint32_t columnBegin;
     std::uint32_t rowBegin;
     std::uint32_t pipeBankXor;
+    std::uint32_t sourceMask;
 };
+
+constexpr std::uint32_t SingleBlockBytes = 256;
+
+std::uint32_t SourceMask(const DetileWindow& window) {
+    return window.singleBlocks ? ~(SingleBlockBytes - 1u) : ~0u;
+}
 
 std::uint32_t BlockBytesFor(TextureTileMode tileMode) {
     switch (tileMode) {
@@ -258,6 +265,7 @@ void TextureDetiler::Dispatch(VkCommandBuffer commands, TextureTileMode tileMode
     push.columnBegin = window.columnBegin;
     push.rowBegin = window.rowBegin;
     push.pipeBankXor = window.pipeBankXor;
+    push.sourceMask = SourceMask(window);
     context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &push);
     const auto groupsX = (columnEnd - window.columnBegin + 7u) / 8u;
     const auto groupsY = (rowEnd - window.rowBegin + 7u) / 8u;
@@ -448,6 +456,7 @@ void TextureDetiler::DispatchImage(VkCommandBuffer commands, TextureTileMode til
     push.columnBegin = window.columnBegin;
     push.rowBegin = window.rowBegin;
     push.pipeBankXor = window.pipeBankXor;
+    push.sourceMask = SourceMask(window);
     context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, imagePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &push);
     const auto groupsX = (columnEnd - window.columnBegin + 7u) / 8u;
     const auto groupsY = (rowEnd - window.rowBegin + 7u) / 8u;

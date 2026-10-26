@@ -38,6 +38,7 @@ VkFormat StorageFormatForGuest(const Context& context, std::uint32_t guestFormat
 bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat);
 VkFormat HostStorageFormat(const Context& context, VkFormat format);
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys);
+bool NoDrawReadbackWaits();
 std::uint64_t SampledTextureMemory();
 bool ClearKeepsDenormals(const Context& context, VkFormat format);
 bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<const std::uint32_t, 4> pattern, VkClearColorValue& clear);
@@ -398,6 +399,7 @@ private:
     // The regions of every array layer, or of the tracked layers `layers` selects.
     std::vector<VkBufferImageCopy> CopyRegions(const std::vector<bool>* layers = nullptr) const;
     void upload(const std::vector<bool>* layers = nullptr);
+    bool singleBlocksOnGpu() const;
     std::vector<bool> cpuUploadLayers(const std::vector<bool>& units) const;
     void captureGuestBytes(const std::vector<bool>* layers);
     bool originalHolds(std::uint64_t address, std::size_t bytes) const;
@@ -484,7 +486,7 @@ private:
     // else from the import (`discard`: the image has no layout yet, a whole-surface first upload).
     // The write-back retiles into the import's unit shadow where a slab takes the piece
     // (`shadowed` receives those guest ranges, `imported` the pieces written to the import).
-    std::uint64_t uploadWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool discard = false);
+    std::uint64_t uploadWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool discard = false, bool singleBlocks = false);
     std::uint64_t writeBackWindows(std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported, Buffer* save = nullptr);
     struct DrawnRect {
         std::uint32_t left = 0;

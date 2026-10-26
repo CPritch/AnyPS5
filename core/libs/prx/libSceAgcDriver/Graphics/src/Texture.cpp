@@ -121,7 +121,7 @@ std::atomic<std::uint64_t> untrackedCompares{0};
 struct StorageTraffic {
     AgcDriver::Mutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
-    std::array<std::pair<std::uint64_t, std::uint64_t>, 4> uploads{};
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 5> uploads{};
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> uploadReasons;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> drawnStores;
     std::uint64_t directWriteBacks = 0;
@@ -145,10 +145,10 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto now = std::chrono::steady_clock::now();
     if (now - traffic.lastReport < std::chrono::seconds(10)) return;
     traffic.lastReport = now;
-    static constexpr const char* uploadNames[4] = {"clear", "direct", "cpu", "alias"};
+    static constexpr const char* uploadNames[5] = {"clear", "direct", "cpu", "alias", "single"};
     std::string line;
     char text[96];
-    for (std::size_t i = 0; i < 4; ++i) {
+    for (std::size_t i = 0; i < 5; ++i) {
         std::snprintf(text, sizeof(text), " %s %llu/%.1f", uploadNames[i], static_cast<unsigned long long>(traffic.uploads[i].first), traffic.uploads[i].second / 1048576.0);
         line += text;
         traffic.uploads[i] = {};
@@ -1347,6 +1347,14 @@ VkFormat StorageFormatForGuest(const Context& context, std::uint32_t guestFormat
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys) {
     VkClearColorValue clear{};
     return IsDccClear(keys) && StorageFormatAvailable(context, guestFormat) && ClearColorFor(StorageFormatForGuest(context, guestFormat), keys, clear);
+}
+
+bool NoDrawReadbackWaits() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_NO_DRAW_READBACK_WAITS");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
 }
 
 VkFormat SrgbTwinFormat(const Context& context, VkFormat format) {
@@ -2633,6 +2641,16 @@ bool SingleKeyColorFor(const GuestTextureResource& resource, std::uint64_t guest
     return FillClearColor(format, elementBytes, pattern, clear);
 }
 
+bool StorageTexture::singleBlocksOnGpu() const {
+    if (!NoDrawReadbackWaits() || !SingleKeysReadable(descriptor)) return false;
+    for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+        for (std::uint32_t level = 0; level < mips.size(); ++level) {
+            if (geometry.HasLayer(level, layer) && (geometry.GuestLayerOffset(layer) + mips[level].tiledOffset) % 256 != 0) return false;
+        }
+    }
+    return true;
+}
+
 std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units) const {
     if (descriptor.dimension != TextureDimension::k2DArray || descriptor.mipCount != 1 || descriptor.dccAddress != 0 || IsBlockCompressed(descriptor.format) || geometry.thick || arrayLayers <= 1 || geometry.imageLayers != arrayLayers || trackedLayerBytes == 0 || units.size() != trackedLayers) return {};
     std::vector<bool> selected(arrayLayers, false);
@@ -2680,9 +2698,11 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     };
     uploadedKeys = ProvedClearKeys(descriptor, guestBytes, keyProof);
     filledKeys = DccKeys::Uncompressed;
+    const auto* singleImport = uploadedKeys == DccKeys::ClearSingle && singleBlocksOnGpu() ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr;
+    const bool singleProvable = singleImport == nullptr || guestBytesSettled();
     VkClearColorValue clearValue{};
     const bool fastClear = IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle;
-    if (fastClear && (ClearColorFor(storageFormat, uploadedKeys, clearValue) || SingleKeyColorFor(descriptor, guestBytes, now, singleProof, storageFormat, uploadedKeys, clearValue))) {
+    if (fastClear && (ClearColorFor(storageFormat, uploadedKeys, clearValue) || (singleProvable && SingleKeyColorFor(descriptor, guestBytes, now, singleProof, storageFormat, uploadedKeys, clearValue)))) {
         // A fast-cleared surface is cleared on the GPU; its texel memory is neither read nor filled.
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
@@ -2740,7 +2760,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
         return;
     }
-    if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
+    if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : singleImport) {
+        const bool single = uploadedKeys == DccKeys::ClearSingle;
+        const auto path = single ? std::size_t{4} : std::size_t{1};
         if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             layerOriginal.assign(trackedLayers, false);
             cancelStoredSaves();
@@ -2762,8 +2784,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 forgetBorrowed(0, trackedLayers);
                 runs.emplace_back(0, guestBytes);
             }
-            const auto uploadedBytes = uploadWindows(*import, runs, layers == nullptr && version == 0);
-            countStorageUpload(1, uploadedBytes);
+            const auto uploadedBytes = uploadWindows(*import, runs, layers == nullptr && version == 0, single);
+            countStorageUpload(path, uploadedBytes);
             if (layers != nullptr) {
                 partialUploads.fetch_add(1, std::memory_order_relaxed);
                 partialUploadBytes.fetch_add(uploadedBytes, std::memory_order_relaxed);
@@ -2817,14 +2839,14 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 for (std::uint32_t level = 0; level < mips.size(); ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
-                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
+                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor, .singleBlocks = single});
                 }
             }
             recordDirectUploadDone(commands);
             singlePassMoves.fetch_add(1, std::memory_order_relaxed);
             if (batch) batch->SubmitAndWait();
             else recorder->EndGpuTiming(timing, uploadedBytes);
-            countStorageUpload(1, uploadedBytes);
+            countStorageUpload(path, uploadedBytes);
             ++Profile().storageDirectUploads;
             ++version;
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
@@ -2836,7 +2858,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             for (std::uint32_t level = 0; level < mips.size(); ++level) {
                 if (!geometry.HasLayer(level, layer)) continue;
                 const auto& mip = mips[level];
-                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
+                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor, .singleBlocks = single});
             }
         }
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -2861,7 +2883,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
         if (batch) batch->SubmitAndWait();
         else recorder->EndGpuTiming(timing, uploadedBytes);
-        countStorageUpload(1, uploadedBytes);
+        countStorageUpload(path, uploadedBytes);
         ++Profile().storageDirectUploads;
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
@@ -3202,7 +3224,7 @@ void StorageTexture::recordDirectUploadDone(VkCommandBuffer commands) {
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &written);
 }
 
-std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool discard) {
+std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool discard, bool singleBlocks) {
     const auto elementBytes = BytesPerElement(descriptor.format);
     // Each run's pieces by source (a unit shadow's slab while fresh, else the import), the tail
     // blocks moved whole by one window each; the windows are built per piece.
@@ -3282,6 +3304,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
             const auto& source = sourceOf(window);
             auto detile = window.window;
             detile.pipeBankXor = descriptor.pipeBankXor;
+            detile.singleBlocks = singleBlocks;
             const auto view = elementLayerView(window.level, window.layer);
             if (source.shadow) {
                 detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, source.buffer, source.offset + (window.tiledBegin - source.begin), view, mip, false, window.layer, detile);
@@ -3304,6 +3327,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         const auto& source = sourceOf(window);
         auto detile = window.window;
         detile.pipeBankXor = descriptor.pipeBankXor;
+        detile.singleBlocks = singleBlocks;
         if (source.shadow) {
             // The slab holds the piece from the window's first tiled byte: the window's tiled base
             // is its range begin (sliceWindows builds it so), read from the piece's slab offset.
