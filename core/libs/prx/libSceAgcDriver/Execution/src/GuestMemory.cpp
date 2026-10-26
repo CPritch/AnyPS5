@@ -15,6 +15,7 @@
 #include <atomic>
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <emmintrin.h>
 #include <functional>
 #include <cstdio>
@@ -26,6 +27,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -102,6 +104,13 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
+std::atomic<std::uint64_t> aliasWalks{0};
+std::atomic<std::uint64_t> aliasWalkBytes{0};
+std::atomic<std::uint64_t> aliasStores{0};
+std::atomic<std::uint64_t> aliasProofs{0};
+std::atomic<std::uint64_t> aliasAudits{0};
+std::atomic<std::uint64_t> aliasStale{0};
+std::atomic<std::uint64_t> aliasUnaudited{0};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -309,6 +318,16 @@ bool MemoryProfiled() {
     return profile;
 }
 
+void ReportAliasWatch() {
+    if (!GuestWriteWatch::GuestWriteWatchAliasesEnabled_nid_postfix()) return;
+    const std::array<std::uint64_t, 8> now{aliasProofs.load(std::memory_order_relaxed), aliasAudits.load(std::memory_order_relaxed), aliasStale.load(std::memory_order_relaxed), aliasUnaudited.load(std::memory_order_relaxed), aliasWalks.load(std::memory_order_relaxed), aliasWalkBytes.load(std::memory_order_relaxed), aliasStores.load(std::memory_order_relaxed), GuestWriteWatch::GuestWriteWatchAliasSerial_nid_postfix()};
+    static std::array<std::uint64_t, 8> last{};
+    std::array<unsigned long long, 8> window{};
+    for (std::size_t i = 0; i < now.size(); ++i) window[i] = static_cast<unsigned long long>(now[i] - last[i]);
+    last = now;
+    AgcDriver::ProfilePrint_nid_no_patch("[alias-watch] (10 s): %llu proofs over aliased memory, %llu audited by a compare (%llu stale), %llu audits due without a snapshot; %llu walks of other views (%.0f MiB); %llu driver stores stamped into other views; %llu alias table changes; %llu stale proofs in all\n", window[0], window[1], window[2], window[3], window[4], window[5] / 1048576.0, window[6], window[7], static_cast<unsigned long long>(now[2]));
+}
+
 class TimedAccess {
 public:
     TimedAccess(MemoryCounterKind kind, std::uint64_t bytes) : kind(kind), bytes(bytes), start(MemoryProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
@@ -345,6 +364,7 @@ public:
             if (count != 0) AgcDriver::ProfilePrint_nid_no_patch(" %s=%llu", ReadSiteName(static_cast<ReadSite>(site)), static_cast<unsigned long long>(count));
         }
         AgcDriver::ProfilePrint_nid_no_patch("\n");
+        ReportAliasWatch();
     }
 private:
     MemoryCounterKind kind;
@@ -1114,6 +1134,7 @@ struct WriteTracker {
             if (unstamped) noteUnstampedStore(other, otherEnd);
             stampWatchedPart(other, otherEnd, stampGeneration, complete);
         }
+        if (!pieces.empty()) aliasStores.fetch_add(1, std::memory_order_relaxed);
     }
 
     void noteDriverStore(std::uint64_t block, std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration, bool complete) {
@@ -1485,6 +1506,8 @@ bool collectViews(CollectFunction collect, std::uint64_t first, std::uint64_t st
         if (!complete) break;
         runs.through = &piece;
         complete = collect(piece.other, piece.end - piece.begin, &stampWrittenRun, &runs);
+        aliasWalks.fetch_add(1, std::memory_order_relaxed);
+        aliasWalkBytes.fetch_add(piece.end - piece.begin, std::memory_order_relaxed);
     }
     runs.through = nullptr;
     runs.aliases = {};
@@ -2232,6 +2255,30 @@ bool Aliased(std::uint64_t address, std::size_t bytes) {
 
 std::uint64_t AliasSerial() {
     return GuestWriteWatch::GuestWriteWatchAliasSerial_nid_postfix();
+}
+
+bool AliasProofAudited() {
+    static const std::uint64_t every = [] {
+        constexpr std::uint64_t fallback = 64;
+        const char* value = std::getenv("APS5_ALIAS_WATCH_AUDIT");
+        if (value == nullptr) return fallback;
+        std::uint64_t parsed = 0;
+        const auto end = value + std::strlen(value);
+        const auto result = std::from_chars(value, end, parsed);
+        return result.ec == std::errc{} && result.ptr == end && parsed != 0 ? parsed : fallback;
+    }();
+    return (aliasProofs.fetch_add(1, std::memory_order_relaxed) + 1) % every == 0;
+}
+
+void NoteAliasAudit(AliasAudit audit) {
+    switch (audit) {
+        case AliasAudit::Equal: aliasAudits.fetch_add(1, std::memory_order_relaxed); break;
+        case AliasAudit::Differs:
+            aliasAudits.fetch_add(1, std::memory_order_relaxed);
+            aliasStale.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case AliasAudit::Unavailable: aliasUnaudited.fetch_add(1, std::memory_order_relaxed); break;
+    }
 }
 
 namespace {

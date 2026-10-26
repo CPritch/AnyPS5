@@ -710,6 +710,46 @@ void reportGuestAllocation(const GuestTextureResource& resource, std::uint64_t g
     std::fprintf(stderr, "[gpu] view 0x%llx of %llu MiB lies in the guest allocation 0x%llx..0x%llx (%llu MiB, range 0x%llx..0x%llx, %s%s%s): %llu of its %u slices fit in the range\n", static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(guestBytes >> 20u), static_cast<unsigned long long>(range->allocationAddress), static_cast<unsigned long long>(range->allocationAddress + range->allocationBytes), static_cast<unsigned long long>(range->allocationBytes >> 20u), static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(end), range->readable ? "r" : "-", range->writable ? "w" : "-", range->gpu ? "g" : "-", static_cast<unsigned long long>(fitting), geometry.layers);
 }
 
+void reportStaleAliasProof(std::uint64_t address, std::uint64_t bytes) {
+    static AgcDriver::Mutex mutex;
+    static std::set<std::pair<std::uint64_t, std::uint64_t>> reported;
+    {
+        std::lock_guard lock(mutex);
+        if (!reported.emplace(address, bytes).second) return;
+    }
+    std::fprintf(stderr, "[alias-watch] stale proof 0x%llx+0x%llx: bytes differ\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+}
+
+bool auditedSnapshotEqual(std::uint64_t address, std::span<const std::byte> snapshot, DccKeys keys, GuestMemory::AliasAudit& audit) {
+    if (snapshot.empty() || keys != DccKeys::Uncompressed || Recorder::SnapshotWriteOverlaps(address, snapshot.size())) {
+        audit = GuestMemory::AliasAudit::Unavailable;
+        return true;
+    }
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+    const bool equal = GuestMemory::EqualsCommittedUnsynced(address, snapshot);
+    audit = equal ? GuestMemory::AliasAudit::Equal : GuestMemory::AliasAudit::Differs;
+    return equal;
+}
+
+bool auditAliasedSnapshot(const Texture* texture, std::uint64_t address, std::size_t bytes) {
+    auto& cache = Textures();
+    std::lock_guard lock(cache.mutex);
+    const CacheHold held(sampledCacheHeld);
+    const auto entry = std::find_if(cache.entries.begin(), cache.entries.end(), [&](const CachedTexture& cached) { return cached.texture.get() == texture; });
+    if (entry == cache.entries.end() || entry->source != nullptr || entry->bytes.size() != bytes) {
+        GuestMemory::NoteAliasAudit(GuestMemory::AliasAudit::Unavailable);
+        return true;
+    }
+    auto audit = GuestMemory::AliasAudit::Unavailable;
+    const bool equal = auditedSnapshotEqual(address, entry->bytes, entry->keys, audit);
+    GuestMemory::NoteAliasAudit(audit);
+    if (equal) return true;
+    reportStaleAliasProof(address, bytes);
+    entry->generation = 0;
+    entry->committed.reset();
+    return false;
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
     const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
@@ -951,7 +991,19 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 (same ? counters.untrackedKept : counters.untrackedCompared).fetch_add(1, std::memory_order_relaxed);
                 return same;
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) {
+            bool staleProof = false;
+            const auto proved = [&] {
+                if (!unchanged()) return false;
+                if (!GuestMemory::Aliased(address, bytes) || !GuestMemory::AliasProofAudited()) return true;
+                auto audit = GuestMemory::AliasAudit::Unavailable;
+                const bool equal = auditedSnapshotEqual(address, it->bytes, *keys, audit);
+                GuestMemory::NoteAliasAudit(audit);
+                if (equal) return true;
+                reportStaleAliasProof(address, bytes);
+                staleProof = true;
+                return false;
+            };
+            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || proved() || kept() || (!staleProof && equalsCommitted())) {
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 it->untracked = untracked;
@@ -1011,7 +1063,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.texture = createTexture(*context.detiler, resource, components, entry.bytes, depthCompare);
         entry.accounted = entry.texture->AllocationBytes();
         constexpr std::size_t SnapshotCompareBytes = 256u << 10u;
-        if (entry.bytes.size() > SnapshotCompareBytes && (entry.generation != 0 || entry.untracked[0] != 0)) parkSnapshot(cache, entry.bytes);
+        if (entry.bytes.size() > SnapshotCompareBytes && (entry.generation != 0 || entry.untracked[0] != 0) && !GuestMemory::Aliased(address, bytes)) parkSnapshot(cache, entry.bytes);
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
     const auto budget = sampledBudget(context, cache);
@@ -3206,6 +3258,19 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
     if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
+    if (const auto aliasSerial = GuestMemory::AliasSerial(); aliasSerial != 0) {
+        for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
+            auto& surface = validatedTextures[i];
+            if (surface.depth || surface.source != nullptr || (scannedKeys[i] != DccKeys::Uncompressed && scannedKeys[i] != DccKeys::ClearSingle)) continue;
+            const auto address = surface.resource.baseAddress;
+            const auto bytes = static_cast<std::size_t>(surface.bytes);
+            if (surface.aliasSerial != aliasSerial) {
+                surface.aliased = GuestMemory::Aliased(address, bytes);
+                surface.aliasSerial = aliasSerial;
+            }
+            if (surface.aliased && GuestMemory::AliasProofAudited() && !auditAliasedSnapshot(textures[i].get(), address, bytes)) return fail(FastFail::Changed);
+        }
+    }
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
     for (const auto* image : images) image->NoteProved();
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {

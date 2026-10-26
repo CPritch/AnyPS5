@@ -166,6 +166,12 @@ void CheckMemo(const DirectViews& views) {
     Require(UnchangedSince(a + Block, Block, settled), "the next epoch's collect stamped a block nothing wrote");
 }
 
+void CheckAudit() {
+    unsigned due = 0;
+    for (unsigned proof = 0; proof < 8; ++proof) due += AliasProofAudited() ? 1u : 0u;
+    Require(due == 2, "APS5_ALIAS_WATCH_AUDIT=4 did not audit every fourth proof");
+}
+
 void CheckUnmapReturnsToNormal(DirectViews& views) {
     const auto a = views.A();
     const auto b = views.B();
@@ -210,6 +216,7 @@ int main() {
         CheckUnalignedView(views);
         CheckDriverStores(views);
         CheckMemo(views);
+        CheckAudit();
         CheckUnmapReturnsToNormal(views);
         CheckUnwatchedAlias(views);
     } catch (const std::exception& error) {
