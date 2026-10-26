@@ -32,7 +32,7 @@ void PinWorkerThread(const char* role) {
     static std::once_flag summary;
     std::call_once(summary, [mask] {
         const auto& layout = CpuTopology::Get();
-        std::fprintf(stderr, "[affinity] queue workers and presenter -> 0x%llx (hybrid=%d efficient=0x%llx performant=0x%llx process=0x%llx)\n", static_cast<unsigned long long>(mask), layout.hybrid ? 1 : 0, static_cast<unsigned long long>(layout.efficient), static_cast<unsigned long long>(layout.performant), static_cast<unsigned long long>(layout.process));
+        std::fprintf(stderr, "[affinity] queue workers and presenter -> 0x%llx (hybrid=%d efficient=0x%llx performant=0x%llx process=0x%llx; classes %s)\n", static_cast<unsigned long long>(mask), layout.hybrid ? 1 : 0, static_cast<unsigned long long>(layout.efficient), static_cast<unsigned long long>(layout.performant), static_cast<unsigned long long>(layout.process), layout.classes.empty() ? "none" : layout.classes.c_str());
     });
     CpuTopology::PinTraced(role, nullptr, mask);
 }
