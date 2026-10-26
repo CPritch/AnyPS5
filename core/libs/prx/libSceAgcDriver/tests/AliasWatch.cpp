@@ -209,7 +209,7 @@ int main() {
             std::cout << "no write watching: skipped\n";
             return 77;
         }
-        Require(GuestWriteWatch::GuestWriteWatchAliasesEnabled_nid_postfix(), "the alias watch is off (APS5_ALIAS_WATCH=1 is not set)");
+        Require(GuestWriteWatch::GuestWriteWatchAliasesEnabled_nid_postfix(), "the alias watch is off (APS5_ALIAS_WATCH=0)");
         DirectViews views;
         CheckBothViewsWatched(views);
         CheckWriteThroughEitherView(views);

@@ -263,7 +263,7 @@ private:
     Watch() {
         if (std::getenv("APS5_NO_WRITE_WATCH") == nullptr) open();
         const char* aliasWatch = std::getenv("APS5_ALIAS_WATCH");
-        _aliasWatch = Available() && aliasWatch != nullptr && std::strcmp(aliasWatch, "0") != 0;
+        _aliasWatch = Available() && (aliasWatch == nullptr || std::strcmp(aliasWatch, "0") != 0);
     }
 
     void open() {
