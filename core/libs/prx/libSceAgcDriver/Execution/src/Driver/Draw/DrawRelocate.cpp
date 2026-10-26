@@ -171,11 +171,34 @@ void Driver::bufferBaseRelocation(const ShaderRecompiler::ResourceCapture& captu
             rebases.push_back({VariantRebase::Kind::BufferWord, base.word >= 0, index, element * 4u, base.word >= 0 ? static_cast<std::uint64_t>(base.word) : base.address});
         }
     }
+    const auto flat = std::ranges::find(compiled.bindings, ShaderRecompiler::DescriptorRole::FlattenedSrt, &ShaderRecompiler::DescriptorBinding::role);
+    std::vector<std::uint64_t> flatRebased;
     for (const auto& rebase : rebases) {
-        if (!rebase.userWord) continue;
-        const auto word = static_cast<std::uint32_t>(rebase.source);
-        if (word < hiddenWords || word >= 64u || ((use.asValue | pinnedWords) >> word & 1u) != 0) continue;
-        pool.words |= std::uint64_t {1} << word;
+        if (rebase.userWord) {
+            const auto word = static_cast<std::uint32_t>(rebase.source);
+            if (word < hiddenWords || word >= 64u || ((use.asValue | pinnedWords) >> word & 1u) != 0) continue;
+            pool.words |= std::uint64_t {1} << word;
+            pool.rebases.push_back(rebase);
+            continue;
+        }
+        // A table word moves with the table's pointer when the walk read it for nothing but buffer bases and, for
+        // a flat SRT slot, the flat copy, which the result's FlattenedSrt binding holds and is rebased with it.
+        const auto address = rebase.source;
+        const auto base = std::ranges::find(use.bufferBases, address, &ShaderRecompiler::SrtBufferBase::address);
+        if (base == use.bufferBases.end() || base->origin < 0 || (address & 3u) != 0 || std::ranges::find(pinnedReads, address) != pinnedReads.end()) continue;
+        if (std::ranges::any_of(use.bufferBases, [&](const auto& other) { return other.word < 0 && other.address == address && (other.origin != base->origin || other.slot != base->slot); })) continue;
+        const auto reads = std::ranges::count(use.reads, address, &std::pair<std::uint64_t, std::int32_t>::first);
+        if (base->slot < 0 ? reads != 0 : reads > 1 || std::ranges::find(use.valueSlots, static_cast<std::uint32_t>(base->slot)) != use.valueSlots.end()) continue;
+        if (base->slot >= 0 && flat != compiled.bindings.end() && std::ranges::find(flatRebased, address) == flatRebased.end()) {
+            const auto slot = static_cast<std::size_t>(base->slot);
+            const auto offset = slot < capture.plan->srtReads.size() ? capture.plan->srtReads[slot].flatOffset : ~std::uint32_t {0};
+            if (offset < flat->guestDescriptor.size()) {
+                if (flat->guestDescriptor[offset] != buffers[base->resource].dwords[0]) continue;
+                pool.rebases.push_back({VariantRebase::Kind::BufferWord, false, static_cast<std::uint32_t>(flat - compiled.bindings.begin()), offset, address});
+            }
+            flatRebased.push_back(address);
+        }
+        pool.movable.push_back(address);
         pool.rebases.push_back(rebase);
     }
 }
