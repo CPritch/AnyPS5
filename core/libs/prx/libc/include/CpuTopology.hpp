@@ -1,9 +1,11 @@
 #ifndef CORE_LIBS_PRX_LIBC_INCLUDE_CPUTOPOLOGY_HPP
 #define CORE_LIBS_PRX_LIBC_INCLUDE_CPUTOPOLOGY_HPP
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #ifdef _WIN32
@@ -12,7 +14,6 @@
 #include <fstream>
 #include <pthread.h>
 #include <sched.h>
-#include <string>
 #include <unistd.h>
 #endif
 
@@ -26,6 +27,7 @@ struct Layout {
     std::uint64_t efficient = 0;
     std::uint64_t performant = 0;
     bool hybrid = false;
+    std::string classes;
 };
 
 #ifdef __linux__
@@ -72,6 +74,61 @@ inline Layout LayoutFromClasses(const std::uint64_t* byClass, const bool* seen, 
     return result;
 }
 
+inline Layout LayoutFromCpuValues(const std::uint64_t* values, std::size_t count, const char* source) {
+    const std::size_t cpus = std::min<std::size_t>(count, 64);
+    std::vector<std::uint64_t> distinct;
+    for (std::size_t cpu = 0; cpu < cpus; ++cpu)
+        if (values[cpu] != 0) distinct.push_back(values[cpu]);
+    std::sort(distinct.begin(), distinct.end());
+    std::vector<std::uint64_t> floors;
+    for (const auto value : distinct)
+        if (floors.empty() || value * 10 > floors.back() * 11) floors.push_back(value);
+    std::uint64_t byClass[64] = {};
+    bool seen[64] = {};
+    std::uint64_t highest[64] = {};
+    for (std::size_t cpu = 0; cpu < cpus; ++cpu) {
+        if (values[cpu] == 0) continue;
+        const auto cls = static_cast<std::size_t>(std::upper_bound(floors.begin(), floors.end(), values[cpu]) - floors.begin()) - 1;
+        byClass[cls] |= std::uint64_t{1} << cpu;
+        seen[cls] = true;
+        highest[cls] = std::max(highest[cls], values[cpu]);
+    }
+    auto result = LayoutFromClasses(byClass, seen, floors.size());
+    if (!result.hybrid) return result;
+    result.classes = source;
+    for (std::size_t cls = floors.size(); cls-- > 0;) {
+        char text[64];
+        std::snprintf(text, sizeof(text), "%s %llu: 0x%llx", cls + 1 == floors.size() ? "" : ",", static_cast<unsigned long long>(highest[cls]), static_cast<unsigned long long>(byClass[cls]));
+        result.classes += text;
+    }
+    return result;
+}
+
+#ifdef __linux__
+inline std::uint64_t NumberFromFile(const std::string& path) {
+    std::ifstream file(path);
+    unsigned long long value = 0;
+    if (!(file >> value)) return 0;
+    return value;
+}
+
+inline Layout LayoutFromSysfs(const std::string& root) {
+    const auto online = MaskFromCpuList((root + "/online").c_str());
+    if (online == 0) return {};
+    for (const char* source : {"cpufreq/cpuinfo_max_freq", "acpi_cppc/highest_perf"}) {
+        std::uint64_t values[64] = {};
+        bool complete = true;
+        for (unsigned cpu = 0; cpu < 64 && complete; ++cpu) {
+            if (((online >> cpu) & 1u) == 0) continue;
+            values[cpu] = NumberFromFile(root + "/cpu" + std::to_string(cpu) + "/" + source);
+            complete = values[cpu] != 0;
+        }
+        if (complete) return LayoutFromCpuValues(values, 64, source);
+    }
+    return {};
+}
+#endif
+
 inline const Layout& Get() {
     static const Layout layout = [] {
         Layout result{};
@@ -110,6 +167,17 @@ inline const Layout& Get() {
         result.performant = MaskFromCpuList("/sys/devices/cpu_core/cpus");
         result.efficient = MaskFromCpuList("/sys/devices/cpu_atom/cpus");
         result.hybrid = result.efficient != 0 && result.performant != 0 && (result.efficient & result.performant) == 0;
+        if (result.hybrid) {
+            result.classes = "cpu_core/cpu_atom";
+        } else {
+            auto classified = LayoutFromSysfs("/sys/devices/system/cpu");
+            if (classified.hybrid) {
+                result.efficient = classified.efficient;
+                result.performant = classified.performant;
+                result.hybrid = true;
+                result.classes = std::move(classified.classes);
+            }
+        }
 #endif
         return result;
     }();
