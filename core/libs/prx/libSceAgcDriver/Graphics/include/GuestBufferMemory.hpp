@@ -326,6 +326,13 @@ public:
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
+    // APS5_STAGE_FROM_SHADOW: a staged region's copy-in reads the units a unit shadow holds fresh
+    // from their slabs, device to device, and the flush before it leaves unpublished the units
+    // wholly inside a range its copy-back stores (ShadowStagedRanges): that copy-back stores every
+    // byte of those units into the import, the shadow's included, so publishing them first only
+    // moved the bytes across the bus twice. Every other unit the flush reaches is published as before.
+    static bool StageFromShadow();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ShadowStagedRanges() const;
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -445,6 +452,9 @@ private:
         bool gpuCopy = false;
         VkBuffer copySource = VK_NULL_HANDLE;
         std::uint64_t copySourceBase = 0;
+        // The import the copy source belongs to (its base and size), for the shadow's sources.
+        std::uint64_t copyImportBase = 0;
+        std::uint64_t copyImportBytes = 0;
         bool copiedBack = false;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
@@ -497,6 +507,13 @@ private:
     // instead of the CPU (see Region::gpuCopy): live guest bytes, not sparse, at most the size
     // APS5_GPU_COPY_MAX_KIB allows, and APS5_CPU_COPIES unset.
     bool gpuCopyEligible(const Region& region) const;
+    // A staged region whose copy-in reads the unit shadows (StageFromShadow), and the written
+    // ranges inside [first, last), merged: the copy-back ranges of such a region.
+    bool readsShadow(const Region& region) const;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenWithin(std::uint64_t first, std::uint64_t last) const;
+    // Records the copy-in of a staged region from the shadow's slabs where its units are fresh and
+    // from the import elsewhere; false when the import's shadow holds nothing for it.
+    bool recordShadowCopyIn(Recorder& recorder, VkCommandBuffer commands, Region& region);
     // Whether a region inside a host import is staged in device memory instead of bound in place
     // (see GuestBufferMemory.cpp): staging allowed, not address-based unless an overlay region, a
     // written element inside, and an atomic element or a size within the written-shadow window.

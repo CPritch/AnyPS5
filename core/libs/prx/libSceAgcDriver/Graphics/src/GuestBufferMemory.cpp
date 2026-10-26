@@ -5094,6 +5094,7 @@ struct CopyStats {
     std::atomic<std::uint64_t> stagedReused{0};
     std::atomic<std::uint64_t> stagedInBytes{0};
     std::atomic<std::uint64_t> stagedOutBytes{0};
+    std::atomic<std::uint64_t> stagedShadowBytes{0};
     std::atomic<std::uint64_t> stagedLost{0};
     std::atomic<std::uint64_t> stagingRefused{0};
     std::atomic<std::int64_t> lastStagingReport{0};
@@ -5136,14 +5137,16 @@ void reportStaging() {
     auto last = stats.lastStagingReport.load();
     if (nowMs - last < 10000 || !stats.lastStagingReport.compare_exchange_strong(last, nowMs)) return;
     // One reporter per period (the exchange above), so the previous totals need no lock.
-    static std::uint64_t lastStaged = 0, lastIn = 0, lastOut = 0;
+    static std::uint64_t lastStaged = 0, lastIn = 0, lastOut = 0, lastShadow = 0;
     const auto staged = stats.staged.load();
     const auto in = stats.stagedInBytes.load();
     const auto out = stats.stagedOutBytes.load();
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
+    const auto shadow = stats.stagedShadowBytes.load();
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in (%.0f KiB of it from unit-shadow slabs), %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (shadow - lastShadow) / 1024.0, (out - lastOut) / 1024.0);
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
+    lastShadow = shadow;
 }
 
 }
@@ -5160,6 +5163,76 @@ GuestBufferMemory::~GuestBufferMemory() {
     for (const auto& region : regions) {
         if (region.gpuCopy && region.deviceLocal && !region.copiedBack) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+bool GuestBufferMemory::StageFromShadow() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_STAGE_FROM_SHADOW");
+        return value != nullptr && std::strcmp(value, "0") != 0 && UnitShadowEnabled();
+    }();
+    return enabled;
+}
+
+bool GuestBufferMemory::readsShadow(const Region& region) const {
+    return StageFromShadow() && region.deviceLocal && !region.overlay;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::writtenWithin(std::uint64_t first, std::uint64_t last) const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (const auto& [begin, end] : writes) {
+        const auto from = std::max(begin, first);
+        const auto to = std::min(end, last);
+        if (from < to) ranges.emplace_back(from, to);
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& range : ranges) {
+        if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    return merged;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::ShadowStagedRanges() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    if (!StageFromShadow() || !uploaded || committed) return ranges;
+    for (const auto& region : regions) {
+        if (!region.gpuCopy || region.copyImportBytes == 0 || !readsShadow(region)) continue;
+        const auto own = writtenWithin(region.begin, region.end);
+        ranges.insert(ranges.end(), own.begin(), own.end());
+    }
+    return ranges;
+}
+
+bool GuestBufferMemory::recordShadowCopyIn(Recorder& recorder, VkCommandBuffer commands, Region& region) {
+    HostImport import{};
+    import.base = region.copyImportBase;
+    import.bytes = region.copyImportBytes;
+    import.buffer = region.copySource;
+    import.lead = region.copyImportBase - region.copySourceBase;
+    if (region.begin < import.base || region.end > import.base + import.bytes) return false;
+    const std::pair<std::uint64_t, std::uint64_t> run{region.begin, region.end};
+    const auto fresh = [](const ShadowRun& source) { return source.shadow; };
+    auto sources = ShadowSources(context, import, 0, std::span(&run, 1), {}, false);
+    if (std::none_of(sources.begin(), sources.end(), fresh)) return false;
+    constexpr std::uint64_t unit = 65536;
+    for (const auto& source : sources) {
+        if (!source.shadow) continue;
+        const auto from = std::max(source.begin & ~(unit - 1), import.base);
+        const auto to = std::min((source.end + unit - 1) & ~(unit - 1), import.base + import.bytes);
+        GuestMemory::CollectWritesUncached(from, static_cast<std::size_t>(to - from));
+    }
+    sources = ShadowSources(context, import, 0, std::span(&run, 1), {}, false);
+    if (std::none_of(sources.begin(), sources.end(), fresh)) return false;
+    std::uint64_t fromShadow = 0;
+    for (const auto& source : sources) {
+        CopyBuffer(context, commands, source.buffer, source.offset, region.buffer->Handle(), source.begin - region.begin, source.end - source.begin);
+        if (!source.shadow) continue;
+        recorder.Keep(source.slab);
+        fromShadow += source.end - source.begin;
+    }
+    Copies().stagedShadowBytes.fetch_add(fromShadow, std::memory_order_relaxed);
+    return true;
 }
 
 bool GuestBufferMemory::gpuCopyEligible(const Region& region) const {
@@ -5417,7 +5490,16 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     uploaded = true;
     for (const auto& region : regions) static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
     for (const auto& [begin, end] : writes) RequireNoResidentDepthRead_nid_no_patch(begin, static_cast<std::size_t>(end - begin));
-    for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> staged;
+    for (const auto& region : regions) {
+        if (!readsShadow(region)) continue;
+        const auto own = writtenWithin(region.begin, region.end);
+        staged.insert(staged.end(), own.begin(), own.end());
+    }
+    for (const auto& [begin, end] : writes) {
+        if (staged.empty()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
+        else StorageTexture::FlushPendingAroundStaged(begin, static_cast<std::size_t>(end - begin), staged, "written buffer range");
+    }
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
@@ -5568,6 +5650,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 region.deviceLocal = staged;
                 region.copySource = entry->buffer;
                 region.copySourceBase = entry->base - entry->lead;
+                region.copyImportBase = entry->base;
+                region.copyImportBytes = entry->bytes;
             }
         }
         if (region.direct != nullptr) {
@@ -5591,7 +5675,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // reconcile retires is handed to it (retireImport keeps nothing while the recorder is
             // idle) and outlives the copy.
             static_cast<void>(recorder->Commands());
-            StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
+            const auto staged = readsShadow(region) ? writtenWithin(region.begin, region.end) : std::vector<std::pair<std::uint64_t, std::uint64_t>>{};
+            if (staged.empty()) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
+            else StorageTexture::FlushPendingAroundStaged(region.begin, static_cast<std::size_t>(bytes), staged, "copied buffer region");
             region.gpuCopy = true;
             gpuCopies.push_back(&region);
             continue;
@@ -5796,7 +5882,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 expected.assign(snapshotBytes.begin(), snapshotBytes.end());
             }
         }
-        CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        if (inputSnapshot != nullptr || !region->deviceLocal || !StageFromShadow() || !recordShadowCopyIn(*recorder, commands, *region)) CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);

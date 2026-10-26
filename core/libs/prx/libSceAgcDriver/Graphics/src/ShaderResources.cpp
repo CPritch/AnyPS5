@@ -3784,8 +3784,12 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             StorageTexture::ScanPending(regions);
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
             // published by the flush, as one over a pending image is stored.
-            for (const auto& region : regions) {
-                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+            const auto staged = guestMemory.ShadowStagedRanges();
+            for (std::size_t index = 0; index < regions.size(); ++index) {
+                const auto& region = regions[index];
+                if (!region.overlaps && !AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) continue;
+                if (index < directRegions.size() || staged.empty()) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+                else StorageTexture::FlushPendingAroundStaged(region.begin, static_cast<std::size_t>(region.end - region.begin), staged, "imported buffer region");
             }
         }
         if (HostImportsUnchanged(context, importsProof)) {
@@ -3796,7 +3800,11 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         }
     } else {
         for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
-        for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
+        const auto staged = guestMemory.ShadowStagedRanges();
+        for (const auto& [begin, end] : guestMemory.Writes()) {
+            if (staged.empty()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
+            else StorageTexture::FlushPendingAroundStaged(begin, static_cast<std::size_t>(end - begin), staged, "written buffer range");
+        }
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in

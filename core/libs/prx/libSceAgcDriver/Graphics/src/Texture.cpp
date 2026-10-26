@@ -4554,6 +4554,27 @@ bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes
     return true;
 }
 
+bool StorageTexture::FlushPendingAroundStaged(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> staged, const char* reason) {
+    const auto end = address + bytes;
+    const bool inside = std::any_of(staged.begin(), staged.end(), [&](const auto& range) { return range.first < end && address < range.second; });
+    if (!inside || AgcDriver::DriverDetail::DrawPipeline::HeldReads(address, bytes)) return FlushPending(address, bytes, nullptr, reason);
+    const bool stored = FlushPending(address, bytes, nullptr, reason, PublishScope::None);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges(staged.begin(), staged.end());
+    std::sort(ranges.begin(), ranges.end());
+    auto cursor = address;
+    for (const auto& [first, last] : ranges) {
+        const auto from = std::max(first, address);
+        const auto to = std::min(last, end);
+        if (from >= to || to <= cursor) continue;
+        if (cursor < from) static_cast<void>(PublishShadowsOnly(cursor, static_cast<std::size_t>(from - cursor), PublishScope::Whole, reason));
+        const auto begin = std::max(from, cursor);
+        static_cast<void>(PublishShadowsOnly(begin, static_cast<std::size_t>(to - begin), PublishScope::PartialUnits, reason));
+        cursor = to;
+    }
+    if (cursor < end) static_cast<void>(PublishShadowsOnly(cursor, static_cast<std::size_t>(end - cursor), PublishScope::Whole, reason));
+    return stored;
+}
+
 namespace {
 
 struct StorageDumpSelector {
