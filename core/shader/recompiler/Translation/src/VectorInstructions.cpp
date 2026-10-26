@@ -1,5 +1,6 @@
 #include "Translation/VectorInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "Recompiler.hpp"
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -68,7 +69,7 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     case RdnaOpcode::VMin3F32:
     case RdnaOpcode::VMax3F32:
     case RdnaOpcode::VMed3F32:
-        if (!floatMode.has_value() || ((floatMode->floatMode >> 4u) & 1u) == 0u) return 3u;
+        if (!floatMode.has_value() || ((floatMode->floatMode >> 4u) & 1u) == 0u) return ExactF32Arithmetic() ? 3u : 0u;
         if (((floatMode->floatMode >> 4u) & 3u) == 1u && (!float32DenormPreserve || float32FlushToZero)) {
             throw std::runtime_error("f32 denormal mode 1 at pc " + std::to_string(inst.programCounter) + " needs DenormPreserve 32, which the device does not offer for this shader");
         }
@@ -111,6 +112,7 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     case RdnaOpcode::VCmpxNleF32:
     case RdnaOpcode::VCmpxNlgF32:
     case RdnaOpcode::VCmpxNltF32:
+        return floatMode.has_value() && ((floatMode->floatMode >> 4u) & 1u) != 0u ? 0u : 1u;
     case RdnaOpcode::VCvtI32F32:
     case RdnaOpcode::VCvtU32F32:
     case RdnaOpcode::VCvtRpiI32F32:
@@ -122,6 +124,7 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     case RdnaOpcode::VCvtPkU8F32:
     case RdnaOpcode::VCvtPkrtzF16F32:
     case RdnaOpcode::VCvtF16F32:
+        if (!ExactF32Arithmetic()) return 0u;
         return floatMode.has_value() && ((floatMode->floatMode >> 4u) & 1u) != 0u ? 0u : 1u;
     case RdnaOpcode::VDivScaleF32:
     case RdnaOpcode::VDivFixupF32:
@@ -145,6 +148,7 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
         }
         throw std::runtime_error("f32 denormal mode " + std::to_string(denormals) + " at pc " + std::to_string(inst.programCounter) + " is not implemented");
     }
+    if (!ExactF32Arithmetic()) return 0u;
     if (denormals != 0u) return 0u;
     return flush == 3u && float32FlushToZero && flushesInHardware(inst) ? 0u : flush;
 }
