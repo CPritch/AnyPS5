@@ -140,6 +140,9 @@ constexpr std::uint8_t BlockWritten = 1;
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {});
 bool Aliased(std::uint64_t address, std::size_t bytes);
 std::uint64_t AliasSerial();
+bool AliasProofAudited();
+enum class AliasAudit : std::uint8_t { Equal, Differs, Unavailable };
+void NoteAliasAudit(AliasAudit audit);
 
 // Serializes device work: draws, dispatches, presentation and the deferred write-backs below. The
 // mutex is recursive; it is wrapped so every acquisition (std::lock_guard at any site) measures how

@@ -520,6 +520,8 @@ private:
         const StorageTexture* source = nullptr;
         bool depth = false;
         bool valid = false;
+        std::uint64_t aliasSerial = 0;
+        bool aliased = false;
     };
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
