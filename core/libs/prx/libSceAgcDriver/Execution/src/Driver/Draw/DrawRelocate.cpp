@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -108,6 +109,75 @@ bool Driver::vertexTableRelocation(const DrawProgram& program, const ShaderRecom
     for (std::uint32_t index = 0; index < compiled.vertexAttributes.size(); ++index) pool.rebases.push_back({VariantRebase::Kind::VertexBase, false, index, 0, reads[2u * compiled.vertexAttributes[index].location + 1u].address});
     pool.words |= std::uint64_t {1} << table;
     return true;
+}
+
+void Driver::bufferBaseRelocation(const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::RecompileResult& compiled, std::uint32_t hiddenWords, PoolRelocation& pool) {
+    const auto& use = capture.userDataUse;
+    if (use.bufferBases.empty() || capture.plan == nullptr) return;
+    const auto& buffers = capture.snapshot.buffers;
+    // Where each buffer resource's base dword came from; a resource the walk took it from twice, differently, has
+    // none, as has one whose descriptor aliases an image.
+    struct Source {
+        bool known = false;
+        bool mixed = false;
+        ShaderRecompiler::SrtBufferBase base{};
+    };
+    std::vector<Source> sources(buffers.size());
+    for (const auto& base : use.bufferBases) {
+        if (base.resource >= sources.size()) return;
+        auto& source = sources[base.resource];
+        const auto same = [&](const ShaderRecompiler::SrtBufferBase& other) { return other.word == base.word && (base.word >= 0 || (other.address == base.address && other.origin == base.origin)); };
+        if (source.known && !same(source.base)) source.mixed = true;
+        source.known = true;
+        source.base = base;
+    }
+    const auto& planned = capture.plan->info.buffers;
+    for (std::size_t resource = 0; resource < sources.size(); ++resource) {
+        if (resource >= planned.size() || planned[resource].imageAlias != ShaderRecompiler::BufferResource::NoImageAlias) sources[resource].mixed = true;
+    }
+    // A bound element is a snapshot buffer's four words; when several buffers hold its words, it is rebased only if
+    // they all took their base from the same place, and those places are kept still otherwise.
+    std::uint64_t pinnedWords = 0;
+    std::vector<std::uint64_t> pinnedReads;
+    std::vector<VariantRebase> rebases;
+    const auto pin = [&](const Source& source) {
+        if (!source.known) return;
+        if (source.base.word >= 0) pinnedWords |= std::uint64_t {1} << source.base.word;
+        else pinnedReads.push_back(source.base.address);
+    };
+    for (std::uint32_t index = 0; index < compiled.bindings.size(); ++index) {
+        const auto& binding = compiled.bindings[index];
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+        if (binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return;
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            const auto* words = binding.guestDescriptor.data() + element * 4u;
+            const Source* first = nullptr;
+            bool uniform = true;
+            for (std::size_t resource = 0; resource < buffers.size(); ++resource) {
+                const auto& value = buffers[resource];
+                if (value.dwordCount != 4u || !std::equal(words, words + 4, value.dwords.begin())) continue;
+                const auto& source = sources[resource];
+                if (first == nullptr) first = &source;
+                uniform = uniform && source.known && !source.mixed && first->known && source.base.word == first->base.word && (source.base.word >= 0 || (source.base.address == first->base.address && source.base.origin == first->base.origin));
+            }
+            if (first == nullptr) return;
+            if (!uniform) {
+                for (std::size_t resource = 0; resource < buffers.size(); ++resource) {
+                    if (buffers[resource].dwordCount == 4u && std::equal(words, words + 4, buffers[resource].dwords.begin())) pin(sources[resource]);
+                }
+                continue;
+            }
+            const auto& base = first->base;
+            rebases.push_back({VariantRebase::Kind::BufferWord, base.word >= 0, index, element * 4u, base.word >= 0 ? static_cast<std::uint64_t>(base.word) : base.address});
+        }
+    }
+    for (const auto& rebase : rebases) {
+        if (!rebase.userWord) continue;
+        const auto word = static_cast<std::uint32_t>(rebase.source);
+        if (word < hiddenWords || word >= 64u || ((use.asValue | pinnedWords) >> word & 1u) != 0) continue;
+        pool.words |= std::uint64_t {1} << word;
+        pool.rebases.push_back(rebase);
+    }
 }
 
 std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable) {
