@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <bitset>
 #include <cmath>
@@ -248,6 +249,36 @@ bool ditheredAlphaLocationsSupported(const Registers& cx) {
         if (first == cx.end() || second == cx.end() || first->second != 0xbd153fd1u || second->second != 0x9773f95bu) return false;
     }
     return true;
+}
+
+bool ditheredAlphaFallback() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_A2C_FALLBACK");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+void reportDitheredAlphaDrawnUndithered(const Registers& cx, bool customLocations) {
+    static std::atomic<bool> reported{false};
+    if (reported.exchange(true)) return;
+    const auto config = find(cx, 0x2f8);
+    const auto eqaa = find(cx, 0x201);
+    char raster[96] = "raster samples unknown (PA_SC_AA_CONFIG unwritten)";
+    if (config != cx.end()) std::snprintf(raster, sizeof(raster), "raster samples %u, exposed %u (PA_SC_AA_CONFIG 0x%08x)", 1u << (config->second & 7u), 1u << ((config->second >> 20u) & 7u), config->second);
+    char samples[160] = "DB_EQAA samples unknown (DB_EQAA unwritten)";
+    char iteration[48] = "pixel iteration unknown";
+    if (eqaa != cx.end()) {
+        std::snprintf(samples, sizeof(samples), "DB_EQAA samples anchor %u, mask export %u, alpha-to-mask %u%s (DB_EQAA 0x%08x)", 1u << (eqaa->second & 7u), 1u << ((eqaa->second >> 8u) & 7u), 1u << ((eqaa->second >> 12u) & 7u), (eqaa->second & 0x200000u) != 0 ? ", ALPHA_TO_MASK_EQAA_DISABLE" : "", eqaa->second);
+        std::snprintf(iteration, sizeof(iteration), "pixel iteration %u", 1u << ((eqaa->second >> 4u) & 7u));
+    }
+    char locations[96] = "custom locations no";
+    if (customLocations) {
+        const auto first = find(cx, 0x2fe);
+        const auto second = find(cx, 0x2ff);
+        std::snprintf(locations, sizeof(locations), "custom locations yes (PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0 0x%08x 0x%08x)", first == cx.end() ? 0u : first->second, second == cx.end() ? 0u : second->second);
+    }
+    std::fprintf(stderr, "[gpu] dithered alpha-to-coverage with %s/%s/%s/%s: drawn undithered\n", raster, samples, iteration, locations);
 }
 constexpr std::uint32_t ScanModeMask = ~0x22u;
 constexpr std::uint32_t ScanControlMask = ~0x76033fffu;
@@ -1428,6 +1459,10 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     result.alphaToCoverage = alpha == AlphaToCoverageUndithered || (!alphaDisabled && alpha == AlphaToCoverageDithered);
     result.ditheredAlphaToCoverage = result.alphaToCoverage && alpha == AlphaToCoverageDithered;
     if (!result.alphaToCoverage) zero(cx, 0x2dc, alphaDisabled ? AlphaToCoverageMask & ~1u : AlphaToCoverageMask, "dithered or rounded alpha-to-coverage");
+    if (result.ditheredAlphaToCoverage && ditheredAlphaFallback() && (!ditheredAlphaSamplesSupported(cx) || result.customSampleLocations)) {
+        reportDitheredAlphaDrawnUndithered(cx, result.customSampleLocations);
+        result.ditheredAlphaToCoverage = false;
+    }
     if (result.ditheredAlphaToCoverage) {
         Require(ditheredAlphaSamplesSupported(cx), "dithered alpha-to-coverage requires eight matched raster/DB_EQAA samples and one pixel iteration");
         Require(!result.customSampleLocations, "dithered alpha-to-coverage with custom sample locations is unsupported");
@@ -2272,8 +2307,9 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
         if ((word != AlphaToCoverageUndithered && word != AlphaToCoverageDithered) || alphaDisabled) {
             if (auto reason = nonzero(cx, 0x2dc, alphaDisabled ? AlphaToCoverageMask & ~1u : AlphaToCoverageMask, "dithered or rounded alpha-to-coverage"); !reason.empty()) return reason;
         }
-        if (!alphaDisabled && word == AlphaToCoverageDithered && !ditheredAlphaSamplesSupported(cx)) return "AGC graphics: dithered alpha-to-coverage requires eight matched raster/DB_EQAA samples and one pixel iteration";
-        if (!alphaDisabled && word == AlphaToCoverageDithered) {
+        const bool dithered = !alphaDisabled && word == AlphaToCoverageDithered && !(ditheredAlphaFallback() && (!ditheredAlphaSamplesSupported(cx) || !ditheredAlphaLocationsSupported(cx)));
+        if (dithered && !ditheredAlphaSamplesSupported(cx)) return "AGC graphics: dithered alpha-to-coverage requires eight matched raster/DB_EQAA samples and one pixel iteration";
+        if (dithered) {
             if (!ditheredAlphaLocationsSupported(cx)) return "AGC graphics: dithered alpha-to-coverage with custom sample locations is unsupported";
             std::uint32_t format = 0;
             if (value(cx, 0x1c5, format)) {

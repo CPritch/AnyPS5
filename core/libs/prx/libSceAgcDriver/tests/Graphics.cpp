@@ -34,8 +34,10 @@
 #include <spirv/unified1/spirv.hpp>
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 #include <algorithm>
 #include <array>
@@ -4895,6 +4897,126 @@ void AlphaToCoverageTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "floating-point alpha");
     queue.context[0x8e] = targetMask;
     queue.context[0x1c5] = exportFormat;
+}
+
+template<typename TAction>
+std::string stderrOf(TAction action) {
+    std::fflush(stderr);
+    std::FILE* file = std::tmpfile();
+    Require(file != nullptr, "cannot open a temporary file for stderr");
+#ifdef _WIN32
+    const int saved = _dup(_fileno(stderr));
+    _dup2(_fileno(file), _fileno(stderr));
+#else
+    const int saved = dup(fileno(stderr));
+    dup2(fileno(file), fileno(stderr));
+#endif
+    std::exception_ptr failure;
+    try {
+        action();
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    std::fflush(stderr);
+#ifdef _WIN32
+    _dup2(saved, _fileno(stderr));
+    _close(saved);
+#else
+    dup2(saved, fileno(stderr));
+    close(saved);
+#endif
+    std::rewind(file);
+    std::string text;
+    char buffer[4096];
+    for (std::size_t count = 0; (count = std::fread(buffer, 1, sizeof(buffer), file)) != 0;) text.append(buffer, count);
+    std::fclose(file);
+    if (failure) std::rethrow_exception(failure);
+    return text;
+}
+
+void DitheredAlphaToCoverageFallbackTests(bool fallback) {
+    auto supported = makeState();
+    supported.context[0x203] = 0x8010;
+    supported.context[0x201] = 0x00133303;
+    supported.context[0x2dc] = 0x18701;
+    supported.context[0x2f8] = 0x0030e003;
+    supported.context[0x292] = 3;
+    supported.context[0x31d] = 0x1b000;
+    supported.context[0x1b3] = 2;
+    supported.context[0x1b4] = 2;
+    for (std::uint32_t pixel = 0; pixel < 4; ++pixel) {
+        supported.context[0x2fe + pixel * 4u] = 0xbd153fd1u;
+        supported.context[0x2ff + pixel * 4u] = 0x9773f95bu;
+    }
+    std::vector<std::pair<AgcDriver::QueueState, std::string_view>> unsupported;
+    auto single = makeState();
+    single.context[0x203] = 0x8010;
+    single.context[0x201] = 0;
+    single.context[0x2dc] = 0x18701;
+    single.context[0x1b3] = 2;
+    single.context[0x1b4] = 2;
+    unsupported.emplace_back(single, "DB_EQAA");
+    auto four = supported;
+    four.context[0x201] = 0x00132202;
+    four.context[0x2f8] = 0x0020e002;
+    four.context[0x31d] = 0x12000;
+    for (std::uint32_t pixel = 0; pixel < 4; ++pixel) {
+        four.context[0x2fe + pixel * 4u] = 0x622ae6aeu;
+        four.context[0x2ff + pixel * 4u] = 0;
+    }
+    unsupported.emplace_back(four, "DB_EQAA");
+    for (const auto eqaa : {0x00133333u, 0x00132303u, 0x00133203u, 0x00333303u}) {
+        auto queue = supported;
+        queue.context[0x201] = eqaa;
+        unsupported.emplace_back(queue, "DB_EQAA");
+    }
+    auto custom = supported;
+    for (std::uint32_t pixel = 0; pixel < 4; ++pixel) custom.context[0x2fe + pixel * 4u] ^= 1u;
+    unsupported.emplace_back(custom, "custom sample locations");
+    const auto output = stderrOf([&] {
+        Require(AgcDriver::Graphics::DrawRejection(supported, false).empty(), "the precheck refused the measured eight-sample dither");
+        Require(AgcDriver::Graphics::DecodeState(supported).ditheredAlphaToCoverage, "the measured eight-sample dither was drawn undithered");
+        for (const auto& entry : unsupported) {
+            const auto& queue = entry.first;
+            const auto reason = entry.second;
+            if (!fallback) {
+                expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, reason);
+                Require(AgcDriver::Graphics::DrawRejection(queue, false).find(reason) != std::string::npos, "APS5_A2C_FALLBACK=0 let the precheck accept unsupported dithered coverage");
+                continue;
+            }
+            auto undithered = queue;
+            undithered.context[0x2dc] = 0xaa01;
+            const auto expected = AgcDriver::Graphics::DecodeState(undithered);
+            const auto rejection = AgcDriver::Graphics::DrawRejection(queue, false);
+            Require(rejection.empty() && AgcDriver::Graphics::DrawRejection(undithered, false).empty(), "the precheck refused dithered coverage that falls back to undithered: " + rejection);
+            const auto state = AgcDriver::Graphics::DecodeState(queue);
+            Require(state.alphaToCoverage && !state.ditheredAlphaToCoverage, "unsupported dithered coverage did not fall back to undithered alpha-to-coverage");
+            Require(expected.alphaToCoverage && !expected.ditheredAlphaToCoverage && state.samples == expected.samples && state.customSampleLocations == expected.customSampleLocations && state.sampleLocations == expected.sampleLocations && state.sampleLocationGrid == expected.sampleLocationGrid && state.perSampleShading == expected.perSampleShading, "the dithered fallback decoded differently from undithered alpha-to-coverage");
+        }
+        auto exports = single;
+        for (const auto format : {3u, 5u, 6u}) {
+            exports.context[0x1c5] = format;
+            if (!fallback) {
+                expectFailure([&] { AgcDriver::Graphics::DecodeState(exports); }, "DB_EQAA");
+                continue;
+            }
+            const auto state = AgcDriver::Graphics::DecodeState(exports);
+            Require(state.alphaToCoverage && !state.ditheredAlphaToCoverage && AgcDriver::Graphics::DrawRejection(exports, false).empty(), "the dithered fallback kept the dithered export format rule");
+        }
+    });
+    std::vector<std::string> reports;
+    for (std::size_t begin = 0; begin < output.size();) {
+        const auto end = std::min(output.find('\n', begin), output.size());
+        const auto line = output.substr(begin, end - begin);
+        if (line.find("dithered alpha-to-coverage") != std::string::npos) reports.push_back(line);
+        begin = end + 1;
+    }
+    if (!fallback) {
+        Require(reports.empty(), "APS5_A2C_FALLBACK=0 reported a dithered fallback: " + output);
+        return;
+    }
+    Require(reports.size() == 1, "the dithered fallback was not reported exactly once: " + output);
+    Require(reports.front() == "[gpu] dithered alpha-to-coverage with raster samples 1, exposed 1 (PA_SC_AA_CONFIG 0x00000000)/DB_EQAA samples anchor 1, mask export 1, alpha-to-mask 1 (DB_EQAA 0x00000000)/pixel iteration 1/custom locations no: drawn undithered", "the dithered fallback report changed: " + reports.front());
 }
 
 void InitialContextTests() {
@@ -12063,6 +12185,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
             descriptorLayoutFlagTests();
             std::cout << "Descriptor layout native and captured binding flags passed\n";
+            return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--dithered-alpha-to-coverage-fallback" || std::string_view(argv[1]) == "--dithered-alpha-to-coverage-no-fallback")) {
+            DitheredAlphaToCoverageFallbackTests(std::string_view(argv[1]) == "--dithered-alpha-to-coverage-fallback");
+            std::cout << "Dithered alpha-to-coverage fallback checks passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--alpha-to-coverage-state") {
