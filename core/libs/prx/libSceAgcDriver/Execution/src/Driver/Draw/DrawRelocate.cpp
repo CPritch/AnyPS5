@@ -76,7 +76,7 @@ bool Driver::drawRelocationEnabled() {
 bool Driver::poolRelocationEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_POOL_RELOCATION");
-        return drawRelocationEnabled() && value != nullptr && std::strcmp(value, "1") == 0;
+        return drawRelocationEnabled() && (value == nullptr || std::strcmp(value, "0") != 0);
     }();
     return enabled;
 }
