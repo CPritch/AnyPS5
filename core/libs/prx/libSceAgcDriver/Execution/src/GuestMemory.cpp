@@ -892,6 +892,20 @@ struct WindowCopy {
 void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_t generation);
 #endif
 
+struct AliasPiece {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+    std::uintptr_t other;
+};
+
+using AliasPieces = std::vector<AliasPiece>;
+
+void aliasPieces(std::uint64_t address, std::uint64_t end, AliasPieces& pieces) {
+    pieces.clear();
+    if (end <= address) return;
+    GuestWriteWatch::GuestWriteWatchAliases_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(end - address), [](void* context, std::uintptr_t begin, std::uintptr_t stop, std::uintptr_t other) { static_cast<AliasPieces*>(context)->push_back({begin, stop, other}); }, &pieces);
+}
+
 struct WriteTracker {
     AgcDriver::Mutex mutex;
     bool initialized = false;
@@ -1089,6 +1103,17 @@ struct WriteTracker {
             if (!blockPartWatched(first, stop)) continue;
             stamp(block, stampGeneration, StampKind::Driver);
             noteDriverStore(block, address, end, stampGeneration, complete);
+        }
+    }
+
+    void stampAliases(std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration, bool complete, bool unstamped) {
+        AliasPieces pieces;
+        aliasPieces(address, end, pieces);
+        for (const auto& piece : pieces) {
+            const auto other = static_cast<std::uint64_t>(piece.other);
+            const auto otherEnd = other + (piece.end - piece.begin);
+            if (unstamped) noteUnstampedStore(other, otherEnd);
+            stampWatchedPart(other, otherEnd, stampGeneration, complete);
         }
     }
 
@@ -1412,26 +1437,61 @@ struct StampRuns {
     StampKind kind;
     std::size_t stamped = 0;
     const WindowCopy* window = nullptr;
+    std::span<const AliasPiece> aliases{};
+    const AliasPiece* through = nullptr;
 };
+
+void stampRunAt(StampRuns& runs, std::uintptr_t begin, std::uintptr_t end, std::uintptr_t at) {
+    auto& tracker = runs.tracker;
+    const auto kind = runs.kind;
+    const auto generation = tracker.generation.load(std::memory_order_relaxed);
+    const auto stop = at + (end - begin);
+    if (kind != StampKind::Driver) tracker.noteCpuStore(at, stop, generation);
+    else tracker.noteWalkStore(at, stop, generation);
+    if (runs.window != nullptr) {
+        for (auto page = begin; page < end; page += WritePageBytes) tracker.stamp(tracker.blockOf(at + (page - begin)), generation, runs.window->Holds(page) ? StampKind::ImportWindow : kind);
+    } else {
+        for (auto block = tracker.blockOf(at); block <= tracker.blockOf(stop - 1); ++block) tracker.stamp(block, generation, kind);
+    }
+}
 
 void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     auto& runs = *static_cast<StampRuns*>(context);
-    auto& tracker = runs.tracker;
-    const auto kind = runs.kind;
     if (end <= begin) return;
     ++runs.stamped;
-    const auto generation = tracker.generation.load(std::memory_order_relaxed);
-    if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
-    else tracker.noteWalkStore(begin, end, generation);
-    if (runs.window != nullptr) {
-        for (auto page = begin; page < end; page += WritePageBytes) tracker.stamp(tracker.blockOf(page), generation, runs.window->Holds(page) ? StampKind::ImportWindow : kind);
-    } else {
-        for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, kind);
+    if (runs.through != nullptr) {
+        begin = begin - runs.through->other + runs.through->begin;
+        end = end - runs.through->other + runs.through->begin;
+    }
+    stampRunAt(runs, begin, end, begin);
+    for (const auto& alias : runs.aliases) {
+        const auto from = std::max(begin, alias.begin);
+        const auto to = std::min(end, alias.end);
+        if (from < to) stampRunAt(runs, from, to, alias.other + (from - alias.begin));
     }
 #ifndef _WIN32
     collectDirtyRuns.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
+
+#ifndef _WIN32
+using CollectFunction = bool (*)(std::uintptr_t, std::size_t, void (*)(void*, std::uintptr_t, std::uintptr_t), void*);
+
+bool collectViews(CollectFunction collect, std::uint64_t first, std::uint64_t stop, StampRuns& runs) {
+    AliasPieces pieces;
+    aliasPieces(first, stop, pieces);
+    runs.aliases = pieces;
+    bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
+    for (const auto& piece : pieces) {
+        if (!complete) break;
+        runs.through = &piece;
+        complete = collect(piece.other, piece.end - piece.begin, &stampWrittenRun, &runs);
+    }
+    runs.through = nullptr;
+    runs.aliases = {};
+    return complete;
+}
+#endif
 
 #ifdef _WIN32
 std::atomic<FreshCollectHook> freshCollectHook{nullptr};
@@ -1491,7 +1551,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #else
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
-    const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
+    const bool complete = collectViews(collect, first, stop, runs);
     if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
     return complete;
 #endif
@@ -1710,6 +1770,9 @@ void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
     hook(begin, static_cast<std::size_t>(end - begin));
 #else
     hook(address, bytes);
+    AliasPieces pieces;
+    aliasPieces(address, address + bytes, pieces);
+    for (const auto& piece : pieces) hook(piece.other, static_cast<std::size_t>(piece.end - piece.begin));
 #endif
 }
 
@@ -1923,13 +1986,17 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
         ++tracker.generation;
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) {
             tracker.noteUnstampedStore(stored.first, stored.second);
-            if (tracker.watched) tracker.stampWatchedPart(stored.first, stored.second, tracker.generation, true);
+            if (tracker.watched) {
+                tracker.stampWatchedPart(stored.first, stored.second, tracker.generation, true);
+                tracker.stampAliases(stored.first, stored.second, tracker.generation, true, true);
+            }
             return 0;
         }
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
             tracker.stamp(block, tracker.generation, StampKind::Driver);
             tracker.noteDriverStore(block, stored.first, stored.second, tracker.generation, true);
         }
+        tracker.stampAliases(stored.first, stored.second, tracker.generation, true, false);
         return tracker.generation;
     };
     auto& tracker = Tracker();
@@ -1970,7 +2037,10 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
     ++tracker.generation;
     if (!tracker.watched || !tracker.covers(address, bytes)) {
         tracker.noteUnstampedStore(address, address + bytes);
-        if (tracker.watched) tracker.stampWatchedPart(address, address + bytes, tracker.generation, complete);
+        if (tracker.watched) {
+            tracker.stampWatchedPart(address, address + bytes, tracker.generation, complete);
+            tracker.stampAliases(address, address + bytes, tracker.generation, complete, true);
+        }
         return 0;
     }
     {
@@ -1980,7 +2050,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
 #ifdef _WIN32
         const bool collected = collectWindowsWrites(runs, blockFirst, blockStop, false);
 #else
-        const bool collected = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
+        const bool collected = collectViews(&GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix, blockFirst, blockStop, runs);
 #endif
         if (!collected) {
             lock.Suspend();
@@ -1988,6 +2058,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
             lock.Resume();
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             tracker.noteUnstampedStore(address, address + bytes);
+            tracker.stampAliases(address, address + bytes, tracker.generation, complete, true);
             return 0;
         }
         if (runs.stamped != 0) ++tracker.generation;
@@ -1998,6 +2069,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
         tracker.stamp(block, tracker.generation, StampKind::Driver);
         tracker.noteDriverStore(block, address, address + bytes, tracker.generation, complete);
     }
+    tracker.stampAliases(address, address + bytes, tracker.generation, complete, false);
     return tracker.generation;
 }
 
@@ -2170,6 +2242,15 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
         if (k < cpu.size()) cpu[k] = generation == 0 || tracker.cpuStampOf(block) > generation ? 1 : 0;
     }
     return true;
+}
+
+bool Aliased(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    return GuestWriteWatch::GuestWriteWatchAliases_nid_postfix(static_cast<std::uintptr_t>(address), bytes, [](void*, std::uintptr_t, std::uintptr_t, std::uintptr_t) {}, nullptr) != 0;
+}
+
+std::uint64_t AliasSerial() {
+    return GuestWriteWatch::GuestWriteWatchAliasSerial_nid_postfix();
 }
 
 namespace {

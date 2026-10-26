@@ -20,6 +20,10 @@ void GuestWriteWatchProtectionChanged_nid_postfix(const void* pointer, std::size
 int GuestWriteWatchProtection_nid_postfix(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* runEnd);
 bool GuestWriteWatchCollectArmed_nid_postfix(std::uintptr_t address, std::size_t bytes, void (*written)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context);
 bool GuestWriteWatchCollectFresh_nid_postfix(std::uintptr_t address, std::size_t bytes, void (*written)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context);
+bool GuestWriteWatchAliasesEnabled_nid_postfix();
+void GuestWriteWatchSetAliases_nid_postfix(std::uintptr_t address, std::size_t bytes, const std::uintptr_t* others, std::size_t count);
+std::size_t GuestWriteWatchAliases_nid_postfix(std::uintptr_t address, std::size_t bytes, void (*alias)(void* context, std::uintptr_t begin, std::uintptr_t end, std::uintptr_t other), void* context);
+std::uint64_t GuestWriteWatchAliasSerial_nid_postfix();
 
 }
 

@@ -2840,6 +2840,96 @@ static void CheckDirectMemoryWriteWatchFollowsRemovedMappings() {
     Require(sceKernelReleaseDirectMemory(phys, page * 4) == 0);
 }
 
+using AliasRuns = std::vector<std::array<std::uintptr_t, 3>>;
+
+static AliasRuns AliasesOf(const void* view, std::size_t bytes) {
+    AliasRuns runs;
+    GuestWriteWatch::GuestWriteWatchAliases_nid_postfix(reinterpret_cast<std::uintptr_t>(view), bytes, [](void* context, std::uintptr_t begin, std::uintptr_t end, std::uintptr_t other) {
+        static_cast<AliasRuns*>(context)->push_back({begin, end, other});
+    }, &runs);
+    std::sort(runs.begin(), runs.end());
+    return runs;
+}
+
+static std::array<std::uintptr_t, 3> Alias(std::uintptr_t begin, std::uintptr_t end, std::uintptr_t other) {
+    return {begin, end, other};
+}
+
+static AliasRuns Sorted(AliasRuns runs) {
+    std::sort(runs.begin(), runs.end());
+    return runs;
+}
+
+static void CheckDirectMemoryAliasWatch() {
+    if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
+        std::puts("write watch unavailable: the alias watch not tested");
+        return;
+    }
+    Require(GuestWriteWatch::GuestWriteWatchAliasesEnabled_nid_postfix());
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t small = 4096;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 4, 0, 0, &phys) == 0);
+    void* first = nullptr;
+    Require(sceKernelMapDirectMemory(&first, page * 4, 3, 0, phys, 0) == 0);
+    const auto address = reinterpret_cast<std::uintptr_t>(first);
+    auto* bytes = static_cast<volatile unsigned char*>(first);
+    Require(Written(first, page * 4, {{0, page * 4 / small}}));
+    Require(AliasesOf(first, page * 4).empty());
+    const auto serial = GuestWriteWatch::GuestWriteWatchAliasSerial_nid_postfix();
+    Require(serial != 0);
+    void* second = nullptr;
+    Require(sceKernelMapDirectMemory(&second, page * 2, 3, 0, phys + page, 0) == 0);
+    const auto aliasAddress = reinterpret_cast<std::uintptr_t>(second);
+    auto* aliasBytes = static_cast<volatile unsigned char*>(second);
+    Require(GuestWriteWatch::GuestWriteWatchAliasSerial_nid_postfix() != serial);
+    Require(GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address, page * 4) && GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(aliasAddress, page * 2));
+    Require(AliasesOf(first, page * 4) == AliasRuns{Alias(address + page, address + page * 3, aliasAddress)});
+    Require(AliasesOf(second, page * 2) == AliasRuns{Alias(aliasAddress, aliasAddress + page * 2, address + page)});
+    Require(AliasesOf(first, page).empty() && AliasesOf(reinterpret_cast<const void*>(address + page * 3), page).empty());
+    Require(AliasesOf(reinterpret_cast<const void*>(address + page + 100), 8) == AliasRuns{Alias(address + page + 100, address + page + 108, aliasAddress + 100)});
+    Require(Written(second, page * 2, {{0, page * 2 / small}}));
+    Require(Written(first, page * 4, {}));
+    aliasBytes[5] = 1;
+    Require(bytes[page + 5] == 1);
+    Require(Written(first, page * 4, {}));
+    Require(Written(second, page * 2, {{0, 1}}));
+    void* third = nullptr;
+    Require(sceKernelMapDirectMemory(&third, page, 3, 0, phys + page * 2, 0) == 0);
+    const auto thirdAddress = reinterpret_cast<std::uintptr_t>(third);
+    Require(AliasesOf(first, page * 4) == Sorted({Alias(address + page, address + page * 2, aliasAddress), Alias(address + page * 2, address + page * 3, aliasAddress + page), Alias(address + page * 2, address + page * 3, thirdAddress)}));
+    Require(AliasesOf(third, page) == Sorted({Alias(thirdAddress, thirdAddress + page, address + page * 2), Alias(thirdAddress, thirdAddress + page, aliasAddress + page)}));
+    Require(Written(third, page, {{0, page / small}}));
+    Require(Written(first, page * 4, {}) && Written(second, page * 2, {}));
+    const auto threeViews = GuestWriteWatch::GuestWriteWatchAliasSerial_nid_postfix();
+    Require(sceKernelMtypeprotect(second, page * 2, 3, 3) == 0);
+    Require(GuestWriteWatch::GuestWriteWatchAliasSerial_nid_postfix() == threeViews);
+    Require(Written(first, page * 4, {}) && Written(second, page * 2, {}) && Written(third, page, {}));
+    Require(sceKernelMunmap(thirdAddress, page) == 0);
+    Require(AliasesOf(first, page * 4) == AliasRuns{Alias(address + page, address + page * 3, aliasAddress)});
+    Require(Written(first, page * 4, {{page * 2 / small, page * 3 / small}}));
+    Require(Written(second, page * 2, {{page / small, page * 2 / small}}));
+    aliasBytes[page + 9] = 2;
+    Require(sceKernelMunmap(aliasAddress, page * 2) == 0);
+    Require(AliasesOf(first, page * 4).empty());
+    Require(GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address, page * 4));
+    Require(bytes[page * 2 + 9] == 2);
+    Require(Written(first, page * 4, {{page / small, page * 3 / small}}));
+    Require(Written(first, page * 4, {}));
+    bytes[3] = 3;
+    Require(Written(first, page * 4, {{0, 1}}));
+    void* fixed = const_cast<unsigned char*>(bytes + page * 3);
+    Require(sceKernelMapDirectMemory(&fixed, page, 3, 0x10, phys, 0) == 0 && reinterpret_cast<std::uintptr_t>(fixed) == address + page * 3);
+    Require(AliasesOf(first, page * 4) == AliasRuns{Alias(address, address + page, address + page * 3), Alias(address + page * 3, address + page * 4, address)});
+    Require(Written(first, page * 4, {{page * 3 / small, page * 4 / small}}));
+    bytes[page * 3 + 1] = 4;
+    Require(bytes[1] == 4);
+    Require(Written(first, page * 4, {{page * 3 / small, page * 3 / small + 1}}));
+    Require(sceKernelMunmap(address, page * 4) == 0);
+    Require(AliasesOf(first, page * 4).empty());
+    Require(sceKernelReleaseDirectMemory(phys, page * 4) == 0);
+}
+
 static double MapAcrossBackingsSeconds(std::int64_t phys, std::size_t backings) {
     constexpr std::size_t page = 0x4000;
     const auto threadSeconds = [] {
@@ -3310,6 +3400,15 @@ static void CheckMunmapOverUnmappedPages() {
 int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "1000");
+#endif
+#if defined(__linux__)
+    if (argc == 2 && std::strcmp(argv[1], "alias-watch") == 0) {
+        CheckWriteWatch();
+        CheckWriteWatchArmedCollect();
+        CheckWriteWatchFreshCollect();
+        CheckDirectMemoryAliasWatch();
+        return 0;
+    }
 #endif
     if (argc == 2 && std::strcmp(argv[1], "fixed-anonymous") == 0) {
         CheckPosixFixedAnonymousMapping();
