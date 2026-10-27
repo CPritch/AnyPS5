@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -283,6 +284,8 @@ public:
     // Walks the write watch over every image surface of a completed object (no device lock: the
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
+    void PrecollectSurfaces(GuestMemory::PrecollectedWrites& into) const;
+    bool InResourceCache() const { return inResourceCache.load(std::memory_order_acquire); }
     bool Reusable() const { return reusable; }
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
@@ -349,6 +352,8 @@ public:
 
 private:
     friend class AgcDriver::VulkanDevice;
+    friend class ResourceCache;
+    std::atomic<bool> inResourceCache{false};
     bool refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder);
     std::optional<std::size_t> shaderDataAllocation(const CompiledShader& shader) const;
     VkBuffer shaderDataBuffer(const CompiledShader& shader) const;
@@ -701,7 +706,7 @@ private:
 class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
-    std::shared_ptr<ShaderResources> Find(const Key& key);
+    std::shared_ptr<ShaderResources> Find(const Key& key, bool counted = true);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
@@ -728,6 +733,7 @@ public:
 
 private:
     void erase(const Key& key);
+    static void forget(const std::shared_ptr<ShaderResources>& resources);
     void noteMiss(const Key& key);
     void dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteEvicted(const Key& key);

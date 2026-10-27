@@ -74,6 +74,30 @@ void SetFreshCollectHook(FreshCollectHook hook);
 #endif
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
+struct PrecollectedWrites {
+    std::uint64_t epoch = 0;
+    struct Walk {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t mapping = 0;
+        std::uint64_t generation = 0;
+    };
+    std::vector<Walk> walks;
+};
+bool Precollect(PrecollectedWrites& into, std::uint64_t address, std::size_t bytes);
+class PrecollectedScope {
+public:
+    explicit PrecollectedScope(const PrecollectedWrites* walks);
+    ~PrecollectedScope();
+    PrecollectedScope(const PrecollectedScope&) = delete;
+    PrecollectedScope& operator=(const PrecollectedScope&) = delete;
+
+private:
+    const PrecollectedWrites* previous;
+};
+std::uint64_t PrecollectedHits();
+void FollowCollectToken(std::uint64_t token);
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // UnchangedSince for several ranges under one tracker lock: true only when every one holds.
 struct UnchangedQuery {

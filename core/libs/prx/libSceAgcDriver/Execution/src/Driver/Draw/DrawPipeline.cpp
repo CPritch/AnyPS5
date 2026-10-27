@@ -429,6 +429,7 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
     if (followed == token) return;
     followed = token;
     GuestMemory::BumpCollectEpoch();
+    GuestMemory::FollowCollectToken(token);
 }
 
 unsigned DrawPipeline::Committers() {

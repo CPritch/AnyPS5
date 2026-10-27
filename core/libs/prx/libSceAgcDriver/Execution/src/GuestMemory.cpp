@@ -103,6 +103,7 @@ std::atomic<std::uint64_t> forgetCalls{0};
 std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
+std::atomic<std::uint64_t> precollectedHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
@@ -353,7 +354,7 @@ public:
         for (std::size_t i = 0; i < MemoryCounterCount; ++i) {
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
-        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, precollected hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(precollectedHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
@@ -1500,6 +1501,20 @@ bool sharedCollectMemo() {
     return shared;
 }
 
+struct PrecollectedSlot {};
+struct CollectTokenSlot {};
+
+struct PrecollectShare {
+    AgcDriver::Mutex mutex;
+    std::array<std::pair<std::uint64_t, std::map<std::uint64_t, PrecollectedWrites::Walk>>, 4> epochs;
+    std::size_t next = 0;
+};
+
+PrecollectShare& precollectShare() {
+    static auto* share = new PrecollectShare();
+    return *share;
+}
+
 struct StampRuns {
     WriteTracker& tracker;
     StampKind kind;
@@ -1669,6 +1684,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
+    if (const auto* precollected = useMemo ? HostThreadSlot<const PrecollectedWrites*, PrecollectedSlot>::Get() : nullptr; precollected != nullptr && precollected->epoch != 0 && precollected->epoch == HostThreadSlot<std::uint64_t, CollectTokenSlot>::Get()) {
+        for (const auto& walk : precollected->walks) {
+            if (walk.unwatched == unwatched && walk.mapping == mapping && walk.begin <= first && stop <= walk.end) {
+                precollectedHits.fetch_add(1, std::memory_order_relaxed);
+                return tracker.stable.load(std::memory_order_acquire);
+            }
+        }
+    }
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
@@ -1737,6 +1760,67 @@ std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, false);
+}
+
+bool Precollect(PrecollectedWrites& into, std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    constexpr std::uint64_t page = 4096;
+    const auto first = address & ~(page - 1);
+    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto covers = [&](const PrecollectedWrites::Walk& walk) { return walk.unwatched == unwatched && walk.mapping == mapping && walk.begin <= first && stop <= walk.end; };
+    if (std::any_of(into.walks.begin(), into.walks.end(), covers)) return true;
+    auto& share = precollectShare();
+    if (into.epoch != 0) {
+        std::lock_guard lock(share.mutex);
+        for (const auto& [epoch, walks] : share.epochs) {
+            if (epoch != into.epoch) continue;
+            const auto after = walks.upper_bound(first);
+            if (after == walks.begin()) continue;
+            if (const auto& walk = std::prev(after)->second; covers(walk)) {
+                into.walks.push_back(walk);
+                return true;
+            }
+        }
+    }
+    PrecollectedWrites::Walk walk{first, stop, unwatched, mapping, 0};
+    {
+        auto& tracker = Tracker();
+        const auto lock = lockTracker(tracker);
+        tracker.initialize();
+        if (!tracker.watched || !tracker.covers(address, bytes)) return false;
+        const TimedAccess timed(CounterCollect, bytes);
+        if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return false;
+        walk.generation = tracker.generation.load(std::memory_order_relaxed);
+    }
+    into.walks.push_back(walk);
+    if (into.epoch == 0) return true;
+    std::lock_guard lock(share.mutex);
+    auto slot = std::find_if(share.epochs.begin(), share.epochs.end(), [&](const auto& entry) { return entry.first == into.epoch; });
+    if (slot == share.epochs.end()) {
+        slot = share.epochs.begin() + static_cast<std::ptrdiff_t>(share.next++ % share.epochs.size());
+        slot->first = into.epoch;
+        slot->second.clear();
+    }
+    if (slot->second.size() < 4096) slot->second[first] = walk;
+    return true;
+}
+
+PrecollectedScope::PrecollectedScope(const PrecollectedWrites* walks) : previous(HostThreadSlot<const PrecollectedWrites*, PrecollectedSlot>::Get()) {
+    HostThreadSlot<const PrecollectedWrites*, PrecollectedSlot>::Set(walks);
+}
+
+PrecollectedScope::~PrecollectedScope() {
+    HostThreadSlot<const PrecollectedWrites*, PrecollectedSlot>::Set(previous);
+}
+
+std::uint64_t PrecollectedHits() {
+    return precollectedHits.load(std::memory_order_relaxed);
+}
+
+void FollowCollectToken(std::uint64_t token) {
+    HostThreadSlot<std::uint64_t, CollectTokenSlot>::Set(token);
 }
 
 std::uint64_t WriteGeneration() {

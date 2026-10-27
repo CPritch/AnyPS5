@@ -5,6 +5,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -38,10 +39,13 @@ struct DrawAhead {
     std::uint32_t proxied = 0;
     std::shared_ptr<Pipeline> pipeline;
     std::uint64_t storeHash = 0;
+    bool looked = false;
+    std::shared_ptr<ShaderResources> found;
+    GuestMemory::PrecollectedWrites walks;
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
 
-enum class DrawAheadEvent : std::uint8_t { Offered, Prepared, Thrown, NotStarted, Unfinished, Device, Used, NotLean, PipelineInputs, ShapeMemo, Verified, Mismatch, Count };
+enum class DrawAheadEvent : std::uint8_t { Offered, Prepared, Thrown, NotStarted, Unfinished, Device, Used, NotLean, PipelineInputs, ShapeMemo, TemplateHinted, TemplateGone, Precollected, PrecollectStale, Verified, Mismatch, Count };
 void PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t shape, DrawAhead& ahead);
 void CountDrawAhead(DrawAheadEvent event);
 std::array<std::uint64_t, static_cast<std::size_t>(DrawAheadEvent::Count)> DrawAheadTotals();

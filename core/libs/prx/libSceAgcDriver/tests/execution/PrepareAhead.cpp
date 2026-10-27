@@ -46,6 +46,8 @@ alignas(256) Target HalfReference{};
 alignas(256) std::array<Target, 4> Queued{};
 alignas(256) Target Overdrawn{};
 alignas(256) std::array<Target, 2> Faulted{};
+alignas(256) Target FilledReference{};
+alignas(256) Target Filled{};
 alignas(256) std::array<std::uint32_t, 4> Label{};
 
 struct Header {
@@ -121,6 +123,11 @@ void AppendDraw(std::vector<std::uint32_t>& commands) {
     Append(commands, 0x2d, {3, 2});
 }
 
+void AppendFill(std::vector<std::uint32_t>& commands, Target& memory, std::uint32_t value) {
+    const auto address = reinterpret_cast<std::uintptr_t>(memory.data());
+    commands.insert(commands.end(), {0xc0055000u, 2u << 29u, value, 0u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), static_cast<std::uint32_t>(memory.size())});
+}
+
 void AppendLabel(std::vector<std::uint32_t>& commands, std::uint32_t* target, std::uint32_t value) {
     const auto address = reinterpret_cast<std::uintptr_t>(target);
     commands.insert(commands.end(), {0xc0064900u, 0x514u, (1u << 29u) | (2u << 24u), static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), value, 0, 0});
@@ -158,16 +165,29 @@ void WaitUntil(Ready ready, const std::string& what) {
     }
 }
 
+template <typename Ready>
+bool WaitAWhile(Ready ready) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!ready()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
 struct Blocker {
     struct State {
         std::atomic<bool> release{false};
         std::atomic<bool> done{false};
     };
     std::shared_ptr<State> state = std::make_shared<State>();
-    void Enqueue() {
-        DrawPipeline::Queue0().Enqueue([state = state] {
+    void Enqueue(bool forgetTemplates = false) {
+        DrawPipeline::Queue0().Enqueue([state = state, forgetTemplates] {
             while (!state->release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            { std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex()); }
+            {
+                std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+                if (forgetTemplates) AgcDriver::Graphics::SharedResourceCache().Clear();
+            }
             state->done = true;
         }, {});
     }
@@ -204,7 +224,7 @@ void DrawReference(Target& memory, float color) {
     Require(covered != 0 && covered != memory.size(), "the reference draw covered " + std::to_string(covered) + " of " + std::to_string(memory.size()) + " bytes, expected an edge through the target");
 }
 
-void QueuedDrawsUseTheirPreparation(const Mode& mode) {
+void QueuedDrawsUseTheirPreparation(const Mode& mode, bool forgetTemplates = false) {
     const auto offered = Total(DrawAheadEvent::Offered);
     const auto prepared = Total(DrawAheadEvent::Prepared);
     const auto used = Total(DrawAheadEvent::Used);
@@ -218,7 +238,7 @@ void QueuedDrawsUseTheirPreparation(const Mode& mode) {
         AppendDraw(commands);
     }
     Blocker blocker;
-    blocker.Enqueue();
+    blocker.Enqueue(forgetTemplates);
     Submit(commands, "the queued draws");
     if (mode.on) WaitUntil([&] { return Total(DrawAheadEvent::Prepared) >= prepared + Queued.size(); }, "the queued draws' preparation");
     else WaitUntil([] { return DrawPipeline::Queue0().Outstanding() >= 1 + Queued.size(); }, "the queued draws");
@@ -262,6 +282,52 @@ void LaterDrawsStillWinInQueueOrder(const Mode& mode) {
     Flush(Overdrawn);
     Require(Label[0] == 2, "the labels behind the queued draws ended at " + std::to_string(Label[0]) + ", expected the second");
     Same(Overdrawn, HalfReference, "the target the second queued draw overdrew");
+}
+
+void TemplatesFoundAheadServeTheCommit(const Mode& mode) {
+    if (!mode.on || AgcDriver::Graphics::SharedResourceCache().Size() == 0) return;
+    const auto hinted = Total(DrawAheadEvent::TemplateHinted);
+    const auto gone = Total(DrawAheadEvent::TemplateGone);
+    QueuedDrawsUseTheirPreparation(mode);
+    const auto served = Total(DrawAheadEvent::TemplateHinted) - hinted;
+    Require(Total(DrawAheadEvent::TemplateGone) == gone, "a template found ahead of a blocked committer was gone at the commit");
+    if (!mode.verify) Require(served == Queued.size(), "the commits served " + std::to_string(served) + " of " + std::to_string(Queued.size()) + " repeated draws from the templates found ahead");
+    QueuedDrawsUseTheirPreparation(mode, true);
+    Require(Total(DrawAheadEvent::TemplateHinted) - hinted == served, "a template the cache let go between the preparation and the commit was used");
+    if (!mode.verify) Require(Total(DrawAheadEvent::TemplateGone) - gone == Queued.size(), "the commits did not find the templates the cache let go again");
+}
+
+void FillsBetweenPreparationAndCommitAreSeen(const Mode& mode) {
+    FilledReference.fill(std::byte{0x11});
+    {
+        std::vector<std::uint32_t> commands;
+        AppendState(commands);
+        AppendTarget(commands, FilledReference);
+        AppendColor(commands, 0.5f);
+        AppendDraw(commands);
+        Submit(commands, "the filled reference");
+        Finish();
+        Flush(FilledReference);
+    }
+    const auto prepared = Total(DrawAheadEvent::Prepared);
+    Filled.fill(Kept);
+    std::vector<std::uint32_t> commands;
+    AppendState(commands);
+    AppendTarget(commands, Filled);
+    AppendColor(commands, 1.0f);
+    AppendDraw(commands);
+    AppendFill(commands, Filled, 0x11111111u);
+    AppendColor(commands, 0.5f);
+    AppendDraw(commands);
+    Blocker blocker;
+    blocker.Enqueue();
+    Submit(commands, "the draws around a queued fill");
+    if (mode.on) static_cast<void>(WaitAWhile([&] { return Total(DrawAheadEvent::Prepared) >= prepared + 2; }));
+    blocker.Release();
+    Finish();
+    blocker.Join();
+    Flush(Filled);
+    Same(Filled, FilledReference, "the target a queued fill wrote between its draws");
 }
 
 void ThrownPreparationsAreRedoneAtTheCommit(const Mode& mode) {
@@ -317,6 +383,8 @@ int main() {
         Require(std::memcmp(OpaqueReference.data(), HalfReference.data(), TargetBytes) != 0, "the two reference colors wrote the same bytes");
         QueuedDrawsUseTheirPreparation(mode);
         LaterDrawsStillWinInQueueOrder(mode);
+        TemplatesFoundAheadServeTheCommit(mode);
+        FillsBetweenPreparationAndCommitAreSeen(mode);
         ThrownPreparationsAreRedoneAtTheCommit(mode);
         Require(AgcDriver::Graphics::DrawAheadTotals()[static_cast<std::size_t>(DrawAheadEvent::Mismatch)] == 0, "a verified preparation differed from the commit's");
         AgcDriverShutdown_nid_postfix();

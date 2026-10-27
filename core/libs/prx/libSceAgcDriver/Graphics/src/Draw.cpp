@@ -1817,7 +1817,21 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
             if (ahead.Checks() && !ahead.ahead->contentKey.empty()) checkAhead(resolved.contentKey == ahead.ahead->contentKey, "resource-cache key");
         }
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        std::shared_ptr<ShaderResources> cached;
+        if (ahead.ahead != nullptr && ahead.ahead->looked) {
+            auto& hint = ahead.ahead->found;
+            if (ahead.Takes() && hint != nullptr && hint->InResourceCache()) {
+                cached = std::move(hint);
+                CountDrawAhead(DrawAheadEvent::TemplateHinted);
+            } else {
+                cached = SharedResourceCache().Find(resolved.contentKey, false);
+                if (ahead.Checks()) checkAhead(hint == nullptr || !hint->InResourceCache() || hint == cached, "resource-cache template");
+                else if (hint != nullptr) CountDrawAhead(DrawAheadEvent::TemplateGone);
+            }
+        } else {
+            cached = SharedResourceCache().Find(resolved.contentKey);
+        }
+        if (cached != nullptr) {
             const bool valid = cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
@@ -3751,6 +3765,17 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.trace = trace;
     prepared.shape = shape;
     prepared.ahead = aheadFor(context, ahead);
+    std::optional<GuestMemory::PrecollectedScope> precollected;
+    if (prepared.ahead.ahead != nullptr && !prepared.ahead.ahead->walks.walks.empty()) {
+        if (prepared.ahead.verify) {
+            for (const auto& walk : prepared.ahead.ahead->walks.walks) {
+                if (!GuestMemory::UnchangedSinceCollected(walk.begin, static_cast<std::size_t>(walk.end - walk.begin), walk.generation)) CountDrawAhead(DrawAheadEvent::PrecollectStale);
+            }
+        } else {
+            precollected.emplace(&prepared.ahead.ahead->walks);
+            CountDrawAhead(DrawAheadEvent::Precollected);
+        }
+    }
     const bool counted = DrawSplitCounted();
     if (counted) {
         prepared.timer.counted = true;
@@ -3780,6 +3805,22 @@ void PrepareDrawAhead(const Context& context, const State& state, const Pm4::Dra
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     const bool keyed = !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (keyed) ahead.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
+    static const bool hints = std::getenv("APS5_NO_PREPARE_AHEAD_TEMPLATES") == nullptr;
+    if (keyed && hints) {
+        ahead.looked = true;
+        ahead.found = SharedResourceCache().Find(ahead.contentKey);
+        if (ahead.found != nullptr) ahead.found->PrecollectSurfaces(ahead.walks);
+    }
+    static const bool precollect = std::getenv("APS5_NO_PREPARE_AHEAD_PRECOLLECT") == nullptr;
+    if (precollect) {
+        for (const auto& color : state.colors) {
+            if (color.samples > 1 || color.mipCount > 1 || color.depth > 1 || color.arrayLastSlice != 0) continue;
+            const ColorTargetLayout layout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+            GuestMemory::Precollect(ahead.walks, color.address, static_cast<std::size_t>(layout.Bytes()));
+        }
+        const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+        if (draw.indexed && !draw.indirect && indexBytes >= Recorder::KeptIndexRangeIndices * draw.indexSize) GuestMemory::Precollect(ahead.walks, draw.indexAddress, static_cast<std::size_t>(indexBytes));
+    }
     bool memoized = false;
     bool hit = false;
     ahead.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, memoized, hit, false);
@@ -3832,8 +3873,8 @@ std::string DrawAheadReport() {
     for (std::size_t index = 0; index < totals.size(); ++index) window[index] = static_cast<unsigned long long>(totals[index] - reported[index]);
     reported = totals;
     const auto at = [&](DrawAheadEvent event) { return window[static_cast<std::size_t>(event)]; };
-    char line[512];
-    std::snprintf(line, sizeof(line), "[prepare-ahead] (10 s): %llu offered, %llu prepared, %llu used; not used: %llu not started, %llu unfinished, %llu exception, %llu device; pipeline redone: %llu not lean, %llu pipeline inputs; %llu pipelines left to the shape memo; %llu verified, %llu mismatches%s", at(DrawAheadEvent::Offered), at(DrawAheadEvent::Prepared), at(DrawAheadEvent::Used), at(DrawAheadEvent::NotStarted), at(DrawAheadEvent::Unfinished), at(DrawAheadEvent::Thrown), at(DrawAheadEvent::Device), at(DrawAheadEvent::NotLean), at(DrawAheadEvent::PipelineInputs), at(DrawAheadEvent::ShapeMemo), at(DrawAheadEvent::Verified), at(DrawAheadEvent::Mismatch), DrawAheadDisabled() ? " (off after a mismatch)" : "");
+    char line[1024];
+    std::snprintf(line, sizeof(line), "[prepare-ahead] (10 s): %llu offered, %llu prepared, %llu used; not used: %llu not started, %llu unfinished, %llu exception, %llu device; pipeline redone: %llu not lean, %llu pipeline inputs; %llu pipelines left to the shape memo; templates: %llu hinted, %llu gone; %llu draws on precollected walks, %llu walks written since; %llu verified, %llu mismatches%s", at(DrawAheadEvent::Offered), at(DrawAheadEvent::Prepared), at(DrawAheadEvent::Used), at(DrawAheadEvent::NotStarted), at(DrawAheadEvent::Unfinished), at(DrawAheadEvent::Thrown), at(DrawAheadEvent::Device), at(DrawAheadEvent::NotLean), at(DrawAheadEvent::PipelineInputs), at(DrawAheadEvent::ShapeMemo), at(DrawAheadEvent::TemplateHinted), at(DrawAheadEvent::TemplateGone), at(DrawAheadEvent::Precollected), at(DrawAheadEvent::PrecollectStale), at(DrawAheadEvent::Verified), at(DrawAheadEvent::Mismatch), DrawAheadDisabled() ? " (off after a mismatch)" : "");
     return line;
 }
 
