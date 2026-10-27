@@ -192,7 +192,9 @@ struct DrawAheadSlot {
     std::shared_ptr<const DrawDecode> decode;
     Pm4::DrawParameters draw{};
     std::uint64_t shape = 0;
-    std::vector<Graphics::CompiledShader> stages;
+    static constexpr std::size_t MaxStages = 8;
+    std::array<Graphics::CompiledShader, MaxStages> stages{};
+    std::size_t stageCount = 0;
     Graphics::DrawAhead result;
 
     void Prepare() {
@@ -200,7 +202,7 @@ struct DrawAheadSlot {
         if (!phase.compare_exchange_strong(expected, Running, std::memory_order_acq_rel)) return;
         bool prepared = false;
         try {
-            device->PrepareDrawAhead(decode->state, draw, stages, shape, result);
+            device->PrepareDrawAhead(decode->state, draw, std::span<const Graphics::CompiledShader>(stages.data(), stageCount), shape, result);
             prepared = true;
         } catch (...) {
         }
@@ -1312,13 +1314,14 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
         std::shared_ptr<DrawAheadSlot> ahead;
-        if (recipe == nullptr && DrawPipeline::PreparesAhead()) {
+        if (recipe == nullptr && stages.size() <= DrawAheadSlot::MaxStages && DrawPipeline::PreparesAhead()) {
             ahead = std::make_shared<DrawAheadSlot>();
             ahead->device = localDevice;
             ahead->decode = decode;
             ahead->draw = drawParameters;
             ahead->shape = tail.shapeKey;
-            ahead->stages = stages;
+            std::copy(stages.begin(), stages.end(), ahead->stages.begin());
+            ahead->stageCount = stages.size();
             Graphics::CountDrawAhead(Graphics::DrawAheadEvent::Offered);
         }
         auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, ahead, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {

@@ -164,13 +164,11 @@ private:
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     std::mutex prepareMutex;
-    std::condition_variable prepareWake;
     std::deque<Prepare> prepares;
     std::vector<Prepare> spentPrepares;
     std::vector<std::thread> preparers;
     std::atomic<std::size_t> queuedPrepares{0};
-    unsigned sleepingPreparers = 0;
-    bool preparersClosing = false;
+    std::atomic<bool> preparersClosing{false};
 };
 
 class DrawFinisher {

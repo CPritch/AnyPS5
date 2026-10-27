@@ -1317,7 +1317,10 @@ struct DrawInputs {
 };
 
 constexpr std::size_t DrawAheadEvents = static_cast<std::size_t>(DrawAheadEvent::Count);
-std::array<std::atomic<std::uint64_t>, DrawAheadEvents> drawAheadTotals{};
+struct alignas(64) DrawAheadCounter {
+    std::atomic<std::uint64_t> count{0};
+};
+std::array<DrawAheadCounter, DrawAheadEvents> drawAheadTotals{};
 std::atomic<bool> drawAheadDisabled{false};
 std::atomic<bool> drawAheadThrows{false};
 
@@ -3811,12 +3814,12 @@ void PrepareDrawAhead(const Context& context, const State& state, const Pm4::Dra
 }
 
 void CountDrawAhead(DrawAheadEvent event) {
-    drawAheadTotals[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+    drawAheadTotals[static_cast<std::size_t>(event)].count.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::array<std::uint64_t, DrawAheadEvents> DrawAheadTotals() {
     std::array<std::uint64_t, DrawAheadEvents> totals{};
-    for (std::size_t index = 0; index < totals.size(); ++index) totals[index] = drawAheadTotals[index].load(std::memory_order_relaxed);
+    for (std::size_t index = 0; index < totals.size(); ++index) totals[index] = drawAheadTotals[index].count.load(std::memory_order_relaxed);
     return totals;
 }
 

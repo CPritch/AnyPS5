@@ -454,25 +454,27 @@ void DrawPipeline::queuePrepare(Prepare prepare) {
     reclaim.clear();
     std::lock_guard lock(prepareMutex);
     if (!spentPrepares.empty()) std::swap(spentPrepares, reclaim);
-    if (preparersClosing) return;
+    if (preparersClosing.load(std::memory_order_relaxed)) return;
     prepares.push_back(std::move(prepare));
     queuedPrepares.fetch_add(1, std::memory_order_release);
     while (preparers.size() < PrepareThreads()) preparers.emplace_back([this] { prepareAhead(); });
-    if (sleepingPreparers != 0) prepareWake.notify_one();
 }
 
 void DrawPipeline::prepareAhead() {
     PinPreparerThread("draw preparer");
     PerformanceTrace::BindThread("draw preparer", std::size_t{1} << 17u);
+    constexpr std::chrono::microseconds idleNap{200};
     for (;;) {
+        const auto queued = [&] { return queuedPrepares.load(std::memory_order_acquire) != 0 || preparersClosing.load(std::memory_order_relaxed); };
+        if (!SpinUntil(HandoffSpinWindow(), queued)) {
+            std::this_thread::sleep_for(idleNap);
+            continue;
+        }
+        if (preparersClosing.load(std::memory_order_acquire)) return;
         Prepare prepare;
-        SpinUntil(HandoffSpinWindow(), [&] { return queuedPrepares.load(std::memory_order_acquire) != 0; });
         {
-            std::unique_lock lock(prepareMutex);
-            ++sleepingPreparers;
-            prepareWake.wait(lock, [&] { return !prepares.empty() || preparersClosing; });
-            --sleepingPreparers;
-            if (preparersClosing) return;
+            std::lock_guard lock(prepareMutex);
+            if (prepares.empty()) continue;
             prepare = std::move(prepares.front());
             prepares.pop_front();
             queuedPrepares.fetch_sub(1, std::memory_order_release);
@@ -734,10 +736,9 @@ void DrawPipeline::Stop() {
     std::vector<std::thread> stopped;
     {
         std::lock_guard lock(prepareMutex);
-        preparersClosing = true;
+        preparersClosing.store(true, std::memory_order_release);
         stopped = std::move(preparers);
     }
-    prepareWake.notify_all();
     for (auto& preparer : stopped) {
         if (preparer.get_id() == std::this_thread::get_id()) preparer.detach();
         else preparer.join();
