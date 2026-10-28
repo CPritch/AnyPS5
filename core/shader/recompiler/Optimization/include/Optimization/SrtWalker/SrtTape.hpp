@@ -44,6 +44,9 @@ private:
         // and the flat SRT slot of that read, or -1.
         std::uint32_t bufferBase = NoNode;
         std::int32_t slot = -1;
+        // For a buffer base read, the shared node of the same read, whose value it takes once it has recorded
+        // the base, so the base costs no guest read of its own; NoNode when there is none.
+        std::uint32_t twin = NoNode;
         std::array<std::uint32_t, 5> arguments{};
         std::uint64_t immediate = 0;
         const IrValue* source = nullptr;

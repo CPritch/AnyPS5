@@ -278,8 +278,12 @@ bool BasicEvaluator<TNode>::EvaluateRawRead(const TNode& inst, std::uint64_t& re
         result = 0;
         return true;
     }
-    if (_runtime.userDataUse != nullptr && bufferBase != nullptr) _runtime.userDataUse->bufferBases.push_back({bufferBase->resource, -1, address, origin, bufferBase->slot});
-    else if (_runtime.userDataUse != nullptr) _runtime.userDataUse->reads.emplace_back(address, origin);
+    if (_runtime.userDataUse != nullptr && bufferBase != nullptr) {
+        _runtime.userDataUse->bufferBases.push_back({bufferBase->resource, -1, address, origin, bufferBase->slot});
+        // The value is the read's own evaluation, memoized: read once per walk, as without the base recorded.
+        return EvaluateWide(inst, result);
+    }
+    if (_runtime.userDataUse != nullptr) _runtime.userDataUse->reads.emplace_back(address, origin);
     if (_inaccessible != nullptr && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t)) && LoadedFromMemory(*handle.Value())) {
         *_inaccessible = {inst.Value(), address};
         return false;

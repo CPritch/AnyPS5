@@ -146,8 +146,10 @@ private:
         if ((value->Opcode() != IrOpcode::LoadAddressU32 && value->Opcode() != IrOpcode::ReadConstBuffer) || !IsRawRead(plan, *value)) return SrtTape::NoNode;
         const auto index = build(value, MainContext, 0);
         if (index == failNode || (tape.nodes[index].op != Op::Read && tape.nodes[index].op != Op::ReadConstBuffer)) return SrtTape::NoNode;
+        const auto twin = compile(value, MainContext, 0);
         tape.nodes[index].bufferBase = resource;
         tape.nodes[index].slot = slot;
+        if (twin != failNode && twin != index && tape.nodes[twin].op == tape.nodes[index].op) tape.nodes[index].twin = twin;
         return index;
     }
 
@@ -484,8 +486,11 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
                 frame.nullRoot = true;
                 return false;
             }
-            if (frame.runtime.userDataUse != nullptr && node.bufferBase != NoNode) frame.runtime.userDataUse->bufferBases.push_back({node.bufferBase, -1, address, origin, node.slot});
-            else if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
+            if (frame.runtime.userDataUse != nullptr && node.bufferBase != NoNode) {
+                frame.runtime.userDataUse->bufferBases.push_back({node.bufferBase, -1, address, origin, node.slot});
+                // The value is the shared read's: read once per walk, as without the base recorded.
+                if (node.twin != NoNode) return evaluate(frame, node.twin, result);
+            } else if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
             if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
                 if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
