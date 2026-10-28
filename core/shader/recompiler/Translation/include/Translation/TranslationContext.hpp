@@ -28,6 +28,7 @@ public:
     void SetFastFloat16(bool enabled) { fastFloat16 = enabled; }
     void SetFloat32DenormPreserve(bool enabled) { float32DenormPreserve = enabled; }
     void SetFloat32FlushToZero(bool enabled) { float32FlushToZero = enabled; }
+    void SetFloat32FlushDeclared(bool enabled) { float32FlushDeclared = enabled; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
     void TranslateUnlinkedCall(const RdnaInstruction& instruction);
@@ -391,6 +392,7 @@ private:
     RdnaOpcode currentOpcode = RdnaOpcode::Unknown;
     std::uint32_t f32DenormalFlush = 0u;
     bool float32FlushToZero = false;
+    bool float32FlushDeclared = false;
     bool float32DenormPreserve = false;
     std::uint32_t currentProgramCounter = 0;
     std::uint32_t currentVectorLimit = 1;

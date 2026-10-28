@@ -51,6 +51,7 @@ bool g_robust2 = false;
 bool g_waveLdsMemoryBarriers = false;
 bool g_deviceScopeLdsMemoryBarriers = false;
 bool g_fastFloat16 = false;
+bool g_ldsLockFences = false;
 bool g_code = false;
 
 bool Replay(const char* path) {
@@ -153,6 +154,7 @@ bool Replay(const char* path) {
         if (g_waveLdsMemoryBarriers) request.request.target.waveLdsMemoryBarriers = true;
         if (g_deviceScopeLdsMemoryBarriers) request.request.target.deviceScopeLdsMemoryBarriers = true;
         if (g_fastFloat16) request.request.target.fastFloat16 = true;
+        if (g_ldsLockFences) request.request.target.ldsLockFences = true;
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
         if (g_spirv) {
@@ -190,7 +192,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--fast-f16] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--fast-f16] [--lds-lock-fences] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
         return 2;
     }
     int failures = 0;
@@ -225,6 +227,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--fast-f16") {
             g_fastFloat16 = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--lds-lock-fences") {
+            g_ldsLockFences = true;
             continue;
         }
         if (std::string(argv[i]) == "--mem") {

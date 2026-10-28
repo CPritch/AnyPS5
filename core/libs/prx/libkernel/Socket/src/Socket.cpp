@@ -210,13 +210,13 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
             kernel.entries.push_back({descriptor, events, 0});
             kernel.slots.push_back(requested.size());
             requested.push_back({descriptor, events, 0});
-        } else if (IsKqueueDescriptor(descriptor)) {
+        } else if (IsKqueueDescriptor_nid_no_patch(descriptor)) {
             kqueues.entries.push_back({descriptor, events, 0});
             kqueues.slots.push_back(requested.size());
             requested.push_back({descriptor, events, 0});
         } else if (File::IsRandomDevice(descriptor)) devices.push_back({descriptor, events, static_cast<short>((events & KernelSocketPoll::Readable) != 0 ? KernelSocketPoll::Readable : events)});
-        else if (descriptor <= 2) devices.push_back({descriptor, events, static_cast<short>(descriptor == 0 ? 0 : events & KernelSocketPoll::Writable)});
         else if (File::IsVnode(descriptor)) devices.push_back({descriptor, events, static_cast<short>(events & (KernelSocketPoll::Readable | KernelSocketPoll::Writable))});
+        else if (descriptor <= 2) devices.push_back({descriptor, events, static_cast<short>(descriptor == 0 ? 0 : events & KernelSocketPoll::Writable)});
         else {
             net.entries.push_back({descriptor, events, 0});
             net.slots.push_back(requested.size());

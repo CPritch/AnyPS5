@@ -46,6 +46,8 @@ RECORD_HAS_SEGMENT = 0x800
 RECORD_SEGMENT_SHIFT = 20
 FIRST_REGION = 0x400
 MAX_ALIGNMENT_PADDING = 64 * 1024 * 1024
+MAX_OUTPUT_FACTOR = 4
+MIN_OUTPUT_LIMIT = 256 * 1024 * 1024
 PT_LOAD = 1
 PT_NOTE = 4
 ENTROPY_LIMIT = 7.5
@@ -67,6 +69,8 @@ PHDR_NAMES = {
     0x6FFFFF00: "PT_OS_0x6fffff00",
     0x6FFFFF01: "PT_OS_0x6fffff01",
 }
+
+PT_TLS = 7
 
 
 class Refused(Exception):
@@ -106,7 +110,16 @@ def parse_elf(data):
     header = bytearray(data[inner:inner + 0x40])
     if header[4] != 2 or header[5] != 1:
         raise Refused("inner ELF is not 64-bit little-endian")
+    version = struct.unpack_from("<I", header, 0x14)[0]
+    if header[6] != 1 or version != 1:
+        raise Refused("unsupported inner ELF version (identification %d, object %d)" % (header[6], version))
     program_offset = struct.unpack_from("<Q", header, 0x20)[0]
+    machine = struct.unpack_from("<H", header, 0x12)[0]
+    if machine != 62:
+        raise Refused("unsupported inner ELF machine %d (expected 62)" % machine)
+    header_size = struct.unpack_from("<H", header, 0x34)[0]
+    if header_size != 64:
+        raise Refused("invalid inner ELF header size %d (expected 64)" % header_size)
     entry_size = struct.unpack_from("<H", header, 0x36)[0]
     count = struct.unpack_from("<H", header, 0x38)[0]
     if entry_size != 56 or count == 0:
@@ -120,13 +133,18 @@ def parse_elf(data):
         offset = inner + program_offset + index * 56
         kind, flags, file_offset, vaddr, _, file_size, memory_size, alignment = struct.unpack_from(
             "<IIQQQQQQ", data, offset)
-        if kind == PT_LOAD:
+        if kind in (PT_LOAD, PT_TLS):
             if file_size > memory_size:
                 raise Refused("segment %d file size exceeds memory size" % index)
             if alignment and alignment & (alignment - 1):
                 raise Refused("segment %d alignment is not a power of two" % index)
-            if memory_size > (1 << 64) - vaddr:
-                raise Refused("segment %d memory range exceeds ELF64" % index)
+        if kind == PT_TLS:
+            if alignment > 8192:
+                raise Refused("segment %d TLS alignment exceeds 8192" % index)
+            if memory_size > 0x7FFF0000:
+                raise Refused("segment %d TLS memory size exceeds 0x7fff0000" % index)
+        if kind == PT_LOAD and memory_size > (1 << 64) - vaddr:
+            raise Refused("segment %d memory range exceeds ELF64" % index)
         headers.append({
             "index": index, "type": kind, "flags": flags, "offset": file_offset,
             "vaddr": vaddr, "size": file_size, "memory": memory_size,
@@ -186,6 +204,12 @@ def place_segments(data, headers, records):
         if header["type"] == PT_LOAD:
             continue
         if header["index"] in placed:
+            host = load_for(header["vaddr"], header["size"])
+            if host is not None:
+                offset = header["vaddr"] - host["vaddr"]
+                if (host["size"] and offset <= host["size"] and header["size"] <= host["size"] - offset
+                        and header["source"] == host["source"] + offset):
+                    header["host"] = host
             if header["size"] and (tail is None or header["offset"] > tail[0]):
                 tail = (header["offset"], header["source"] - header["offset"])
             continue
@@ -275,6 +299,28 @@ def unwrap(path, output, verbose=False):
                             "vaddr": header["vaddr"], "align": header["align"]})
 
     regions.sort(key=lambda region: region["old"])
+
+    def output_region(header):
+        host = header if header["type"] == PT_LOAD else header["host"]
+        region = load_regions.get(host["index"]) if host is not None else None
+        return region if region is not None else region_for(header["source"], header["size"])
+
+    for header in headers:
+        if header["size"] == 0 and (header["type"] == PT_LOAD or header["source"] == 0):
+            continue
+        region = output_region(header)
+        alignment = header["align"]
+        if region is None or alignment <= 1 or alignment & (alignment - 1):
+            continue
+        current = region["align"]
+        current = current if current and (current & (current - 1)) == 0 else 1
+        address = header["vaddr"] - (header["source"] - region["old"])
+        if (address - region["vaddr"]) % min(current, alignment):
+            raise Refused("segment %d has incompatible alignment within its output region" % header["index"])
+        if alignment > current:
+            region["align"] = alignment
+            region["vaddr"] = address
+
     program_offset = struct.unpack_from("<Q", elf_header, 0x20)[0]
     cursor = max(FIRST_REGION, program_offset + len(headers) * 56)
     padding = 0
@@ -293,6 +339,10 @@ def unwrap(path, output, verbose=False):
     if padding > MAX_ALIGNMENT_PADDING:
         raise Refused("segment alignment requires more than %d bytes of output padding" % MAX_ALIGNMENT_PADDING)
     cursor = empty_end
+    output_limit = max(MAX_OUTPUT_FACTOR * len(data), MIN_OUTPUT_LIMIT)
+    if cursor > output_limit:
+        raise Refused("the load segments need %d bytes of output, more than the %d allowed for a %d byte container"
+                      % (cursor, output_limit, len(data)))
 
     result = bytearray(cursor)
     for region in regions:
@@ -302,10 +352,7 @@ def unwrap(path, output, verbose=False):
         if header["size"] == 0 and (header["type"] == PT_LOAD or header["source"] == 0):
             header["new"] = header["vaddr"] % max(header["align"], 1) if header["type"] == PT_LOAD else 0
             continue
-        host = header if header["type"] == PT_LOAD else header["host"]
-        region = load_regions.get(host["index"]) if host is not None else None
-        if region is None:
-            region = region_for(header["source"], header["size"])
+        region = output_region(header)
         header["new"] = header["source"] if region is None else region["new"] + (header["source"] - region["old"])
         if header["new"] + header["size"] > len(result):
             raise Refused("segment %d escaped the output" % header["index"])
