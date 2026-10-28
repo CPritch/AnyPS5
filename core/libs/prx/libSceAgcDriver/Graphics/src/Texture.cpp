@@ -4161,7 +4161,10 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
     }
     recorder->EndGpuTiming(timing, storedBytes);
     recorder->MarkShaderReadsCovered();
-    recorder->NotePendingWrite(hullBegin, hullBytes);
+    // Noted as this image's store, so a later flush over it can record behind it
+    // (APS5_ORDERED_WRITEBACKS) like behind a whole-layer store.
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> hull{{{hullBegin, hullBegin + hullBytes}}};
+    recorder->NotePendingStores(hull, storeSerial);
     noteStore(recorder->LastWriteNote(hullBegin, hullBytes));
     return storedBytes;
 }
