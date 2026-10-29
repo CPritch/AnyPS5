@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RecordingThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FloatFlushProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -2131,7 +2132,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (compileOnly) return;
     // Before anything resolves device entry points: every one of them, the device's own lookups
     // included, then goes through the recording thread's.
-    if (Graphics::RecordingThreadEnabled()) state->deviceProc = Graphics::RecordOnRecordingThread(state->device, state->deviceProc, {[] { DriverDetail::PinRecordingThread("recording thread"); }, HandoffSpinWindow()});
+    if (Graphics::RecordingThreadEnabled()) state->deviceProc = Graphics::RecordOnRecordingThread(state->device, state->deviceProc, {[] {
+        DriverDetail::PinRecordingThread("recording thread");
+        PerformanceTrace::BindThread("recording thread");
+    }, HandoffSpinWindow()});
     if (state->deferDestruction) state->contextDeviceProc = Graphics::DeferDestructionToIdle(state->device, state->deviceProc);
     if (calibratedTimestamps != nullptr) {
         const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;

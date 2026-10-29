@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/RecordingThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -328,6 +329,7 @@ void flush(Stream& stream, std::atomic<std::uint64_t> Counters::*cause) {
     const auto target = stream.published.load(std::memory_order_seq_cst);
     if (stream.replayed.load(std::memory_order_acquire) >= target) return;
     auto& count = counters();
+    PerformanceTimer timing("Recording.Flush");
     const auto started = nowNs();
     const auto spin = registry().options.spin;
     if (!SpinUntil(spin, [&] { return stream.replayed.load(std::memory_order_acquire) >= target; })) {
@@ -385,6 +387,7 @@ void replayStream(const std::shared_ptr<Stream>& owner) {
     for (;;) {
         const auto end = stream.published.load(std::memory_order_seq_cst);
         if (stream.consumed < end) {
+            PerformanceTimer timing("Recording.Replay");
             const auto started = nowNs();
             replayUpTo(stream, end);
             counters().replayNs.fetch_add(nowNs() - started, std::memory_order_relaxed);
