@@ -3740,7 +3740,10 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
 }
 
 bool DrawPipelineEnabled() {
-    static const bool enabled = std::getenv("APS5_DRAW_PIPELINE") != nullptr;
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_DRAW_PIPELINE");
+        return text == nullptr || text[0] != '0';
+    }();
     return enabled;
 }
 

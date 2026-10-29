@@ -28,7 +28,7 @@ namespace {
 bool DispatchItemsEnabled() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_PIPELINE_DISPATCH");
-        return text != nullptr && text[0] != '\0' && text[0] != '0';
+        return text == nullptr || text[0] != '0';
     }();
     return enabled;
 }
