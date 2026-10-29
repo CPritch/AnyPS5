@@ -110,6 +110,8 @@ struct Real {
     PFN_vkResetCommandPool resetCommandPool = nullptr;
     PFN_vkDestroyCommandPool destroyCommandPool = nullptr;
     PFN_vkDestroyDevice destroyDevice = nullptr;
+    PFN_vkUpdateDescriptorSets updateDescriptorSets = nullptr;
+    PFN_vkAllocateDescriptorSets allocateDescriptorSets = nullptr;
 };
 
 Real& real() {
@@ -139,7 +141,14 @@ struct Chunk {
 
 struct Counters {
     std::atomic<std::uint64_t> queued{0}, direct{0}, flushes{0}, flushWaitNs{0}, submitFlushes{0}, poolFlushes{0}, destroyFlushes{0}, replayNs{0};
+    // With the stats switch: the driver calls that stay on the calling threads.
+    std::atomic<std::uint64_t> submits{0}, submitNs{0}, descriptorUpdates{0}, descriptorUpdateNs{0}, descriptorAllocations{0}, descriptorAllocationNs{0};
 };
+
+bool StatsEnabled() {
+    static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
 
 Counters& counters() {
     static auto& state = *new Counters();
@@ -818,8 +827,7 @@ struct ResetCall {
 
 // APS5_PIPELINE_STATS or APS5_PROFILE_DRAW: a [recording] line every 10 s, from the submits.
 void report() {
-    static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!enabled) return;
+    if (!StatsEnabled()) return;
     static std::mutex mutex;
     static auto last = std::chrono::steady_clock::now();
     static RecordingThreadCounts before{};
@@ -830,10 +838,24 @@ void report() {
     last = now;
     const auto totals = RecordingThreadTotals();
     const auto flushes = totals.flushes - before.flushes;
+    auto& count = counters();
+    static std::uint64_t submits = 0, submitNs = 0, updates = 0, updateNs = 0, allocations = 0, allocationNs = 0;
+    const auto take = [](const std::atomic<std::uint64_t>& total, std::uint64_t& kept) {
+        const auto now = total.load(std::memory_order_relaxed);
+        const auto delta = now - kept;
+        kept = now;
+        return delta;
+    };
+    const auto submitCount = take(count.submits, submits), submitTime = take(count.submitNs, submitNs);
+    const auto updateCount = take(count.descriptorUpdates, updates), updateTime = take(count.descriptorUpdateNs, updateNs);
+    const auto allocationCount = take(count.descriptorAllocations, allocations), allocationTime = take(count.descriptorAllocationNs, allocationNs);
     std::fprintf(stderr, "[recording] (10 s): %llu commands made on the recording thread, %llu directly; %llu flushes waited (submit %llu, pool %llu, destroy %llu), %.1f us each; the thread spent %.1f ms in commands\n",
         static_cast<unsigned long long>(totals.queued - before.queued), static_cast<unsigned long long>(totals.direct - before.direct), static_cast<unsigned long long>(flushes),
         static_cast<unsigned long long>(totals.submitFlushes - before.submitFlushes), static_cast<unsigned long long>(totals.poolFlushes - before.poolFlushes), static_cast<unsigned long long>(totals.destroyFlushes - before.destroyFlushes),
         flushes == 0 ? 0.0 : static_cast<double>(totals.flushWaitNs - before.flushWaitNs) / 1e3 / static_cast<double>(flushes), static_cast<double>(totals.replayNs - before.replayNs) / 1e6);
+    std::fprintf(stderr, "[recording] (10 s) still on the calling threads: %llu submits %.1f ms, %llu descriptor set updates %.1f ms, %llu descriptor set allocations %.1f ms\n",
+        static_cast<unsigned long long>(submitCount), static_cast<double>(submitTime) / 1e6, static_cast<unsigned long long>(updateCount), static_cast<double>(updateTime) / 1e6,
+        static_cast<unsigned long long>(allocationCount), static_cast<double>(allocationTime) / 1e6);
     before = totals;
 }
 
@@ -847,7 +869,27 @@ VKAPI_ATTR VkResult VKAPI_CALL queueSubmit(VkQueue queue, std::uint32_t count, c
             if (stream->error != VK_SUCCESS) return stream->error;
         }
     }
-    return real().queueSubmit(queue, count, submits, fence);
+    if (!StatsEnabled()) return real().queueSubmit(queue, count, submits, fence);
+    const auto started = nowNs();
+    const auto result = real().queueSubmit(queue, count, submits, fence);
+    counters().submits.fetch_add(1, std::memory_order_relaxed);
+    counters().submitNs.fetch_add(nowNs() - started, std::memory_order_relaxed);
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL timedUpdateDescriptorSets(VkDevice device, std::uint32_t writeCount, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
+    const auto started = nowNs();
+    real().updateDescriptorSets(device, writeCount, writes, copyCount, copies);
+    counters().descriptorUpdates.fetch_add(1, std::memory_order_relaxed);
+    counters().descriptorUpdateNs.fetch_add(nowNs() - started, std::memory_order_relaxed);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL timedAllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets) {
+    const auto started = nowNs();
+    const auto result = real().allocateDescriptorSets(device, info, sets);
+    counters().descriptorAllocations.fetch_add(1, std::memory_order_relaxed);
+    counters().descriptorAllocationNs.fetch_add(nowNs() - started, std::memory_order_relaxed);
+    return result;
 }
 
 void forget(std::span<const VkCommandBuffer> buffers) {
@@ -1014,6 +1056,8 @@ PFN_vkGetDeviceProcAddr RecordOnRecordingThread(VkDevice device, PFN_vkGetDevice
     resolve(table.resetCommandPool, "vkResetCommandPool", true);
     resolve(table.destroyCommandPool, "vkDestroyCommandPool", true);
     resolve(table.destroyDevice, "vkDestroyDevice", true);
+    resolve(table.updateDescriptorSets, "vkUpdateDescriptorSets", false);
+    resolve(table.allocateDescriptorSets, "vkAllocateDescriptorSets", false);
     offer("vkCmdBindPipeline", table.cmdBindPipeline != nullptr, Entry(&ValueCommand<&Real::cmdBindPipeline>::Call));
     offer("vkCmdBindIndexBuffer", table.cmdBindIndexBuffer != nullptr, Entry(&ValueCommand<&Real::cmdBindIndexBuffer>::Call));
     offer("vkCmdFillBuffer", table.cmdFillBuffer != nullptr, Entry(&ValueCommand<&Real::cmdFillBuffer>::Call));
@@ -1075,6 +1119,10 @@ PFN_vkGetDeviceProcAddr RecordOnRecordingThread(VkDevice device, PFN_vkGetDevice
     offer("vkResetCommandPool", true, Entry(&resetCommandPool));
     offer("vkDestroyCommandPool", true, Entry(&destroyCommandPool));
     offer("vkDestroyDevice", true, Entry(&destroyDevice));
+    if (StatsEnabled()) {
+        offer("vkUpdateDescriptorSets", table.updateDescriptorSets != nullptr, Entry(&timedUpdateDescriptorSets));
+        offer("vkAllocateDescriptorSets", table.allocateDescriptorSets != nullptr, Entry(&timedAllocateDescriptorSets));
+    }
 #define APS5_FLUSHING(type, member, name) offer(name, table.member != nullptr, Entry(&FlushingCall<&Real::member>::Call));
     APS5_FLUSHING_DESTROYS(APS5_FLUSHING)
 #undef APS5_FLUSHING
