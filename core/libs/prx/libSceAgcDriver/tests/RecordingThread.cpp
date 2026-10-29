@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -44,6 +45,12 @@ std::vector<Event> events;
 std::thread::id caller;
 VkResult endResult = VK_SUCCESS;
 std::atomic<std::uintptr_t> nextHandle{0x1000};
+
+// APS5_RECORDING_SUBMITS=0 runs the same checks with the submits made by the calling thread.
+bool ThreadSubmits() {
+    const char* value = std::getenv("APS5_RECORDING_SUBMITS");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}
 
 void Note(VkCommandBuffer commands, std::string what) {
     std::lock_guard lock(eventMutex);
@@ -147,10 +154,23 @@ VKAPI_ATTR VkResult VKAPI_CALL mockReset(VkCommandBuffer commands, VkCommandBuff
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL mockSubmit(VkQueue, std::uint32_t count, const VkSubmitInfo* submits, VkFence) {
+VKAPI_ATTR VkResult VKAPI_CALL mockSubmit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits, VkFence) {
+    std::uint32_t buffers = 0;
     for (std::uint32_t s = 0; s < count; ++s) {
         for (std::uint32_t i = 0; i < submits[s].commandBufferCount; ++i) Note(submits[s].pCommandBuffers[i], "submit");
+        buffers += submits[s].commandBufferCount;
     }
+    Note(VK_NULL_HANDLE, "queue " + std::to_string(Value(queue)) + " submit of " + std::to_string(buffers));
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockQueueWaitIdle(VkQueue queue) {
+    Note(VK_NULL_HANDLE, "queue " + std::to_string(Value(queue)) + " idle");
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockDeviceWaitIdle(VkDevice) {
+    Note(VK_NULL_HANDLE, "device idle");
     return VK_SUCCESS;
 }
 
@@ -207,6 +227,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkDestroyCommandPool", reinterpret_cast<PFN_vkVoidFunction>(&mockDestroyPool)},
         {"vkDestroyPipeline", reinterpret_cast<PFN_vkVoidFunction>(&mockDestroyPipeline)},
         {"vkDestroyDevice", reinterpret_cast<PFN_vkVoidFunction>(&mockDestroyDevice)},
+        {"vkQueueWaitIdle", reinterpret_cast<PFN_vkVoidFunction>(&mockQueueWaitIdle)},
+        {"vkDeviceWaitIdle", reinterpret_cast<PFN_vkVoidFunction>(&mockDeviceWaitIdle)},
     };
     for (const auto& entry : entries) {
         if (std::strcmp(entry.name, name) == 0) return entry.function;
@@ -253,9 +275,13 @@ struct Device {
     }
     VkResult Submit(VkCommandBuffer commands) const {
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.commandBufferCount = 1;
+        submit.commandBufferCount = commands != VK_NULL_HANDLE ? 1 : 0;
         submit.pCommandBuffers = &commands;
         return Function<PFN_vkQueueSubmit>("vkQueueSubmit")(Handle<VkQueue>(0x600), 1, &submit, VK_NULL_HANDLE);
+    }
+    // vkQueueWaitIdle: every submit handed to the recording thread is made first.
+    VkResult Idle() const {
+        return Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(Handle<VkQueue>(0x600));
     }
 };
 
@@ -305,6 +331,7 @@ void CommandsAreMadeInOrderOnTheRecordingThreadFromCopies() {
     }
     Expect(device.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands) == VK_SUCCESS, "end on a recorded command buffer returns success");
     Expect(device.Submit(commands) == VK_SUCCESS, "the submit of a recorded command buffer succeeds");
+    device.Idle();
     const auto seen = Taken();
     const std::vector<std::string> expected = {
         "begin 1",
@@ -330,7 +357,9 @@ void CommandsAreMadeInOrderOnTheRecordingThreadFromCopies() {
     }
     Expect(offThread, "every recorded command ran on the recording thread");
     const auto submit = std::find_if(seen.begin(), seen.end(), [](const Event& event) { return event.what == "submit"; });
-    Expect(submit != seen.end() && submit->callerThread, "the submit ran on the caller's thread");
+    Expect(submit != seen.end() && submit->callerThread == !ThreadSubmits(), ThreadSubmits() ? "the submit was made by the recording thread" : "the submit was made by the caller's thread");
+    const auto idle = std::find_if(seen.begin(), seen.end(), [](const Event& event) { return event.what == "queue 1536 idle"; });
+    Expect(submit < idle && idle != seen.end(), "the queue waits for idle after the submit was made");
 }
 
 void CommandBuffersOfOtherPoolsAreRecordedDirectly() {
@@ -350,13 +379,21 @@ void AnEndFailureIsReturnedByTheSubmit() {
     device.Begin(commands);
     endResult = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     Expect(device.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands) == VK_SUCCESS, "end returns before it is made");
-    Expect(device.Submit(commands) == VK_ERROR_OUT_OF_DEVICE_MEMORY, "the submit returns the failure of the end");
-    const auto whats = Whats(Taken(), Value(commands));
+    if (ThreadSubmits()) {
+        Expect(device.Submit(commands) == VK_SUCCESS, "the submit returns before it is made");
+        Expect(device.Idle() == VK_ERROR_OUT_OF_DEVICE_MEMORY, "the next queue wait returns the failure of the end");
+        Expect(device.Idle() == VK_SUCCESS, "...once");
+    } else {
+        Expect(device.Submit(commands) == VK_ERROR_OUT_OF_DEVICE_MEMORY, "the submit returns the failure of the end");
+    }
+    const auto seen = Taken();
+    const auto whats = Whats(seen, Value(commands));
     Expect(std::find(whats.begin(), whats.end(), "submit") == whats.end(), "a command buffer whose end failed is not submitted");
+    if (ThreadSubmits()) Expect(std::any_of(seen.begin(), seen.end(), [](const Event& event) { return event.what == "queue 1536 submit of 0"; }), "its submit is still made, without it, so its fence and semaphores signal");
     endResult = VK_SUCCESS;
     device.Begin(commands);
     device.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands);
-    Expect(device.Submit(commands) == VK_SUCCESS, "a new begin clears the failure");
+    Expect(device.Submit(commands) == VK_SUCCESS && device.Idle() == VK_SUCCESS, "a new begin clears the failure");
 }
 
 void DestroysAndPoolChangesWaitForTheQueuedCommands() {
@@ -396,6 +433,7 @@ void AQueueLongerThanAChunkKeepsItsOrder() {
     }
     device.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands);
     device.Submit(commands);
+    device.Idle();
     const auto whats = Whats(Taken(), Value(commands));
     bool ordered = whats.size() == Count + 3;
     for (std::uint32_t i = 0; ordered && i < Count; ++i) {
@@ -425,6 +463,7 @@ void ThreadsRecordingTheirOwnCommandBuffersKeepEachOrder() {
         });
     }
     for (auto& thread : threads) thread.join();
+    device.Idle();
     const auto seen = Taken();
     for (int t = 0; t < Threads; ++t) {
         const auto whats = Whats(seen, Value(buffers[static_cast<std::size_t>(t)]));
@@ -490,9 +529,36 @@ void RenderPassChainsAreCopiedAndUnknownChainsRefused() {
     }
     device.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands);
     device.Submit(commands);
+    device.Idle();
     const auto whats = Whats(Taken(), Value(commands));
     Expect(whats.size() == 6 && whats[1] == "pass 208 clears 11 12 locations 4 8" && whats[2] == "rendering 1 colors 225 226 depth 227" && whats[3] == "barrier 65536->4096 memory images 240:1->6 located 2 14", "a render pass begin with its sample locations, a rendering begin with its attachments and an image barrier with its sample locations arrive as they were called");
     if (whats.size() > 3) std::fprintf(stderr, "  barrier: %s\n", whats[3].c_str());
+}
+
+void SubmitsKeepTheirOrderWithDirectOnes() {
+    Device device(0x109);
+    const auto recorded = device.Allocate(device.recorded);
+    const auto direct = device.Allocate(device.direct);
+    for (int round = 0; round < 50; ++round) {
+        device.Begin(recorded);
+        for (std::uint32_t i = 0; i < 200; ++i) device.Function<PFN_vkCmdDraw>("vkCmdDraw")(recorded, i, 1, 0, 0);
+        device.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(recorded);
+        device.Submit(recorded);
+        device.Begin(direct);
+        device.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(direct);
+        device.Submit(direct);
+        device.Submit(VK_NULL_HANDLE);
+    }
+    device.Idle();
+    std::vector<std::string> order;
+    for (const auto& event : Taken()) {
+        if (event.what == "submit") order.push_back(event.commands == Value(recorded) ? "recorded" : "direct");
+        if (event.what == "queue 1536 submit of 0") order.push_back("empty");
+    }
+    bool ordered = order.size() == 150;
+    for (std::size_t i = 0; ordered && i < order.size(); ++i) ordered = order[i] == (i % 3 == 0 ? "recorded" : i % 3 == 1 ? "direct" : "empty");
+    Expect(ordered, "submits of recorded command buffers, others and none reach the queue in the order they were made");
+    device.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(device.device);
 }
 
 void UnknownCommandsAreUnavailableAndOtherDevicesPassThrough() {
@@ -525,6 +591,7 @@ int main() {
     ThreadsRecordingTheirOwnCommandBuffersKeepEachOrder();
     RenderPassChainsAreCopiedAndUnknownChainsRefused();
     UnknownCommandsAreUnavailableAndOtherDevicesPassThrough();
+    SubmitsKeepTheirOrderWithDirectOnes();
     DestroyingTheDeviceMakesEveryQueuedCommandFirst();
     if (failures != 0) {
         std::fprintf(stderr, "%d recording thread checks failed\n", failures);

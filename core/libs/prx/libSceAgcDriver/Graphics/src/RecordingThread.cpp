@@ -96,8 +96,7 @@ struct Real {
     X(PFN_vkDestroyDescriptorSetLayout, destroyDescriptorSetLayout, "vkDestroyDescriptorSetLayout") \
     X(PFN_vkResetDescriptorPool, resetDescriptorPool, "vkResetDescriptorPool") \
     X(PFN_vkFreeDescriptorSets, freeDescriptorSets, "vkFreeDescriptorSets") \
-    X(PFN_vkDestroyQueryPool, destroyQueryPool, "vkDestroyQueryPool") \
-    X(PFN_vkDeviceWaitIdle, deviceWaitIdle, "vkDeviceWaitIdle")
+    X(PFN_vkDestroyQueryPool, destroyQueryPool, "vkDestroyQueryPool")
 #define APS5_MEMBER(type, member, name) type member = nullptr;
     APS5_RECORDED_COMMANDS(APS5_MEMBER)
     APS5_FLUSHING_DESTROYS(APS5_MEMBER)
@@ -111,8 +110,12 @@ struct Real {
     PFN_vkResetCommandPool resetCommandPool = nullptr;
     PFN_vkDestroyCommandPool destroyCommandPool = nullptr;
     PFN_vkDestroyDevice destroyDevice = nullptr;
+    PFN_vkDeviceWaitIdle deviceWaitIdle = nullptr;
     PFN_vkUpdateDescriptorSets updateDescriptorSets = nullptr;
     PFN_vkAllocateDescriptorSets allocateDescriptorSets = nullptr;
+    PFN_vkQueueWaitIdle queueWaitIdle = nullptr;
+    PFN_vkQueuePresentKHR queuePresent = nullptr;
+    PFN_vkQueueBindSparse queueBindSparse = nullptr;
 };
 
 Real& real() {
@@ -144,6 +147,8 @@ struct Counters {
     std::atomic<std::uint64_t> queued{0}, direct{0}, flushes{0}, flushWaitNs{0}, submitFlushes{0}, poolFlushes{0}, destroyFlushes{0}, replayNs{0};
     // With the stats switch: the driver calls that stay on the calling threads.
     std::atomic<std::uint64_t> submits{0}, submitNs{0}, descriptorUpdates{0}, descriptorUpdateNs{0}, descriptorAllocations{0}, descriptorAllocationNs{0};
+    // Submits the recording thread made, and the waits for them (submitFlushes counts the waits of submits made on the calling thread).
+    std::atomic<std::uint64_t> threadSubmits{0}, threadSubmitNs{0}, submitQueueFlushes{0}, submitQueueWaitNs{0};
 };
 
 bool StatsEnabled() {
@@ -178,6 +183,20 @@ struct Stream : std::enable_shared_from_this<Stream> {
     ~Stream();
 };
 
+// A vkQueueSubmit the recording thread makes once the command buffers it names are made up to
+// the point of the submit; its arrays are copies.
+struct SubmitItem {
+    VkQueue queue = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    std::vector<VkSubmitInfo> infos;
+    std::vector<VkTimelineSemaphoreSubmitInfo> timelines;
+    std::vector<std::vector<VkSemaphore>> waits, signals;
+    std::vector<std::vector<VkPipelineStageFlags>> stages;
+    std::vector<std::vector<VkCommandBuffer>> buffers;
+    std::vector<std::vector<std::uint64_t>> waitValues, signalValues;
+    std::vector<std::pair<std::shared_ptr<Stream>, std::uint64_t>> targets;
+};
+
 struct Registry {
     std::mutex mutex;
     VkDevice device = VK_NULL_HANDLE;
@@ -196,6 +215,15 @@ struct Registry {
     std::condition_variable readyChanged;
     std::deque<std::shared_ptr<Stream>> ready;
     std::atomic<std::size_t> readyCount{0};
+    std::deque<std::unique_ptr<SubmitItem>> submits;
+    std::atomic<std::uint64_t> submitsQueued{0}, submitsMade{0};
+    std::atomic<std::uint32_t> submitWaiters{0};
+    // The first failure of a submit the recording thread made (or of a begin or end it found
+    // there), returned by every later submit and queue wait.
+    std::atomic<VkResult> submitError{VK_SUCCESS};
+    // One lock per queue around every queue call this layer makes, so the recording thread's
+    // submits never run beside another thread's call on the same queue.
+    std::unordered_map<VkQueue, std::unique_ptr<std::mutex>> queueLocks;
     bool sleeping = false;
     bool stopping = false;
     std::unordered_map<std::string, PFN_vkVoidFunction> thunks;
@@ -204,6 +232,19 @@ struct Registry {
 Registry& registry() {
     static auto& state = *new Registry();
     return state;
+}
+
+std::mutex& queueLock(VkQueue queue) {
+    auto& state = registry();
+    std::lock_guard lock(state.mutex);
+    auto& entry = state.queueLocks[queue];
+    if (entry == nullptr) entry = std::make_unique<std::mutex>();
+    return *entry;
+}
+
+// A failure found on the recording thread, returned once by the next submit or queue wait.
+VkResult takeSubmitError() {
+    return registry().submitError.exchange(VK_SUCCESS, std::memory_order_acq_rel);
 }
 
 Chunk* takeChunk() {
@@ -396,30 +437,79 @@ void replayStream(const std::shared_ptr<Stream>& owner) {
             continue;
         }
         // Caught up: the command buffer's next command is usually a few microseconds away.
-        if (SpinUntil(state.options.spin, [&] { return stream.published.load(std::memory_order_acquire) != stream.consumed || state.readyCount.load(std::memory_order_acquire) != 0; }) && stream.published.load(std::memory_order_acquire) != stream.consumed) continue;
+        if (SpinUntil(state.options.spin, [&] { return stream.published.load(std::memory_order_acquire) != stream.consumed || state.readyCount.load(std::memory_order_acquire) != 0 || state.submitsQueued.load(std::memory_order_acquire) != state.submitsMade.load(std::memory_order_acquire); }) && stream.published.load(std::memory_order_acquire) != stream.consumed) continue;
         stream.scheduled.store(false, std::memory_order_seq_cst);
         if (stream.published.load(std::memory_order_seq_cst) != stream.consumed && !stream.scheduled.exchange(true, std::memory_order_seq_cst)) continue;
         return;
     }
 }
 
+// Makes a submit: first the commands of its command buffers up to the submit, then the submit.
+// A command buffer whose begin or end failed is left out (its semaphores and fence are still
+// signaled, so nothing waits forever) and the failure is kept for the next submit to return.
+void makeSubmit(SubmitItem& item) {
+    auto& state = registry();
+    bool failed = false;
+    for (auto& [stream, target] : item.targets) {
+        if (stream->consumed < target) {
+            PerformanceTimer timing("Recording.Replay");
+            const auto started = nowNs();
+            replayUpTo(*stream, target);
+            counters().replayNs.fetch_add(nowNs() - started, std::memory_order_relaxed);
+            stream->replayed.store(stream->consumed, std::memory_order_seq_cst);
+            if (stream->waiters.load(std::memory_order_seq_cst) != 0) stream->replayed.notify_all();
+        }
+        if (stream->error != VK_SUCCESS) {
+            auto expected = VK_SUCCESS;
+            state.submitError.compare_exchange_strong(expected, stream->error);
+            failed = true;
+        }
+    }
+    if (failed) {
+        for (auto& info : item.infos) info.commandBufferCount = 0;
+    }
+    PerformanceTimer timing("Recording.Submit");
+    const auto started = nowNs();
+    VkResult result;
+    {
+        std::lock_guard lock(queueLock(item.queue));
+        result = real().queueSubmit(item.queue, static_cast<std::uint32_t>(item.infos.size()), item.infos.data(), item.fence);
+    }
+    counters().threadSubmits.fetch_add(1, std::memory_order_relaxed);
+    counters().threadSubmitNs.fetch_add(nowNs() - started, std::memory_order_relaxed);
+    if (result != VK_SUCCESS) {
+        auto expected = VK_SUCCESS;
+        state.submitError.compare_exchange_strong(expected, result);
+    }
+    state.submitsMade.fetch_add(1, std::memory_order_seq_cst);
+    if (state.submitWaiters.load(std::memory_order_seq_cst) != 0) state.submitsMade.notify_all();
+}
+
 void runRecordingThread() {
     auto& state = registry();
     if (state.options.onStart) state.options.onStart();
     for (;;) {
-        SpinUntil(state.options.spin, [&] { return state.readyCount.load(std::memory_order_acquire) != 0; });
+        SpinUntil(state.options.spin, [&] { return state.readyCount.load(std::memory_order_acquire) != 0 || state.submitsQueued.load(std::memory_order_acquire) != state.submitsMade.load(std::memory_order_acquire); });
         std::shared_ptr<Stream> stream;
+        std::unique_ptr<SubmitItem> submit;
         {
             std::unique_lock lock(state.readyMutex);
             state.sleeping = true;
-            state.readyChanged.wait(lock, [&] { return !state.ready.empty() || state.stopping; });
+            state.readyChanged.wait(lock, [&] { return !state.ready.empty() || !state.submits.empty() || state.stopping; });
             state.sleeping = false;
-            if (state.ready.empty()) return;
-            stream = std::move(state.ready.front());
-            state.ready.pop_front();
-            state.readyCount.fetch_sub(1, std::memory_order_release);
+            if (!state.submits.empty()) {
+                submit = std::move(state.submits.front());
+                state.submits.pop_front();
+            } else if (!state.ready.empty()) {
+                stream = std::move(state.ready.front());
+                state.ready.pop_front();
+                state.readyCount.fetch_sub(1, std::memory_order_release);
+            } else {
+                return;
+            }
         }
-        replayStream(stream);
+        if (submit != nullptr) makeSubmit(*submit);
+        else replayStream(stream);
     }
 }
 
@@ -872,28 +962,140 @@ void report() {
         static_cast<unsigned long long>(totals.queued - before.queued), static_cast<unsigned long long>(totals.direct - before.direct), static_cast<unsigned long long>(flushes),
         static_cast<unsigned long long>(totals.submitFlushes - before.submitFlushes), static_cast<unsigned long long>(totals.poolFlushes - before.poolFlushes), static_cast<unsigned long long>(totals.destroyFlushes - before.destroyFlushes),
         flushes == 0 ? 0.0 : static_cast<double>(totals.flushWaitNs - before.flushWaitNs) / 1e3 / static_cast<double>(flushes), static_cast<double>(totals.replayNs - before.replayNs) / 1e6);
+    static std::uint64_t threadSubmits = 0, threadSubmitNs = 0, queueFlushes = 0, queueWaitNs = 0;
+    const auto threadCount = take(count.threadSubmits, threadSubmits), threadTime = take(count.threadSubmitNs, threadSubmitNs);
+    const auto queueFlushCount = take(count.submitQueueFlushes, queueFlushes), queueWaitTime = take(count.submitQueueWaitNs, queueWaitNs);
+    std::fprintf(stderr, "[recording] (10 s) submits made by the recording thread: %llu, %.1f ms; waits for them (queue idle, present, direct submits): %llu, %.1f ms\n",
+        static_cast<unsigned long long>(threadCount), static_cast<double>(threadTime) / 1e6, static_cast<unsigned long long>(queueFlushCount), static_cast<double>(queueWaitTime) / 1e6);
     std::fprintf(stderr, "[recording] (10 s) still on the calling threads: %llu submits %.1f ms, %llu descriptor set updates %.1f ms, %llu descriptor set allocations %.1f ms\n",
         static_cast<unsigned long long>(submitCount), static_cast<double>(submitTime) / 1e6, static_cast<unsigned long long>(updateCount), static_cast<double>(updateTime) / 1e6,
         static_cast<unsigned long long>(allocationCount), static_cast<double>(allocationTime) / 1e6);
     before = totals;
 }
 
+// APS5_RECORDING_SUBMITS: on unless set to 0 (with the recording thread on).
+bool SubmitsOnThread() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_RECORDING_SUBMITS");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+// A copy of the submit for the recording thread, or null when it names a pNext chain the copy
+// does not know (that submit is made by the calling thread).
+std::unique_ptr<SubmitItem> copySubmit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    auto item = std::make_unique<SubmitItem>();
+    item->queue = queue;
+    item->fence = fence;
+    item->infos.assign(submits, submits + count);
+    item->timelines.resize(count);
+    item->waits.resize(count);
+    item->signals.resize(count);
+    item->stages.resize(count);
+    item->buffers.resize(count);
+    item->waitValues.resize(count);
+    item->signalValues.resize(count);
+    for (std::uint32_t s = 0; s < count; ++s) {
+        auto& info = item->infos[s];
+        const auto& from = submits[s];
+        item->waits[s].assign(from.pWaitSemaphores, from.pWaitSemaphores + from.waitSemaphoreCount);
+        item->stages[s].assign(from.pWaitDstStageMask, from.pWaitDstStageMask + (from.pWaitDstStageMask != nullptr ? from.waitSemaphoreCount : 0));
+        item->signals[s].assign(from.pSignalSemaphores, from.pSignalSemaphores + from.signalSemaphoreCount);
+        item->buffers[s].assign(from.pCommandBuffers, from.pCommandBuffers + from.commandBufferCount);
+        info.pWaitSemaphores = item->waits[s].data();
+        info.pWaitDstStageMask = from.pWaitDstStageMask != nullptr ? item->stages[s].data() : nullptr;
+        info.pSignalSemaphores = item->signals[s].data();
+        info.pCommandBuffers = item->buffers[s].data();
+        if (from.pNext == nullptr) continue;
+        const auto* timeline = static_cast<const VkTimelineSemaphoreSubmitInfo*>(from.pNext);
+        if (timeline->sType != VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO || timeline->pNext != nullptr) return nullptr;
+        auto& copy = item->timelines[s];
+        copy = *timeline;
+        item->waitValues[s].assign(timeline->pWaitSemaphoreValues, timeline->pWaitSemaphoreValues + (timeline->pWaitSemaphoreValues != nullptr ? timeline->waitSemaphoreValueCount : 0));
+        item->signalValues[s].assign(timeline->pSignalSemaphoreValues, timeline->pSignalSemaphoreValues + (timeline->pSignalSemaphoreValues != nullptr ? timeline->signalSemaphoreValueCount : 0));
+        copy.pWaitSemaphoreValues = timeline->pWaitSemaphoreValues != nullptr ? item->waitValues[s].data() : nullptr;
+        copy.pSignalSemaphoreValues = timeline->pSignalSemaphoreValues != nullptr ? item->signalValues[s].data() : nullptr;
+        info.pNext = &copy;
+    }
+    return item;
+}
+
+// Waits until the recording thread has made every submit handed to it so far.
+void flushSubmits() {
+    auto& state = registry();
+    const auto target = state.submitsQueued.load(std::memory_order_seq_cst);
+    if (state.submitsMade.load(std::memory_order_acquire) >= target) return;
+    PerformanceTimer timing("Recording.Flush");
+    const auto started = nowNs();
+    if (!SpinUntil(state.options.spin, [&] { return state.submitsMade.load(std::memory_order_acquire) >= target; })) {
+        state.submitWaiters.fetch_add(1, std::memory_order_seq_cst);
+        for (auto seen = state.submitsMade.load(std::memory_order_seq_cst); seen < target; seen = state.submitsMade.load(std::memory_order_seq_cst)) state.submitsMade.wait(seen, std::memory_order_seq_cst);
+        state.submitWaiters.fetch_sub(1, std::memory_order_seq_cst);
+    }
+    counters().submitQueueFlushes.fetch_add(1, std::memory_order_relaxed);
+    counters().submitQueueWaitNs.fetch_add(nowNs() - started, std::memory_order_relaxed);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL queueSubmit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
     report();
+    auto& state = registry();
+    std::vector<std::pair<std::shared_ptr<Stream>, std::uint64_t>> targets;
     for (std::uint32_t s = 0; s < count; ++s) {
         for (std::uint32_t i = 0; i < submits[s].commandBufferCount; ++i) {
             auto* stream = streamFor(submits[s].pCommandBuffers[i]);
-            if (stream == nullptr) continue;
-            flush(*stream, &Counters::submitFlushes);
-            if (stream->error != VK_SUCCESS) return stream->error;
+            if (stream != nullptr) targets.emplace_back(stream->shared_from_this(), stream->published.load(std::memory_order_seq_cst));
         }
     }
+    if (const auto failed = takeSubmitError(); failed != VK_SUCCESS) return failed;
+    if (!targets.empty() && SubmitsOnThread()) {
+        if (auto item = copySubmit(queue, count, submits, fence)) {
+            item->targets = std::move(targets);
+            std::lock_guard lock(state.readyMutex);
+            state.submits.push_back(std::move(item));
+            state.submitsQueued.fetch_add(1, std::memory_order_seq_cst);
+            if (state.sleeping) state.readyChanged.notify_one();
+            return VK_SUCCESS;
+        }
+    }
+    // Made here: after every submit handed to the recording thread, so the queue sees them in order.
+    flushSubmits();
+    for (const auto& [stream, target] : targets) {
+        flush(*stream, &Counters::submitFlushes);
+        if (stream->error != VK_SUCCESS) return stream->error;
+    }
+    std::lock_guard lock(queueLock(queue));
     if (!StatsEnabled()) return real().queueSubmit(queue, count, submits, fence);
     const auto started = nowNs();
     const auto result = real().queueSubmit(queue, count, submits, fence);
     counters().submits.fetch_add(1, std::memory_order_relaxed);
     counters().submitNs.fetch_add(nowNs() - started, std::memory_order_relaxed);
     return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL queueWaitIdle(VkQueue queue) {
+    flushSubmits();
+    if (const auto failed = takeSubmitError(); failed != VK_SUCCESS) return failed;
+    std::lock_guard lock(queueLock(queue));
+    return real().queueWaitIdle(queue);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL queuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
+    flushSubmits();
+    std::lock_guard lock(queueLock(queue));
+    return real().queuePresent(queue, info);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL queueBindSparse(VkQueue queue, std::uint32_t count, const VkBindSparseInfo* binds, VkFence fence) {
+    flushSubmits();
+    std::lock_guard lock(queueLock(queue));
+    return real().queueBindSparse(queue, count, binds, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL deviceWaitIdle(VkDevice device) {
+    flushAll(&Counters::destroyFlushes);
+    flushSubmits();
+    return real().deviceWaitIdle(device);
 }
 
 VKAPI_ATTR void VKAPI_CALL timedUpdateDescriptorSets(VkDevice device, std::uint32_t writeCount, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
@@ -1087,6 +1289,10 @@ PFN_vkGetDeviceProcAddr RecordOnRecordingThread(VkDevice device, PFN_vkGetDevice
     resolve(table.resetCommandPool, "vkResetCommandPool", true);
     resolve(table.destroyCommandPool, "vkDestroyCommandPool", true);
     resolve(table.destroyDevice, "vkDestroyDevice", true);
+    resolve(table.deviceWaitIdle, "vkDeviceWaitIdle", true);
+    resolve(table.queueWaitIdle, "vkQueueWaitIdle", true);
+    resolve(table.queuePresent, "vkQueuePresentKHR", false);
+    resolve(table.queueBindSparse, "vkQueueBindSparse", false);
     resolve(table.updateDescriptorSets, "vkUpdateDescriptorSets", false);
     resolve(table.allocateDescriptorSets, "vkAllocateDescriptorSets", false);
     offer("vkCmdBindPipeline", table.cmdBindPipeline != nullptr, Entry(&ValueCommand<&Real::cmdBindPipeline>::Call));
@@ -1150,6 +1356,10 @@ PFN_vkGetDeviceProcAddr RecordOnRecordingThread(VkDevice device, PFN_vkGetDevice
     offer("vkResetCommandPool", true, Entry(&resetCommandPool));
     offer("vkDestroyCommandPool", true, Entry(&destroyCommandPool));
     offer("vkDestroyDevice", true, Entry(&destroyDevice));
+    offer("vkDeviceWaitIdle", true, Entry(&deviceWaitIdle));
+    offer("vkQueueWaitIdle", true, Entry(&queueWaitIdle));
+    offer("vkQueuePresentKHR", table.queuePresent != nullptr, Entry(&queuePresent));
+    offer("vkQueueBindSparse", table.queueBindSparse != nullptr, Entry(&queueBindSparse));
     if (StatsEnabled()) {
         offer("vkUpdateDescriptorSets", table.updateDescriptorSets != nullptr, Entry(&timedUpdateDescriptorSets));
         offer("vkAllocateDescriptorSets", table.allocateDescriptorSets != nullptr, Entry(&timedAllocateDescriptorSets));
@@ -1178,6 +1388,7 @@ void StopRecordingThread(VkDevice device) noexcept {
         if (device != state.device || !state.thread.joinable()) return;
     }
     flushAll(&Counters::destroyFlushes);
+    flushSubmits();
     {
         std::lock_guard lock(state.readyMutex);
         state.stopping = true;
@@ -1189,6 +1400,9 @@ void StopRecordingThread(VkDevice device) noexcept {
     gone.swap(state.streams);
     state.pools.clear();
     state.ready.clear();
+    state.submits.clear();
+    state.submitError.store(VK_SUCCESS, std::memory_order_release);
+    state.queueLocks.clear();
     state.device = VK_NULL_HANDLE;
     state.epoch.fetch_add(1, std::memory_order_acq_rel);
     state.generation.fetch_add(1, std::memory_order_acq_rel);
