@@ -83,7 +83,13 @@ VKAPI_ATTR void VKAPI_CALL mockPipelineBarrier(VkCommandBuffer commands, VkPipel
     std::string text = "barrier " + std::to_string(source) + "->" + std::to_string(destination) + " memory";
     for (std::uint32_t i = 0; i < memoryCount; ++i) text += " " + std::to_string(memory[i].srcAccessMask) + "/" + std::to_string(memory[i].dstAccessMask);
     text += " images";
-    for (std::uint32_t i = 0; i < imageCount; ++i) text += " " + std::to_string(Value(images[i].image)) + ":" + std::to_string(images[i].oldLayout) + "->" + std::to_string(images[i].newLayout);
+    for (std::uint32_t i = 0; i < imageCount; ++i) {
+        text += " " + std::to_string(Value(images[i].image)) + ":" + std::to_string(images[i].oldLayout) + "->" + std::to_string(images[i].newLayout);
+        if (images[i].pNext == nullptr) continue;
+        const auto& locations = *static_cast<const VkSampleLocationsInfoEXT*>(images[i].pNext);
+        text += " located";
+        for (std::uint32_t s = 0; s < locations.sampleLocationsCount; ++s) text += " " + std::to_string(static_cast<int>(locations.pSampleLocations[s].y * 16.0f));
+    }
     Note(commands, text);
 }
 
@@ -463,6 +469,15 @@ void RenderPassChainsAreCopiedAndUnknownChainsRefused() {
         device.Function<PFN_vkCmdBeginRenderingKHR>("vkCmdBeginRenderingKHR")(commands, &rendering);
         colors[1].imageView = VK_NULL_HANDLE;
         depth.imageView = VK_NULL_HANDLE;
+        VkSampleLocationEXT depthLocations[2] = {{0.5f, 0.125f}, {0.5f, 0.875f}};
+        VkSampleLocationsInfoEXT depthInfo{VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT, nullptr, VK_SAMPLE_COUNT_2_BIT, {1, 1}, 2, depthLocations};
+        VkImageMemoryBarrier located{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, &depthInfo};
+        located.image = Handle<VkImage>(0xf0);
+        located.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        located.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        device.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &located);
+        depthLocations[1].y = 0.0f;
+        depthInfo.sampleLocationsCount = 0;
         VkMemoryBarrier2 unknown{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER, &unknown};
         bool refused = false;
@@ -476,7 +491,8 @@ void RenderPassChainsAreCopiedAndUnknownChainsRefused() {
     device.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands);
     device.Submit(commands);
     const auto whats = Whats(Taken(), Value(commands));
-    Expect(whats.size() == 5 && whats[1] == "pass 208 clears 11 12 locations 4 8" && whats[2] == "rendering 1 colors 225 226 depth 227", "a render pass begin with its sample locations, and a rendering begin with its attachments, arrive as they were called");
+    Expect(whats.size() == 6 && whats[1] == "pass 208 clears 11 12 locations 4 8" && whats[2] == "rendering 1 colors 225 226 depth 227" && whats[3] == "barrier 65536->4096 memory images 240:1->6 located 2 14", "a render pass begin with its sample locations, a rendering begin with its attachments and an image barrier with its sample locations arrive as they were called");
+    if (whats.size() > 3) std::fprintf(stderr, "  barrier: %s\n", whats[3].c_str());
 }
 
 void UnknownCommandsAreUnavailableAndOtherDevicesPassThrough() {

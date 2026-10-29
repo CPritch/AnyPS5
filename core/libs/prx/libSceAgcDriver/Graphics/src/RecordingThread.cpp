@@ -504,9 +504,25 @@ struct PipelineBarrierCall {
         APS5_DIRECT_OR_STREAM(cmdPipelineBarrier, source, destination, dependency, memoryCount, memory, bufferCount, buffers, imageCount, images)
         for (std::uint32_t i = 0; i < memoryCount; ++i) requireNoChain(memory[i].pNext, "VkMemoryBarrier");
         for (std::uint32_t i = 0; i < bufferCount; ++i) requireNoChain(buffers[i].pNext, "VkBufferMemoryBarrier");
-        for (std::uint32_t i = 0; i < imageCount; ++i) requireNoChain(images[i].pNext, "VkImageMemoryBarrier");
-        queue<PipelineBarrierCall>(*stream, Room<VkMemoryBarrier>(memoryCount) + Room<VkBufferMemoryBarrier>(bufferCount) + Room<VkImageMemoryBarrier>(imageCount), [&](PipelineBarrierCall& c, Packer& p) {
-            c = {source, destination, dependency, memoryCount, bufferCount, imageCount, p.Put(memory, memoryCount), p.Put(buffers, bufferCount), p.Put(images, imageCount)};
+        // An image barrier may carry the sample locations of a depth image (VkSampleLocationsInfoEXT,
+        // SampleOrder.cpp's transitionLocated): copied with its locations.
+        std::size_t extra = Room<VkMemoryBarrier>(memoryCount) + Room<VkBufferMemoryBarrier>(bufferCount) + Room<VkImageMemoryBarrier>(imageCount);
+        for (std::uint32_t i = 0; i < imageCount; ++i) {
+            if (images[i].pNext == nullptr) continue;
+            const auto* locations = static_cast<const VkSampleLocationsInfoEXT*>(images[i].pNext);
+            if (locations->sType != VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT) requireNoChain(images[i].pNext, "VkImageMemoryBarrier");
+            requireNoChain(locations->pNext, "VkSampleLocationsInfoEXT");
+            extra += Room<VkSampleLocationsInfoEXT>(1) + Room<VkSampleLocationEXT>(locations->sampleLocationsCount);
+        }
+        queue<PipelineBarrierCall>(*stream, extra, [&](PipelineBarrierCall& c, Packer& p) {
+            auto* copies = p.Put(images, imageCount);
+            c = {source, destination, dependency, memoryCount, bufferCount, imageCount, p.Put(memory, memoryCount), p.Put(buffers, bufferCount), copies};
+            for (std::uint32_t i = 0; i < imageCount; ++i) {
+                if (images[i].pNext == nullptr) continue;
+                auto* locations = p.Put(static_cast<const VkSampleLocationsInfoEXT*>(images[i].pNext), 1);
+                locations->pSampleLocations = p.Put(locations->pSampleLocations, locations->sampleLocationsCount);
+                copies[i].pNext = locations;
+            }
         });
     }
 };
@@ -994,16 +1010,22 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL recordingDeviceProc(VkDevice device, co
     auto& state = registry();
     if (device != state.device) return state.resolver(device, name);
     // Call sites resolve by name on every call (Context::Function), so the answer is kept per
-    // thread for each name pointer, checked against the name it was given for.
+    // thread for each name pointer, checked against the name it was given for. Plain entries in a
+    // fixed table: static destructors at exit still resolve through here after the thread's
+    // thread_local objects are gone.
     struct Kept {
-        std::string name;
-        VkDevice device = VK_NULL_HANDLE;
-        std::uint64_t generation = 0;
-        PFN_vkVoidFunction function = nullptr;
+        const char* pointer;
+        VkDevice device;
+        std::uint64_t generation;
+        PFN_vkVoidFunction function;
+        char name[64];
     };
-    thread_local std::unordered_map<const char*, Kept> kept;
+    constexpr std::size_t KeptEntries = 512;
+    thread_local Kept kept[KeptEntries];
     const auto generation = state.generation.load(std::memory_order_acquire);
-    if (const auto found = kept.find(name); found != kept.end() && found->second.device == device && found->second.generation == generation && found->second.name == name) return found->second.function;
+    auto& slot = kept[(reinterpret_cast<std::uintptr_t>(name) >> 3u) % KeptEntries];
+    const bool fits = std::strlen(name) < sizeof(slot.name);
+    if (fits && slot.pointer == name && slot.device == device && slot.generation == generation && std::strcmp(slot.name, name) == 0) return slot.function;
     PFN_vkVoidFunction function = nullptr;
     if (std::strcmp(name, "vkGetDeviceProcAddr") == 0) function = reinterpret_cast<PFN_vkVoidFunction>(&recordingDeviceProc);
     else if (const auto thunk = thunkFor(name)) function = thunk;
@@ -1013,7 +1035,13 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL recordingDeviceProc(VkDevice device, co
         std::fprintf(stderr, "[recording] %s has no recording-thread entry and is unavailable while APS5_RECORDING_THREAD is on\n", name);
         function = nullptr;
     } else function = state.resolver(device, name);
-    kept.insert_or_assign(name, Kept{name, device, generation, function});
+    if (fits) {
+        slot.pointer = name;
+        slot.device = device;
+        slot.generation = generation;
+        slot.function = function;
+        std::memcpy(slot.name, name, std::strlen(name) + 1);
+    }
     return function;
 }
 
