@@ -51,6 +51,16 @@ std::uint64_t CommitterAffinityMask() {
     return mask;
 }
 
+std::uint64_t RecordingAffinityMask() {
+    static const std::uint64_t mask = [] {
+        const auto requested = CpuTopology::MaskFromEnvironment("APS5_RECORDING_AFFINITY_MASK");
+        if (requested != 0) return requested;
+        const auto& layout = CpuTopology::Get();
+        return layout.hybrid ? layout.efficient : std::uint64_t{0};
+    }();
+    return mask;
+}
+
 void PinWorkerThread(const char* role) {
     NameThread(role);
     static std::once_flag summary;
@@ -61,6 +71,12 @@ void PinCommitterThread(const char* role) {
     NameThread(role);
     static std::once_flag summary;
     PinThread(role, CommitterAffinityMask(), summary, "draw committer and finisher");
+}
+
+void PinRecordingThread(const char* role) {
+    NameThread(role);
+    static std::once_flag summary;
+    PinThread(role, RecordingAffinityMask(), summary, "recording thread");
 }
 
 }
