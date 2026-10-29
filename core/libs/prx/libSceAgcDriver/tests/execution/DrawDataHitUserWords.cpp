@@ -180,7 +180,8 @@ void UnreadUserWordsKeepTheStage(bool verify) {
     Require(counters.dataStagesCompiled - moved.dataStagesCompiled >= 1, "a draw that pointed the pixel stage at another buffer descriptor reused the pixel stage: " + Counts(counters));
     if (!verify) Require(counters.dataStagesReused - moved.dataStagesReused == 1, "a draw that changed only the pixel stage's descriptor pointer did not reuse the vertex stage: " + Counts(counters));
 
-    const bool refresh = std::getenv("APS5_DRAW_PIPELINE") != nullptr;
+    const char* drawPipeline = std::getenv("APS5_DRAW_PIPELINE");
+    const bool refresh = drawPipeline == nullptr || drawPipeline[0] != '0';
     for (const std::uint32_t unread : {0x33u, 0x44u}) {
         commands.clear();
         PixelUserData(commands, second, unread);

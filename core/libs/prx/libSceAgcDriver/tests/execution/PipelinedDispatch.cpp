@@ -141,7 +141,7 @@ int main() {
             if (!probe) return VulkanTestSkipped;
         }
         const char* dispatchSwitch = std::getenv("APS5_PIPELINE_DISPATCH");
-        const bool pipelinedDispatch = dispatchSwitch != nullptr && dispatchSwitch[0] != '\0' && dispatchSwitch[0] != '0';
+        const bool pipelinedDispatch = dispatchSwitch == nullptr || dispatchSwitch[0] != '0';
 
         Shader shader{};
         shader.file_header = 0x34333231;
