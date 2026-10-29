@@ -5168,7 +5168,7 @@ GuestBufferMemory::~GuestBufferMemory() {
 bool GuestBufferMemory::StageFromShadow() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_STAGE_FROM_SHADOW");
-        return value != nullptr && std::strcmp(value, "0") != 0 && UnitShadowEnabled();
+        return (value == nullptr || std::strcmp(value, "0") != 0) && UnitShadowEnabled();
     }();
     return enabled;
 }

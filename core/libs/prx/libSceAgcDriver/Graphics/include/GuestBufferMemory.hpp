@@ -326,11 +326,12 @@ public:
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
-    // APS5_STAGE_FROM_SHADOW: a staged region's copy-in reads the units a unit shadow holds fresh
-    // from their slabs, device to device, and the flush before it leaves unpublished the units
-    // wholly inside a range its copy-back stores (ShadowStagedRanges): that copy-back stores every
-    // byte of those units into the import, the shadow's included, so publishing them first only
-    // moved the bytes across the bus twice. Every other unit the flush reaches is published as before.
+    // APS5_STAGE_FROM_SHADOW (on by default in this fork, 0 turns it off): a staged region's
+    // copy-in reads the units a unit shadow holds fresh from their slabs, device to device, and
+    // the flush before it leaves unpublished the units wholly inside a range its copy-back stores
+    // (ShadowStagedRanges): that copy-back stores every byte of those units into the import, the
+    // shadow's included, so publishing them first only moved the bytes across the bus twice.
+    // Every other unit the flush reaches is published as before.
     static bool StageFromShadow();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ShadowStagedRanges() const;
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
