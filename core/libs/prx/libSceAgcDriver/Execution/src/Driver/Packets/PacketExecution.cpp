@@ -583,23 +583,26 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
-    const bool deferredEnd = pipelined && orderedCompletion && deferredLabels().labels.empty() && submission.rewindTail == nullptr && !finisherSettlesSubmissions();
+    const bool orderedEnd = pipelined && orderedCompletion && deferredLabels().labels.empty();
+    const bool rewindReady = orderedEnd && submission.rewindTail != nullptr && (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0;
+    const bool deferredEnd = orderedEnd && (submission.rewindTail == nullptr || rewindReady) && !finisherSettlesSubmissions();
     if (submission.queue == 0 && !deferredEnd) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherEnd);
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
-    if (pipelined && orderedCompletion && deferredLabels().labels.empty()) {
+    if (orderedEnd) {
         if (submission.rewindTail == nullptr) {
             if (deferredEnd) settleFinisher.queue0 = false;
             deferCompletion(submission);
             return;
         }
-        if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
+        if (rewindReady) {
             DrawPipeline::Queue0().Enqueue([this, progress = submission.progress] {
                 submitOpenWork(progress);
                 wakeQueueZeroForCompletions();
             }, {}, 0, {}, {}, false, DrawPipeline::ItemKind::Completion);
             endTiming.Finish();
+            if (deferredEnd) settleFinisher.queue0 = false;
             executeRewindTail(submission);
             return;
         }
