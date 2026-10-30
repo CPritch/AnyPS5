@@ -199,7 +199,7 @@ void DrawFinisher::NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits) {
 }
 
 std::string DrawFinisher::DrainText() {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw", "item enqueue"};
     std::string text = "; worker drains of the finisher (drained/skipped):";
     for (std::size_t i = 0; i < names.size(); ++i) {
         char item[64];
@@ -375,8 +375,36 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
+namespace {
+
+bool ItemsThroughFinisher() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_FINISHER_ITEMS");
+        return text == nullptr || text[0] != '0';
+    }();
+    return enabled;
+}
+
+}
+
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, ItemKind kind) {
-    if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherEnqueue);
+    if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
+        const bool forward = ItemsThroughFinisher() && DrawFinisher::Overlap() && !draw && reads.empty();
+        DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Enqueue, !forward);
+        if (forward) {
+            DrawFinisher::Pending held;
+            held.unknown = false;
+            held.writes = writes;
+            if (labelAddress != 0 && !labelBytes.empty()) held.writes.emplace_back(labelAddress, labelAddress + labelBytes.size());
+            held.labelAddress = labelAddress;
+            held.labelBytes = labelBytes;
+            DrawFinisher::Get().Enqueue([this, commit = std::move(commit), writes = std::move(writes), labelAddress, labelBytes = std::move(labelBytes), kind]() mutable {
+                Enqueue(std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), {}, false, kind);
+            }, std::move(held));
+            return;
+        }
+        DrawFinisher::Get().Drain(QueueWaits::Site::FinisherEnqueue);
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();

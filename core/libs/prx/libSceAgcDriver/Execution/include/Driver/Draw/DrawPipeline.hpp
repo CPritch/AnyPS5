@@ -163,7 +163,7 @@ public:
     bool PendingOverlapsAny(std::span<const Range> ranges);
     bool PendingKey(std::uint64_t key, std::uint64_t shape);
     static bool LookupDrainsEvery();
-    enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, Count };
+    enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, Enqueue, Count };
     static void NoteDrain(DrainSite site, bool drained);
     static std::string DrainText();
     static void NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits);
