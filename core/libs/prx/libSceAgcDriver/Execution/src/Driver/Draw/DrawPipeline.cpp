@@ -496,6 +496,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     }
     kindCommits = {};
     kindCommitNs = {};
+    char targetedText[160];
+    std::snprintf(targetedText, sizeof(targetedText), "; targeted waits %llu (%.1f ms), %.1f items left queued behind each", static_cast<unsigned long long>(targetedWaits), static_cast<double>(targetedWaitNs) / 1e6, targetedWaits == 0 ? 0.0 : static_cast<double>(targetedBehind) / static_cast<double>(targetedWaits));
+    drainText += targetedText;
+    targetedWaits = targetedWaitNs = targetedBehind = 0;
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
@@ -573,7 +577,7 @@ void DrawPipeline::run() {
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+        if ((idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) || targetWaiters != 0) idle.notify_all();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -616,6 +620,44 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
     drainOpcodeNs[std::min<std::uint32_t>(opcode, 0x100)] += waited;
     drainWaitNs[index] += waited;
+    if (DrawFinisher::OnFinisherThread()) QueueWaits::Note(QueueWaits::Site::PipelineDrainFinisher, start);
+    rethrowFailure();
+}
+
+void DrawPipeline::WaitWritten(std::uint64_t address, std::size_t bytes, DrainReason reason, std::uint32_t opcode) {
+    static const bool targeted = [] {
+        const char* text = std::getenv("APS5_TARGETED_WAITS");
+        return text == nullptr || text[0] != '0';
+    }();
+    const auto end = address + bytes;
+    const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
+    if (!targeted || (finisherBusy && (!DrawFinisher::Overlap() || DrawFinisher::Get().PendingOverlaps(address, end)))) {
+        Drain(reason, opcode);
+        return;
+    }
+    drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t target = 0;
+    {
+        std::lock_guard lock(mutex);
+        for (std::size_t i = items.size(); i-- > 0;) {
+            const auto& writes = items[i].writes;
+            if (std::none_of(writes.begin(), writes.end(), [&](const Range& range) { return address < range.second && range.first < end; })) continue;
+            target = retiredItems.load(std::memory_order_relaxed) + i + 1;
+            targetedBehind += items.size() - i - 1;
+            break;
+        }
+    }
+    if (target == 0) return;
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline wait under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
+    PerformanceTimer timing("DrawPipeline.WaitWritten");
+    const auto start = std::chrono::steady_clock::now();
+    SpinUntil(HandoffSpinWindow() * 2, [&] { return retiredItems.load(std::memory_order_acquire) >= target; });
+    std::unique_lock lock(mutex);
+    ++targetWaiters;
+    idle.wait(lock, [&] { return retiredItems.load(std::memory_order_acquire) >= target || failure != nullptr || stopped; });
+    --targetWaiters;
+    ++targetedWaits;
+    targetedWaitNs += elapsedNs(start);
     if (DrawFinisher::OnFinisherThread()) QueueWaits::Note(QueueWaits::Site::PipelineDrainFinisher, start);
     rethrowFailure();
 }

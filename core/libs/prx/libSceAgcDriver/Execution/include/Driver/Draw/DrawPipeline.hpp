@@ -73,6 +73,7 @@ public:
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    void WaitWritten(std::uint64_t address, std::size_t bytes, DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     void ReleaseRetired();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
@@ -121,6 +122,10 @@ private:
     std::atomic<std::uint64_t> decodeDrains{0};
     std::uint64_t reportedDecodeDrains = 0;
     std::uint32_t idleWaiters = 0;
+    std::uint32_t targetWaiters = 0;
+    std::uint64_t targetedWaits = 0;
+    std::uint64_t targetedWaitNs = 0;
+    std::uint64_t targetedBehind = 0;
     std::size_t resumeAt = 0;
     bool committerWaiting = false;
     bool stopped = false;

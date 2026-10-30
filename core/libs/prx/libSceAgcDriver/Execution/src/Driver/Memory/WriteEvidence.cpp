@@ -224,7 +224,7 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
     if (checksQueuedWrites()) {
         if (overQueuedWrite(address, bytes)) {
             const auto opcode = GuestMemory::CurrentPacket().opcode;
-            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture, opcode < 0x100 ? opcode : 0x100);
+            DrawPipeline::Queue0().WaitWritten(address, bytes, DrawPipeline::DrainReason::Capture, opcode < 0x100 ? opcode : 0x100);
         }
     } else if (QueueWaits::Enabled() && DrawFinisher::OnFinisherThread()) {
         overQueuedWrite(address, bytes);

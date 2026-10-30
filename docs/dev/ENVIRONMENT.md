@@ -72,6 +72,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 
 | Name | Kind | Source | Default | Description |
 |------|------|--------|---------|-------------|
+| `APS5_TARGETED_WAITS` | string | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp` |  | on by default in this fork: a capture over a write still queued in the queue-0 draw pipeline waits until the latest queued item that writes the range has been committed, instead of draining the whole pipeline; the [draw] line counts these waits and how many items they left queued behind; a value starting with `0` drains the pipeline as before |
 | `APS5_TRACE_LABEL` | integer | `core/libs/prx/libSceAgc/Cb/src/Sync.cpp`, `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/LabelHistory.cpp` | 0 | hex guest address; logs a matching RELEASE_MEM when recorded, and nearby RELEASE_MEM, WRITE_DATA, COPY_DATA, DMA_DATA and WAIT_REG_MEM packets when executed |
 
 ### libSceAgcDriver
