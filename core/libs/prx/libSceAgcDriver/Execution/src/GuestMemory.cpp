@@ -2564,6 +2564,10 @@ void CountGpuLockWaits(HotThread thread) {
     hotThread = thread;
 }
 
+HotThread CurrentHotThread() {
+    return hotThread;
+}
+
 std::string TakeHotLockWaitText() {
     constexpr std::array<const char*, HotThreadCount> names{"", "worker", "finisher", "committer"};
     std::string text;

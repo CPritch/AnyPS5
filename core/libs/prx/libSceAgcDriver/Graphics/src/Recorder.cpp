@@ -760,6 +760,26 @@ HookSyncStats& HookSyncs() {
     return stats;
 }
 
+struct HotHookSync {
+    std::uint64_t count = 0;
+    double ms = 0;
+};
+std::mutex hotHookSyncMutex;
+std::map<std::tuple<int, int, int, std::uint64_t, std::size_t>, HotHookSync> hotHookSyncs;
+
+bool HotHookSyncCounted() {
+    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return counted && GuestMemory::CurrentHotThread() != GuestMemory::HotThread::None;
+}
+
+void NoteHotHookSync(int kind, std::uint64_t address, std::size_t bytes, std::chrono::steady_clock::time_point start) {
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::lock_guard lock(hotHookSyncMutex);
+    auto& entry = hotHookSyncs[{static_cast<int>(GuestMemory::CurrentHotThread()), kind, static_cast<int>(GuestMemory::CurrentReadSite()), address, bytes}];
+    ++entry.count;
+    entry.ms += ms;
+}
+
 bool HookSyncProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_HOOKSYNC_PROFILE") == nullptr;
     return profiled;
@@ -1040,9 +1060,12 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
             const HookSyncScope attribution(*recorder, address, bytes);
             Recorder::CountSync(1);
+            const bool hot = HotHookSyncCounted();
+            const auto hotStart = hot ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             // The wait runs without the mutex when this acquisition is the outermost one (a stage-A
             // read, a game thread); the recorder is not dereferenced after the call.
             recorder->SyncThrough(address, bytes, true);
+            if (hot) NoteHotHookSync(0, address, bytes, hotStart);
         }
     }
     const auto site = GuestMemory::CurrentReadSite();
@@ -1079,8 +1102,11 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr) {
             const RecordedStoreSyncScope attribution(*recorder, address, bytes, classification, stored, HookSyncProfiled() ? RecordedStoreKey() : HookSyncKey{});
             Recorder::CountSync(2);
+            const bool hot = HotHookSyncCounted();
+            const auto hotStart = hot ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (HookFullSync() || completionDepth != 0) recorder->Sync();
             else recorder->SyncThrough(address, bytes, true);
+            if (hot) NoteHotHookSync(stored ? 1 : 2, address, bytes, hotStart);
         }
     }
 }
@@ -1425,6 +1451,27 @@ void Recorder::CountSync(int source, const void* site) {
 
 void Recorder::AnnounceSyncSite(const void* site) {
     announcedSite = site;
+}
+
+std::string Recorder::TakeHotHookSyncText() {
+    std::vector<std::pair<std::tuple<int, int, int, std::uint64_t, std::size_t>, HotHookSync>> entries;
+    {
+        std::lock_guard lock(hotHookSyncMutex);
+        entries.assign(hotHookSyncs.begin(), hotHookSyncs.end());
+        hotHookSyncs.clear();
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    constexpr std::array<const char*, 4> threads{"other", "worker", "finisher", "committer"};
+    constexpr std::array<const char*, 3> kinds{"pending write", "recorded store", "shadow or snapshot"};
+    std::string text;
+    for (std::size_t i = 0; i < entries.size() && i < 6; ++i) {
+        const auto& [key, sync] = entries[i];
+        const auto& [thread, kind, site, address, bytes] = key;
+        char item[192];
+        std::snprintf(item, sizeof(item), "%s %s %s at %s 0x%llx+0x%zx: %llu, %.1f ms", i == 0 ? "" : ";", threads[static_cast<std::size_t>(thread) % threads.size()], kinds[static_cast<std::size_t>(kind) % kinds.size()], GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(site)), static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(sync.count), sync.ms);
+        text += item;
+    }
+    return text.empty() ? " none" : text;
 }
 
 double Recorder::ThreadWaitedMs() {

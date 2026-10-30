@@ -95,6 +95,7 @@ std::string QueueWaits::Text() {
     text += "; finisher drains of the pipeline " + QueueWaitText(PipelineDrainFinisher);
     text += "; idle: finisher spinning " + QueueWaitMs(FinisherIdleSpin) + ", blocked " + QueueWaitMs(FinisherIdleBlocked) + "; committer spinning " + QueueWaitMs(CommitterIdleSpin) + ", blocked " + QueueWaitMs(CommitterIdleBlocked) + ", of that behind a drain or targeted wait " + QueueWaitText(CommitterIdleBehindWait) + "; committer retiring items " + QueueWaitMs(CommitterRetire);
     text += "; proof breaks:" + GuestMemory::TakeProofBreakText();
+    text += "; CPU-access GPU waits of the hot threads (largest):" + Graphics::Recorder::TakeHotHookSyncText();
     text += "; GPU lock waits (count, waited):" + GuestMemory::TakeHotLockWaitText();
     char held[128];
     std::snprintf(held, sizeof(held), "; targeted finisher waits for a held label %llu, a held job with unknown writes %llu, another held job %llu", static_cast<unsigned long long>(heldWaitLabels.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(heldWaitUnknown.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(heldWaitOther.exchange(0, std::memory_order_relaxed)));

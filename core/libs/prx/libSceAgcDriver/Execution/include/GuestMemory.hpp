@@ -205,6 +205,7 @@ enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hoo
 void TagGpuLockSite(GpuLockSite site);
 enum class HotThread : std::uint8_t { None = 0, Worker, Finisher, Committer, Count };
 void CountGpuLockWaits(HotThread thread);
+HotThread CurrentHotThread();
 std::string TakeHotLockWaitText();
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).
