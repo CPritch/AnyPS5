@@ -204,8 +204,17 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
     return validateSkipVerify() ? Policy::VerifyRaw : Policy::Raw;
 }
 
+namespace {
+
+bool checksQueuedWrites() {
+    static const bool finisherOrdered = std::getenv("APS5_NO_FINISHER_CAPTURE_ORDER") == nullptr;
+    return DrawPipeline::Active() || (finisherOrdered && DrawFinisher::OnFinisherThread());
+}
+
+}
+
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
-    if (DrawPipeline::Active()) {
+    if (checksQueuedWrites()) {
         auto& pipeline = DrawPipeline::Queue0();
         if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
     }
@@ -216,7 +225,7 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
 }
 
 ShaderMemory::PendingWrite Driver::QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
-    if (DrawPipeline::Active()) {
+    if (checksQueuedWrites()) {
         auto& pipeline = DrawPipeline::Queue0();
         if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) return ShaderMemory::PendingWrite::Sync;
     }
