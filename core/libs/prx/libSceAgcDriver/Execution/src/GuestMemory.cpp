@@ -1838,8 +1838,24 @@ std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
-void BreakProofs() {
+namespace {
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ProofBreak::Count)> proofBreaks{};
+}
+
+void BreakProofs(ProofBreak cause) {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    proofBreaks[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string TakeProofBreakText() {
+    constexpr std::array<const char*, static_cast<std::size_t>(ProofBreak::Count)> names{"other", "non-draw items", "other threads' lock holds", "driver stores", "driver writes", "write-backs"};
+    std::string text;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        char item[64];
+        std::snprintf(item, sizeof(item), "%s %s %llu", i == 0 ? "" : ",", names[i], static_cast<unsigned long long>(proofBreaks[i].exchange(0, std::memory_order_relaxed)));
+        text += item;
+    }
+    return text;
 }
 
 void MarkProofThread() {
@@ -2089,7 +2105,7 @@ static GuestAllocations::Lease::Ranges pinStoreRanges(std::uint64_t address, std
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
     const auto pinned = pinStoreRanges(address, bytes);
-    BreakProofs();
+    BreakProofs(ProofBreak::Store);
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -2140,7 +2156,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
-    BreakProofs();
+    BreakProofs(ProofBreak::Write);
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2582,7 +2598,7 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        if (!proofThread) BreakProofs(ProofBreak::ForeignHold);
     }
 }
 
@@ -3027,7 +3043,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint32_t byteStoreLimit) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(ProofBreak::WriteBack);
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).

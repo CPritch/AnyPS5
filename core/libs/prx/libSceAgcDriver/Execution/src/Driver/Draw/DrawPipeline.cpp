@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -40,6 +41,7 @@ std::atomic<std::uint64_t> heldReadHits{0};
 namespace {
 thread_local bool finisherThread = false;
 thread_local bool finisherProducer = false;
+std::size_t RoomBatch(std::size_t depth);
 
 constexpr std::size_t QueueWaitSites = static_cast<std::size_t>(QueueWaits::Site::Count);
 constexpr std::array<const char*, QueueWaitSites> QueueWaitNames{"relocation", "lookup", "reads", "kept draw", "enqueue", "packet", "pipeline drain", "end of submission", "settle", "special dispatch", "targeted", "other", "room"};
@@ -91,7 +93,8 @@ std::string QueueWaits::Text() {
     }
     text += "; room waits: worker for the finisher " + QueueWaitText(FinisherRoom) + ", worker for the committer " + QueueWaitText(PipelineRoomWorker) + ", finisher for the committer " + QueueWaitText(PipelineRoomFinisher);
     text += "; finisher drains of the pipeline " + QueueWaitText(PipelineDrainFinisher);
-    text += "; idle: finisher spinning " + QueueWaitMs(FinisherIdleSpin) + ", blocked " + QueueWaitMs(FinisherIdleBlocked) + "; committer spinning " + QueueWaitMs(CommitterIdleSpin) + ", blocked " + QueueWaitMs(CommitterIdleBlocked);
+    text += "; idle: finisher spinning " + QueueWaitMs(FinisherIdleSpin) + ", blocked " + QueueWaitMs(FinisherIdleBlocked) + "; committer spinning " + QueueWaitMs(CommitterIdleSpin) + ", blocked " + QueueWaitMs(CommitterIdleBlocked) + ", of that behind a drain or targeted wait " + QueueWaitText(CommitterIdleBehindWait) + "; committer retiring items " + QueueWaitMs(CommitterRetire);
+    text += "; proof breaks:" + GuestMemory::TakeProofBreakText();
     text += "; GPU lock waits (count, waited):" + GuestMemory::TakeHotLockWaitText();
     char held[128];
     std::snprintf(held, sizeof(held), "; targeted finisher waits for a held label %llu, a held job with unknown writes %llu, another held job %llu", static_cast<unsigned long long>(heldWaitLabels.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(heldWaitUnknown.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(heldWaitOther.exchange(0, std::memory_order_relaxed)));
@@ -246,7 +249,10 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (jobs.size() >= depth) {
         PerformanceTimer timing("DrawFinisher.EnqueueWait");
         const auto start = std::chrono::steady_clock::now();
-        idle.wait(lock, [&] { return jobs.size() < depth; });
+        const auto resume = depth - std::min(RoomBatch(depth) / 2 + 1, depth);
+        ++roomWaiters;
+        room.wait(lock, [&] { return jobs.size() <= resume; });
+        --roomWaiters;
         QueueWaits::Note(QueueWaits::Site::FinisherRoom, start);
     }
     jobs.push_back(std::move(job));
@@ -307,7 +313,9 @@ void DrawFinisher::run() {
             pending.pop_front();
             ++ranJobs;
             outstanding.fetch_sub(1, std::memory_order_release);
-            idle.notify_all();
+            constexpr std::size_t depth = 16;
+            if (idleWaiters != 0) idle.notify_all();
+            if (roomWaiters != 0 && jobs.size() <= depth - std::min(RoomBatch(depth) / 2 + 1, depth)) room.notify_all();
         }
         if (report) Driver::Get().ReportFailure(error);
     }
@@ -318,7 +326,9 @@ void DrawFinisher::Settle() {
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
     const auto start = std::chrono::steady_clock::now();
     std::unique_lock lock(mutex);
+    ++idleWaiters;
     idle.wait(lock, [&] { return jobs.empty(); });
+    --idleWaiters;
     QueueWaits::Note(QueueWaits::Site::FinisherSettle, start);
 }
 
@@ -331,7 +341,11 @@ void DrawFinisher::Drain(QueueWaits::Site site) {
     const auto start = busy ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
-    if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
+    if (!jobs.empty()) {
+        ++idleWaiters;
+        idle.wait(lock, [&] { return jobs.empty(); });
+        --idleWaiters;
+    }
     if (busy) QueueWaits::Note(site, start);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
@@ -354,7 +368,9 @@ void DrawFinisher::WaitPendingWritten(std::span<const Range> ranges) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher wait under the GPU lock");
     PerformanceTimer timing("DrawFinisher.WaitPending");
     const auto start = std::chrono::steady_clock::now();
+    ++idleWaiters;
     idle.wait(lock, [&] { return ranJobs >= target || failure != nullptr; });
+    --idleWaiters;
     QueueWaits::Note(QueueWaits::Site::FinisherTargeted, start);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
@@ -416,6 +432,14 @@ void DrawPipeline::rethrowFailure() {
 
 namespace {
 
+std::size_t RoomBatch(std::size_t depth) {
+    static const std::size_t batch = [] {
+        const char* text = std::getenv("APS5_ROOM_BATCH");
+        return text == nullptr ? std::size_t{8} : static_cast<std::size_t>(std::max<long long>(1, std::strtoll(text, nullptr, 10)));
+    }();
+    return std::clamp<std::size_t>(batch, 1, std::max<std::size_t>(depth, 1));
+}
+
 bool ItemsThroughFinisher() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_FINISHER_ITEMS");
@@ -462,11 +486,10 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         PerformanceTimer timing("DrawPipeline.EnqueueWait");
         const auto start = std::chrono::steady_clock::now();
-        resumeAt = Depth() - 1;
-        ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() <= resumeAt; });
-        --idleWaiters;
-        resumeAt = 0;
+        const auto resume = Depth() - RoomBatch(Depth());
+        ++roomWaiters;
+        room.wait(lock, [&] { return items.size() <= resume || failure != nullptr; });
+        --roomWaiters;
         fullWaitNs += elapsedNs(start);
         QueueWaits::Note(DrawFinisher::OnFinisherThread() ? QueueWaits::Site::PipelineRoomFinisher : QueueWaits::Site::PipelineRoomWorker, start);
         rethrowFailure();
@@ -522,6 +545,14 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         std::snprintf(item, sizeof(item), " %s %llu %.1f", kindNames[kind], static_cast<unsigned long long>(kindCommits[kind]), static_cast<double>(kindCommitNs[kind]) / 1e6);
         drainText += item;
     }
+    drainText += "; committer GPU waits by item kind (ms):";
+    for (std::size_t kind = 0; kind < kindNames.size(); ++kind) {
+        if (kindGpuWaitNs[kind] == 0) continue;
+        char item[64];
+        std::snprintf(item, sizeof(item), " %s %.1f", kindNames[kind], static_cast<double>(kindGpuWaitNs[kind]) / 1e6);
+        drainText += item;
+    }
+    kindGpuWaitNs = {};
     kindCommits = {};
     kindCommitNs = {};
     char targetedText[160];
@@ -559,6 +590,7 @@ void DrawPipeline::run() {
     GuestMemory::CountGpuLockWaits(GuestMemory::HotThread::Committer);
     const bool counted = QueueWaits::Enabled();
     auto idleStart = std::chrono::steady_clock::now();
+    bool idleBehindWait = false;
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
@@ -579,13 +611,15 @@ void DrawPipeline::run() {
         if (counted) {
             QueueWaits::Note(QueueWaits::Site::CommitterIdleSpin, idleStart, spun);
             QueueWaits::Note(QueueWaits::Site::CommitterIdleBlocked, spun, start);
+            if (idleBehindWait) QueueWaits::Note(QueueWaits::Site::CommitterIdleBehindWait, idleStart, start);
         }
+        const double gpuWaitedBefore = counted ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
         try {
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofs();
+            if (!isDraw) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Item);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();
@@ -595,25 +629,37 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
-        idleStart = std::chrono::steady_clock::now();
-        const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(idleStart - start).count());
+        const auto committed = std::chrono::steady_clock::now();
+        const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(committed - start).count());
+        const auto gpuWaitedNs = counted ? static_cast<std::uint64_t>((Graphics::Recorder::ThreadWaitedMs() - gpuWaitedBefore) * 1e6) : 0;
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        std::lock_guard lock(mutex);
-        countWrites(items.front().writes, false);
-        retired.push_back(std::move(items.front()));
-        items.pop_front();
-        retiredItems.fetch_add(1, std::memory_order_release);
-        ++commits;
-        commitNs += spent;
-        ++kindCommits[kind];
-        kindCommitNs[kind] += spent;
-        if (failed) ++commitErrors;
-        if (fatal != nullptr && failure == nullptr) failure = fatal;
-        outstanding.fetch_sub(1, std::memory_order_release);
-        if ((idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) || targetWaiters != 0) idle.notify_all();
+        {
+            std::lock_guard lock(mutex);
+            countWrites(items.front().writes, false);
+            retired.push_back(std::move(items.front()));
+            items.pop_front();
+            const auto retiredNow = retiredItems.fetch_add(1, std::memory_order_release) + 1;
+            ++commits;
+            commitNs += spent;
+            ++kindCommits[kind];
+            kindCommitNs[kind] += spent;
+            kindGpuWaitNs[kind] += gpuWaitedNs;
+            if (failed) ++commitErrors;
+            if (fatal != nullptr && failure == nullptr) failure = fatal;
+            outstanding.fetch_sub(1, std::memory_order_release);
+            idleBehindWait = items.empty() && (idleWaiters != 0 || targetWaiters != 0);
+            if (idleWaiters != 0 && items.empty()) idle.notify_all();
+            if (roomWaiters != 0 && (items.size() <= Depth() - RoomBatch(Depth()) || failure != nullptr)) room.notify_all();
+            if (targetWaiters != 0 && (retiredNow >= targetWake || failure != nullptr)) {
+                targetWake = ~std::uint64_t{0};
+                retiredWake.notify_all();
+            }
+        }
+        idleStart = std::chrono::steady_clock::now();
+        if (counted) QueueWaits::Note(QueueWaits::Site::CommitterRetire, committed, idleStart);
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -703,7 +749,11 @@ void DrawPipeline::WaitWrittenAny(std::span<const Range> ranges, DrainReason rea
     SpinUntil(HandoffSpinWindow() * 2, [&] { return retiredItems.load(std::memory_order_acquire) >= target; });
     std::unique_lock lock(mutex);
     ++targetWaiters;
-    idle.wait(lock, [&] { return retiredItems.load(std::memory_order_acquire) >= target || failure != nullptr || stopped; });
+    retiredWake.wait(lock, [&] {
+        if (retiredItems.load(std::memory_order_acquire) >= target || failure != nullptr || stopped) return true;
+        targetWake = std::min(targetWake, target);
+        return false;
+    });
     --targetWaiters;
     ++targetedWaits;
     targetedWaitNs += elapsedNs(start);

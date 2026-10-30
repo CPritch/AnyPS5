@@ -43,6 +43,8 @@ public:
         FinisherIdleBlocked,
         CommitterIdleSpin,
         CommitterIdleBlocked,
+        CommitterIdleBehindWait,
+        CommitterRetire,
         Count
     };
     static bool Enabled();
@@ -116,6 +118,8 @@ private:
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
+    std::condition_variable room;
+    std::condition_variable retiredWake;
     std::deque<Item> items;
     std::vector<std::pair<Range, std::uint32_t>> queuedWrites;
     std::vector<Item> retired;
@@ -125,12 +129,14 @@ private:
     std::atomic<std::uint64_t> decodeDrains{0};
     std::uint64_t reportedDecodeDrains = 0;
     std::uint32_t idleWaiters = 0;
+    std::uint32_t roomWaiters = 0;
     std::uint32_t targetWaiters = 0;
+    std::uint64_t targetWake = ~std::uint64_t{0};
+    std::array<std::uint64_t, static_cast<std::size_t>(ItemKind::Count)> kindGpuWaitNs{};
     std::uint64_t targetedWaits = 0;
     std::uint64_t targetedWaitNs = 0;
     std::uint64_t targetedBehind = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ItemKind::Count)> targetedKinds{};
-    std::size_t resumeAt = 0;
     bool committerWaiting = false;
     bool stopped = false;
     bool closing = false;
@@ -195,6 +201,9 @@ private:
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
+    std::condition_variable room;
+    std::uint32_t idleWaiters = 0;
+    std::uint32_t roomWaiters = 0;
     std::deque<Job> jobs;
     std::deque<Pending> pending;
     std::vector<Job> ran;
