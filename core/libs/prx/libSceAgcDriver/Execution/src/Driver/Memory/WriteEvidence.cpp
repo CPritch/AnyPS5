@@ -211,12 +211,20 @@ bool checksQueuedWrites() {
     return DrawPipeline::Active() || (finisherOrdered && DrawFinisher::OnFinisherThread());
 }
 
+bool overQueuedWrite(std::uint64_t address, std::size_t bytes) {
+    auto& pipeline = DrawPipeline::Queue0();
+    const bool overlaps = pipeline.Busy() && pipeline.Overlaps(address, bytes);
+    if (QueueWaits::Enabled() && DrawFinisher::OnFinisherThread()) QueueWaits::NoteShadowCapture(overlaps);
+    return overlaps;
+}
+
 }
 
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (checksQueuedWrites()) {
-        auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        if (overQueuedWrite(address, bytes)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture);
+    } else if (QueueWaits::Enabled() && DrawFinisher::OnFinisherThread()) {
+        overQueuedWrite(address, bytes);
     }
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;
@@ -226,8 +234,9 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
 
 ShaderMemory::PendingWrite Driver::QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (checksQueuedWrites()) {
-        auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) return ShaderMemory::PendingWrite::Sync;
+        if (overQueuedWrite(address, bytes)) return ShaderMemory::PendingWrite::Sync;
+    } else if (QueueWaits::Enabled() && DrawFinisher::OnFinisherThread()) {
+        overQueuedWrite(address, bytes);
     }
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;

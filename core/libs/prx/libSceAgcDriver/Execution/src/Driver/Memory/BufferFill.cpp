@@ -455,7 +455,7 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
         DrawPipeline::Queue0().Enqueue([store, queueId] {
             GuestMemory::SetCurrentPacket(0x15, queueId);
             store();
-        }, {{base, base + bytes}});
+        }, {{base, base + bytes}}, 0, {}, {}, false, DrawPipeline::ItemKind::Fill);
         return;
     }
     store();

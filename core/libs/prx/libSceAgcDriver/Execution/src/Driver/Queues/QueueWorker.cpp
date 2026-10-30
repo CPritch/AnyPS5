@@ -72,7 +72,7 @@ void Driver::deferCompletion(const Submission& submission) {
     completionDeferred() = true;
     DrawPipeline::Queue0().Enqueue([this, serial = submission.serial, received, labelWrites = submission.labelWrites, progress = submission.progress] {
         completeSubmission(serial, received, labelWrites, progress);
-    }, {});
+    }, {}, 0, {}, {}, false, DrawPipeline::ItemKind::Completion);
 }
 
 void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress) {
@@ -142,6 +142,7 @@ void Driver::run(std::uint32_t id) noexcept {
     else PinWorkerThread(role);
 
     GuestMemory::TagGpuLockThread(id);
+    if (id == 0) GuestMemory::CountGpuLockWaits(GuestMemory::HotThread::Worker);
     if (id == 0) StartWorkerSampler();
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

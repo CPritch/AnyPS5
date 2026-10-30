@@ -20,6 +20,36 @@
 
 namespace AgcDriver::DriverDetail {
 
+class QueueWaits {
+public:
+    enum class Site : std::uint8_t {
+        FinisherRelocation,
+        FinisherLookup,
+        FinisherReads,
+        FinisherKept,
+        FinisherEnqueue,
+        FinisherPacket,
+        FinisherPipelineDrain,
+        FinisherEnd,
+        FinisherSettle,
+        FinisherOther,
+        FinisherRoom,
+        PipelineRoomWorker,
+        PipelineRoomFinisher,
+        PipelineDrainFinisher,
+        FinisherIdleSpin,
+        FinisherIdleBlocked,
+        CommitterIdleSpin,
+        CommitterIdleBlocked,
+        Count
+    };
+    static bool Enabled();
+    static void Note(Site site, std::chrono::steady_clock::time_point since, std::chrono::steady_clock::time_point until);
+    static void Note(Site site, std::chrono::steady_clock::time_point since) { Note(site, since, std::chrono::steady_clock::now()); }
+    static void NoteShadowCapture(bool overlapped);
+    static std::string Text();
+};
+
 class DrawPipeline {
 public:
     using Commit = std::function<void()>;
@@ -30,6 +60,7 @@ public:
         std::vector<Range> writes;
     };
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
+    enum class ItemKind : std::uint8_t { Other, Draw, IndirectDraw, Dispatch, Label, Fill, Copy, Store, Pass, Seal, Completion, Count };
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
@@ -39,7 +70,7 @@ public:
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     void ReleaseRetired();
@@ -69,6 +100,7 @@ private:
         std::vector<std::byte> labelBytes;
         std::vector<Range> reads;
         bool draw = false;
+        ItemKind kind = ItemKind::Other;
     };
     DrawPipeline() = default;
     void run();
@@ -103,6 +135,9 @@ private:
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drains{};
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};
     std::array<std::uint64_t, 257> drainOpcodes{};
+    std::array<std::uint64_t, 257> drainOpcodeNs{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ItemKind::Count)> kindCommits{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ItemKind::Count)> kindCommitNs{};
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -136,7 +171,7 @@ public:
     static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
-    void Drain();
+    void Drain(QueueWaits::Site site = QueueWaits::Site::FinisherOther);
     void Settle();
     void ReleaseRan();
 

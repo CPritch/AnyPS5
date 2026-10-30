@@ -60,7 +60,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
                     const auto& target = current != nullptr ? current : localDevice;
                     recordLabelsForPacket(target.get(), queueId);
                     target->ColorMetadataPass(pass);
-                }, std::move(writes));
+                }, std::move(writes), 0, {}, {}, false, DrawPipeline::ItemKind::Pass);
                 DrawPipeline::CountPipelinedMetadataPass();
                 return DrawVerdict::Drawn;
             }

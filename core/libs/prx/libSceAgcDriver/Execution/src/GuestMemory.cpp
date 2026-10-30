@@ -2532,6 +2532,42 @@ std::string WaitedBehindReport(const HolderMatrixValues& waited) {
 
 namespace {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
+
+constexpr std::size_t HotThreadCount = static_cast<std::size_t>(HotThread::Count);
+thread_local HotThread hotThread = HotThread::None;
+std::array<std::array<std::atomic<std::uint64_t>, GpuLockSiteCount>, HotThreadCount> hotLockWaits{}, hotLockWaitNs{};
+
+void NoteHotLockWait(std::size_t site, std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end) {
+    const auto thread = static_cast<std::size_t>(hotThread);
+    hotLockWaits[thread][site].fetch_add(1, std::memory_order_relaxed);
+    hotLockWaitNs[thread][site].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()), std::memory_order_relaxed);
+}
+}
+
+void CountGpuLockWaits(HotThread thread) {
+    hotThread = thread;
+}
+
+std::string TakeHotLockWaitText() {
+    constexpr std::array<const char*, HotThreadCount> names{"", "worker", "finisher", "committer"};
+    std::string text;
+    for (std::size_t thread = 1; thread < HotThreadCount; ++thread) {
+        text += " ";
+        text += names[thread];
+        bool any = false;
+        for (std::size_t site = 0; site < GpuLockSiteCount; ++site) {
+            const auto count = hotLockWaits[thread][site].exchange(0, std::memory_order_relaxed);
+            const auto ns = hotLockWaitNs[thread][site].exchange(0, std::memory_order_relaxed);
+            if (count == 0) continue;
+            char item[64];
+            std::snprintf(item, sizeof(item), "%s %s %llu %.1f ms", any ? "," : "", GpuLockSiteNames[site], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e6);
+            text += item;
+            any = true;
+        }
+        if (!any) text += " none";
+        text += thread + 1 < HotThreadCount ? ";" : "";
+    }
+    return text;
 }
 
 void GpuMutexType::enter() {
@@ -2616,14 +2652,16 @@ void AssertGpuLockHeld(const char* where) {
 void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
-        if (trace == nullptr) {
+        if (trace == nullptr && hotThread == HotThread::None) {
             enter();
         } else {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!tryEnter()) {
                 const auto start = std::chrono::steady_clock::now();
                 LockSpinning(mutex, HandoffSpinWindow());
-                trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
+                const auto end = std::chrono::steady_clock::now();
+                if (trace != nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, end);
+                if (hotThread != HotThread::None) NoteHotLockWait(site, start, end);
             }
         }
         acquired();
@@ -2644,6 +2682,7 @@ void GpuMutexType::lock() {
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
+        if (hotThread != HotThread::None) NoteHotLockWait(site, start, now);
         if (holders) {
             HolderMatrixValues after{};
             Holders().Snapshot(after);

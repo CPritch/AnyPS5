@@ -402,7 +402,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
-            if (DrawFinisher::Busy() && drawRelocationPending.key != 0) DrawFinisher::Get().Drain();
+            if (DrawFinisher::Busy() && drawRelocationPending.key != 0) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherRelocation);
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
             std::lock_guard cacheLock(drawCacheMutex);
             learnPendingRelocation();
@@ -423,7 +423,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
             }
             const bool drain = !DrawFinisher::Overlap() || DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0);
-            if (drain) DrawFinisher::Get().Drain();
+            if (drain) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherLookup);
             if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain);
         }
         std::unique_lock cacheLock(drawCacheMutex);
@@ -584,7 +584,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (DrawFinisher::Busy()) {
         const bool drain = !DrawFinisher::Overlap();
-        if (drain) DrawFinisher::Get().Drain();
+        if (drain) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherReads);
         else DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Reads, false);
     }
     auto& memory = tail.memory;
@@ -760,7 +760,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     noteFinisherHandOff(false);
     if (DrawFinisher::Busy()) {
-        DrawFinisher::Get().Drain();
+        DrawFinisher::Get().Drain(QueueWaits::Site::FinisherKept);
         if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Kept, true);
     }
     tail.queue = &queue;
@@ -1199,7 +1199,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0);
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
-                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, {}, false, DrawPipeline::ItemKind::IndirectDraw);
                 phaseTiming.Phase(DrawRowLockWait);
                 timing.Mark("draw_enqueued");
                 return drawn();
