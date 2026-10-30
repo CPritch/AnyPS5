@@ -475,7 +475,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     }
     drainOpcodes = {};
     drainOpcodeNs = {};
-    constexpr std::array<const char*, static_cast<std::size_t>(ItemKind::Count)> kindNames{"other", "draw", "indirect draw", "dispatch", "label", "fill", "copy", "store", "pass", "seal", "completion", "occlusion dump"};
+    constexpr std::array<const char*, static_cast<std::size_t>(ItemKind::Count)> kindNames{"other", "draw", "indirect draw", "dispatch", "dispatch miss", "dispatch without recipe", "label", "fill", "copy", "store", "pass", "seal", "completion", "occlusion dump"};
     drainText += "; committer by item kind (items, ms):";
     for (std::size_t kind = 0; kind < kindNames.size(); ++kind) {
         if (kindCommits[kind] == 0) continue;

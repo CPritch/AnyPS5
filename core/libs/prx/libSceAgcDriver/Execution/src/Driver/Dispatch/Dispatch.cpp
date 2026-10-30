@@ -33,10 +33,28 @@ bool DispatchItemsEnabled() {
     return enabled;
 }
 
+bool MissItemsEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_DISPATCH_MISS_ITEMS");
+        return text == nullptr || text[0] != '0';
+    }();
+    return enabled;
+}
+
+bool NoRecipeItemsEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_DISPATCH_NO_RECIPE_ITEMS");
+        return text == nullptr || text[0] != '0';
+    }();
+    return enabled;
+}
+
 enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)> ItemFallbackNames{"miss", "reads", "no recipe", "writes", "verify"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
 std::atomic<std::uint64_t> itemCommits{0};
+std::atomic<std::uint64_t> missItemCommits{0};
+std::atomic<std::uint64_t> noRecipeItemCommits{0};
 std::atomic<std::uint64_t> itemRebuilds{0};
 
 void NoteItemFallback(ItemFallback reason) {
@@ -55,7 +73,7 @@ void ReportDispatchItems(bool profile) {
         std::snprintf(item, sizeof(item), " %s %llu", ItemFallbackNames[i], static_cast<unsigned long long>(itemFallbacks[i].load(std::memory_order_relaxed)));
         drained += item;
     }
-    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
+    std::fprintf(stderr, "[dispatch-item] %llu commit items, %llu of them cache misses and %llu without a recipe (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(missItemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(noRecipeItemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
 }
 
 bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
@@ -306,6 +324,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     phaseTiming.Phase(PhaseKey);
     timing.Mark("decode_key_device_setup");
     bool readsClear = false;
+    bool missItem = false;
+    bool noRecipeItem = false;
     if (pipelineCandidate) {
         std::vector<ShaderRecompiler::MemoryRegion> reads;
         bool entryFound = false;
@@ -318,13 +338,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         if (!entryFound || noDispatchCache || stampValidate()) {
             NoteItemFallback(ItemFallback::Miss);
+            missItem = !entryFound && !noDispatchCache && !stampValidate() && MissItemsEnabled();
         } else if (verifyDataHits()) {
             NoteItemFallback(ItemFallback::Verify);
         } else {
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
             if (!readsClear) NoteItemFallback(ItemFallback::Reads);
         }
-        if (!readsClear && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!readsClear && !missItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     }
     if (fromAhead) {
         compiledResult = std::move(ahead.compiledResult);
@@ -357,8 +378,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);
+            noRecipeItem = cached && keepVariant != nullptr && NoRecipeItemsEnabled();
         }
-        if (!pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!pipelined && !noRecipeItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     }
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
@@ -488,12 +510,35 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     };
     phaseTiming.Phase(PhaseSnapshots);
 
+    auto itemKind = DrawPipeline::ItemKind::Dispatch;
+    if (!pipelined && (missItem || noRecipeItem)) {
+        const auto code = std::span(snapshot.code).subspan(codeOffset);
+        bool special = false;
+        if (indirectArguments == 0 && !partialLastGroup) {
+            special = MatchSgprPatternFill(packet, code, userData, compute).has_value();
+            if (!special) {
+                const auto clear = Graphics::MatchStorageImageClear(code, userData, compute, groups);
+                special = clear.has_value() && Graphics::StorageImageClearAddress(*clear) != 0 && Graphics::DepthSurfaceAt(Graphics::StorageImageClearAddress(*clear));
+            }
+        }
+        bool bounded = false;
+        if (!special && compiledResult != nullptr) itemWrites = DispatchWriteRanges(*compiledResult, bounded);
+        pipelined = bounded;
+        if (pipelined) {
+            (missItem ? missItemCommits : noRecipeItemCommits).fetch_add(1, std::memory_order_relaxed);
+            itemKind = missItem ? DrawPipeline::ItemKind::DispatchMiss : DrawPipeline::ItemKind::DispatchNoRecipe;
+        } else if (DrawPipeline::Queue0().Busy()) {
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
+    }
+
     if (pipelined) {
-        const auto recipe = keepVariant->recipe.load(std::memory_order_acquire);
+        const auto recipe = keepVariant != nullptr ? keepVariant->recipe.load(std::memory_order_acquire) : nullptr;
+        const auto attach = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant : attachVariant;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion] {
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, attach, dataHit, epoch, htileClearCompletion, dispatchThreads] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
@@ -504,7 +549,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 bool writersNoted = false;
                 for (;;) {
                     std::shared_ptr<PreparedDispatch> prepared;
-                    if (recipeHit == nullptr || VulkanDevice::VerifyRecipes() || htileClearCompletion.has_value()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots);
+                    if (recipeHit == nullptr || VulkanDevice::VerifyRecipes() || htileClearCompletion.has_value()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots, dispatchThreads, address);
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
                     recordLabelsForPacket(localDevice.get(), queueId);
@@ -522,18 +567,18 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                             continue;
                         }
                     } else {
-                        localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : &builtRecipe, htileClearCompletion);
+                        localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() || attach == nullptr ? nullptr : &builtRecipe, htileClearCompletion);
                     }
                     break;
                 }
                 if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
-                if (builtRecipe != nullptr) {
-                    if (dataHit) {
+                if (builtRecipe != nullptr && attach != nullptr) {
+                    if (dataHit && keepVariant != nullptr) {
                         auto own = std::make_shared<Recipe>(*builtRecipe);
                         own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, keepVariant->compiled.get(), 0});
                         builtRecipe = std::move(own);
                     }
-                    keepVariant->recipe.store(std::move(builtRecipe), std::memory_order_release);
+                    attach->recipe.store(std::move(builtRecipe), std::memory_order_release);
                     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
                 }
             } catch (const std::exception& error) {
@@ -541,7 +586,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
                 throw std::runtime_error(where + std::string(error.what()));
             }
-        }, std::move(itemWrites), 0, {}, {}, false, DrawPipeline::ItemKind::Dispatch);
+        }, std::move(itemWrites), 0, {}, {}, false, itemKind);
         ReportDispatchItems(profile);
         return;
     }

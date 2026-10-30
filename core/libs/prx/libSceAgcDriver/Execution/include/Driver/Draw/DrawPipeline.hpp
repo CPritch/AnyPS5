@@ -60,7 +60,7 @@ public:
         std::vector<Range> writes;
     };
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
-    enum class ItemKind : std::uint8_t { Other, Draw, IndirectDraw, Dispatch, Label, Fill, Copy, Store, Pass, Seal, Completion, Dump, Count };
+    enum class ItemKind : std::uint8_t { Other, Draw, IndirectDraw, Dispatch, DispatchMiss, DispatchNoRecipe, Label, Fill, Copy, Store, Pass, Seal, Completion, Dump, Count };
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
