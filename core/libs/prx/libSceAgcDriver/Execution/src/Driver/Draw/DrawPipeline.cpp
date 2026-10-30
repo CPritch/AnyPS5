@@ -45,6 +45,7 @@ constexpr std::size_t QueueWaitSites = static_cast<std::size_t>(QueueWaits::Site
 constexpr std::array<const char*, QueueWaitSites> QueueWaitNames{"relocation", "lookup", "reads", "kept draw", "enqueue", "packet", "pipeline drain", "end of submission", "settle", "special dispatch", "targeted", "other", "room"};
 std::array<std::atomic<std::uint64_t>, QueueWaitSites> queueWaitCounts{}, queueWaitNs{};
 std::atomic<std::uint64_t> shadowCaptures{0}, shadowOverlaps{0};
+std::atomic<std::uint64_t> heldWaitLabels{0}, heldWaitUnknown{0}, heldWaitOther{0};
 
 std::string QueueWaitText(QueueWaits::Site site) {
     const auto index = static_cast<std::size_t>(site);
@@ -92,6 +93,9 @@ std::string QueueWaits::Text() {
     text += "; finisher drains of the pipeline " + QueueWaitText(PipelineDrainFinisher);
     text += "; idle: finisher spinning " + QueueWaitMs(FinisherIdleSpin) + ", blocked " + QueueWaitMs(FinisherIdleBlocked) + "; committer spinning " + QueueWaitMs(CommitterIdleSpin) + ", blocked " + QueueWaitMs(CommitterIdleBlocked);
     text += "; GPU lock waits (count, waited):" + GuestMemory::TakeHotLockWaitText();
+    char held[128];
+    std::snprintf(held, sizeof(held), "; targeted finisher waits for a held label %llu, a held job with unknown writes %llu, another held job %llu", static_cast<unsigned long long>(heldWaitLabels.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(heldWaitUnknown.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(heldWaitOther.exchange(0, std::memory_order_relaxed)));
+    text += held;
     char shadow[160];
     std::snprintf(shadow, sizeof(shadow), "; finisher capture queries %llu, over writes still queued in the pipeline %llu (waited for unless APS5_NO_FINISHER_CAPTURE_ORDER)", static_cast<unsigned long long>(shadowCaptures.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(shadowOverlaps.exchange(0, std::memory_order_relaxed)));
     text += shadow;
@@ -343,6 +347,7 @@ void DrawFinisher::WaitPendingWritten(std::span<const Range> ranges) {
         const auto& held = pending[i];
         if (!held.unknown && std::none_of(held.writes.begin(), held.writes.end(), overlapping)) continue;
         target = ranJobs + i + 1;
+        (held.unknown ? heldWaitUnknown : held.labelAddress != 0 ? heldWaitLabels : heldWaitOther).fetch_add(1, std::memory_order_relaxed);
         break;
     }
     if (target == 0) return;
@@ -522,6 +527,14 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     char targetedText[160];
     std::snprintf(targetedText, sizeof(targetedText), "; targeted waits %llu (%.1f ms), %.1f items left queued behind each", static_cast<unsigned long long>(targetedWaits), static_cast<double>(targetedWaitNs) / 1e6, targetedWaits == 0 ? 0.0 : static_cast<double>(targetedBehind) / static_cast<double>(targetedWaits));
     drainText += targetedText;
+    drainText += ", waiting for:";
+    for (std::size_t kind = 0; kind < kindNames.size(); ++kind) {
+        if (targetedKinds[kind] == 0) continue;
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", kindNames[kind], static_cast<unsigned long long>(targetedKinds[kind]));
+        drainText += item;
+    }
+    targetedKinds = {};
     targetedWaits = targetedWaitNs = targetedBehind = 0;
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
@@ -679,6 +692,7 @@ void DrawPipeline::WaitWrittenAny(std::span<const Range> ranges, DrainReason rea
             if (std::none_of(writes.begin(), writes.end(), overlapping)) continue;
             target = retiredItems.load(std::memory_order_relaxed) + i + 1;
             targetedBehind += items.size() - i - 1;
+            ++targetedKinds[static_cast<std::size_t>(items[i].kind)];
             break;
         }
     }

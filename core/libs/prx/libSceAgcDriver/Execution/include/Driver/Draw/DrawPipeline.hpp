@@ -129,6 +129,7 @@ private:
     std::uint64_t targetedWaits = 0;
     std::uint64_t targetedWaitNs = 0;
     std::uint64_t targetedBehind = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ItemKind::Count)> targetedKinds{};
     std::size_t resumeAt = 0;
     bool committerWaiting = false;
     bool stopped = false;
