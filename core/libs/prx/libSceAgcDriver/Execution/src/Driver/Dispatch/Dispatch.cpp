@@ -63,7 +63,7 @@ void NoteItemFallback(ItemFallback reason) {
 
 void ReportDispatchItems(bool profile) {
     static auto lastReport = std::chrono::steady_clock::now();
-    if (!profile) return;
+    if (!profile && !QueueWaits::Enabled()) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
