@@ -1350,10 +1350,10 @@ configure_windows_unwind(agc_recording_thread_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_recording_thread_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_recording_thread COMMAND agc_recording_thread_tests)
-    add_test(NAME agc_recording_thread_caller_submits COMMAND agc_recording_thread_tests)
-    set_tests_properties(agc_recording_thread_caller_submits PROPERTIES ENVIRONMENT "APS5_RECORDING_SUBMITS=0")
+    add_test(NAME agc_recording_thread_thread_submits COMMAND agc_recording_thread_tests)
+    set_tests_properties(agc_recording_thread_thread_submits PROPERTIES ENVIRONMENT "APS5_RECORDING_SUBMITS=1")
     if(WIN32)
-        set_tests_properties(agc_recording_thread agc_recording_thread_caller_submits PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recording_thread agc_recording_thread_thread_submits PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

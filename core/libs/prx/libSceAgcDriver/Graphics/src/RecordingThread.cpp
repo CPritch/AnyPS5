@@ -999,11 +999,14 @@ void report() {
     before = totals;
 }
 
-// APS5_RECORDING_SUBMITS: on unless set to 0 (with the recording thread on).
+// APS5_RECORDING_SUBMITS=1 (with the recording thread on): off by default. At the front door the
+// GPU is fed batch by batch, and a submit made by the recording thread reaches it later: the queue
+// worker waited 2.8 ms a frame for the GPU instead of 0.3 and the GPU idled 14.2 ms instead of 10.6
+// (exp-20261030-worker-threading-p2-door).
 bool SubmitsOnThread() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_RECORDING_SUBMITS");
-        return value == nullptr || std::strcmp(value, "0") != 0;
+        return value != nullptr && std::strcmp(value, "0") != 0;
     }();
     return enabled;
 }

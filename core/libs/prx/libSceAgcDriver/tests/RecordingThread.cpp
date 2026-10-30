@@ -46,10 +46,10 @@ std::thread::id caller;
 VkResult endResult = VK_SUCCESS;
 std::atomic<std::uintptr_t> nextHandle{0x1000};
 
-// APS5_RECORDING_SUBMITS=0 runs the same checks with the submits made by the calling thread.
+// APS5_RECORDING_SUBMITS=1 runs the same checks with the submits made by the recording thread.
 bool ThreadSubmits() {
     const char* value = std::getenv("APS5_RECORDING_SUBMITS");
-    return value == nullptr || std::strcmp(value, "0") != 0;
+    return value != nullptr && std::strcmp(value, "0") != 0;
 }
 
 void Note(VkCommandBuffer commands, std::string what) {
