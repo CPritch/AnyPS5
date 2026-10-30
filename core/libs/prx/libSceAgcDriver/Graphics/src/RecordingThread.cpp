@@ -170,6 +170,9 @@ struct Stream : std::enable_shared_from_this<Stream> {
     Chunk* writeChunk = nullptr;
     std::size_t writeOffset = 0;
     std::uint64_t written = 0;
+    std::uint32_t unpublished = 0;
+    // `written` for other threads: a flush publishes up to it first.
+    std::atomic<std::uint64_t> writtenSoFar{0};
     std::atomic<std::uint64_t> published{0};
     Chunk* readChunk = nullptr;
     std::size_t readOffset = 0;
@@ -355,10 +358,32 @@ std::byte* reserve(Stream& stream, ReplayFn replay, std::size_t payload) {
     return at + sizeof(OpHeader);
 }
 
-void publish(Stream& stream) {
-    stream.published.store(stream.written, std::memory_order_seq_cst);
+// Commands reach the recording thread in steps of PublishBatch (or at once, `now`): each publish
+// moves the stream's counter between the cores, so one a command costs the recording thread's core
+// a cache line per command. Whatever waits for the stream publishes what was written first.
+constexpr std::uint32_t PublishBatch = 32;
+
+void publish(Stream& stream, bool now = false) {
+    stream.writtenSoFar.store(stream.written, std::memory_order_release);
     tally(&Counters::queued);
+    if (!now && ++stream.unpublished < PublishBatch) return;
+    stream.unpublished = 0;
+    stream.published.store(stream.written, std::memory_order_seq_cst);
     schedule(stream);
+}
+
+// Publishes everything written to the stream so far, from any thread.
+void publishWritten(Stream& stream) {
+    const auto target = stream.writtenSoFar.load(std::memory_order_acquire);
+    auto seen = stream.published.load(std::memory_order_seq_cst);
+    bool raised = false;
+    while (seen < target) {
+        if (stream.published.compare_exchange_weak(seen, target, std::memory_order_seq_cst)) {
+            raised = true;
+            break;
+        }
+    }
+    if (raised) schedule(stream);
 }
 
 std::uint64_t nowNs() {
@@ -367,6 +392,7 @@ std::uint64_t nowNs() {
 
 // Waits until the recording thread has made every command published to the stream so far.
 void flush(Stream& stream, std::atomic<std::uint64_t> Counters::*cause) {
+    publishWritten(stream);
     const auto target = stream.published.load(std::memory_order_seq_cst);
     if (stream.replayed.load(std::memory_order_acquire) >= target) return;
     auto& count = counters();
@@ -564,12 +590,12 @@ void requireNoChain(const void* next, const char* what) {
 }
 
 template<typename TCall, typename TFill>
-void queue(Stream& stream, std::size_t extra, TFill&& fill) {
+void queue(Stream& stream, std::size_t extra, TFill&& fill, bool now = false) {
     auto* payload = reserve(stream, &TCall::Replay, sizeof(TCall) + extra);
     auto* call = new (payload) TCall{};
     Packer packer{payload, sizeof(TCall)};
     fill(*call, packer);
-    publish(stream);
+    publish(stream, now);
 }
 
 #define APS5_DIRECT_OR_STREAM(member, ...) \
@@ -915,7 +941,7 @@ struct EndCall {
     static VKAPI_ATTR VkResult VKAPI_CALL Call(VkCommandBuffer commands) {
         auto* stream = streamFor(commands);
         if (stream == nullptr) return real().endCommandBuffer(commands);
-        queue<EndCall>(*stream, 0, [](EndCall&, Packer&) {});
+        queue<EndCall>(*stream, 0, [](EndCall&, Packer&) {}, true);
         return VK_SUCCESS;
     }
 };
@@ -1044,7 +1070,9 @@ VKAPI_ATTR VkResult VKAPI_CALL queueSubmit(VkQueue queue, std::uint32_t count, c
     for (std::uint32_t s = 0; s < count; ++s) {
         for (std::uint32_t i = 0; i < submits[s].commandBufferCount; ++i) {
             auto* stream = streamFor(submits[s].pCommandBuffers[i]);
-            if (stream != nullptr) targets.emplace_back(stream->shared_from_this(), stream->published.load(std::memory_order_seq_cst));
+            if (stream == nullptr) continue;
+            publishWritten(*stream);
+            targets.emplace_back(stream->shared_from_this(), stream->published.load(std::memory_order_seq_cst));
         }
     }
     if (const auto failed = takeSubmitError(); failed != VK_SUCCESS) return failed;

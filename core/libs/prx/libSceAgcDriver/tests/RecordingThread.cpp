@@ -561,6 +561,19 @@ void SubmitsKeepTheirOrderWithDirectOnes() {
     device.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(device.device);
 }
 
+void AnotherThreadsWaitSeesCommandsNotYetPublished() {
+    Device device(0x10a);
+    const auto commands = device.Allocate(device.recorded);
+    std::thread recorder([&] {
+        device.Begin(commands);
+        device.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, Handle<VkPipeline>(0xc1));
+    });
+    recorder.join();
+    device.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device.device, Handle<VkPipeline>(0xc1), nullptr);
+    const auto seen = Taken();
+    Expect(seen.size() == 4 && seen[2].what == "bind pipeline 0 193" && seen[3].what == "destroy pipeline 193", "a destroy on another thread waits for a command written there but not yet published");
+}
+
 void UnknownCommandsAreUnavailableAndOtherDevicesPassThrough() {
     Device device(0x107);
     Expect(device.proc(device.device, "vkCmdSetLineWidth") == nullptr, "a command without a recording-thread entry is unavailable");
@@ -592,6 +605,7 @@ int main() {
     RenderPassChainsAreCopiedAndUnknownChainsRefused();
     UnknownCommandsAreUnavailableAndOtherDevicesPassThrough();
     SubmitsKeepTheirOrderWithDirectOnes();
+    AnotherThreadsWaitSeesCommandsNotYetPublished();
     DestroyingTheDeviceMakesEveryQueuedCommandFirst();
     if (failures != 0) {
         std::fprintf(stderr, "%d recording thread checks failed\n", failures);
