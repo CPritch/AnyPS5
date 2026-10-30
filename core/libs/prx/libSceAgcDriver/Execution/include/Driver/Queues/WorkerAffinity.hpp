@@ -9,6 +9,8 @@ std::uint64_t WorkerAffinityMask();
 std::uint64_t CommitterAffinityMask();
 
 void PinWorkerThread(const char* role);
+void PinDrawWorkerThread(const char* role);
+void PinFinisherThread(const char* role);
 void PinCommitterThread(const char* role);
 
 }

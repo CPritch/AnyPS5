@@ -42,10 +42,13 @@ template<typename TReady>
 bool SpinUntil(std::chrono::nanoseconds window, TReady&& ready) {
     if (ready()) return true;
     if (window.count() <= 0) return false;
+    constexpr unsigned pausesPerClockRead = 8;
     const auto until = std::chrono::steady_clock::now() + window;
     do {
-        SpinPause();
-        if (ready()) return true;
+        for (unsigned pause = 0; pause < pausesPerClockRead; ++pause) {
+            SpinPause();
+            if (ready()) return true;
+        }
     } while (std::chrono::steady_clock::now() < until);
     return false;
 }

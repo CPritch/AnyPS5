@@ -1,5 +1,6 @@
 #pragma once
 
+#include "prx/libc/include/CpuTopology.hpp"
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -21,7 +22,10 @@ class ProfileOutput {
 public:
     explicit ProfileOutput(std::function<void(std::string_view)> writer, std::size_t capacity = 4 * 1024 * 1024) : writer(std::move(writer)), capacity(capacity) {
         if (!this->writer || capacity == 0) throw std::invalid_argument("invalid profile output writer or capacity");
-        worker = std::thread([this] { run(); });
+        worker = std::thread([this] {
+            CpuTopology::PinHelperThread("profile output");
+            run();
+        });
     }
 
     ~ProfileOutput() {

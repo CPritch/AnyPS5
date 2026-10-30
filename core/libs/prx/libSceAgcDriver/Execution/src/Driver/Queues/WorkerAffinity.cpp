@@ -26,6 +26,21 @@ void PinThread(const char* role, std::uint64_t mask, std::once_flag& summary, co
     CpuTopology::PinTraced(role, nullptr, mask);
 }
 
+std::once_flag workerSummary;
+std::once_flag committerSummary;
+
+bool PinPlaced(const char* role, std::uint64_t CpuTopology::Placement::*slot) {
+    const auto& placement = CpuTopology::GetPlacement();
+    if (!placement.Active()) return false;
+    static std::once_flag summary;
+    std::call_once(summary, [&placement] {
+        const auto& layout = CpuTopology::Get();
+        std::fprintf(stderr, "[affinity] placement: queue worker 0x0 -> 0x%llx, draw finisher -> 0x%llx, draw committer -> 0x%llx, every other thread -> 0x%llx (performant=0x%llx process=0x%llx; classes %s)\n", static_cast<unsigned long long>(placement.worker), static_cast<unsigned long long>(placement.finisher), static_cast<unsigned long long>(placement.committer), static_cast<unsigned long long>(placement.shared), static_cast<unsigned long long>(layout.performant), static_cast<unsigned long long>(layout.process), layout.classes.empty() ? "none" : layout.classes.c_str());
+    });
+    CpuTopology::PinTraced(role, nullptr, placement.*slot);
+    return true;
+}
+
 }
 
 std::uint64_t WorkerAffinityMask() {
@@ -53,14 +68,26 @@ std::uint64_t CommitterAffinityMask() {
 
 void PinWorkerThread(const char* role) {
     NameThread(role);
-    static std::once_flag summary;
-    PinThread(role, WorkerAffinityMask(), summary, "queue workers and presenter");
+    if (PinPlaced(role, &CpuTopology::Placement::shared)) return;
+    PinThread(role, WorkerAffinityMask(), workerSummary, "queue workers and presenter");
+}
+
+void PinDrawWorkerThread(const char* role) {
+    NameThread(role);
+    if (PinPlaced(role, &CpuTopology::Placement::worker)) return;
+    PinThread(role, WorkerAffinityMask(), workerSummary, "queue workers and presenter");
+}
+
+void PinFinisherThread(const char* role) {
+    NameThread(role);
+    if (PinPlaced(role, &CpuTopology::Placement::finisher)) return;
+    PinThread(role, CommitterAffinityMask(), committerSummary, "draw committer and finisher");
 }
 
 void PinCommitterThread(const char* role) {
     NameThread(role);
-    static std::once_flag summary;
-    PinThread(role, CommitterAffinityMask(), summary, "draw committer and finisher");
+    if (PinPlaced(role, &CpuTopology::Placement::committer)) return;
+    PinThread(role, CommitterAffinityMask(), committerSummary, "draw committer and finisher");
 }
 
 }

@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETRACE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETRACE_HPP
 
+#include "prx/libc/include/CpuTopology.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -345,7 +346,10 @@ class TraceBenchWriter {
 public:
     explicit TraceBenchWriter(std::function<void(const TraceBenchSnapshot&)> writer) : writer(std::move(writer)) {
         if (!this->writer) throw std::invalid_argument("invalid benchmark writer");
-        worker = std::thread([this] { run(); });
+        worker = std::thread([this] {
+            CpuTopology::PinHelperThread("performance trace writer");
+            run();
+        });
     }
 
     TraceBenchWriter(const TraceBenchWriter&) = delete;

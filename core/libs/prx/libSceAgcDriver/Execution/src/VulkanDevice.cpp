@@ -31,6 +31,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PresentationPass.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
+#include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -225,7 +226,10 @@ public:
         require(pixels.size() <= maxBytes, "a frame dump exceeds the 64 MiB queue");
         changed.wait(lock, [&] { return stopping || pixels.size() <= maxBytes - queuedBytes; });
         require(!stopping, "frame dump writer has stopped");
-        if (!worker.joinable()) worker = std::thread([this] { run(); });
+        if (!worker.joinable()) worker = std::thread([this] {
+            CpuTopology::PinHelperThread("frame dump writer");
+            run();
+        });
         const auto bytes = pixels.size();
         pending.push_back({index, width, height, screenshot, std::move(pixels)});
         queuedBytes += bytes;

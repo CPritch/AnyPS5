@@ -1,5 +1,6 @@
 #pragma once
 
+#include "prx/libc/include/CpuTopology.hpp"
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -58,7 +59,10 @@ private:
             return;
         }
         output.exceptions(std::ios::badbit | std::ios::failbit);
-        worker = std::thread([this] { run(); });
+        worker = std::thread([this] {
+            CpuTopology::PinHelperThread("capture trace writer");
+            run();
+        });
     }
 
     ~CaptureTrace() {

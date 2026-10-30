@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "ShaderDiskCache.hpp"
+#include "prx/libc/include/CpuTopology.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -74,7 +75,10 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
     }
     Check(result, "vkCreatePipelineCache");
     try {
-        if (!path.empty()) saver = std::thread([this] { run(); });
+        if (!path.empty()) saver = std::thread([this] {
+            CpuTopology::PinHelperThread("pipeline cache saver");
+            run();
+        });
     } catch (...) {
         context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, nullptr);
         throw;

@@ -239,10 +239,73 @@ inline std::uint64_t PinTraced(const char* role, void* handle, std::uint64_t mas
     return applied;
 }
 
-// Helper threads (deferred release, mirror refresh) are pinned only when APS5_HELPER_AFFINITY_MASK
-// names their cores.
+struct Placement {
+    std::uint64_t worker = 0;
+    std::uint64_t finisher = 0;
+    std::uint64_t committer = 0;
+    std::uint64_t shared = 0;
+    bool Active() const {
+        return shared != 0;
+    }
+};
+
+inline Placement PlacementFor(const Layout& layout, const std::vector<std::uint64_t>& performantCores) {
+    constexpr std::size_t dedicated = 3;
+    if (!layout.hybrid || performantCores.size() <= dedicated) return {};
+    Placement result{};
+    result.worker = performantCores[0];
+    result.finisher = performantCores[1];
+    result.committer = performantCores[2];
+    result.shared = layout.process & ~(result.worker | result.finisher | result.committer);
+    if (result.shared == 0) return {};
+    return result;
+}
+
+#ifdef __linux__
+inline std::vector<std::uint64_t> CoresFromSysfs(const std::string& root, std::uint64_t mask) {
+    std::vector<std::uint64_t> cores;
+    std::uint64_t seen = 0;
+    for (unsigned cpu = 0; cpu < 64; ++cpu) {
+        const std::uint64_t bit = std::uint64_t{1} << cpu;
+        if ((mask & bit) == 0 || (seen & bit) != 0) continue;
+        auto siblings = MaskFromCpuList((root + "/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list").c_str()) & mask;
+        if ((siblings & bit) == 0) siblings = bit;
+        seen |= siblings;
+        cores.push_back(siblings);
+    }
+    return cores;
+}
+#endif
+
+inline bool PlacementRequested() {
+    for (const char* name : {"APS5_NO_CORE_PLACEMENT", "APS5_NO_WORKER_AFFINITY"})
+        if (std::getenv(name) != nullptr) return false;
+    return MaskFromEnvironment("APS5_WORKER_AFFINITY_MASK") == 0 && MaskFromEnvironment("APS5_COMMITTER_AFFINITY_MASK") == 0;
+}
+
+inline const Placement& GetPlacement() {
+    static const Placement placement = [] {
+        if (!PlacementRequested()) return Placement{};
+#ifdef __linux__
+        const auto& layout = Get();
+        return PlacementFor(layout, CoresFromSysfs("/sys/devices/system/cpu", layout.performant & layout.process));
+#else
+        return Placement{};
+#endif
+    }();
+    return placement;
+}
+
 inline void PinHelperThread(const char* role) {
-    static const std::uint64_t mask = MaskFromEnvironment("APS5_HELPER_AFFINITY_MASK");
+    static const std::uint64_t mask = [] {
+        const auto requested = MaskFromEnvironment("APS5_HELPER_AFFINITY_MASK");
+        return requested != 0 ? requested : GetPlacement().shared;
+    }();
+    if (mask != 0) PinTraced(role, nullptr, mask);
+}
+
+inline void PinGuestThread(const char* role) {
+    const auto mask = GetPlacement().shared;
     if (mask != 0) PinTraced(role, nullptr, mask);
 }
 

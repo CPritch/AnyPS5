@@ -1,5 +1,6 @@
 #pragma once
 
+#include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libc/include/general/LogMacros.hpp"
 #include <algorithm>
@@ -205,7 +206,10 @@ private:
         LogSink().store(&AsyncLog::Sink, std::memory_order_release);
         std::atexit(&AsyncLog::FlushAtEnd);
         InitializeWaits();
-        std::thread([this] { Run(); }).detach();
+        std::thread([this] {
+            CpuTopology::PinHelperThread("log writer");
+            Run();
+        }).detach();
         LibcSetEndFlush_nid_no_patch(&AsyncLog::FlushAtEnd);
     }
 

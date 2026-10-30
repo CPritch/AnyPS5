@@ -929,6 +929,14 @@ static void* StartNativeThread(void* opaque) {
 #if defined(__linux__)
         self->hostTid = static_cast<int>(gettid());
         RegisterGuestStackMapping(self);
+        {
+            std::string name;
+            {
+                std::lock_guard lock(self->nameLock);
+                name = self->name;
+            }
+            CpuTopology::PinGuestThread(name.empty() ? "guest thread" : name.c_str());
+        }
 #endif
         args->initialized.set_value();
     } catch (...) {
@@ -1193,6 +1201,9 @@ Pthread APS5_VABI scePthreadSelf() {
         adoptedThread->hostThread = pthread_self();
         SetStackFromHost(adoptedThread.get());
         CurrentGuestState().current = adoptedThread.get();
+#if defined(__linux__)
+        if (gettid() == getpid()) CpuTopology::PinGuestThread("guest main thread");
+#endif
     }
 #endif
     return CurrentGuestState().current;

@@ -135,6 +135,39 @@ int main() {
 
     Require(!FakeCpus(nullptr).Read().hybrid, "no online list");
 
+    {
+        FakeCpus cpus("0-19\n");
+        for (unsigned cpu = 0; cpu < 20; ++cpu) {
+            const unsigned core = cpu % 10;
+            WriteFile(cpus.root / ("cpu" + std::to_string(cpu)) / "topology" / "thread_siblings_list", std::to_string(core) + "," + std::to_string(core + 10) + "\n");
+        }
+        const auto cores = CpuTopology::CoresFromSysfs(cpus.root.string(), 0x3c0full);
+        Require(cores == std::vector<std::uint64_t>{0x401ull, 0x802ull, 0x1004ull, 0x2008ull}, "performant cores grouped by SMT siblings in cpu order");
+        Require(CpuTopology::CoresFromSysfs(cpus.root.string(), 0x0c03ull) == std::vector<std::uint64_t>{0x401ull, 0x802ull}, "siblings outside the mask are left out");
+        Require(CpuTopology::CoresFromSysfs(cpus.root.string(), 0x3ull) == std::vector<std::uint64_t>{0x1ull, 0x2ull}, "a core with one sibling in the mask");
+
+        CpuTopology::Layout zen5{};
+        zen5.process = 0xfffffull;
+        zen5.performant = 0x3c0full;
+        zen5.efficient = 0xfc3f0ull;
+        zen5.hybrid = true;
+        const auto placement = CpuTopology::PlacementFor(zen5, cores);
+        Require(placement.Active() && placement.worker == 0x401ull && placement.finisher == 0x802ull && placement.committer == 0x1004ull, "a performant core each for the worker, finisher and committer");
+        Require(placement.shared == 0xfe3f8ull, "every other thread on the fourth performant core and the efficient cores");
+
+        Require(!CpuTopology::PlacementFor(zen5, {0x401ull, 0x802ull, 0x1004ull}).Active(), "no placement without a performant core left to share");
+        auto uniform = zen5;
+        uniform.hybrid = false;
+        Require(!CpuTopology::PlacementFor(uniform, cores).Active(), "no placement on uniform cores");
+        auto narrow = zen5;
+        narrow.process = 0x1c07ull;
+        Require(!CpuTopology::PlacementFor(narrow, cores).Active(), "no placement when the process has no other cpu");
+    }
+    {
+        FakeCpus cpus("0-3\n");
+        Require(CpuTopology::CoresFromSysfs(cpus.root.string(), 0xfull) == std::vector<std::uint64_t>{0x1ull, 0x2ull, 0x4ull, 0x8ull}, "cpus without topology are cores of their own");
+    }
+
     const auto& layout = CpuTopology::Get();
     Require(layout.process != 0, "process affinity read");
     Require(!layout.hybrid || (layout.performant & layout.efficient) == 0, "hybrid classes overlap");

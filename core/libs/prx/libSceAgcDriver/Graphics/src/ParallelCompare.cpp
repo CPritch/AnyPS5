@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
+#include "prx/libc/include/CpuTopology.hpp"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -17,7 +18,10 @@ public:
     explicit ComparePool(unsigned count) {
         stopping = count == 0;
         for (unsigned i = 0; i < count; ++i) {
-            workers.emplace_back([this] { work(); });
+            workers.emplace_back([this] {
+                CpuTopology::PinHelperThread("parallel compare");
+                work();
+            });
             runningHelpers.fetch_add(1, std::memory_order_acq_rel);
         }
     }
