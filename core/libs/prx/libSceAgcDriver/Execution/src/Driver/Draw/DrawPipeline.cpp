@@ -625,23 +625,34 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
 }
 
 void DrawPipeline::WaitWritten(std::uint64_t address, std::size_t bytes, DrainReason reason, std::uint32_t opcode) {
+    const Range range{address, address + bytes};
+    WaitWrittenAny(std::span(&range, 1), reason, opcode);
+}
+
+bool DrawPipeline::TargetedWaits() {
     static const bool targeted = [] {
         const char* text = std::getenv("APS5_TARGETED_WAITS");
         return text == nullptr || text[0] != '0';
     }();
-    const auto end = address + bytes;
+    return targeted;
+}
+
+void DrawPipeline::WaitWrittenAny(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode) {
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
-    if (!targeted || (finisherBusy && (!DrawFinisher::Overlap() || DrawFinisher::Get().PendingOverlaps(address, end)))) {
+    if (!TargetedWaits() || (finisherBusy && (!DrawFinisher::Overlap() || DrawFinisher::Get().PendingOverlapsAny(ranges)))) {
         Drain(reason, opcode);
         return;
     }
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
+    const auto overlapping = [&](const Range& write) {
+        return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < write.second && write.first < range.second; });
+    };
     std::uint64_t target = 0;
     {
         std::lock_guard lock(mutex);
         for (std::size_t i = items.size(); i-- > 0;) {
             const auto& writes = items[i].writes;
-            if (std::none_of(writes.begin(), writes.end(), [&](const Range& range) { return address < range.second && range.first < end; })) continue;
+            if (std::none_of(writes.begin(), writes.end(), overlapping)) continue;
             target = retiredItems.load(std::memory_order_relaxed) + i + 1;
             targetedBehind += items.size() - i - 1;
             break;

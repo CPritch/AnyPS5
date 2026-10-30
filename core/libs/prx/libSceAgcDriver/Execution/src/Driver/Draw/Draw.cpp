@@ -350,8 +350,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (pipelined && drawParameters.indirect) {
         const auto& indirect = *drawParameters.indirect;
         auto& pipeline = DrawPipeline::Queue0();
-        const bool overlaps = pipeline.Busy() && (pipeline.Overlaps(indirect.arguments, static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes))) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4)));
-        if (!pipelinedIndirect || overlaps) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
+        const std::uint64_t argumentsEnd = indirect.arguments + std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes);
+        const bool overlaps = pipeline.Busy() && (pipeline.Overlaps(indirect.arguments, static_cast<std::size_t>(argumentsEnd - indirect.arguments)) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4)));
+        if (!pipelinedIndirect) {
+            pipeline.Drain(DrawPipeline::DrainReason::Indirect);
+        } else if (overlaps) {
+            std::array<DrawPipeline::Range, 2> read{DrawPipeline::Range{indirect.arguments, argumentsEnd}, DrawPipeline::Range{indirect.countAddress, indirect.countAddress + 4}};
+            pipeline.WaitWrittenAny(std::span(read.data(), indirect.countIndirect ? 2u : 1u), DrawPipeline::DrainReason::Indirect);
+        }
     }
     auto& traceIndirect = tail.traceIndirect;
     if (const auto verdict = precheckDraw(queue, submission, packetOffset, packet, drawParameters, rejected, traceIndirect)) {

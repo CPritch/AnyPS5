@@ -352,6 +352,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         } else {
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
             if (!readsClear) NoteItemFallback(ItemFallback::Reads);
+            if (!readsClear && DrawPipeline::TargetedWaits()) {
+                std::vector<DrawPipeline::Range> ranges;
+                ranges.reserve(reads.size());
+                for (const auto& region : reads) ranges.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+                DrawPipeline::Queue0().WaitWrittenAny(ranges, DrawPipeline::DrainReason::Packet, 0x15);
+                readsClear = true;
+            }
         }
         if (!readsClear && !missItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     }
