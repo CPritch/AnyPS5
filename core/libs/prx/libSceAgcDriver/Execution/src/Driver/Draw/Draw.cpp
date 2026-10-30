@@ -168,6 +168,7 @@ struct DrawTail {
     bool stageEntries = false;
     bool patchedStages = false;
     const Submission* submission = nullptr;
+    std::shared_ptr<const ShaderRegistry> shaders;
     std::uint32_t submissionQueue = 0;
     std::uint64_t submissionSerial = 0;
     std::size_t packetOffset = 0;
@@ -748,6 +749,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (handOff) {
         tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         tail.submissionSerial = submission.serial;
+        tail.shaders = submission.shaders;
         tail.packetOffset = static_cast<std::size_t>(packet.data() - submission.commands.data());
         noteFinisherHandOff(true);
         DrawFinisher::Pending held;
@@ -838,7 +840,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     const bool stageEntries = tail.stageEntries;
     const bool patchedStages = tail.patchedStages;
     std::uint64_t stageDataVerified = 0;
-    const Submission& submission = *tail.submission;
+    Submission handedOff{};
+    if (tail.queue == nullptr) {
+        handedOff.serial = tail.submissionSerial;
+        handedOff.queue = tail.submissionQueue;
+        handedOff.shaders = tail.shaders;
+    }
+    const Submission& submission = tail.queue != nullptr ? *tail.submission : handedOff;
     std::string& rejected = tail.rejected != nullptr ? *tail.rejected : tail.ownRejected;
     static const QueueState noQueue{};
     const QueueState& queue = tail.queue != nullptr ? *tail.queue : noQueue;

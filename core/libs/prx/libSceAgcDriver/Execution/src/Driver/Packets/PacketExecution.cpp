@@ -32,6 +32,11 @@ bool orderedFills() {
     return ordered;
 }
 
+bool finisherSettlesSubmissions() {
+    static const bool settles = std::getenv("APS5_FINISHER_SUBMISSION_END") != nullptr;
+    return settles;
+}
+
 bool dispatchesBesideFinisher() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_FINISHER_DISPATCH");
@@ -578,12 +583,14 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
-    if (submission.queue == 0) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherEnd);
+    const bool deferredEnd = pipelined && orderedCompletion && deferredLabels().labels.empty() && submission.rewindTail == nullptr && !finisherSettlesSubmissions();
+    if (submission.queue == 0 && !deferredEnd) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherEnd);
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
     if (pipelined && orderedCompletion && deferredLabels().labels.empty()) {
         if (submission.rewindTail == nullptr) {
+            if (deferredEnd) settleFinisher.queue0 = false;
             deferCompletion(submission);
             return;
         }
