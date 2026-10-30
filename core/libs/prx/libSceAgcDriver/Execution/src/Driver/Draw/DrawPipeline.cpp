@@ -42,7 +42,7 @@ thread_local bool finisherThread = false;
 thread_local bool finisherProducer = false;
 
 constexpr std::size_t QueueWaitSites = static_cast<std::size_t>(QueueWaits::Site::Count);
-constexpr std::array<const char*, QueueWaitSites> QueueWaitNames{"relocation", "lookup", "reads", "kept draw", "enqueue", "packet", "pipeline drain", "end of submission", "settle", "other", "room"};
+constexpr std::array<const char*, QueueWaitSites> QueueWaitNames{"relocation", "lookup", "reads", "kept draw", "enqueue", "packet", "pipeline drain", "end of submission", "settle", "special dispatch", "other", "room"};
 std::array<std::atomic<std::uint64_t>, QueueWaitSites> queueWaitCounts{}, queueWaitNs{};
 std::atomic<std::uint64_t> shadowCaptures{0}, shadowOverlaps{0};
 
@@ -82,7 +82,7 @@ void QueueWaits::NoteShadowCapture(bool overlapped) {
 std::string QueueWaits::Text() {
     using enum Site;
     std::string text = "worker drains of the finisher (count, waited):";
-    for (const auto site : {FinisherRelocation, FinisherLookup, FinisherReads, FinisherKept, FinisherEnqueue, FinisherPacket, FinisherPipelineDrain, FinisherEnd, FinisherSettle, FinisherOther}) {
+    for (const auto site : {FinisherRelocation, FinisherLookup, FinisherReads, FinisherKept, FinisherEnqueue, FinisherPacket, FinisherPipelineDrain, FinisherEnd, FinisherSettle, FinisherDispatch, FinisherOther}) {
         text += " ";
         text += QueueWaitNames[static_cast<std::size_t>(site)];
         text += " " + QueueWaitText(site);

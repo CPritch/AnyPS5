@@ -32,6 +32,14 @@ bool orderedFills() {
     return ordered;
 }
 
+bool dispatchesBesideFinisher() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_FINISHER_DISPATCH");
+        return text == nullptr || text[0] != '0';
+    }();
+    return enabled;
+}
+
 bool keepsDrawFinisher(std::uint32_t header, std::uint32_t opcode) {
     if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
     if (Pm4::DrawOpcode(opcode)) return true;
@@ -266,7 +274,7 @@ void Driver::execute(const Submission& submission) {
             const bool queuesLabel = queuesItem && labelPacketQueues(packet, opcode);
             const bool queuesDump = queuesItem && sampleDumpQueues(packet, opcode, submission.queue);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
-            const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || queuesDump || heldLabelWait || keepsDrawPipeline(packet, header, opcode));
+            const bool beside = DrawFinisher::Overlap() && (opcode != 0x15 || (dispatchesBesideFinisher() && queuesItem)) && (queuesLabel || queuesDump || heldLabelWait || keepsDrawPipeline(packet, header, opcode));
             if (!beside) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherPacket);
             if (DrawFinisher::Overlap()) {
                 DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside);

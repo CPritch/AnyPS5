@@ -159,6 +159,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
         if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
     } else {
+        if (submission.queue == 0 && DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
+            const auto code = std::span(snapshot.code).subspan(codeOffset);
+            const bool fills = !partialLastGroup && (MatchDwordPatternFill(packet, code, userData, compute) || MatchConstantDwordFill(packet, code, userData, compute) || MatchClampedGlobalFill(packet, code, userData, compute) || MatchMemoryValueBufferFill(packet, code, userData, compute) || matchesFillKernel(code, userData, compute));
+            const bool copies = !partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(code, userData, compute) || MatchesStreamCopyKernel(code, userData, compute) || MatchesIndexedCopyKernel(code, userData, compute));
+            const bool clears = indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(code, userData, compute.numThreads).has_value();
+            const bool notes = Graphics::HtileDepthClearAddress(code, userData, compute.numThreads) != 0 || (indirectArguments == 0 && (packet[4] & 0x20u) == 0 && Graphics::MatchMemoryValueFill(code, userData, compute.numThreads, {packet[1], packet[2], packet[3]}).has_value());
+            if (fills || copies || clears || notes) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherDispatch);
+        }
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;

@@ -32,6 +32,7 @@ public:
         FinisherPipelineDrain,
         FinisherEnd,
         FinisherSettle,
+        FinisherDispatch,
         FinisherOther,
         FinisherRoom,
         PipelineRoomWorker,
