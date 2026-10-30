@@ -141,6 +141,7 @@ struct DrawTail {
     std::shared_ptr<const DrawDecode> relocatedDecode;
     std::shared_ptr<DrawEntry> dataEntry;
     std::uint64_t shapeKey = 0;
+    DrawRelocationPending relocationPending{};
     ShaderRecompiler::ShaderPixelStageInfo pixel{};
     std::vector<DrawProgram> writablePrograms;
     const std::vector<DrawProgram>* programs = nullptr;
@@ -242,6 +243,7 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     DrawFinisher::Pending held;
     held.key = tail.drawKey;
     held.shape = tail.shapeKey;
+    held.inserts = tail.stageEntries && !tail.drawHit;
     if (tail.decode == nullptr) {
         noteHeld(HeldReason::NoDecode);
         return held;
@@ -402,10 +404,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
-            if (DrawFinisher::Busy() && drawRelocationPending.key != 0) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherRelocation);
+            if (relocationDrain() && relocationAwaitsLearn && DrawFinisher::Busy()) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherRelocation);
+            relocationAwaitsLearn = false;
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
             std::lock_guard cacheLock(drawCacheMutex);
-            learnPendingRelocation();
             const auto known = drawRelocations.find(drawIdentity);
             if (known != drawRelocations.end()) {
                 auto& trial = drawRelocationTrials[drawIdentity];
@@ -417,12 +419,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
         if (DrawFinisher::Busy()) {
             bool shapeMatters = false;
-            if (DrawFinisher::Overlap() && drawDataHits()) {
+            bool cached = false;
+            if (DrawFinisher::Overlap()) {
                 std::lock_guard peekLock(drawCacheMutex);
-                const auto shape = drawShapes.find(shapeKey);
-                shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
+                cached = !DrawFinisher::LookupDrainsEvery() && drawCache.contains(drawKey);
+                if (drawDataHits()) {
+                    const auto shape = drawShapes.find(shapeKey);
+                    shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
+                }
             }
-            const bool drain = !DrawFinisher::Overlap() || DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0);
+            const bool drain = !DrawFinisher::Overlap() || (!cached && DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0));
             if (drain) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherLookup);
             if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain);
         }
@@ -441,7 +447,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias);
                 cacheLock.lock();
             }
-            if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity};
+            if (drawIdentity != 0) {
+                tail.relocationPending = {drawKey, drawAlias, drawIdentity};
+                relocationAwaitsLearn = true;
+            }
             if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
             if (relocation != nullptr) {
                 auto& trial = drawRelocationTrials[drawIdentity];
@@ -997,7 +1006,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
-    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
+    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, tail.relocationPending, shapeNeedsEntry);
+    if (tail.relocationPending.key != 0) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        learnPendingRelocation(tail.relocationPending);
+    }
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {

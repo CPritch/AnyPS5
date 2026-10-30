@@ -169,10 +169,16 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
     return false;
 }
 
+bool DrawFinisher::LookupDrainsEvery() {
+    static const bool every = std::getenv("APS5_LOOKUP_DRAIN") != nullptr;
+    return every;
+}
+
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
     if (!Busy() || !finisherProducer) return false;
+    const bool every = LookupDrainsEvery();
     std::lock_guard lock(mutex);
-    return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return held.key == key || (shape != 0 && held.shape == shape); });
+    return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return (every || held.inserts) && (held.key == key || (shape != 0 && held.shape == shape)); });
 }
 
 namespace {
