@@ -42,7 +42,7 @@ thread_local bool finisherThread = false;
 thread_local bool finisherProducer = false;
 
 constexpr std::size_t QueueWaitSites = static_cast<std::size_t>(QueueWaits::Site::Count);
-constexpr std::array<const char*, QueueWaitSites> QueueWaitNames{"relocation", "lookup", "reads", "kept draw", "enqueue", "packet", "pipeline drain", "end of submission", "settle", "special dispatch", "other", "room"};
+constexpr std::array<const char*, QueueWaitSites> QueueWaitNames{"relocation", "lookup", "reads", "kept draw", "enqueue", "packet", "pipeline drain", "end of submission", "settle", "special dispatch", "targeted", "other", "room"};
 std::array<std::atomic<std::uint64_t>, QueueWaitSites> queueWaitCounts{}, queueWaitNs{};
 std::atomic<std::uint64_t> shadowCaptures{0}, shadowOverlaps{0};
 
@@ -82,7 +82,7 @@ void QueueWaits::NoteShadowCapture(bool overlapped) {
 std::string QueueWaits::Text() {
     using enum Site;
     std::string text = "worker drains of the finisher (count, waited):";
-    for (const auto site : {FinisherRelocation, FinisherLookup, FinisherReads, FinisherKept, FinisherEnqueue, FinisherPacket, FinisherPipelineDrain, FinisherEnd, FinisherSettle, FinisherDispatch, FinisherOther}) {
+    for (const auto site : {FinisherRelocation, FinisherLookup, FinisherReads, FinisherKept, FinisherEnqueue, FinisherPacket, FinisherPipelineDrain, FinisherEnd, FinisherSettle, FinisherDispatch, FinisherTargeted, FinisherOther}) {
         text += " ";
         text += QueueWaitNames[static_cast<std::size_t>(site)];
         text += " " + QueueWaitText(site);
@@ -301,6 +301,7 @@ void DrawFinisher::run() {
             ran.push_back(std::move(jobs.front()));
             jobs.pop_front();
             pending.pop_front();
+            ++ranJobs;
             outstanding.fetch_sub(1, std::memory_order_release);
             idle.notify_all();
         }
@@ -328,6 +329,28 @@ void DrawFinisher::Drain(QueueWaits::Site site) {
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
     if (busy) QueueWaits::Note(site, start);
+    if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
+}
+
+void DrawFinisher::WaitPendingWritten(std::span<const Range> ranges) {
+    if (!Busy() || OnFinisherThread()) return;
+    const auto overlapping = [&](const Range& write) {
+        return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < write.second && write.first < range.second; });
+    };
+    std::unique_lock lock(mutex);
+    std::uint64_t target = 0;
+    for (std::size_t i = pending.size(); i-- > 0;) {
+        const auto& held = pending[i];
+        if (!held.unknown && std::none_of(held.writes.begin(), held.writes.end(), overlapping)) continue;
+        target = ranJobs + i + 1;
+        break;
+    }
+    if (target == 0) return;
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher wait under the GPU lock");
+    PerformanceTimer timing("DrawFinisher.WaitPending");
+    const auto start = std::chrono::steady_clock::now();
+    idle.wait(lock, [&] { return ranJobs >= target || failure != nullptr; });
+    QueueWaits::Note(QueueWaits::Site::FinisherTargeted, start);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
@@ -639,10 +662,11 @@ bool DrawPipeline::TargetedWaits() {
 
 void DrawPipeline::WaitWrittenAny(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode) {
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
-    if (!TargetedWaits() || (finisherBusy && (!DrawFinisher::Overlap() || DrawFinisher::Get().PendingOverlapsAny(ranges)))) {
+    if (!TargetedWaits() || (finisherBusy && !DrawFinisher::Overlap())) {
         Drain(reason, opcode);
         return;
     }
+    if (finisherBusy) DrawFinisher::Get().WaitPendingWritten(ranges);
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     const auto overlapping = [&](const Range& write) {
         return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < write.second && write.first < range.second; });

@@ -274,6 +274,11 @@ void Driver::execute(const Submission& submission) {
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (pipelined && !predicated && Pm4::IndirectRegisterOpcode(opcode) && packet.size() >= 5 && DrawPipeline::TargetedWaits() && DrawPipeline::Queue0().Busy()) {
+            const std::uint64_t source = packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u);
+            const DrawPipeline::Range read{source, source + static_cast<std::uint64_t>(packet[4]) * 8};
+            if (DrawPipeline::Queue0().Overlaps(read.first, static_cast<std::size_t>(read.second - read.first))) DrawPipeline::Queue0().WaitWrittenAny(std::span(&read, 1), DrawPipeline::DrainReason::Packet, opcode);
+        }
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesItem = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor);
             const bool queuesLabel = queuesItem && labelPacketQueues(packet, opcode);

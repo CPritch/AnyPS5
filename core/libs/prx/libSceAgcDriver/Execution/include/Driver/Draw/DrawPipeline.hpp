@@ -33,6 +33,7 @@ public:
         FinisherEnd,
         FinisherSettle,
         FinisherDispatch,
+        FinisherTargeted,
         FinisherOther,
         FinisherRoom,
         PipelineRoomWorker,
@@ -182,6 +183,7 @@ public:
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
     void Drain(QueueWaits::Site site = QueueWaits::Site::FinisherOther);
+    void WaitPendingWritten(std::span<const Range> ranges);
     void Settle();
     void ReleaseRan();
 
@@ -196,6 +198,7 @@ private:
     std::deque<Pending> pending;
     std::vector<Job> ran;
     std::exception_ptr failure;
+    std::uint64_t ranJobs = 0;
     bool running = false;
     bool sleeping = false;
     std::thread thread;
