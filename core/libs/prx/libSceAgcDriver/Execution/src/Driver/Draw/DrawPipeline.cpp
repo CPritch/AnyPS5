@@ -282,18 +282,29 @@ void DrawFinisher::run() {
             QueueWaits::Note(QueueWaits::Site::FinisherIdleBlocked, spun);
         }
         std::exception_ptr error;
+        bool shutdown = false;
         try {
             if (!failed) (*job)();
+        } catch (const ProcessShutdown&) {
+            error = std::current_exception();
+            shutdown = true;
         } catch (...) {
             error = std::current_exception();
         }
-        std::lock_guard lock(mutex);
-        if (error != nullptr && failure == nullptr) failure = error;
-        ran.push_back(std::move(jobs.front()));
-        jobs.pop_front();
-        pending.pop_front();
-        outstanding.fetch_sub(1, std::memory_order_release);
-        idle.notify_all();
+        bool report = false;
+        {
+            std::lock_guard lock(mutex);
+            if (error != nullptr && failure == nullptr) {
+                failure = error;
+                report = !shutdown;
+            }
+            ran.push_back(std::move(jobs.front()));
+            jobs.pop_front();
+            pending.pop_front();
+            outstanding.fetch_sub(1, std::memory_order_release);
+            idle.notify_all();
+        }
+        if (report) Driver::Get().ReportFailure(error);
     }
 }
 
