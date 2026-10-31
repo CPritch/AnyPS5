@@ -2150,12 +2150,62 @@ bool StorageTexture::RefreshLayers(std::uint32_t first, std::uint32_t count) {
     return refresh(firstLayer, lastLayer);
 }
 
+namespace {
+
+struct CommitterRefreshSplit {
+    std::array<std::atomic<std::uint64_t>, 5> count{}, ns{};
+    std::atomic<std::uint64_t> stamped{0}, stampedNs{0};
+};
+
+CommitterRefreshSplit& CommitterRefreshes() {
+    static CommitterRefreshSplit split;
+    return split;
+}
+
+}
+
+std::string StorageTexture::TakeCommitterRefreshText() {
+    auto& split = CommitterRefreshes();
+    constexpr std::array<const char*, 5> names{"reused", "never proved", "new epoch", "proofs broken", "pending images changed"};
+    std::string text = "; committer image refreshes (count/ms):";
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        char item[80];
+        std::snprintf(item, sizeof(item), "%s %s %llu/%.1f", i == 0 ? "" : ",", names[i], static_cast<unsigned long long>(split.count[i].exchange(0, std::memory_order_relaxed)), static_cast<double>(split.ns[i].exchange(0, std::memory_order_relaxed)) / 1e6);
+        text += item;
+    }
+    char stamped[96];
+    std::snprintf(stamped, sizeof(stamped), ", of the rest proved by stamps %llu/%.1f", static_cast<unsigned long long>(split.stamped.exchange(0, std::memory_order_relaxed)), static_cast<double>(split.stampedNs.exchange(0, std::memory_order_relaxed)) / 1e6);
+    return text + stamped;
+}
+
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
     const bool epochProofs = ShaderResources::EpochProofs();
     const auto epoch = epochProofs ? GuestMemory::CollectEpoch() : 0;
+    struct CommitterRefresh {
+        std::size_t reason = 5;
+        bool stamped = false;
+        std::chrono::steady_clock::time_point start;
+        ~CommitterRefresh() {
+            if (reason >= 5) return;
+            auto& split = CommitterRefreshes();
+            const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            split.count[reason].fetch_add(1, std::memory_order_relaxed);
+            split.ns[reason].fetch_add(ns, std::memory_order_relaxed);
+            if (stamped) {
+                split.stamped.fetch_add(1, std::memory_order_relaxed);
+                split.stampedNs.fetch_add(ns, std::memory_order_relaxed);
+            }
+        }
+    } committer;
+    static const bool committerCounted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (committerCounted && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer) {
+        committer.start = std::chrono::steady_clock::now();
+        const auto proved = provedEpoch.load(std::memory_order_relaxed);
+        committer.reason = epoch == 0 || proved == 0 ? 1 : proved != epoch ? 2 : provedProof.load(std::memory_order_relaxed) != GuestMemory::ProofSerial() ? 3 : provedPending.load(std::memory_order_relaxed) != PendingSerial() ? 4 : 0;
+    }
     if (epoch != 0 && provedEpoch.load(std::memory_order_relaxed) == epoch && provedProof.load(std::memory_order_relaxed) == GuestMemory::ProofSerial() && provedPending.load(std::memory_order_relaxed) == PendingSerial()) {
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
@@ -2176,6 +2226,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
+        committer.stamped = true;
         return true;
     }
     refreshProof = {};

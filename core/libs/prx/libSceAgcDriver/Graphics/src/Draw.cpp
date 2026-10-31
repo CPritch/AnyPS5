@@ -3789,6 +3789,8 @@ std::string TakeDrawSplitText() {
     char failed[48];
     std::snprintf(failed, sizeof(failed), ", failed %llu", take(split.proofFailed));
     result += failed;
+    result += ShaderResources::TakeCommitterProofText();
+    result += StorageTexture::TakeCommitterRefreshText();
     return result;
 }
 

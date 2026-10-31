@@ -3544,6 +3544,47 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 
 namespace {
 thread_local ShaderResources::ProofReuse lastProofReuse = ShaderResources::ProofReuse::Off;
+
+struct CommitterProofSplit {
+    std::atomic<std::uint64_t> proofs{0}, totalNs{0}, pendingNs{0}, fastNs{0}, fullWalks{0}, fullWalkNs{0}, fastPassed{0};
+};
+
+CommitterProofSplit& CommitterProofs() {
+    static CommitterProofSplit split;
+    return split;
+}
+
+bool CommitterProofCounted() {
+    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return counted && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer;
+}
+
+struct CommitterProofTimer {
+    bool counted = CommitterProofCounted();
+    std::chrono::steady_clock::time_point start = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::chrono::steady_clock::time_point mark = start;
+    void lap(std::atomic<std::uint64_t>& total) {
+        if (!counted) return;
+        const auto now = std::chrono::steady_clock::now();
+        total.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count()), std::memory_order_relaxed);
+        mark = now;
+    }
+    ~CommitterProofTimer() {
+        if (!counted) return;
+        auto& split = CommitterProofs();
+        split.proofs.fetch_add(1, std::memory_order_relaxed);
+        split.totalNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    }
+};
+}
+
+std::string ShaderResources::TakeCommitterProofText() {
+    auto& split = CommitterProofs();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const auto proofs = take(split.proofs), total = take(split.totalNs), pending = take(split.pendingNs), fast = take(split.fastNs), walks = take(split.fullWalks), walkNs = take(split.fullWalkNs), passed = take(split.fastPassed);
+    char text[256];
+    std::snprintf(text, sizeof(text), "; committer full template proofs %llu, %.1f ms: pending-write checks %.1f ms, stamp proof %.1f ms (%llu passed), full walks %llu %.1f ms, rest %.1f ms", static_cast<unsigned long long>(proofs), static_cast<double>(total) / 1e6, static_cast<double>(pending) / 1e6, static_cast<double>(fast) / 1e6, static_cast<unsigned long long>(passed), static_cast<unsigned long long>(walks), static_cast<double>(walkNs) / 1e6, static_cast<double>(total - std::min(total, pending + fast + walkNs)) / 1e6);
+    return text;
 }
 
 ShaderResources::ProofReuse ShaderResources::LastProofReuse() {
@@ -3592,6 +3633,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    CommitterProofTimer committerTimer;
     for (const auto& region : directRegions) {
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
         CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
@@ -3605,6 +3647,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
+    committerTimer.lap(CommitterProofs().pendingNs);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
@@ -3732,9 +3775,14 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         reason = FastFail::Audit;
     }
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
+    committerTimer.lap(CommitterProofs().fastNs);
+    if (fast && committerTimer.counted) CommitterProofs().fastPassed.fetch_add(1, std::memory_order_relaxed);
     if (!fast) {
         countFullWalk(reason);
-        if (!fullWalk()) {
+        const bool walked = fullWalk();
+        if (committerTimer.counted) CommitterProofs().fullWalks.fetch_add(1, std::memory_order_relaxed);
+        committerTimer.lap(CommitterProofs().fullWalkNs);
+        if (!walked) {
             const auto failure = [&] {
                 switch (reason) {
                     case FastFail::Pending: return ProofFailure::Pending;
