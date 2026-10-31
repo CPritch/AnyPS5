@@ -258,7 +258,7 @@ inline Placement PlacementFor(const Layout& layout, const std::vector<std::uint6
     result.finisher = performantCores[1];
     result.committer = performantCores[2];
     if (resolver && performantCores.size() > dedicated) result.resolver = performantCores[dedicated];
-    result.shared = layout.process & ~(result.worker | result.finisher | result.committer | result.resolver);
+    result.shared = layout.process & ~(result.worker | result.finisher | result.committer);
     if (result.shared == 0) return {};
     return result;
 }
