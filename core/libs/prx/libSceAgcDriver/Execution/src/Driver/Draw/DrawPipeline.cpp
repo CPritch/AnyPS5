@@ -434,7 +434,23 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
     static thread_local std::uint64_t followed = 0;
     if (followed == token) return;
     followed = token;
-    GuestMemory::BumpCollectEpoch();
+    static const bool shared = std::getenv("APS5_NO_SHARED_COMMIT_EPOCH") == nullptr;
+    if (shared && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer) {
+        static AgcDriver::Mutex mutex;
+        static std::array<std::pair<std::uint64_t, std::uint64_t>, 32> epochs{};
+        static std::size_t next = 0;
+        std::lock_guard lock(mutex);
+        const auto found = std::find_if(epochs.begin(), epochs.end(), [&](const auto& entry) { return entry.first == token; });
+        if (found != epochs.end() && found->second != 0) {
+            GuestMemory::AdoptCollectEpoch(found->second);
+        } else {
+            GuestMemory::BumpCollectEpoch();
+            epochs[next] = {token, GuestMemory::ThreadCollectEpoch()};
+            next = (next + 1) % epochs.size();
+        }
+    } else {
+        GuestMemory::BumpCollectEpoch();
+    }
     GuestMemory::FollowCollectToken(token);
 }
 
