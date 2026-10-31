@@ -5701,9 +5701,49 @@ ShaderResources::DrawBindings::~DrawBindings() {
     release(fragmentLayout, fragmentAllocation);
 }
 
+namespace {
+
+struct CommitterMovedSplit {
+    std::atomic<std::uint64_t> calls{0}, unchanged{0}, movedHits{0}, refused{0}, dataMoved{0}, buffersMoved{0}, checkNs{0};
+};
+
+CommitterMovedSplit& CommitterMoved() {
+    static CommitterMovedSplit split;
+    return split;
+}
+
+}
+
+std::string ShaderResources::TakeCommitterMovedText() {
+    auto& split = CommitterMoved();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    char text[256];
+    std::snprintf(text, sizeof(text), "; committer moved-buffer checks %llu: nothing moved %llu, moved %llu (%llu data words, %llu guest buffers), refused %llu; commit-time checks of moved guest buffers %.1f ms", take(split.calls), take(split.unchanged), take(split.movedHits), take(split.dataMoved), take(split.buffersMoved), take(split.refused), static_cast<double>(take(split.checkNs)) / 1e6);
+    return text;
+}
+
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target) const {
+    const bool counted = CommitterProofCounted();
+    struct Outcome {
+        bool counted;
+        std::uint64_t data = 0, buffers = 0;
+        bool refused = true;
+        ~Outcome() {
+            if (!counted) return;
+            auto& split = CommitterMoved();
+            split.calls.fetch_add(1, std::memory_order_relaxed);
+            if (refused) split.refused.fetch_add(1, std::memory_order_relaxed);
+            else if (data + buffers == 0) split.unchanged.fetch_add(1, std::memory_order_relaxed);
+            else split.movedHits.fetch_add(1, std::memory_order_relaxed);
+            split.dataMoved.fetch_add(data, std::memory_order_relaxed);
+            split.buffersMoved.fetch_add(buffers, std::memory_order_relaxed);
+        }
+    } outcome{counted};
     std::vector<MovedBuffer> moved;
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return moved;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) {
+        outcome.refused = false;
+        return moved;
+    }
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
@@ -5719,6 +5759,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 if (item.dataWords.empty() && patched) return std::nullopt;
                 if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, 0, item.size, binding.guestDescriptor});
+                ++outcome.data;
                 continue;
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
@@ -5741,13 +5782,17 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
-                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+                const auto checkStart = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const bool usable = GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) && !(guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes));
+                if (counted) CommitterMoved().checkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - checkStart).count()), std::memory_order_relaxed);
+                if (!usable) return std::nullopt;
                 if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
+                ++outcome.buffers;
             }
         }
     }
+    outcome.refused = false;
     return moved;
 }
 

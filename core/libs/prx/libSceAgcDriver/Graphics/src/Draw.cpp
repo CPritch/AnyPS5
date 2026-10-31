@@ -3790,6 +3790,7 @@ std::string TakeDrawSplitText() {
     std::snprintf(failed, sizeof(failed), ", failed %llu", take(split.proofFailed));
     result += failed;
     result += ShaderResources::TakeCommitterProofText();
+    result += ShaderResources::TakeCommitterMovedText();
     result += StorageTexture::TakeCommitterRefreshText();
     return result;
 }
