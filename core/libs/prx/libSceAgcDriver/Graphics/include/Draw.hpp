@@ -41,6 +41,8 @@ struct DrawAhead {
     std::uint64_t storeHash = 0;
     bool looked = false;
     std::shared_ptr<ShaderResources> found;
+    std::uint64_t proofAtLookup = 0;
+    std::uint64_t pendingAtLookup = 0;
     bool movedPlanned = false;
     std::optional<ShaderResources::MovedPlan> movedPlan;
     GuestMemory::PrecollectedWrites walks;

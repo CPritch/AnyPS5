@@ -1796,7 +1796,12 @@ struct DrawSplitCounts {
     std::array<std::atomic<std::uint64_t>, PhaseCount> phaseNs{};
     std::array<std::atomic<std::uint64_t>, 6> proofs{}, proofNs{};
     std::atomic<std::uint64_t> proofFailed{0}, findNs{0}, movedNs{0}, hits{0}, unmoved{0}, invalidated{0}, misses{0}, uncacheable{0};
+    std::array<std::atomic<std::uint64_t>, 5> proofGap{}, pendingGap{};
 };
+
+std::size_t GapBucket(std::uint64_t gap) {
+    return gap == 0 ? 0 : gap <= 4 ? 1 : gap <= 16 ? 2 : gap <= 64 ? 3 : 4;
+}
 
 DrawSplitCounts& DrawSplit() {
     static DrawSplitCounts counts;
@@ -1870,6 +1875,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             mark = now;
         };
         lap(split.findNs);
+        if (counted && fromHint) {
+            split.proofGap[GapBucket(GuestMemory::ProofSerial() - ahead.ahead->proofAtLookup)].fetch_add(1, std::memory_order_relaxed);
+            split.pendingGap[GapBucket(StorageTexture::PendingSerial() - ahead.ahead->pendingAtLookup)].fetch_add(1, std::memory_order_relaxed);
+        }
         if (cached != nullptr) {
             const bool valid = cached->Revalidate(shaders);
             if (counted) {
@@ -3807,6 +3816,9 @@ std::string TakeDrawSplitText() {
     char failed[48];
     std::snprintf(failed, sizeof(failed), ", failed %llu", take(split.proofFailed));
     result += failed;
+    char gaps[256];
+    std::snprintf(gaps, sizeof(gaps), "; hinted templates by proof breaks between the preparer's lookup and the commit (0, 1-4, 5-16, 17-64, more): %llu %llu %llu %llu %llu; by pending-image changes: %llu %llu %llu %llu %llu", take(split.proofGap[0]), take(split.proofGap[1]), take(split.proofGap[2]), take(split.proofGap[3]), take(split.proofGap[4]), take(split.pendingGap[0]), take(split.pendingGap[1]), take(split.pendingGap[2]), take(split.pendingGap[3]), take(split.pendingGap[4]));
+    result += gaps;
     result += ShaderResources::TakeCommitterProofText();
     result += ShaderResources::TakeCommitterMovedText();
     result += StorageTexture::TakeCommitterRefreshText();
@@ -3873,6 +3885,8 @@ void PrepareDrawAhead(const Context& context, const State& state, const Pm4::Dra
     static const bool hints = std::getenv("APS5_NO_PREPARE_AHEAD_TEMPLATES") == nullptr;
     if (keyed && hints) {
         ahead.looked = true;
+        ahead.proofAtLookup = GuestMemory::ProofSerial();
+        ahead.pendingAtLookup = StorageTexture::PendingSerial();
         ahead.found = SharedResourceCache().Find(ahead.contentKey);
         if (ahead.found != nullptr) ahead.found->PrecollectSurfaces(ahead.walks);
         static const bool movedAhead = std::getenv("APS5_NO_PREPARE_AHEAD_MOVED") == nullptr;
