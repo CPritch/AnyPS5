@@ -2644,8 +2644,9 @@ std::uint64_t StorageTexture::SlabRetiles() {
 bool StorageTexture::otherPendingOverlaps() const {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
-    const auto other = [&](const StorageTexture* texture) { return texture != this && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); };
-    return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
+    const auto overlapping = [&](const StorageTexture* texture) { return texture != this && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); };
+    const auto pendingInside = [&](const StorageTexture* texture) { return overlapping(texture) && texture->pendingUnitInside(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); };
+    return std::any_of(pending.textures.begin(), pending.textures.end(), pendingInside) || std::any_of(pending.flushing.begin(), pending.flushing.end(), overlapping);
 }
 
 bool StorageTexture::refreshProved() {
@@ -4071,7 +4072,9 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         }
     }
     if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(&unsaved);
+    bool newlyPending = false;
     for (std::uint32_t layer = first; layer < first + count; ++layer) {
+        newlyPending = newlyPending || !layerPending[layer];
         if (!layerPending[layer] && !completionKept.empty()) {
             const auto end = layerBegin(layer) + layerBytes(layer);
             for (auto at = layerBegin(layer) & ~std::uint64_t{65535}; at < end; at += 65536) completionKept[static_cast<std::size_t>(at / 65536 - descriptor.baseAddress / 65536)] = 0;
@@ -4116,7 +4119,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     ++version;
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
-        if (wasLent) BumpPendingSerial();
+        if (wasLent || newlyPending) BumpPendingSerial();
         return;
     }
     dirty = true;
