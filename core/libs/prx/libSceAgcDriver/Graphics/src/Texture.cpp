@@ -2257,6 +2257,7 @@ std::string StorageTexture::TakeCommitterRefreshText() {
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
+    GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverRefresh);
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;

@@ -230,7 +230,7 @@ struct ResolveLockTrace {
 };
 enum class ResolveEffect : std::uint8_t { Submit, Reap, ProofBreak, Import, CacheInsert, StorageCreate, Count };
 void NoteResolveEffect(ResolveEffect effect);
-enum class BarrierKind : std::uint8_t { None, Lock, HeldCheck, Commands, Submit, Reap, ProofBreak, Import, CacheInsert, StorageCreate, RecorderWrite, PendingSet, DepthRetire, StorageEvict, Forced, ResolverRecorder, ResolverPath, Count };
+enum class BarrierKind : std::uint8_t { None, Lock, HeldCheck, Commands, Submit, Reap, ProofBreak, Import, CacheInsert, StorageCreate, RecorderWrite, PendingSet, DepthRetire, StorageEvict, Forced, ResolverRecorder, ResolverPath, ResolverRefresh, Count };
 const char* BarrierKindName(BarrierKind kind);
 void ResolveBarrier(BarrierKind kind, const void* site);
 void ResolveCheckpoint();
