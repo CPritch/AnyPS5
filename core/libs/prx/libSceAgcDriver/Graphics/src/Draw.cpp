@@ -4005,15 +4005,32 @@ std::string TakeDrawSplitText() {
     return result;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, DrawAhead* ahead) {
+struct DrawPacket {
+    explicit DrawPacket(bool profile) : prepared(profile) {}
+    PreparedDraw prepared;
+    const State* state = nullptr;
+    Pm4::DrawParameters draw{};
+    std::span<const CompiledShader> shaders;
+    std::span<const GuestMemorySnapshot> snapshots;
+    std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
+    const DrawTraceContext* trace = nullptr;
+    std::uint64_t shape = 0;
+    bool ready = false;
+    bool counted = false;
+    std::chrono::steady_clock::time_point started;
+    std::uint64_t proofAtEmit = 0;
+    std::uint64_t pendingAtEmit = 0;
+};
+
+void DrawPacketDeleter::operator()(DrawPacket* packet) const {
+    delete packet;
+}
+
+DrawPacketPtr ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, DrawAhead* ahead) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
-    if (state.stages.tessellationGeometry) {
-        if (DrawSplitCounted()) DrawSplit().tessellation.fetch_add(1, std::memory_order_relaxed);
-        drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
-        return;
-    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    PreparedDraw prepared(profile);
+    DrawPacketPtr packet(new DrawPacket(profile));
+    auto& prepared = packet->prepared;
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
     prepared.shape = shape;
@@ -4034,10 +4051,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         prepared.timer.counted = true;
         prepared.timer.phaseStart = std::chrono::steady_clock::now();
     }
-    const auto started = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    packet->counted = counted;
+    packet->started = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto proofAtResolve = counted ? GuestMemory::ProofSerial() : 0;
     lastResolveLockFree = false;
-    const bool ready = prepareDraw(context, state, draw, shaders, snapshots, prepared);
+    packet->ready = prepareDraw(context, state, draw, shaders, snapshots, prepared);
     if (counted) {
         staleView.sequence = AgcDriver::DriverDetail::DrawPipeline::CommitSequence();
         staleView.snapshot = Recorder::PendingWriteSnapshot();
@@ -4055,8 +4073,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             if (state.depth->htileAddress != 0) staleView.writes.emplace_back(state.depth->htileAddress, state.depth->htileAddress + HtileMetadataBytes(state.depth->extent));
         }
     }
-    const auto proofAtEmit = counted ? GuestMemory::ProofSerial() : 0;
-    const auto pendingAtEmit = counted ? StorageTexture::PendingSerial() : 0;
+    packet->proofAtEmit = counted ? GuestMemory::ProofSerial() : 0;
+    packet->pendingAtEmit = counted ? StorageTexture::PendingSerial() : 0;
     if (counted && lastResolveLockFree) {
         auto& split = DrawSplit();
         const auto sequence = AgcDriver::DriverDetail::DrawPipeline::CommitSequence();
@@ -4067,6 +4085,25 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         else if (prepared.resolved.resources != nullptr && prepared.resolved.resources->DescribedRangesOverlap(lastEmit.targets)) split.samplesPreviousTargets.fetch_add(1, std::memory_order_relaxed);
         else split.wouldSplit.fetch_add(1, std::memory_order_relaxed);
     }
+    packet->state = &state;
+    packet->draw = draw;
+    packet->shaders = shaders;
+    packet->snapshots = snapshots;
+    packet->recipeOut = recipeOut;
+    packet->trace = trace;
+    packet->shape = shape;
+    return packet;
+}
+
+void EmitDraw(const Context& context, DrawPacket& packet) {
+    const auto& state = *packet.state;
+    const auto& draw = packet.draw;
+    const auto shaders = packet.shaders;
+    const auto snapshots = packet.snapshots;
+    auto& prepared = packet.prepared;
+    const DepthCopySourceScope depthCopySource(state.depthCopySource);
+    std::optional<GuestMemory::PrecollectedScope> precollected;
+    if (prepared.ahead.ahead != nullptr && !prepared.ahead.verify && !prepared.ahead.ahead->walks.walks.empty()) precollected.emplace(&prepared.ahead.ahead->walks);
     if (!prepared.deferred.Empty() && context.recorder != nullptr) context.recorder->ApplyDeferred(prepared.deferred);
     static const bool forceRedo = std::getenv("APS5_FORCE_DRAW_REDO") != nullptr;
     bool redo = forceRedo && !prepared.colorRefreshes.empty();
@@ -4091,7 +4128,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         struct Restore {
             ~Restore() { redoingWhole = false; }
         } restore;
-        Draw(context, state, draw, shaders, snapshots, recipeOut, trace, shape, nullptr);
+        Draw(context, state, draw, shaders, snapshots, packet.recipeOut, packet.trace, packet.shape, nullptr);
         return;
     }
     if (prepared.depthFound.view != VK_NULL_HANDLE) {
@@ -4100,13 +4137,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         deferredDepthViews.fetch_add(1, std::memory_order_relaxed);
         if (view != prepared.depthFound.view) deferredDepthViewsChanged.fetch_add(1, std::memory_order_relaxed);
     }
-    const auto prepared_at = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (ready) recordPreparedDraw(context, state, draw, shaders, prepared);
-    if (counted) {
+    const auto prepared_at = packet.counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (packet.ready) recordPreparedDraw(context, state, draw, shaders, prepared);
+    if (packet.counted) {
         lastEmit.sequence = AgcDriver::DriverDetail::DrawPipeline::CommitSequence();
         lastEmit.proofAtEnd = GuestMemory::ProofSerial();
-        lastEmit.proofStable = lastEmit.proofAtEnd == proofAtEmit;
-        lastEmit.pendingStable = StorageTexture::PendingSerial() == pendingAtEmit;
+        lastEmit.proofStable = lastEmit.proofAtEnd == packet.proofAtEmit;
+        lastEmit.pendingStable = StorageTexture::PendingSerial() == packet.pendingAtEmit;
         lastEmit.targets.clear();
         for (const auto& color : state.colors) lastEmit.targets.emplace_back(color.address, color.address + color.bytes);
         if (state.depth) {
@@ -4116,14 +4153,25 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             if (state.depth->htileAddress != 0) lastEmit.targets.emplace_back(state.depth->htileAddress, state.depth->htileAddress + HtileMetadataBytes(state.depth->extent));
         }
     }
-    if (!counted) return;
+    if (!packet.counted) return;
     auto& split = DrawSplit();
     split.full.fetch_add(1, std::memory_order_relaxed);
-    split.prepareNs.fetch_add(NanosecondsBetween(started, prepared_at), std::memory_order_relaxed);
+    split.prepareNs.fetch_add(NanosecondsBetween(packet.started, prepared_at), std::memory_order_relaxed);
     split.recordNs.fetch_add(NanosecondsBetween(prepared_at, std::chrono::steady_clock::now()), std::memory_order_relaxed);
     for (std::size_t i = 0; i < PhaseCount; ++i) {
         if (prepared.timer.us[i] > 0) split.phaseNs[i].fetch_add(static_cast<std::uint64_t>(prepared.timer.us[i] * 1000.0), std::memory_order_relaxed);
     }
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, DrawAhead* ahead) {
+    if (state.stages.tessellationGeometry) {
+        const DepthCopySourceScope depthCopySource(state.depthCopySource);
+        if (DrawSplitCounted()) DrawSplit().tessellation.fetch_add(1, std::memory_order_relaxed);
+        drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
+        return;
+    }
+    auto packet = ResolveDraw(context, state, draw, shaders, snapshots, recipeOut, trace, shape, ahead);
+    EmitDraw(context, *packet);
 }
 
 void PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t shape, DrawAhead& ahead) {
