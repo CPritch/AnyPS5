@@ -19,6 +19,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef __linux__
+#include <csignal>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
+#endif
 #include <stdexcept>
 #include <string>
 
@@ -548,7 +557,64 @@ void DrawPipeline::joinResolve(bool revoke) {
     }
 }
 
+#ifdef __linux__
+namespace {
+struct sigaction previousSegv {};
+struct sigaction previousBus {};
+
+void reportFatalFault(int signal, siginfo_t* info, void* context) {
+    const auto& previous = signal == SIGBUS ? previousBus : previousSegv;
+    if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
+        previous.sa_sigaction(signal, info, context);
+        return;
+    }
+    if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN && previous.sa_handler != nullptr) {
+        previous.sa_handler(signal);
+        return;
+    }
+    char name[32] = "?";
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+    const auto* registers = static_cast<const ucontext_t*>(context);
+    std::fprintf(stderr, "[crash] signal %d (code %d) at address %p in thread '%s' (tid %ld), rip %p rsp %p\n", signal, info->si_code, info->si_addr, name, static_cast<long>(syscall(SYS_gettid)), reinterpret_cast<void*>(registers->uc_mcontext.gregs[REG_RIP]), reinterpret_cast<void*>(registers->uc_mcontext.gregs[REG_RSP]));
+    void* frames[64];
+    const int count = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    if (const int maps = open("/proc/self/maps", O_RDONLY); maps >= 0) {
+        std::fprintf(stderr, "[crash] executable mappings:\n");
+        char buffer[4096];
+        std::string pending;
+        for (ssize_t got; (got = read(maps, buffer, sizeof(buffer))) > 0;) {
+            pending.append(buffer, static_cast<std::size_t>(got));
+            for (std::size_t end; (end = pending.find('\n')) != std::string::npos; pending.erase(0, end + 1)) {
+                const auto line = pending.substr(0, end);
+                if (line.find(" r-xp ") != std::string::npos) std::fprintf(stderr, "%s\n", line.c_str());
+            }
+        }
+        close(maps);
+    }
+    std::fflush(stderr);
+    ::signal(signal, SIG_DFL);
+    ::raise(signal);
+}
+
+void installFaultReport() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        struct sigaction action {};
+        action.sa_sigaction = reportFatalFault;
+        action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGSEGV, &action, &previousSegv);
+        sigaction(SIGBUS, &action, &previousBus);
+    });
+}
+}
+#endif
+
 void DrawPipeline::resolveAhead() {
+#ifdef __linux__
+    installFaultReport();
+#endif
     GuestMemory::MarkResolverThread();
     PinResolverThread("draw resolver");
     PerformanceTimer::UntraceThisThread();
