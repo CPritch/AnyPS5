@@ -51,6 +51,7 @@ std::array<std::atomic<std::uint64_t>, QueueWaitSites> queueWaitCounts{}, queueW
 std::atomic<std::uint64_t> shadowCaptures{0}, shadowOverlaps{0};
 std::atomic<std::uint64_t> heldWaitLabels{0}, heldWaitUnknown{0}, heldWaitOther{0};
 std::atomic<std::uint64_t> commitSequence{0};
+thread_local const std::vector<DrawPipeline::Range>* committingWrites = nullptr;
 std::atomic<std::uint64_t> queuedLabelReads{0};
 
 std::string QueueWaitText(QueueWaits::Site site) {
@@ -458,6 +459,10 @@ unsigned DrawPipeline::Committers() {
     return runningCommitters.load(std::memory_order_acquire);
 }
 
+const std::vector<std::pair<std::uint64_t, std::uint64_t>>* DrawPipeline::CommittingWrites() {
+    return committingWrites;
+}
+
 std::uint64_t DrawPipeline::CommitSequence() {
     return commitSequence.load(std::memory_order_relaxed);
 }
@@ -699,6 +704,7 @@ void DrawPipeline::run() {
             committerWaiting = false;
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
+            committingWrites = &items.front().writes;
             isDraw = items.front().draw;
             kind = static_cast<std::size_t>(items.front().kind);
         }

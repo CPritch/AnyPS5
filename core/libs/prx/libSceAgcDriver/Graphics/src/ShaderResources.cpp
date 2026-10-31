@@ -5848,6 +5848,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::CheckM
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) || guestMemory.WritesOverlap(begin, bytes)) return false;
         const bool pending = recorder.PendingWriteOverlaps(begin, bytes);
         Recorder::CountSnapshotAgreement(pending, begin, bytes);
+        CountStaleView(StaleViewSite::MovedPending, pending, begin, bytes);
         return !(pending || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes));
     });
     if (counted) {

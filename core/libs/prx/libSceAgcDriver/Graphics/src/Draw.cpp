@@ -1256,14 +1256,17 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
         GuestMemory::FlushGpuWrites(address, bytes);
         const bool pending = recorder->PendingWriteOverlaps(address, bytes);
         Recorder::CountSnapshotAgreement(pending, address, bytes);
+        CountStaleView(StaleViewSite::InputPending, pending, address, bytes);
         if (pending) return nullptr;
     } else {
         StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
         behind = recorder->PendingWriteOverlaps(address, bytes);
         Recorder::CountSnapshotAgreement(behind, address, bytes);
+        CountStaleView(StaleViewSite::InputPending, behind, address, bytes);
     }
     const bool labelled = recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes);
     Recorder::CountLabelSnapshotAgreement(labelled, address, bytes);
+    CountStaleView(StaleViewSite::InputLabel, labelled, address, bytes);
     if (labelled) return nullptr;
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
     if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
@@ -1833,6 +1836,14 @@ struct LastEmit {
 };
 thread_local LastEmit lastEmit;
 
+struct StaleView {
+    std::uint64_t sequence = 0;
+    std::shared_ptr<const Recorder::WriteRanges> snapshot;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+};
+thread_local StaleView staleView;
+std::array<std::array<std::atomic<std::uint64_t>, 3>, static_cast<std::size_t>(StaleViewSite::Count)> staleViewCounts{};
+
 std::string ModuleOffsetText(const void* site) {
     unsigned long long offset = reinterpret_cast<std::uintptr_t>(site);
 #ifdef __linux__
@@ -1863,6 +1874,19 @@ std::uint64_t NanosecondsBetween(std::chrono::steady_clock::time_point from, std
 }
 
 }
+
+}
+
+void CountStaleView(StaleViewSite site, bool live, std::uint64_t address, std::size_t bytes) {
+    if (!DrawSplitCounted() || GuestMemory::CurrentHotThread() != GuestMemory::HotThread::Committer) return;
+    if (staleView.sequence == 0 || staleView.sequence + 1 != AgcDriver::DriverDetail::DrawPipeline::CommitSequence()) return;
+    const auto end = address + bytes;
+    const bool stale = (staleView.snapshot != nullptr && Recorder::SnapshotOverlaps(staleView.snapshot.get(), address, bytes)) || std::any_of(staleView.writes.begin(), staleView.writes.end(), [&](const auto& range) { return range.first < end && address < range.second; });
+    staleViewCounts[static_cast<std::size_t>(site)][live == stale ? 0 : stale ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
+
 
 struct ResolvedResources {
     std::shared_ptr<ShaderResources> resources;
@@ -3969,6 +3993,13 @@ std::string TakeDrawSplitText() {
     result += ShaderResources::TakeCommitterProofText();
     result += ShaderResources::TakeCommitterMovedText();
     result += Recorder::TakeSnapshotAgreementText();
+    constexpr std::array<const char*, static_cast<std::size_t>(StaleViewSite::Count)> staleSites{"input pending writes", "input labels and queued stores", "moved-buffer pending writes"};
+    result += "; resolve's checks against the view at the previous draw's resolve end plus its declared writes and targets (agree/only the view pending/only live pending):";
+    for (std::size_t site = 0; site < staleSites.size(); ++site) {
+        char item[128];
+        std::snprintf(item, sizeof(item), "%s %s %llu/%llu/%llu", site == 0 ? "" : ",", staleSites[site], static_cast<unsigned long long>(staleViewCounts[site][0].exchange(0)), static_cast<unsigned long long>(staleViewCounts[site][1].exchange(0)), static_cast<unsigned long long>(staleViewCounts[site][2].exchange(0)));
+        result += item;
+    }
     result += StorageTexture::TakeCommitterRefreshText();
     result += TakeCommitterCopiedWaitText();
     return result;
@@ -4007,6 +4038,23 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto proofAtResolve = counted ? GuestMemory::ProofSerial() : 0;
     lastResolveLockFree = false;
     const bool ready = prepareDraw(context, state, draw, shaders, snapshots, prepared);
+    if (counted) {
+        staleView.sequence = AgcDriver::DriverDetail::DrawPipeline::CommitSequence();
+        staleView.snapshot = Recorder::PendingWriteSnapshot();
+        staleView.writes.clear();
+        if (const auto* writes = AgcDriver::DriverDetail::DrawPipeline::CommittingWrites()) staleView.writes.assign(writes->begin(), writes->end());
+        for (const auto& color : state.colors) {
+            staleView.writes.emplace_back(color.address, color.address + color.bytes);
+            if (color.dccAddress != 0) staleView.writes.emplace_back(color.dccAddress, color.dccAddress + std::max<std::uint64_t>(color.bytes / 256u, 1u));
+            if (color.cmaskAddress != 0) staleView.writes.emplace_back(color.cmaskAddress, color.cmaskAddress + std::max<std::uint64_t>(color.bytes / 128u, 1u));
+        }
+        if (state.depth) {
+            const auto planeBytes = static_cast<std::uint64_t>(state.depth->extent.width) * state.depth->extent.height * 4u * std::max<std::uint32_t>(state.depth->samples, 1u) * (state.depth->lastSlice - state.depth->firstSlice + 1u);
+            staleView.writes.emplace_back(state.depth->address, state.depth->address + planeBytes);
+            if (state.depth->stencilAddress != 0) staleView.writes.emplace_back(state.depth->stencilAddress, state.depth->stencilAddress + planeBytes / 4u);
+            if (state.depth->htileAddress != 0) staleView.writes.emplace_back(state.depth->htileAddress, state.depth->htileAddress + HtileMetadataBytes(state.depth->extent));
+        }
+    }
     const auto proofAtEmit = counted ? GuestMemory::ProofSerial() : 0;
     const auto pendingAtEmit = counted ? StorageTexture::PendingSerial() : 0;
     if (counted && lastResolveLockFree) {
