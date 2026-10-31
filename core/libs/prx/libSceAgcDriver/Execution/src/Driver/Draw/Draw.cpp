@@ -1400,7 +1400,10 @@ bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const G
     if (result != nullptr && result->found != nullptr && (result->found->DescribedRangesOverlap(writes) || result->found->DescribedRangesOverlap(depth))) return false;
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     const auto split = DrawPipeline::ResolveSplit();
-    if (split >= 2 && !localDevice->ResolverInputsClear()) return false;
+    if (bool stores = false; split >= 2 && !localDevice->ResolverInputsClear(&stores)) {
+        DrawPipeline::NoteEarly(stores ? DrawPipeline::EarlyEvent::DeclinedStores : DrawPipeline::EarlyEvent::DeclinedWriters);
+        return false;
+    }
     auto* prepared = ahead != nullptr ? ahead->Claim() : nullptr;
     early.claimed = true;
     early.proof = GuestMemory::ProofSerial();
