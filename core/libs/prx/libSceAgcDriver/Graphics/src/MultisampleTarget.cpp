@@ -882,6 +882,7 @@ bool holdHostOnly(const MultisampleTarget& target) {
 }
 
 MultisampleTarget& acquire(const Context& context, const ColorTarget& requested) {
+    GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::Commands, __builtin_return_address(0));
     discardRetiredTargets();
     for (const auto& target : targets()) {
         if (!target->active->load(std::memory_order_acquire)) continue;
@@ -929,6 +930,7 @@ MultisampleTarget& acquire(const Context& context, const ColorTarget& requested)
 }
 
 MultisampleTarget& createFilled(const Context& context, const GuestTextureResource& resource, VkFormat format, const char* access, bool written) {
+    GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::StorageCreate, __builtin_return_address(0));
     const auto refuse = [&](const std::string& reason) {
         char text[192];
         std::snprintf(text, sizeof(text), "AGC graphics: %s the %ux%u multisampled texture 0x%llx of %u samples, which no draw rendered to and ", access, resource.width, resource.height, static_cast<unsigned long long>(resource.baseAddress), resource.samples);
