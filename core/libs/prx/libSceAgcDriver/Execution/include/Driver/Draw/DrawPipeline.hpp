@@ -59,6 +59,7 @@ class DrawPipeline {
 public:
     using Commit = std::function<void()>;
     using Prepare = std::function<void()>;
+    using Early = std::function<bool(const std::vector<std::pair<std::uint64_t, std::uint64_t>>&)>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     struct Watch {
         std::uint64_t retired = 0;
@@ -80,7 +81,9 @@ public:
     static unsigned PrepareThreads();
     static bool PreparesAhead();
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {});
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {});
+    static unsigned ResolveSplit();
+    static std::uint64_t FollowedEpoch();
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void WaitWritten(std::uint64_t address, std::size_t bytes, DrainReason reason, std::uint32_t opcode = 0x100);
     void WaitWrittenAny(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode = 0x100);
@@ -114,6 +117,7 @@ private:
         std::vector<Range> reads;
         bool draw = false;
         ItemKind kind = ItemKind::Other;
+        Early early;
     };
     DrawPipeline() = default;
     void run();

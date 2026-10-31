@@ -431,8 +431,25 @@ std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
     return token;
 }
 
+namespace {
+thread_local std::uint64_t followedEpoch = 0;
+std::atomic<std::uint64_t> earlyResolved{0}, earlyDeclined{0}, earlyFailed{0};
+}
+
+unsigned DrawPipeline::ResolveSplit() {
+    static const unsigned mode = [] {
+        const char* text = std::getenv("APS5_RESOLVE_SPLIT");
+        return text == nullptr ? 0u : static_cast<unsigned>(std::strtoul(text, nullptr, 10));
+    }();
+    return mode;
+}
+
+std::uint64_t DrawPipeline::FollowedEpoch() {
+    return followedEpoch;
+}
+
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
-    static thread_local std::uint64_t followed = 0;
+    auto& followed = followedEpoch;
     if (followed == token) return;
     followed = token;
     static const bool shared = std::getenv("APS5_NO_SHARED_COMMIT_EPOCH") == nullptr;
@@ -547,7 +564,7 @@ bool ItemsThroughFinisher() {
 
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, ItemKind kind, Prepare prepare) {
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, ItemKind kind, Prepare prepare, Early early) {
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
         const bool forward = ItemsThroughFinisher() && DrawFinisher::Overlap() && !draw && reads.empty();
         DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Enqueue, !forward);
@@ -596,7 +613,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     ++enqueued;
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
     countWrites(writes, true);
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, draw && kind == ItemKind::Other ? ItemKind::Draw : kind});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, draw && kind == ItemKind::Other ? ItemKind::Draw : kind, std::move(early)});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] {
@@ -719,8 +736,30 @@ void DrawPipeline::run() {
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
+        Early nextEarly;
+        const std::vector<Range>* currentWrites = nullptr;
+        if (ResolveSplit() == 1 && isDraw && commit != nullptr) {
+            std::lock_guard lock(mutex);
+            if (items.size() >= 2 && items[1].draw && items[1].early) {
+                nextEarly = items[1].early;
+                currentWrites = &items.front().writes;
+            }
+        }
         try {
-            if (commit != nullptr) (*commit)();
+            if (nextEarly) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+                std::lock_guard gpu(GuestMemory::GpuMutex());
+                try {
+                    (nextEarly(*currentWrites) ? earlyResolved : earlyDeclined).fetch_add(1, std::memory_order_relaxed);
+                } catch (const ProcessShutdown&) {
+                    throw;
+                } catch (...) {
+                    earlyFailed.fetch_add(1, std::memory_order_relaxed);
+                }
+                (*commit)();
+            } else if (commit != nullptr) {
+                (*commit)();
+            }
             if (!isDraw) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Item);
         } catch (const std::exception&) {
             failed = true;
