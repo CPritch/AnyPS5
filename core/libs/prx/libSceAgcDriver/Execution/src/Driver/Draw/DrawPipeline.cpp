@@ -72,7 +72,7 @@ std::string QueueWaitMs(QueueWaits::Site site) {
 }
 
 bool QueueWaits::Enabled() {
-    static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool enabled = std::getenv("APS5_COMMIT_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return enabled;
 }
 
@@ -626,7 +626,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         ++wakes;
         wake.notify_one();
     }
-    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    static const bool stats = std::getenv("APS5_COMMIT_STATS") != nullptr;
     if (!profile && !stats) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport >= std::chrono::seconds(10)) report(now);

@@ -3534,7 +3534,7 @@ CopiedWaitSplit& CommitterCopiedWaits() {
 }
 
 bool CommitterCopiedWaitCounted() {
-    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
     return counted && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer;
 }
 
@@ -3622,7 +3622,7 @@ CommitterProofSplit& CommitterProofs() {
 }
 
 bool CommitterProofCounted() {
-    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
     return counted && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer;
 }
 

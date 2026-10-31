@@ -1877,7 +1877,7 @@ DrawSplitCounts& DrawSplit() {
 }
 
 bool DrawSplitCounted() {
-    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
     return counted;
 }
 

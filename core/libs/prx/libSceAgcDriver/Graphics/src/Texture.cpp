@@ -2283,7 +2283,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
             }
         }
     } committer;
-    static const bool committerCounted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    static const bool committerCounted = std::getenv("APS5_COMMIT_STATS") != nullptr;
     if (committerCounted && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer) {
         committer.start = std::chrono::steady_clock::now();
         committer.image = {descriptor.baseAddress, guestBytes};
@@ -4511,7 +4511,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 earlier.emplace(*recorder, address, bytes);
                 orderedFlushes.fetch_add(1, std::memory_order_relaxed);
             } else {
-                static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+                static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
                 const bool committer = counted && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer;
                 const auto writes = committer ? recorder->PendingWritesOver(address, bytes) : std::vector<Recorder::PendingWrite>{};
                 const auto waitStart = committer ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

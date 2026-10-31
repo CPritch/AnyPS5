@@ -816,7 +816,7 @@ std::mutex hotHookSyncMutex;
 std::map<std::tuple<int, int, int, std::uint64_t, std::size_t, HotStack>, HotHookSync> hotHookSyncs;
 
 bool HotHookSyncCounted() {
-    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
     return counted && GuestMemory::CurrentHotThread() != GuestMemory::HotThread::None;
 }
 
@@ -1492,14 +1492,14 @@ std::array<std::atomic<std::uint64_t>, 4> labelAgreement{};
 }
 
 void Recorder::CountLabelSnapshotAgreement(bool live, std::uint64_t address, std::size_t bytes) {
-    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
     if (!counted || GuestMemory::CurrentHotThread() != GuestMemory::HotThread::Committer) return;
     const bool snapshot = AgcDriver::Graphics::SnapshotOverlaps(address, bytes);
     labelAgreement[(live ? 2u : 0u) + (snapshot ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed);
 }
 
 void Recorder::CountSnapshotAgreement(bool live, std::uint64_t address, std::size_t bytes) {
-    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
     if (!counted || GuestMemory::CurrentHotThread() != GuestMemory::HotThread::Committer) return;
     const bool snapshot = AgcDriver::Graphics::SnapshotOverlaps(address, bytes);
     snapshotAgreement[(live ? 2u : 0u) + (snapshot ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed);

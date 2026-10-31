@@ -229,7 +229,7 @@ void noteFinisherHandOff(bool handed) {
     static std::atomic<std::uint64_t> handedOff{0}, kept{0};
     static std::atomic<std::int64_t> reportedAt{0};
     (handed ? handedOff : kept).fetch_add(1, std::memory_order_relaxed);
-    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool stats = std::getenv("APS5_COMMIT_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!stats) return;
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
@@ -245,7 +245,7 @@ std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HeldReason::Coun
 
 void noteHeld(HeldReason reason) {
     heldReasons[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
-    static const bool profile = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_COMMIT_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
     static std::atomic<std::uint64_t> total{0};
     const auto count = ++total;
