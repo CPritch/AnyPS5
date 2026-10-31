@@ -87,12 +87,16 @@ public:
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {});
     static unsigned ResolveSplit();
-    enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, OverlapAfter, VerifyMatched, VerifyDiffered, Unoffered, Count };
+    enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, VerifyMatched, VerifyDiffered, Unoffered, Count };
     static void NoteEarly(EarlyEvent event);
     static void OfferEarly(std::span<const Range> depth);
+    static void PostResolve(std::function<void()> body, std::function<void(bool)> finish);
+    static void JoinResolve();
+    static void WaitResolve();
     static bool EarlyStopped();
     static void StopEarly();
     static void NoteEarlyAbort(std::uint8_t kind);
+    static void NoteEarlyResolveNs(std::uint64_t ns);
     static std::uint64_t FollowedEpoch();
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void WaitWritten(std::uint64_t address, std::size_t bytes, DrainReason reason, std::uint32_t opcode = 0x100);
@@ -112,6 +116,7 @@ public:
     std::uint64_t DecodeDrains() const { return decodeDrains.load(std::memory_order_relaxed); }
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
     static bool HeldReads(std::uint64_t address, std::size_t bytes);
+    static void SkipCommittingReads(bool skip);
     static std::uint64_t HeldReadQueries();
     void ReleaseRunningReads();
 
@@ -185,6 +190,13 @@ private:
     std::vector<std::thread> preparers;
     std::atomic<std::size_t> queuedPrepares{0};
     std::atomic<bool> preparersClosing{false};
+    void resolveAhead();
+    static void joinResolve(bool revoke);
+    std::thread resolver;
+    std::atomic<int> resolveState{0};
+    std::function<void()> resolveBody;
+    std::function<void(bool)> resolveFinish;
+    std::chrono::steady_clock::time_point resolvePosted;
 };
 
 class DrawFinisher {

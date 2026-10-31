@@ -2701,7 +2701,17 @@ thread_local ResolveLockTrace resolveTrace;
 thread_local std::uint8_t resolvePhase = 0;
 thread_local bool earlyAbortArmed = false;
 std::atomic<std::uint64_t> earlyPassedUnwinding{0};
+std::atomic<std::uint64_t> earlyPassedHandler{0};
 std::atomic<std::uint64_t> earlyPassedCompletion{0};
+thread_local bool resolverThread = false;
+std::mutex resolverRecorderMutex;
+std::map<const char*, std::uint64_t> resolverRecorderMethods;
+thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* earlyReadLog = nullptr;
+
+bool EarlyBarrierPassFatal() {
+    static const bool aid = std::getenv("APS5_RESOLVE_SPLIT_ABORT_EVERY") != nullptr;
+    return aid && resolverThread;
+}
 bool (*resolveCompletionProbe)() = nullptr;
 
 std::uint64_t ResolveNowNs() {
@@ -2718,15 +2728,19 @@ void ResolveBarrierAt(BarrierKind kind, const void* site) {
         resolveTrace.firstInCompletion = resolveCompletionProbe != nullptr && resolveCompletionProbe();
     }
     if (!earlyAbortArmed) return;
-    if (std::uncaught_exceptions() != 0) {
-        earlyPassedUnwinding.fetch_add(1, std::memory_order_relaxed);
+    const bool unwinding = std::uncaught_exceptions() != 0;
+    if (unwinding || std::current_exception() != nullptr) {
+        (unwinding ? earlyPassedUnwinding : earlyPassedHandler).fetch_add(1, std::memory_order_relaxed);
+        if (EarlyBarrierPassFatal()) {
+            std::fprintf(stderr, "[draw] early resolve: barrier %s at %p passed %s on the resolver\n", BarrierKindName(kind), site, unwinding ? "while unwinding" : "inside an exception handler");
+            std::abort();
+        }
         return;
     }
     if (resolveCompletionProbe != nullptr && resolveCompletionProbe()) {
         earlyPassedCompletion.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    earlyAbortArmed = false;
     throw EarlyResolveAbort{static_cast<std::uint8_t>(kind), site};
 }
 
@@ -2796,7 +2810,7 @@ void BeginResolveLockTrace() {
 }
 
 const char* BarrierKindName(BarrierKind kind) {
-    constexpr std::array<const char*, static_cast<std::size_t>(BarrierKind::Count)> names{"none", "GPU lock", "lock-held check", "commands", "submit", "batch reap", "proof break", "import made or retired", "template inserted", "storage image created", "recorder write", "pending images changed", "depth surface retired", "storage image evicted", "forced"};
+    constexpr std::array<const char*, static_cast<std::size_t>(BarrierKind::Count)> names{"none", "GPU lock", "lock-held check", "commands", "submit", "batch reap", "proof break", "import made or retired", "template inserted", "storage image created", "recorder write", "pending images changed", "depth surface retired", "storage image evicted", "forced", "recorder method off the resolver's list", "path the resolver does not take"};
     const auto index = static_cast<std::size_t>(kind);
     return index < names.size() ? names[index] : "?";
 }
@@ -2823,8 +2837,39 @@ void DisarmEarlyResolve() {
     earlyAbortArmed = false;
 }
 
-std::pair<std::uint64_t, std::uint64_t> TakeEarlyBarriersPassed() {
-    return {earlyPassedUnwinding.exchange(0, std::memory_order_relaxed), earlyPassedCompletion.exchange(0, std::memory_order_relaxed)};
+std::array<std::uint64_t, 3> TakeEarlyBarriersPassed() {
+    return {earlyPassedUnwinding.exchange(0, std::memory_order_relaxed), earlyPassedHandler.exchange(0, std::memory_order_relaxed), earlyPassedCompletion.exchange(0, std::memory_order_relaxed)};
+}
+
+void ResolverBarrier(BarrierKind kind) {
+    if (resolverThread) ResolveBarrierAt(kind, __builtin_return_address(0));
+}
+
+std::string TakeResolverRecorderText() {
+    std::map<const char*, std::uint64_t> taken;
+    {
+        std::lock_guard lock(resolverRecorderMutex);
+        taken.swap(resolverRecorderMethods);
+    }
+    std::string text;
+    for (const auto& [method, count] : taken) text += std::string(" ") + method + " " + std::to_string(count) + ",";
+    return text;
+}
+
+void MarkResolverThread() {
+    resolverThread = true;
+}
+
+bool OnResolverThread() {
+    return resolverThread;
+}
+
+void SetEarlyReadLog(std::vector<std::pair<std::uint64_t, std::uint64_t>>* log) {
+    earlyReadLog = log;
+}
+
+void NoteEarlyRead(std::uint64_t address, std::size_t bytes) {
+    if (earlyReadLog != nullptr && bytes != 0) earlyReadLog->emplace_back(address, address + bytes);
 }
 
 void NoteResolveMemo() {
@@ -2850,6 +2895,16 @@ ResolveLockTrace EndResolveLockTrace() {
 
 void NoteResolveRecorder(const void* site, const char* method) {
     if (!resolveTraceActive && !earlyAbortArmed) return;
+    if (resolverThread && earlyAbortArmed && method != nullptr) {
+        static constexpr std::array<std::string_view, 8> safe{"Active", "PendingWriteOverlaps", "PendingLabelIn", "wideLabelInLocked", "QueuedStoreOverlaps", "ReusableDrawSnapshot", "eraseDrawSnapshot", "KnownHighestIndex"};
+        if (std::find(safe.begin(), safe.end(), std::string_view(method)) == safe.end()) {
+            if (std::uncaught_exceptions() == 0 && std::current_exception() == nullptr) {
+                std::lock_guard lock(resolverRecorderMutex);
+                ++resolverRecorderMethods[method];
+            }
+            ResolveBarrierAt(BarrierKind::ResolverRecorder, method);
+        }
+    }
     ++resolveTrace.recorderUses;
     if (method != nullptr) {
         static const std::array<std::string_view, 33> reads{"Active", "PendingWriteOverlaps", "PendingLabelIn", "wideLabelInLocked", "QueuedStoreOverlaps", "PendingWritesOver", "NewestWriteNote", "PendingWriterSerial", "DescribePendingWrite", "PendingReadOverlaps", "DescribePendingRead", "OpenSerial", "Device", "Idle", "Recording", "InFlightBatches", "HasQueuedStores", "HasQueuedKeyStores", "AnyQueuedStore", "AnyQueuedKeyStore", "CompletionLabelIn", "PendingWriteSettled", "PendingWritesOnlyStores", "OpenWriteOverlaps", "CountingSamples", "OpenBatchSerial", "RecordedWorkSinceSubmit", "readOverlap", "overlaps", "signaled", "unsignaled", "fenceStatus", "QueuedStoreSerial"};
@@ -3069,6 +3124,7 @@ void GuardRead(std::uint64_t address, std::size_t bytes) {
 }
 
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
+    NoteEarlyRead(address, bytes);
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 

@@ -358,6 +358,10 @@ public:
     Graphics::HostImportsProof ImportsIdentity();
     bool ImportsUnchanged(const Graphics::HostImportsProof& proof);
     std::uint64_t RecorderOpenSerial();
+    std::uint64_t RecorderNotedSerial();
+    void ApplyDeferredEffects(Graphics::Recorder::DeferredEffects& effects);
+    bool ResolverInputsClear();
+    bool RecorderNotedSince(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
     void PrepareDrawAhead(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::uint64_t shape, Graphics::DrawAhead& ahead) const;
     bool DrawInputsInPlace() const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;

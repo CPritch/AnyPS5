@@ -4345,6 +4345,26 @@ std::uint64_t VulkanDevice::RecorderOpenSerial() {
     return context.recorder != nullptr ? context.recorder->OpenSerial() : 0;
 }
 
+void VulkanDevice::ApplyDeferredEffects(Graphics::Recorder::DeferredEffects& effects) {
+    const auto context = graphicsContext();
+    if (context.recorder != nullptr) context.recorder->ApplyDeferred(effects);
+}
+
+bool VulkanDevice::ResolverInputsClear() {
+    const auto context = graphicsContext();
+    return (context.recorder == nullptr || !context.recorder->HasQueuedStores()) && state->copiedWriters->empty() && Graphics::DrawCopiedWriters()->empty();
+}
+
+std::uint64_t VulkanDevice::RecorderNotedSerial() {
+    const auto context = graphicsContext();
+    return context.recorder != nullptr ? context.recorder->NotedSerial() : 0;
+}
+
+bool VulkanDevice::RecorderNotedSince(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    const auto context = graphicsContext();
+    return context.recorder == nullptr || context.recorder->NotedSince(since, ranges);
+}
+
 void VulkanDevice::EmitDraw(Graphics::DrawPacket& packet) {
     const auto context = graphicsContext();
     Graphics::EmitDraw(context, packet);

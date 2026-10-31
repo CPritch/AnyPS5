@@ -261,7 +261,7 @@ private:
 
 class PerformanceTimer {
 public:
-    explicit PerformanceTimer(const char* scope) : frame(PerformanceContext::Current()), trace(PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr), scope(scope) {
+    explicit PerformanceTimer(const char* scope) : frame(PerformanceContext::Current()), trace(PerformanceTrace::Recording() && !untraced ? PerformanceTrace::Thread() : nullptr), scope(scope) {
         if (frame != nullptr) {
             total = frame->Get(scope, "total");
         }
@@ -271,6 +271,10 @@ public:
 
     PerformanceTimer(const PerformanceTimer&) = delete;
     PerformanceTimer& operator=(const PerformanceTimer&) = delete;
+
+    static void UntraceThisThread() {
+        untraced = true;
+    }
 
     ~PerformanceTimer() {
         Finish();
@@ -305,6 +309,7 @@ public:
     }
 
 private:
+    inline static thread_local bool untraced = false;
     using Clock = FrameTiming::Clock;
 
     FrameTiming* frame;

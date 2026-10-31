@@ -72,6 +72,23 @@ void EmitDraw(const Context& context, DrawPacket& packet);
 void DiscardDrawPacket(const Context& context, DrawPacket& packet);
 std::uint64_t DrawRedoSerial();
 bool DrawPacketReadsOverlap(const DrawPacket& packet, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+bool DrawPacketTemplateGone(const DrawPacket& packet);
+struct ResolverHandoff {
+    void* shapeMemo = nullptr;
+    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> snapshot;
+    Recorder::DeferredEffects* abandoned = nullptr;
+    std::vector<DrawPacket*>* graveyard = nullptr;
+};
+void* ShapeMemoHandle();
+class ResolverScope {
+public:
+    explicit ResolverScope(const ResolverHandoff& handoff);
+    ~ResolverScope();
+    ResolverScope(const ResolverScope&) = delete;
+    ResolverScope& operator=(const ResolverScope&) = delete;
+};
+void BuryPackets(std::vector<DrawPacket*>& packets);
+void SetRedoHook(void (*hook)());
 enum class DrawPacketField : std::uint8_t { Template, Pipeline, Targets, Framebuffer, Inputs, Moved, Depth, Refreshes, Flags, Count };
 std::uint32_t CompareDrawPackets(const DrawPacket& first, const DrawPacket& second);
 const char* DrawPacketFieldName(DrawPacketField field);

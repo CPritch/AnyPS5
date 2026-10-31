@@ -83,16 +83,16 @@ public:
     // unaligned head or tail; [begin, end) is the guest range. Debug aid: APS5_DCC_KEYS_EACH=1
     // records every store at once, as before (QueueKeyStore then records and returns).
     void QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end);
-    bool HasQueuedKeyStores() const { return open != nullptr && !open->keyStores.empty(); }
+    bool HasQueuedKeyStores() const;
     bool QueuedKeyStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether `overlaps(begin, end)` holds for a queued store's range.
     bool AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const;
     void FlushKeyStores();
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
-    bool Recording() const { return open != nullptr; }
-    bool Idle() const { return open == nullptr && inFlight.empty(); }
-    std::uint64_t OpenSerial() const { return submissions + 1; }
-    std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
+    bool Recording() const;
+    bool Idle() const;
+    std::uint64_t OpenSerial() const;
+    std::uint64_t CompletedThrough() const;
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     struct DeferredEffects {
@@ -118,11 +118,11 @@ public:
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
-    std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
+    std::size_t OpenKeptBytes() const;
     void FlushDeferredReleases();
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
     void BoundKeptBytes();
-    std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
+    std::size_t InFlightKeptBytes() const;
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32, Index16Restart, Index32Restart };
     static constexpr std::size_t DrawSnapshotBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawSnapshotEntries = 1024;
@@ -153,6 +153,8 @@ public:
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t writer = 0);
     void NotePendingStores(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t store);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    std::uint64_t NotedSerial() const { return notedSerial; }
+    bool NotedSince(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
     // memory; its completion stores are the caller's business, see VulkanDevice::CopyBuffer).
@@ -284,9 +286,9 @@ public:
     void SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked = false);
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
-    std::uint64_t Submissions() const { return submissions; }
+    std::uint64_t Submissions() const;
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
-    std::size_t InFlightBatches() const { return inFlight.size(); }
+    std::size_t InFlightBatches() const;
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
     static std::uint64_t ReapsWithWork();
 
@@ -307,7 +309,7 @@ public:
     // stores at once and closes the run at the next command (Commands()) or at Submit, as
     // before; APS5_NO_LABEL_RUNS=1 gives every store barriers of its own.
     void RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address);
-    bool HasQueuedStores() const { return open != nullptr && !open->run.queued.empty(); }
+    bool HasQueuedStores() const;
     bool QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether `overlaps(begin, end)` holds for a queued store's guest range.
     bool AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const;
@@ -406,6 +408,7 @@ public:
     using WriteRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     static std::shared_ptr<const WriteRanges> PendingWriteSnapshot();
     static bool SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::size_t bytes);
+    static void SetResolverState(const WriteRanges* snapshot, DeferredEffects* abandoned);
     // A label behind pending completions (CPU write-backs the label must not precede): stored to
     // guest memory by a completion action appended to the open batch, or to the newest in-flight
     // batch when none is open (no empty submission), so it runs after every earlier write-back in
@@ -907,6 +910,14 @@ private:
     std::uint64_t submissions = 0;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
+    struct NotedRange {
+        std::uint64_t serial = 0;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+    };
+    std::array<NotedRange, 1024> notedRanges{};
+    std::uint64_t notedSerial = 0;
+    void logNoted(std::uint64_t begin, std::uint64_t end);
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
@@ -929,7 +940,7 @@ private:
         std::list<DrawSnapshotKey> recency;
         std::size_t bytes = 0;
     };
-    std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
+    std::array<std::map<DrawSnapshotKey, DrawSnapshot>, 2> drawSnapshotMaps;
     struct UnwrittenSnapshot {
         std::size_t bytes;
         std::shared_ptr<Buffer> buffer;

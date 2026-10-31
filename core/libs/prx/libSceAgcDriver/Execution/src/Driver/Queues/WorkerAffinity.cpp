@@ -31,11 +31,11 @@ std::once_flag committerSummary;
 
 bool PinPlaced(const char* role, std::uint64_t CpuTopology::Placement::*slot) {
     const auto& placement = CpuTopology::GetPlacement();
-    if (!placement.Active()) return false;
+    if (!placement.Active() || placement.*slot == 0) return false;
     static std::once_flag summary;
     std::call_once(summary, [&placement] {
         const auto& layout = CpuTopology::Get();
-        std::fprintf(stderr, "[affinity] placement: queue worker 0x0 -> 0x%llx, draw finisher -> 0x%llx, draw committer -> 0x%llx, every other thread -> 0x%llx (performant=0x%llx process=0x%llx; classes %s)\n", static_cast<unsigned long long>(placement.worker), static_cast<unsigned long long>(placement.finisher), static_cast<unsigned long long>(placement.committer), static_cast<unsigned long long>(placement.shared), static_cast<unsigned long long>(layout.performant), static_cast<unsigned long long>(layout.process), layout.classes.empty() ? "none" : layout.classes.c_str());
+        std::fprintf(stderr, "[affinity] placement: queue worker 0x0 -> 0x%llx, draw finisher -> 0x%llx, draw committer -> 0x%llx, draw resolver -> 0x%llx, every other thread -> 0x%llx (performant=0x%llx process=0x%llx; classes %s)\n", static_cast<unsigned long long>(placement.worker), static_cast<unsigned long long>(placement.finisher), static_cast<unsigned long long>(placement.committer), static_cast<unsigned long long>(placement.resolver), static_cast<unsigned long long>(placement.shared), static_cast<unsigned long long>(layout.performant), static_cast<unsigned long long>(layout.process), layout.classes.empty() ? "none" : layout.classes.c_str());
     });
     CpuTopology::PinTraced(role, nullptr, placement.*slot);
     return true;
@@ -98,6 +98,18 @@ void PinCommitterThread(const char* role) {
     NameThread(role);
     if (PinPlaced(role, &CpuTopology::Placement::committer)) return;
     PinThread(role, CommitterAffinityMask(), committerSummary, "draw committer and finisher");
+}
+
+void PinResolverThread(const char* role) {
+    NameThread(role);
+    static std::once_flag summary;
+    const auto requested = CpuTopology::MaskFromEnvironment("APS5_RESOLVER_AFFINITY_MASK");
+    if (requested != 0) {
+        PinThread(role, requested, summary, "draw resolver");
+        return;
+    }
+    if (PinPlaced(role, &CpuTopology::Placement::resolver)) return;
+    PinThread(role, PreparerAffinityMask(), summary, "draw resolver");
 }
 
 void PinPreparerThread(const char* role) {

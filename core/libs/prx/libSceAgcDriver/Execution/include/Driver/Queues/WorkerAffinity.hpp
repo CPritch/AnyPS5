@@ -14,6 +14,7 @@ void PinDrawWorkerThread(const char* role);
 void PinFinisherThread(const char* role);
 void PinCommitterThread(const char* role);
 void PinPreparerThread(const char* role);
+void PinResolverThread(const char* role);
 
 }
 

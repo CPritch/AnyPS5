@@ -80,7 +80,7 @@ void GpuLockIsABarrier() {
     Require(locked.barriers >= 1 && locked.firstKind == static_cast<std::uint8_t>(AgcDriver::GuestMemory::BarrierKind::Lock), "taking the GPU lock is a barrier");
 }
 
-void EarlyAbortFiresOnce() {
+void EarlyAbortStaysArmed() {
     int site = 0;
     AgcDriver::GuestMemory::ArmEarlyResolve();
     bool thrown = false;
@@ -90,9 +90,29 @@ void EarlyAbortFiresOnce() {
         thrown = abort.kind == static_cast<std::uint8_t>(AgcDriver::GuestMemory::BarrierKind::Commands) && abort.site == &site;
     }
     Require(thrown, "an armed barrier throws the abort with its kind and site");
+    bool again = false;
+    try {
+        AgcDriver::GuestMemory::ResolveBarrier(AgcDriver::GuestMemory::BarrierKind::Commands, &site);
+    } catch (const AgcDriver::GuestMemory::EarlyResolveAbort&) {
+        again = true;
+    }
+    Require(again, "a swallowed abort throws again at the next barrier");
+    AgcDriver::GuestMemory::DisarmEarlyResolve();
     AgcDriver::GuestMemory::ResolveBarrier(AgcDriver::GuestMemory::BarrierKind::Commands, &site);
     AgcDriver::GuestMemory::NoteResolveEffect(AgcDriver::GuestMemory::ResolveEffect::Submit);
+}
+
+void EarlyAbortNotInAHandler() {
+    static_cast<void>(AgcDriver::GuestMemory::TakeEarlyBarriersPassed());
+    AgcDriver::GuestMemory::ArmEarlyResolve();
+    try {
+        throw std::logic_error("handled");
+    } catch (const std::logic_error&) {
+        AgcDriver::GuestMemory::ResolveBarrier(AgcDriver::GuestMemory::BarrierKind::Commands, nullptr);
+    }
     AgcDriver::GuestMemory::DisarmEarlyResolve();
+    const auto [unwinding, handler, completion] = AgcDriver::GuestMemory::TakeEarlyBarriersPassed();
+    Require(unwinding == 0 && handler == 1 && completion == 0, "a barrier inside an exception handler is passed and counted");
 }
 
 void EarlyAbortWithoutTrace() {
@@ -142,8 +162,8 @@ void EarlyAbortNotWhileUnwinding() {
         throw std::logic_error("unwind");
     } catch (const std::logic_error&) {
     }
-    const auto [unwinding, completion] = AgcDriver::GuestMemory::TakeEarlyBarriersPassed();
-    Require(unwinding == 1 && completion == 0, "a barrier during an unwind is passed and counted");
+    const auto [unwinding, handler, completion] = AgcDriver::GuestMemory::TakeEarlyBarriersPassed();
+    Require(unwinding == 1 && handler == 0 && completion == 0, "a barrier during an unwind is passed and counted");
     bool thrown = false;
     try {
         AgcDriver::GuestMemory::ResolveBarrier(AgcDriver::GuestMemory::BarrierKind::Commands, nullptr);
@@ -163,7 +183,8 @@ int main() {
         BarrierOutsideTraceIsInert();
         FirstBarrierIsKept();
         GpuLockIsABarrier();
-        EarlyAbortFiresOnce();
+        EarlyAbortStaysArmed();
+        EarlyAbortNotInAHandler();
         EarlyAbortWithoutTrace();
         EarlyAbortAtTheLock();
         EarlyAbortNotWhileUnwinding();

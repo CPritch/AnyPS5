@@ -230,7 +230,7 @@ struct ResolveLockTrace {
 };
 enum class ResolveEffect : std::uint8_t { Submit, Reap, ProofBreak, Import, CacheInsert, StorageCreate, Count };
 void NoteResolveEffect(ResolveEffect effect);
-enum class BarrierKind : std::uint8_t { None, Lock, HeldCheck, Commands, Submit, Reap, ProofBreak, Import, CacheInsert, StorageCreate, RecorderWrite, PendingSet, DepthRetire, StorageEvict, Forced, Count };
+enum class BarrierKind : std::uint8_t { None, Lock, HeldCheck, Commands, Submit, Reap, ProofBreak, Import, CacheInsert, StorageCreate, RecorderWrite, PendingSet, DepthRetire, StorageEvict, Forced, ResolverRecorder, ResolverPath, Count };
 const char* BarrierKindName(BarrierKind kind);
 void ResolveBarrier(BarrierKind kind, const void* site);
 void ResolveCheckpoint();
@@ -244,7 +244,13 @@ struct EarlyResolveAbort {
 };
 void ArmEarlyResolve();
 void DisarmEarlyResolve();
-std::pair<std::uint64_t, std::uint64_t> TakeEarlyBarriersPassed();
+std::array<std::uint64_t, 3> TakeEarlyBarriersPassed();
+void MarkResolverThread();
+bool OnResolverThread();
+void SetEarlyReadLog(std::vector<std::pair<std::uint64_t, std::uint64_t>>* log);
+void NoteEarlyRead(std::uint64_t address, std::size_t bytes);
+void ResolverBarrier(BarrierKind kind);
+std::string TakeResolverRecorderText();
 void BeginResolveLockTrace();
 ResolveLockTrace EndResolveLockTrace();
 void NoteResolveCommands(const void* site);

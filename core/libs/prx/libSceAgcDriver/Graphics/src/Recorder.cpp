@@ -1810,6 +1810,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes.empty()) return;
     ensureOpen();
+    if (address != 0) logNoted(address, address + bytes.size());
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -2011,8 +2012,60 @@ bool Recorder::closeStoreRun(bool atSubmit) {
     return false;
 }
 
+bool Recorder::HasQueuedKeyStores() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    return open != nullptr && !open->keyStores.empty();
+}
+
+bool Recorder::Recording() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    return open != nullptr;
+}
+
+bool Recorder::Idle() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    return open == nullptr && inFlight.empty();
+}
+
+std::uint64_t Recorder::OpenSerial() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    return submissions + 1;
+}
+
+std::uint64_t Recorder::CompletedThrough() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    return inFlight.empty() ? submissions : inFlight.front()->serial - 1;
+}
+
+std::size_t Recorder::OpenKeptBytes() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    return open != nullptr ? open->keptBytes : 0;
+}
+
+std::size_t Recorder::InFlightKeptBytes() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    return inFlightKeptBytes;
+}
+
+std::uint64_t Recorder::Submissions() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    return submissions;
+}
+
+std::size_t Recorder::InFlightBatches() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    return inFlight.size();
+}
+
+bool Recorder::HasQueuedStores() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    return open != nullptr && !open->run.queued.empty();
+}
+
 bool Recorder::QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) const {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    GuestMemory::NoteEarlyRead(address, bytes);
+    if (GuestMemory::OnResolverThread()) return false;
     if (open == nullptr || bytes == 0) return false;
     const auto end = address + bytes;
     return std::any_of(open->run.queued.begin(), open->run.queued.end(), [&](const Batch::StoreRun::Queued& store) { return address < store.End() && store.address < end; });
@@ -3038,6 +3091,13 @@ std::size_t Recorder::UnsignaledBatches() const {
 
 namespace {
 thread_local Recorder::DeferredEffects* deferringEffects = nullptr;
+thread_local Recorder::DeferredEffects* abandonedEffects = nullptr;
+thread_local const Recorder::WriteRanges* resolverSnapshot = nullptr;
+}
+
+void Recorder::SetResolverState(const WriteRanges* snapshot, DeferredEffects* abandoned) {
+    resolverSnapshot = snapshot;
+    abandonedEffects = abandoned;
 }
 
 Recorder::DeferScope::DeferScope(DeferredEffects* into) : into(into), previous(deferringEffects), exceptions(std::uncaught_exceptions()) {
@@ -3048,7 +3108,15 @@ Recorder::DeferScope::~DeferScope() {
     if (into == nullptr) return;
     deferringEffects = previous;
     if (std::uncaught_exceptions() > exceptions && !into->Empty()) {
-        if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->ApplyDeferred(*into);
+        if (abandonedEffects != nullptr) {
+            abandonedEffects->bound = abandonedEffects->bound || into->bound;
+            std::move(into->kept.begin(), into->kept.end(), std::back_inserter(abandonedEffects->kept));
+            abandonedEffects->keptBytes.insert(abandonedEffects->keptBytes.end(), into->keptBytes.begin(), into->keptBytes.end());
+            abandonedEffects->reads.insert(abandonedEffects->reads.end(), into->reads.begin(), into->reads.end());
+            *into = {};
+        } else if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+            recorder->ApplyDeferred(*into);
+        }
     }
 }
 
@@ -3126,7 +3194,7 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
-    drawSnapshots.erase(entry);
+    drawSnapshotMaps[SnapshotPool(std::get<1>(entry->first))].erase(entry);
 }
 
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
@@ -3171,6 +3239,7 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, VkDeviceSize* offset) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    auto& drawSnapshots = drawSnapshotMaps[SnapshotPool(use)];
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) {
         if (use != SnapshotUse::Storage || offset == nullptr) return {};
@@ -3195,6 +3264,7 @@ std::shared_ptr<Buffer> Recorder::containingDrawSnapshot(std::uint64_t address, 
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto& drawSnapshots = drawSnapshotMaps[SnapshotPool(SnapshotUse::Storage)];
     auto entry = drawSnapshots.upper_bound({address, SnapshotUse::Storage, std::numeric_limits<std::size_t>::max()});
     for (std::size_t probe = 0; probe < ContainingSnapshotProbes && entry != drawSnapshots.begin(); ++probe) {
         --entry;
@@ -3263,6 +3333,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
     const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
     auto& pool = drawSnapshotPools[SnapshotPool(use)];
+    auto& drawSnapshots = drawSnapshotMaps[SnapshotPool(use)];
     if (generation == 0 || bytes > budget) return;
     if (use == SnapshotUse::Vertex) {
         for (auto it = drawSnapshots.lower_bound({address, use, 0}); it != drawSnapshots.end() && std::get<0>(it->first) == address && std::get<1>(it->first) == use && std::get<2>(it->first) <= bytes;) eraseDrawSnapshot(it++);
@@ -3331,6 +3402,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     if (bytes == 0) return false;
     ensureOpen();
     const auto end = address + bytes;
+    logNoted(address, end);
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
@@ -3363,6 +3435,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
+    logNoted(address, address + bytes);
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
@@ -3496,9 +3569,25 @@ bool Recorder::overlaps(const Batch& batch, std::uint64_t address, std::uint64_t
     return false;
 }
 
+void Recorder::logNoted(std::uint64_t begin, std::uint64_t end) {
+    ++notedSerial;
+    notedRanges[notedSerial % notedRanges.size()] = {notedSerial, begin, end};
+}
+
+bool Recorder::NotedSince(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+    if (notedSerial - since > notedRanges.size()) return false;
+    for (auto serial = since + 1; serial <= notedSerial; ++serial) {
+        const auto& noted = notedRanges[serial % notedRanges.size()];
+        ranges.emplace_back(noted.begin, noted.end);
+    }
+    return true;
+}
+
 bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    GuestMemory::NoteEarlyRead(address, bytes);
     if (bytes == 0) return false;
+    if (GuestMemory::OnResolverThread()) return SnapshotOverlaps(resolverSnapshot, address, bytes);
     if (published != nullptr && !SnapshotOverlaps(published.get(), address, bytes)) return false;
     const auto end = address + bytes;
     if (open != nullptr && overlaps(*open, address, end)) return true;
@@ -3859,6 +3948,7 @@ std::size_t Recorder::PendingLabels() const {
 
 bool Recorder::PendingLabelIn(std::uint64_t address, std::size_t bytes) const {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    GuestMemory::NoteEarlyRead(address, bytes);
     std::lock_guard tableLock(labelTableMutex);
     if (bytes == 0) return false;
     const auto end = address + bytes;

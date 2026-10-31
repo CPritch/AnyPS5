@@ -33,6 +33,10 @@ struct PendingEarly {
     const std::vector<DrawPipeline::Range>* writes = nullptr;
 };
 thread_local PendingEarly pendingEarly;
+thread_local bool skipCommittingReads = false;
+enum ResolveJobState : int { ResolveIdle, ResolvePosted, ResolveRunning, ResolveDone };
+std::atomic<std::uint64_t> earlyResolveNs{0}, earlyResolveCount{0};
+std::atomic<std::uint64_t> resolvesPosted{0}, resolvesRevoked{0}, resolvesDoneBeforeJoin{0}, resolvesWaited{0}, resolveWaitNs{0}, resolveStartNs{0}, resolveBusyNs{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::EarlyEvent::Count)> earlyEvents{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> earlyAborts{};
 }
@@ -124,13 +128,24 @@ std::string QueueWaits::Text() {
         const auto take = [](std::atomic<std::uint64_t>& value) { return std::to_string(value.exchange(0, std::memory_order_relaxed)); };
         const auto event = [&](DrawPipeline::EarlyEvent kind) { return take(earlyEvents[static_cast<std::size_t>(kind)]); };
         using E = DrawPipeline::EarlyEvent;
-        text += "; early resolves (APS5_RESOLVE_SPLIT" + std::string(DrawPipeline::EarlyStopped() ? ", stopped by verify" : "") + "): resolved " + take(earlyResolved) + ", declined " + take(earlyDeclined) + ", failed " + take(earlyFailed) + ", never offered " + event(E::Unoffered) + "; packets used " + event(E::Used) + ", redone for proof " + event(E::StaleProof) + ", pending " + event(E::StalePending) + ", imports " + event(E::StaleImports) + ", device " + event(E::StaleDevice) + ", submit " + event(E::StaleSubmit) + ", redo " + event(E::StaleRedo) + "; dropped after resolve for reads overlapping the previous draw's writes " + event(E::OverlapAfter) + "; verified same " + event(E::VerifyMatched) + ", different " + event(E::VerifyDiffered) + "; aborted at a barrier:";
+        text += "; early resolves (APS5_RESOLVE_SPLIT" + std::string(DrawPipeline::EarlyStopped() ? ", stopped by verify" : "") + "): resolved " + take(earlyResolved) + ", declined " + take(earlyDeclined) + ", failed " + take(earlyFailed) + ", never offered " + event(E::Unoffered) + "; packets used " + event(E::Used) + ", redone for proof " + event(E::StaleProof) + ", pending " + event(E::StalePending) + ", imports " + event(E::StaleImports) + ", device " + event(E::StaleDevice) + ", submit " + event(E::StaleSubmit) + ", redo " + event(E::StaleRedo) + ", a later note over its reads " + event(E::StaleNoted) + ", template left the cache " + event(E::StaleTemplate) + "; dropped after resolve for reads overlapping the previous draw's writes " + event(E::OverlapAfter) + ", failed on the resolver " + event(E::ResolverFailed) + "; verified same " + event(E::VerifyMatched) + ", different " + event(E::VerifyDiffered) + "; aborted at a barrier:";
         for (std::size_t kind = 1; kind < earlyAborts.size(); ++kind) {
             const auto count = earlyAborts[kind].exchange(0, std::memory_order_relaxed);
             if (count != 0) text += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
         }
-        const auto [unwinding, completion] = GuestMemory::TakeEarlyBarriersPassed();
-        text += " barriers passed while unwinding " + std::to_string(unwinding) + ", in a completion " + std::to_string(completion);
+        if (DrawPipeline::ResolveSplit() == 1) {
+            const auto count = earlyResolveCount.exchange(0, std::memory_order_relaxed);
+            text += " early resolves on the committer took " + std::to_string(count == 0 ? 0 : earlyResolveNs.exchange(0, std::memory_order_relaxed) / count) + " ns each;";
+        }
+        if (DrawPipeline::ResolveSplit() >= 2) {
+            const auto posted = resolvesPosted.exchange(0, std::memory_order_relaxed);
+            const auto started = posted - std::min(posted, resolvesRevoked.load(std::memory_order_relaxed));
+            const auto waited = resolvesWaited.exchange(0, std::memory_order_relaxed);
+            const auto per = [](std::uint64_t ns, std::uint64_t count) { return count == 0 ? std::string("0") : std::to_string(ns / count); };
+            text += " resolver jobs posted " + std::to_string(posted) + ", revoked unstarted " + take(resolvesRevoked) + ", done before the join " + take(resolvesDoneBeforeJoin) + ", waited for " + std::to_string(waited) + " (" + per(resolveWaitNs.exchange(0, std::memory_order_relaxed), waited) + " ns each), start latency " + per(resolveStartNs.exchange(0, std::memory_order_relaxed), started) + " ns, resolving " + per(resolveBusyNs.exchange(0, std::memory_order_relaxed), started) + " ns a job; recorder methods off the resolver's list:" + GuestMemory::TakeResolverRecorderText() + ";";
+        }
+        const auto [unwinding, handler, completion] = GuestMemory::TakeEarlyBarriersPassed();
+        text += " barriers passed while unwinding " + std::to_string(unwinding) + ", in an exception handler " + std::to_string(handler) + ", in a completion " + std::to_string(completion);
     }
     const auto [importedLayers, uploadedLayers] = Graphics::TakeDepthPlaneLayerCounts();
     char planes[128];
@@ -461,6 +476,11 @@ void DrawPipeline::NoteEarly(EarlyEvent event) {
     earlyEvents[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
 }
 
+void DrawPipeline::NoteEarlyResolveNs(std::uint64_t ns) {
+    earlyResolveNs.fetch_add(ns, std::memory_order_relaxed);
+    earlyResolveCount.fetch_add(1, std::memory_order_relaxed);
+}
+
 void DrawPipeline::NoteEarlyAbort(std::uint8_t kind) {
     earlyAborts[std::min<std::size_t>(kind, earlyAborts.size() - 1)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -471,6 +491,86 @@ unsigned DrawPipeline::ResolveSplit() {
         return text == nullptr ? 0u : static_cast<unsigned>(std::strtoul(text, nullptr, 10));
     }();
     return mode;
+}
+
+void DrawPipeline::PostResolve(std::function<void()> body, std::function<void(bool)> finish) {
+    auto& pipeline = Queue0();
+    if (!pipeline.resolver.joinable()) {
+        std::lock_guard lock(pipeline.prepareMutex);
+        if (!pipeline.preparersClosing.load(std::memory_order_relaxed) && !pipeline.resolver.joinable()) pipeline.resolver = std::thread([&pipeline] { pipeline.resolveAhead(); });
+    }
+    pipeline.resolveBody = std::move(body);
+    pipeline.resolveFinish = std::move(finish);
+    pipeline.resolvePosted = std::chrono::steady_clock::now();
+    resolvesPosted.fetch_add(1, std::memory_order_relaxed);
+    pipeline.resolveState.store(ResolvePosted, std::memory_order_release);
+}
+
+void DrawPipeline::JoinResolve() {
+    joinResolve(true);
+}
+
+void DrawPipeline::WaitResolve() {
+    joinResolve(false);
+}
+
+void DrawPipeline::joinResolve(bool revoke) {
+    auto& pipeline = Queue0();
+    if (pipeline.resolveState.load(std::memory_order_acquire) == ResolveIdle) return;
+    bool ran = true;
+    int expected = ResolvePosted;
+    if (revoke && pipeline.resolveState.compare_exchange_strong(expected, ResolveIdle, std::memory_order_acq_rel)) {
+        ran = false;
+        resolvesRevoked.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        if (!revoke) expected = pipeline.resolveState.load(std::memory_order_acquire);
+        if (expected == ResolveDone) {
+            resolvesDoneBeforeJoin.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const auto start = std::chrono::steady_clock::now();
+            while (pipeline.resolveState.load(std::memory_order_acquire) != ResolveDone) SpinPause();
+            resolvesWaited.fetch_add(1, std::memory_order_relaxed);
+            resolveWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+        }
+        pipeline.resolveState.store(ResolveIdle, std::memory_order_relaxed);
+    }
+    auto finish = std::move(pipeline.resolveFinish);
+    pipeline.resolveFinish = nullptr;
+    pipeline.resolveBody = nullptr;
+    if (!finish) return;
+    if (std::uncaught_exceptions() == 0) {
+        finish(ran);
+        return;
+    }
+    try {
+        finish(ran);
+    } catch (...) {
+    }
+}
+
+void DrawPipeline::resolveAhead() {
+    GuestMemory::MarkResolverThread();
+    PinResolverThread("draw resolver");
+    PerformanceTimer::UntraceThisThread();
+    constexpr std::chrono::microseconds idleNap{20};
+    for (;;) {
+        const auto posted = [&] { return resolveState.load(std::memory_order_acquire) == ResolvePosted || preparersClosing.load(std::memory_order_relaxed); };
+        if (!SpinUntil(HandoffSpinWindow(), posted)) {
+            std::this_thread::sleep_for(idleNap);
+            continue;
+        }
+        if (preparersClosing.load(std::memory_order_acquire)) return;
+        int expected = ResolvePosted;
+        if (!resolveState.compare_exchange_strong(expected, ResolveRunning, std::memory_order_acq_rel)) continue;
+        const auto start = std::chrono::steady_clock::now();
+        resolveStartNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - resolvePosted).count()), std::memory_order_relaxed);
+        try {
+            resolveBody();
+        } catch (...) {
+        }
+        resolveBusyNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+        resolveState.store(ResolveDone, std::memory_order_release);
+    }
 }
 
 bool DrawPipeline::EarlyStopped() {
@@ -787,7 +887,7 @@ void DrawPipeline::run() {
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
-        if (ResolveSplit() == 1 && isDraw && commit != nullptr && !EarlyStopped()) {
+        if (ResolveSplit() != 0 && isDraw && commit != nullptr && !EarlyStopped()) {
             std::lock_guard lock(mutex);
             if (items.size() >= 2 && items[1].draw && items[1].early) {
                 pendingEarly.hook = items[1].early;
@@ -861,6 +961,15 @@ void DrawPipeline::Stop() {
     for (auto& preparer : stopped) {
         if (preparer.get_id() == std::this_thread::get_id()) preparer.detach();
         else preparer.join();
+    }
+    std::thread resolving;
+    {
+        std::lock_guard lock(prepareMutex);
+        resolving = std::move(resolver);
+    }
+    if (resolving.joinable()) {
+        if (resolving.get_id() == std::this_thread::get_id()) resolving.detach();
+        else resolving.join();
     }
     {
         std::lock_guard lock(mutex);
@@ -967,14 +1076,18 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     auto& pipeline = Queue0();
     std::lock_guard lock(pipeline.mutex);
     heldReadQueries.fetch_add(1, std::memory_order_relaxed);
-    for (const auto& item : pipeline.items) {
-        for (const auto& [begin, limit] : item.reads) {
+    for (auto it = pipeline.items.begin() + (skipCommittingReads && !pipeline.items.empty() ? 1 : 0); it != pipeline.items.end(); ++it) {
+        for (const auto& [begin, limit] : it->reads) {
             if (address >= limit || begin >= end) continue;
             heldReadHits.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
     }
     return false;
+}
+
+void DrawPipeline::SkipCommittingReads(bool skip) {
+    skipCommittingReads = skip;
 }
 
 std::uint64_t DrawPipeline::HeldReadQueries() {

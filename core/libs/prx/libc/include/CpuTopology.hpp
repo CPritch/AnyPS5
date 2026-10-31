@@ -243,20 +243,22 @@ struct Placement {
     std::uint64_t worker = 0;
     std::uint64_t finisher = 0;
     std::uint64_t committer = 0;
+    std::uint64_t resolver = 0;
     std::uint64_t shared = 0;
     bool Active() const {
         return shared != 0;
     }
 };
 
-inline Placement PlacementFor(const Layout& layout, const std::vector<std::uint64_t>& performantCores) {
+inline Placement PlacementFor(const Layout& layout, const std::vector<std::uint64_t>& performantCores, bool resolver = false) {
     constexpr std::size_t dedicated = 3;
     if (!layout.hybrid || performantCores.size() <= dedicated) return {};
     Placement result{};
     result.worker = performantCores[0];
     result.finisher = performantCores[1];
     result.committer = performantCores[2];
-    result.shared = layout.process & ~(result.worker | result.finisher | result.committer);
+    if (resolver && performantCores.size() > dedicated) result.resolver = performantCores[dedicated];
+    result.shared = layout.process & ~(result.worker | result.finisher | result.committer | result.resolver);
     if (result.shared == 0) return {};
     return result;
 }
@@ -288,7 +290,9 @@ inline const Placement& GetPlacement() {
         if (!PlacementRequested()) return Placement{};
 #ifdef __linux__
         const auto& layout = Get();
-        return PlacementFor(layout, CoresFromSysfs("/sys/devices/system/cpu", layout.performant & layout.process));
+        const char* split = std::getenv("APS5_RESOLVE_SPLIT");
+        const bool resolver = split != nullptr && std::strtoul(split, nullptr, 10) >= 2 && MaskFromEnvironment("APS5_RESOLVER_AFFINITY_MASK") == 0;
+        return PlacementFor(layout, CoresFromSysfs("/sys/devices/system/cpu", layout.performant & layout.process), resolver);
 #else
         return Placement{};
 #endif

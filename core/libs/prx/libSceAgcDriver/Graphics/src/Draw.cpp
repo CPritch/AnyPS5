@@ -1245,8 +1245,16 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     return copy;
 }
 
+namespace {
+thread_local std::vector<std::function<void(Recorder&)>>* memoKeeps = nullptr;
+}
+
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived) {
     if (recorder == nullptr || copy.reused || copy.generation == 0 || copy.buffer == nullptr) return;
+    if (memoKeeps != nullptr) {
+        memoKeeps->push_back([address, bytes = copy.buffer->Bytes().size(), generation = copy.generation, registryGeneration = copy.registryGeneration, buffer = copy.buffer, use, derived](Recorder& recorder) { recorder.KeepDrawSnapshot(address, bytes, generation, registryGeneration, buffer, use, derived); });
+        return;
+    }
     recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
 }
 
@@ -1270,10 +1278,12 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     Recorder::CountLabelSnapshotAgreement(labelled, address, bytes);
     CountStaleView(StaleViewSite::InputLabel, labelled, address, bytes);
     if (labelled) return nullptr;
-    const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
-    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
-    const auto drawWriters = DrawCopiedWriters();
-    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
+    if (!GuestMemory::OnResolverThread()) {
+        const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+        if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
+        const auto drawWriters = DrawCopiedWriters();
+        if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
+    }
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
     if (deferredReads != nullptr) deferredReads->emplace_back(address, bytes);
@@ -1297,6 +1307,10 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
         return indices;
     }
     indices.highest = HighestDrawIndex(range, indexSize, skipRestart);
+    if (memoKeeps != nullptr) {
+        memoKeeps->push_back([address, bytes, use, generation, registryGeneration, highest = indices.highest](Recorder& recorder) { recorder.KeepHighestIndex(address, bytes, use, generation, registryGeneration, highest); });
+        return indices;
+    }
     recorder.KeepHighestIndex(address, bytes, use, generation, registryGeneration, indices.highest);
     return indices;
 }
@@ -2012,6 +2026,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
+        GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverPath);
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
@@ -2830,6 +2845,7 @@ struct PreparedDraw {
     FoundDepthView depthFound;
     std::vector<std::size_t> colorRefreshes;
     std::optional<std::pair<ResourceCache::Key, std::shared_ptr<ShaderResources>>> deferredInsert;
+    std::vector<std::function<void(Recorder&)>> memoKeeps;
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
     std::uint64_t shape = 0;
@@ -2909,7 +2925,10 @@ struct ShapeMemoStorage {};
 constexpr std::size_t ShapeMemoEntries = 4096;
 constexpr std::size_t ShapeMemoChoices = 4;
 
+thread_local std::unordered_map<std::uint64_t, ShapeEntry>* borrowedShapeMemo = nullptr;
+
 std::unordered_map<std::uint64_t, ShapeEntry>& shapeMemo() {
+    if (borrowedShapeMemo != nullptr) return *borrowedShapeMemo;
     return HostThreadLocal<std::unordered_map<std::uint64_t, ShapeEntry>, ShapeMemoStorage>();
 }
 
@@ -3424,6 +3443,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         Require(std::ranges::any_of(images, [&](const std::pair<VkImage, bool>& image) { return image.first == binding.resident->Image() && image.second; }), "the partial write of a packed color target does not store into the target's resident image");
     }
     if (!lean && !resolved.moved.empty()) {
+        GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverPath);
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
     }
@@ -4108,8 +4128,42 @@ struct DrawPacket {
     std::uint64_t pendingAtEmit = 0;
 };
 
+namespace {
+thread_local std::vector<DrawPacket*>* packetGraveyard = nullptr;
+void (*redoHook)() = nullptr;
+}
+
 void DrawPacketDeleter::operator()(DrawPacket* packet) const {
+    if (packetGraveyard != nullptr && packet != nullptr) {
+        packetGraveyard->push_back(packet);
+        return;
+    }
     delete packet;
+}
+
+void* ShapeMemoHandle() {
+    return &shapeMemo();
+}
+
+ResolverScope::ResolverScope(const ResolverHandoff& handoff) {
+    borrowedShapeMemo = static_cast<std::unordered_map<std::uint64_t, ShapeEntry>*>(handoff.shapeMemo);
+    packetGraveyard = handoff.graveyard;
+    Recorder::SetResolverState(handoff.snapshot.get(), handoff.abandoned);
+}
+
+ResolverScope::~ResolverScope() {
+    borrowedShapeMemo = nullptr;
+    packetGraveyard = nullptr;
+    Recorder::SetResolverState(nullptr, nullptr);
+}
+
+void BuryPackets(std::vector<DrawPacket*>& packets) {
+    for (auto* packet : packets) delete packet;
+    packets.clear();
+}
+
+void SetRedoHook(void (*hook)()) {
+    redoHook = hook;
 }
 
 namespace {
@@ -4123,6 +4177,11 @@ std::uint64_t DrawRedoSerial() {
 bool DrawPacketReadsOverlap(const DrawPacket& packet, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     const auto& resources = packet.prepared.resolved.resources;
     return resources != nullptr && resources->DescribedRangesOverlap(ranges);
+}
+
+bool DrawPacketTemplateGone(const DrawPacket& packet) {
+    const auto& resolved = packet.prepared.resolved;
+    return resolved.cacheable && resolved.resources != nullptr && !packet.prepared.deferredInsert.has_value() && !resolved.resources->InResourceCache();
 }
 
 std::uint32_t CompareDrawPackets(const DrawPacket& first, const DrawPacket& second) {
@@ -4172,6 +4231,11 @@ DrawPacketPtr ResolveDraw(const Context& context, const State& state, const Pm4:
     prepared.trace = trace;
     prepared.shape = shape;
     prepared.ahead = aheadFor(context, ahead);
+    struct MemoKeepScope {
+        std::vector<std::function<void(Recorder&)>>* previous = memoKeeps;
+        explicit MemoKeepScope(std::vector<std::function<void(Recorder&)>>* into) { memoKeeps = into; }
+        ~MemoKeepScope() { memoKeeps = previous; }
+    } memoKeepScope(GuestMemory::OnResolverThread() ? &prepared.memoKeeps : memoKeeps);
     if (DrawSplitCounted()) {
         static const bool probe = (GuestMemory::SetResolveCompletionProbe(&Recorder::InCompletion), true);
         static_cast<void>(probe);
@@ -4264,9 +4328,20 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
         }
         materializeCmaskClear(context, binding.color, binding.resident);
     }
+    if (!redo && prepared.depthFound.view != VK_NULL_HANDLE) {
+        const auto view = DepthSurfaceView(context, *state.depth, state.depthWrite);
+        deferredDepthViews.fetch_add(1, std::memory_order_relaxed);
+        if (view != prepared.depthFound.view) {
+            deferredDepthViewsChanged.fetch_add(1, std::memory_order_relaxed);
+            redo = true;
+        } else if (writesDepthTarget(state)) {
+            NoteDepthSurfaceWrite(context, *state.depth);
+        }
+    }
     if (redo) {
         redoneWhole.fetch_add(1, std::memory_order_relaxed);
         drawRedoSerial.fetch_add(1, std::memory_order_relaxed);
+        if (redoHook != nullptr) redoHook();
         redoingWhole = true;
         struct Restore {
             ~Restore() { redoingWhole = false; }
@@ -4274,15 +4349,13 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
         Draw(context, state, draw, shaders, snapshots, packet.recipeOut, packet.trace, packet.shape, nullptr);
         return;
     }
+    if (!prepared.memoKeeps.empty() && context.recorder != nullptr) {
+        for (auto& keep : prepared.memoKeeps) keep(*context.recorder);
+        prepared.memoKeeps.clear();
+    }
     if (prepared.deferredInsert.has_value()) {
         SharedResourceCache().Insert(prepared.deferredInsert->first, prepared.deferredInsert->second);
         prepared.deferredInsert.reset();
-    }
-    if (prepared.depthFound.view != VK_NULL_HANDLE) {
-        const auto view = DepthSurfaceView(context, *state.depth, state.depthWrite);
-        if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
-        deferredDepthViews.fetch_add(1, std::memory_order_relaxed);
-        if (view != prepared.depthFound.view) deferredDepthViewsChanged.fetch_add(1, std::memory_order_relaxed);
     }
     const auto prepared_at = packet.counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (packet.ready) recordPreparedDraw(context, state, draw, shaders, prepared);
