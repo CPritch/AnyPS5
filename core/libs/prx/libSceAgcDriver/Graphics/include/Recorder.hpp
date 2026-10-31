@@ -457,6 +457,7 @@ public:
     static double ThreadWaitedMs();
     static double HotGpuWaitedMs();
     static std::string TakeHotHookSyncText();
+    static std::string TakeHotWaitSiteText();
     // The calling thread's flush-hook syncs (SyncThrough) that waited for a target batch whose
     // fence had not signaled when the wait began: a read whose bytes are compared around such a
     // sync observed the GPU's work; one that found the fence signaled already read the GPU's bytes

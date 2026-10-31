@@ -138,6 +138,16 @@ AgcDriver::Mutex threadSyncsMutex;
 // of its own work and reads the difference to learn how much of it was waiting for the GPU.
 thread_local double threadWaitedMs = 0;
 thread_local double hotGpuWaitedMs = 0;
+thread_local const void* hotWaitSite = nullptr;
+struct HotWaitSiteScope {
+    const void* previous;
+    explicit HotWaitSiteScope(const void* site) : previous(std::exchange(hotWaitSite, site)) {}
+    ~HotWaitSiteScope() { hotWaitSite = previous; }
+};
+std::mutex hotWaitSitesMutex;
+std::map<std::tuple<int, int, const void*>, std::pair<std::uint64_t, double>> hotWaitSites;
+
+void NoteHotWait(int source, const void* site, double ms);
 
 void CountThreadSync(int source, double ms) {
     threadWaitedMs += ms;
@@ -1452,6 +1462,34 @@ void Recorder::CountSync(int source, const void* site) {
 
 void Recorder::AnnounceSyncSite(const void* site) {
     announcedSite = site;
+}
+
+void NoteHotWait(int source, const void* site, double ms) {
+    std::lock_guard lock(hotWaitSitesMutex);
+    auto& entry = hotWaitSites[{static_cast<int>(GuestMemory::CurrentHotThread()), source, site}];
+    ++entry.first;
+    entry.second += ms;
+}
+
+std::string Recorder::TakeHotWaitSiteText() {
+    std::vector<std::pair<std::tuple<int, int, const void*>, std::pair<std::uint64_t, double>>> entries;
+    {
+        std::lock_guard lock(hotWaitSitesMutex);
+        entries.assign(hotWaitSites.begin(), hotWaitSites.end());
+        hotWaitSites.clear();
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    constexpr std::array<const char*, 4> threads{"other", "worker", "finisher", "committer"};
+    std::string text;
+    for (std::size_t i = 0; i < entries.size() && i < 8; ++i) {
+        const auto& [key, wait] = entries[i];
+        const auto& [thread, source, site] = key;
+        char item[160];
+        static const char* const sources[5] = {"idle", "pending-write", "recorded-store", "address-based", "other"};
+        std::snprintf(item, sizeof(item), "%s %s %s from +0x%llx: %llu, %.1f ms", i == 0 ? "" : ";", threads[static_cast<std::size_t>(thread) % threads.size()], source >= 0 && source < 5 ? sources[source] : "unknown", site != nullptr ? GuestMemory::CodeOffset(site) : 0ull, static_cast<unsigned long long>(wait.first), wait.second);
+        text += item;
+    }
+    return text.empty() ? " none" : text;
 }
 
 std::string Recorder::TakeHotHookSyncText() {
@@ -2882,6 +2920,7 @@ void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
 }
 
 void Recorder::BoundKeptBytes() {
+    const HotWaitSiteScope hotSite{__builtin_return_address(0)};
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
@@ -3958,6 +3997,7 @@ bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
 }
 
 void Recorder::FinishUpTo(std::uint64_t serial) {
+    const HotWaitSiteScope hotSite{__builtin_return_address(0)};
     // A drain: the wait already happened (unlocked), the fences are signaled, so the source-0 wait
     // recorded here is the bookkeeping only (a caller that did not wait first, WaitForLeases, shows
     // up in the site table by its own address).
@@ -3974,6 +4014,7 @@ void Recorder::FinishUpTo(std::uint64_t serial) {
 }
 
 void Recorder::Sync() {
+    const HotWaitSiteScope hotSite{__builtin_return_address(0)};
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
@@ -3995,6 +4036,7 @@ void Recorder::FlushDeferredReleases() {
 }
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
+    const HotWaitSiteScope hotSite{__builtin_return_address(0)};
     if (bytes == 0) return;
     const auto end = address + bytes;
     if (completionDepth != 0 && !CompletionStoreSyncs()) {
@@ -4196,7 +4238,10 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
     mutex.lock();
     const auto ms = std::chrono::duration<double, std::milli>(waited - start).count();
-    if (hot) hotGpuWaitedMs += ms;
+    if (hot) {
+        hotGpuWaitedMs += ms;
+        NoteHotWait(source, site != nullptr ? site : __builtin_return_address(0), ms);
+    }
     if (profile) {
         // The GPU wait is charged like a locked wait, so the per-source, per-thread and per-site
         // totals of the [recorder] line keep their meaning; the unlocked count says how many were
@@ -4305,10 +4350,14 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         struct HotWait {
             bool counted;
             std::chrono::steady_clock::time_point start;
+            int source;
             ~HotWait() {
-                if (counted) hotGpuWaitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                if (!counted) return;
+                const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                hotGpuWaitedMs += ms;
+                NoteHotWait(source, hotWaitSite, ms);
             }
-        } hotWait{HotHookSyncCounted(), waitStart};
+        } hotWait{HotHookSyncCounted(), waitStart, source};
         // A fence still unsignaled here makes this a real GPU wait under the mutex (finish runs
         // under it): the [lock] line's 'locked GPU waits'.
         const bool signaledAtStart = !profile || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
