@@ -48,6 +48,7 @@ constexpr std::array<const char*, QueueWaitSites> QueueWaitNames{"relocation", "
 std::array<std::atomic<std::uint64_t>, QueueWaitSites> queueWaitCounts{}, queueWaitNs{};
 std::atomic<std::uint64_t> shadowCaptures{0}, shadowOverlaps{0};
 std::atomic<std::uint64_t> heldWaitLabels{0}, heldWaitUnknown{0}, heldWaitOther{0};
+std::atomic<std::uint64_t> queuedLabelReads{0};
 
 std::string QueueWaitText(QueueWaits::Site site) {
     const auto index = static_cast<std::size_t>(site);
@@ -77,6 +78,10 @@ void QueueWaits::Note(Site site, std::chrono::steady_clock::time_point since, st
     queueWaitNs[index].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(until - since).count()), std::memory_order_relaxed);
 }
 
+void QueueWaits::NoteQueuedLabelRead() {
+    queuedLabelReads.fetch_add(1, std::memory_order_relaxed);
+}
+
 void QueueWaits::NoteShadowCapture(bool overlapped) {
     shadowCaptures.fetch_add(1, std::memory_order_relaxed);
     if (overlapped) shadowOverlaps.fetch_add(1, std::memory_order_relaxed);
@@ -100,6 +105,9 @@ std::string QueueWaits::Text() {
     char held[128];
     std::snprintf(held, sizeof(held), "; targeted finisher waits for a held label %llu, a held job with unknown writes %llu, another held job %llu", static_cast<unsigned long long>(heldWaitLabels.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(heldWaitUnknown.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(heldWaitOther.exchange(0, std::memory_order_relaxed)));
     text += held;
+    char labelReads[96];
+    std::snprintf(labelReads, sizeof(labelReads), "; capture words read from queued labels %llu", static_cast<unsigned long long>(queuedLabelReads.exchange(0, std::memory_order_relaxed)));
+    text += labelReads;
     char shadow[160];
     std::snprintf(shadow, sizeof(shadow), "; finisher capture queries %llu, over writes still queued in the pipeline %llu (waited for unless APS5_NO_FINISHER_CAPTURE_ORDER)", static_cast<unsigned long long>(shadowCaptures.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(shadowOverlaps.exchange(0, std::memory_order_relaxed)));
     text += shadow;

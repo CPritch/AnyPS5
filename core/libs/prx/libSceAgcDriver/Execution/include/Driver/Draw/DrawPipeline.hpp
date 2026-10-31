@@ -51,6 +51,7 @@ public:
     static void Note(Site site, std::chrono::steady_clock::time_point since, std::chrono::steady_clock::time_point until);
     static void Note(Site site, std::chrono::steady_clock::time_point since) { Note(site, since, std::chrono::steady_clock::now()); }
     static void NoteShadowCapture(bool overlapped);
+    static void NoteQueuedLabelRead();
     static std::string Text();
 };
 

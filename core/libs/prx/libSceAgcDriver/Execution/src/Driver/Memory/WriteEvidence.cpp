@@ -211,6 +211,11 @@ bool checksQueuedWrites() {
     return DrawPipeline::Active() || (finisherOrdered && DrawFinisher::OnFinisherThread());
 }
 
+bool queuedLabelReads() {
+    static const bool enabled = std::getenv("APS5_NO_QUEUED_LABEL_READS") == nullptr;
+    return enabled;
+}
+
 bool overQueuedWrite(std::uint64_t address, std::size_t bytes) {
     auto& pipeline = DrawPipeline::Queue0();
     const bool overlaps = pipeline.Busy() && pipeline.Overlaps(address, bytes);
@@ -223,6 +228,13 @@ bool overQueuedWrite(std::uint64_t address, std::size_t bytes) {
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (checksQueuedWrites()) {
         if (overQueuedWrite(address, bytes)) {
+            if (queuedLabelReads() && !known.empty() && known.size() == bytes && bytes <= 8) {
+                if (const auto value = DrawPipeline::Queue0().PendingLabel(address, bytes)) {
+                    std::memcpy(known.data(), &*value, bytes);
+                    QueueWaits::NoteQueuedLabelRead();
+                    return ShaderMemory::PendingWrite::KnownValue;
+                }
+            }
             const auto opcode = GuestMemory::CurrentPacket().opcode;
             DrawPipeline::Queue0().WaitWritten(address, bytes, DrawPipeline::DrainReason::Capture, opcode < 0x100 ? opcode : 0x100);
         }
