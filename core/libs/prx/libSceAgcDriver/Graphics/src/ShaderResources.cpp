@@ -5845,7 +5845,10 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::CheckM
     const auto checkStart = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto usable = std::all_of(plan.checks.begin(), plan.checks.end(), [&](const std::pair<std::uint64_t, std::size_t>& check) {
         const auto [begin, bytes] = check;
-        return GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) && !(guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes));
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) || guestMemory.WritesOverlap(begin, bytes)) return false;
+        const bool pending = recorder.PendingWriteOverlaps(begin, bytes);
+        Recorder::CountSnapshotAgreement(pending, begin, bytes);
+        return !(pending || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes));
     });
     if (counted) {
         auto& split = CommitterMoved();

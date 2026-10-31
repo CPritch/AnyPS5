@@ -1254,10 +1254,13 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     bool behind = false;
     if (behindGpuWrite == nullptr) {
         GuestMemory::FlushGpuWrites(address, bytes);
-        if (recorder->PendingWriteOverlaps(address, bytes)) return nullptr;
+        const bool pending = recorder->PendingWriteOverlaps(address, bytes);
+        Recorder::CountSnapshotAgreement(pending, address, bytes);
+        if (pending) return nullptr;
     } else {
         StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
         behind = recorder->PendingWriteOverlaps(address, bytes);
+        Recorder::CountSnapshotAgreement(behind, address, bytes);
     }
     if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
@@ -3963,6 +3966,7 @@ std::string TakeDrawSplitText() {
     }
     result += ShaderResources::TakeCommitterProofText();
     result += ShaderResources::TakeCommitterMovedText();
+    result += Recorder::TakeSnapshotAgreementText();
     result += StorageTexture::TakeCommitterRefreshText();
     result += TakeCommitterCopiedWaitText();
     return result;

@@ -1486,6 +1486,24 @@ bool Recorder::SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes) {
     return AgcDriver::Graphics::SnapshotOverlaps(address, bytes);
 }
 
+namespace {
+std::array<std::atomic<std::uint64_t>, 4> snapshotAgreement{};
+}
+
+void Recorder::CountSnapshotAgreement(bool live, std::uint64_t address, std::size_t bytes) {
+    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!counted || GuestMemory::CurrentHotThread() != GuestMemory::HotThread::Committer) return;
+    const bool snapshot = AgcDriver::Graphics::SnapshotOverlaps(address, bytes);
+    snapshotAgreement[(live ? 2u : 0u) + (snapshot ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string Recorder::TakeSnapshotAgreementText() {
+    const auto take = [](std::size_t index) { return static_cast<unsigned long long>(snapshotAgreement[index].exchange(0, std::memory_order_relaxed)); };
+    char text[192];
+    std::snprintf(text, sizeof(text), "; resolve's pending-write checks against the published snapshot: both clear %llu, both pending %llu, only the snapshot pending %llu, only the recorder pending %llu", take(0), take(3), take(1), take(2));
+    return text;
+}
+
 std::shared_ptr<const Recorder::WriteRanges> Recorder::PendingWriteSnapshot() {
     return pendingWrites.load(std::memory_order_acquire);
 }
