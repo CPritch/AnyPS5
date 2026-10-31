@@ -127,11 +127,11 @@ void appendDepthRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ran
     };
     if (exact && depth.extent.width != 0 && depth.extent.height != 0) {
         const bool d16 = depth.format == VK_FORMAT_D16_UNORM || depth.format == VK_FORMAT_D16_UNORM_S8_UINT;
-        add(depth.address, Graphics::DepthSliceBytes(depth.extent, d16 ? 2u : 4u));
-        add(depth.stencilAddress, Graphics::DepthSliceBytes(depth.extent, 1u));
+        add(depth.address, depth.samples > 1u ? Graphics::MultisampledDepthBytes_nid_no_patch(depth.extent, d16 ? 2u : 4u, depth.samples) : Graphics::DepthSliceBytes(depth.extent, d16 ? 2u : 4u));
+        add(depth.stencilAddress, depth.samples > 1u ? Graphics::MultisampledDepthBytes_nid_no_patch(depth.extent, 1u, depth.samples) : Graphics::DepthSliceBytes(depth.extent, 1u));
     } else {
         const auto align = [](std::uint64_t value) { return (value + 255) & ~255ull; };
-        const auto pixels = align(depth.extent.width) * align(depth.extent.height);
+        const auto pixels = align(depth.extent.width) * align(depth.extent.height) * std::max<std::uint32_t>(depth.samples, 1u);
         const auto bytes = pixels != 0 ? pixels * 8 + DrawSlack : DrawUnknownBytes;
         add(depth.address, bytes);
         add(depth.stencilAddress, bytes);
