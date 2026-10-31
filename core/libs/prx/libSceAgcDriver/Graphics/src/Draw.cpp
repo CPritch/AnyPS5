@@ -1170,11 +1170,12 @@ namespace {
 // DrawWithRecipe.
 struct DrawTimer {
     bool profile;
+    bool counted = false;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
     explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
     void phase(DrawPhase which) {
-        if (!profile) return;
+        if (!profile && !counted) return;
         const auto now = std::chrono::steady_clock::now();
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
         phaseStart = now;
@@ -3598,6 +3599,7 @@ namespace {
 
 struct DrawSplitCounts {
     std::atomic<std::uint64_t> full{0}, prepareNs{0}, recordNs{0}, recipe{0}, recipeNs{0}, tessellation{0};
+    std::array<std::atomic<std::uint64_t>, PhaseCount> phaseNs{};
 };
 
 DrawSplitCounts& DrawSplit() {
@@ -3625,8 +3627,16 @@ std::string TakeDrawSplitText() {
     const auto recipeNs = split.recipeNs.exchange(0, std::memory_order_relaxed);
     const auto tessellation = split.tessellation.exchange(0, std::memory_order_relaxed);
     char text[256];
-    std::snprintf(text, sizeof(text), " full path %llu (prepare %.1f ms, record %.1f ms), recipe %llu (%.1f ms), tessellation %llu", static_cast<unsigned long long>(full), static_cast<double>(prepare) / 1e6, static_cast<double>(record) / 1e6, static_cast<unsigned long long>(recipe), static_cast<double>(recipeNs) / 1e6, static_cast<unsigned long long>(tessellation));
-    return text;
+    std::snprintf(text, sizeof(text), " full path %llu (prepare %.1f ms, record %.1f ms), recipe %llu (%.1f ms), tessellation %llu; full-path phases (ms):", static_cast<unsigned long long>(full), static_cast<double>(prepare) / 1e6, static_cast<double>(record) / 1e6, static_cast<unsigned long long>(recipe), static_cast<double>(recipeNs) / 1e6, static_cast<unsigned long long>(tessellation));
+    std::string result = text;
+    for (std::size_t i = 0; i < PhaseCount; ++i) {
+        const auto ns = split.phaseNs[i].exchange(0, std::memory_order_relaxed);
+        if (ns == 0) continue;
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %.1f", DrawPhaseNames[i], static_cast<double>(ns) / 1e6);
+        result += item;
+    }
+    return result;
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape) {
@@ -3642,6 +3652,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.trace = trace;
     prepared.shape = shape;
     const bool counted = DrawSplitCounted();
+    if (counted) {
+        prepared.timer.counted = true;
+        prepared.timer.phaseStart = std::chrono::steady_clock::now();
+    }
     const auto started = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool ready = prepareDraw(context, state, draw, shaders, snapshots, prepared);
     const auto prepared_at = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3651,6 +3665,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     split.full.fetch_add(1, std::memory_order_relaxed);
     split.prepareNs.fetch_add(NanosecondsBetween(started, prepared_at), std::memory_order_relaxed);
     split.recordNs.fetch_add(NanosecondsBetween(prepared_at, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+    for (std::size_t i = 0; i < PhaseCount; ++i) {
+        if (prepared.timer.us[i] > 0) split.phaseNs[i].fetch_add(static_cast<std::uint64_t>(prepared.timer.us[i] * 1000.0), std::memory_order_relaxed);
+    }
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {

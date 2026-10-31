@@ -32,6 +32,9 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -1490,7 +1493,18 @@ std::string Recorder::TakeHotWaitSiteText() {
         const auto& [thread, source, site] = key;
         char item[160];
         static const char* const sources[5] = {"idle", "pending-write", "recorded-store", "address-based", "other"};
-        std::snprintf(item, sizeof(item), "%s %s %s from +0x%llx: %llu, %.1f ms", i == 0 ? "" : ";", threads[static_cast<std::size_t>(thread) % threads.size()], source >= 0 && source < 5 ? sources[source] : "unknown", site != nullptr ? GuestMemory::CodeOffset(site) : 0ull, static_cast<unsigned long long>(wait.first), wait.second);
+        const char* module = "?";
+        unsigned long long offset = reinterpret_cast<std::uintptr_t>(site);
+#ifdef __linux__
+        Dl_info info{};
+        if (site != nullptr && dladdr(site, &info) != 0 && info.dli_fbase != nullptr) {
+            offset = reinterpret_cast<std::uintptr_t>(site) - reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+            if (info.dli_fname != nullptr) {
+                module = std::strrchr(info.dli_fname, '/') != nullptr ? std::strrchr(info.dli_fname, '/') + 1 : info.dli_fname;
+            }
+        }
+#endif
+        std::snprintf(item, sizeof(item), "%s %s %s from %s+0x%llx: %llu, %.1f ms", i == 0 ? "" : ";", threads[static_cast<std::size_t>(thread) % threads.size()], source >= 0 && source < 5 ? sources[source] : "unknown", module, offset, static_cast<unsigned long long>(wait.first), wait.second);
         text += item;
     }
     return text.empty() ? " none" : text;
