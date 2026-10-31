@@ -2776,7 +2776,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& timer = prepared.timer;
+    const bool counted = timer.counted;
     timer = DrawTimer(profile);
+    timer.counted = counted;
     // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
     // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
     // draws, their inputs: per-draw string building at ~1400 draws per 10 s is itself a cost the
