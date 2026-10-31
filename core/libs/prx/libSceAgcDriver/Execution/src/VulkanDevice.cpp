@@ -4328,6 +4328,23 @@ Graphics::DrawPacketPtr VulkanDevice::ResolveDraw(const Graphics::State& graphic
     return Graphics::ResolveDraw(context, graphics, draw, shaders, snapshots, recipe, trace, shape, ahead);
 }
 
+void VulkanDevice::DiscardDraw(Graphics::DrawPacket& packet) {
+    Graphics::DiscardDrawPacket(graphicsContext(), packet);
+}
+
+Graphics::HostImportsProof VulkanDevice::ImportsIdentity() {
+    return Graphics::HostImportsIdentity(graphicsContext());
+}
+
+bool VulkanDevice::ImportsUnchanged(const Graphics::HostImportsProof& proof) {
+    return Graphics::HostImportsUnchanged(graphicsContext(), proof);
+}
+
+std::uint64_t VulkanDevice::RecorderOpenSerial() {
+    const auto context = graphicsContext();
+    return context.recorder != nullptr ? context.recorder->OpenSerial() : 0;
+}
+
 void VulkanDevice::EmitDraw(Graphics::DrawPacket& packet) {
     const auto context = graphicsContext();
     Graphics::EmitDraw(context, packet);

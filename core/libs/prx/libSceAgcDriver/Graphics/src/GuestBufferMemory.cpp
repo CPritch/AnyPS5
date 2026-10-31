@@ -2289,6 +2289,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> changedSpans(std::vector<Re
 // guest addresses. Walks the imports only when the registry changed since the last walk.
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
     if (state.device != context.device) {
+        GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::Import, __builtin_return_address(0));
 #ifdef _WIN32
         drainSettles(state);
 #endif
@@ -2329,6 +2330,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     if (state.freeMemory == nullptr) state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
+    GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::Import, __builtin_return_address(0));
     state.refreshedGeneration = generation;
     state.gateRefusals.clear();
     const auto budget = effectiveBudget(context, state);
@@ -2622,6 +2624,7 @@ void growResident(ImageMirror& mirror, const GuestRuns& runs) {
     if (mirror.resident == nullptr) return;
     const auto need = mirror.resident->UnboundBytes(runs);
     if (need == 0) return;
+    GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::RecorderWrite, __builtin_return_address(0));
     auto& state = Mirrors();
     bool counted = false;
     for (int attempt = 0; !counted; ++attempt) {
@@ -3136,6 +3139,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         if (pieces.empty()) return nullptr;
     }
     const bool sparse = !pieces.empty();
+    GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::RecorderWrite, __builtin_return_address(0));
     mirror = std::make_shared<ImageMirror>();
     mirror->base = selected.address;
     mirror->bytes = sparse ? sparseExtent(selected.address, selected.bytes, pieces) : selected.bytes;

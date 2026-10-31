@@ -80,6 +80,81 @@ void GpuLockIsABarrier() {
     Require(locked.barriers >= 1 && locked.firstKind == static_cast<std::uint8_t>(AgcDriver::GuestMemory::BarrierKind::Lock), "taking the GPU lock is a barrier");
 }
 
+void EarlyAbortFiresOnce() {
+    int site = 0;
+    AgcDriver::GuestMemory::ArmEarlyResolve();
+    bool thrown = false;
+    try {
+        AgcDriver::GuestMemory::ResolveBarrier(AgcDriver::GuestMemory::BarrierKind::Commands, &site);
+    } catch (const AgcDriver::GuestMemory::EarlyResolveAbort& abort) {
+        thrown = abort.kind == static_cast<std::uint8_t>(AgcDriver::GuestMemory::BarrierKind::Commands) && abort.site == &site;
+    }
+    Require(thrown, "an armed barrier throws the abort with its kind and site");
+    AgcDriver::GuestMemory::ResolveBarrier(AgcDriver::GuestMemory::BarrierKind::Commands, &site);
+    AgcDriver::GuestMemory::NoteResolveEffect(AgcDriver::GuestMemory::ResolveEffect::Submit);
+    AgcDriver::GuestMemory::DisarmEarlyResolve();
+}
+
+void EarlyAbortWithoutTrace() {
+    Require(!AgcDriver::GuestMemory::ResolveTraceActive(), "no trace is active");
+    AgcDriver::GuestMemory::ArmEarlyResolve();
+    bool thrown = false;
+    try {
+        AgcDriver::GuestMemory::NoteResolveEffect(AgcDriver::GuestMemory::ResolveEffect::Submit);
+    } catch (const AgcDriver::GuestMemory::EarlyResolveAbort& abort) {
+        thrown = abort.kind == static_cast<std::uint8_t>(AgcDriver::GuestMemory::BarrierKind::Submit);
+    }
+    AgcDriver::GuestMemory::DisarmEarlyResolve();
+    Require(thrown, "an armed effect aborts without the statistics trace");
+}
+
+void EarlyAbortAtTheLock() {
+    auto& gpu = AgcDriver::GuestMemory::GpuMutex();
+    AgcDriver::GuestMemory::ArmEarlyResolve();
+    bool locked = false;
+    try {
+        const std::lock_guard lock(gpu);
+        locked = true;
+    } catch (const AgcDriver::GuestMemory::EarlyResolveAbort& abort) {
+        Require(abort.kind == static_cast<std::uint8_t>(AgcDriver::GuestMemory::BarrierKind::Lock), "taking the GPU lock aborts as a lock barrier");
+    }
+    AgcDriver::GuestMemory::DisarmEarlyResolve();
+    Require(!locked && !gpu.HeldByThisThread(), "an aborted lock is not taken");
+    AgcDriver::GuestMemory::ArmEarlyResolve();
+    bool checked = false;
+    try {
+        static_cast<void>(gpu.HeldByThisThread());
+    } catch (const AgcDriver::GuestMemory::EarlyResolveAbort& abort) {
+        checked = abort.kind == static_cast<std::uint8_t>(AgcDriver::GuestMemory::BarrierKind::HeldCheck);
+    }
+    AgcDriver::GuestMemory::DisarmEarlyResolve();
+    Require(checked, "a lock-held check aborts when armed");
+}
+
+void EarlyAbortNotWhileUnwinding() {
+    static_cast<void>(AgcDriver::GuestMemory::TakeEarlyBarriersPassed());
+    struct Barrier {
+        ~Barrier() { AgcDriver::GuestMemory::ResolveBarrier(AgcDriver::GuestMemory::BarrierKind::Commands, nullptr); }
+    };
+    AgcDriver::GuestMemory::ArmEarlyResolve();
+    try {
+        const Barrier barrier;
+        throw std::logic_error("unwind");
+    } catch (const std::logic_error&) {
+    }
+    const auto [unwinding, completion] = AgcDriver::GuestMemory::TakeEarlyBarriersPassed();
+    Require(unwinding == 1 && completion == 0, "a barrier during an unwind is passed and counted");
+    bool thrown = false;
+    try {
+        AgcDriver::GuestMemory::ResolveBarrier(AgcDriver::GuestMemory::BarrierKind::Commands, nullptr);
+    } catch (const AgcDriver::GuestMemory::EarlyResolveAbort&) {
+        thrown = true;
+    }
+    AgcDriver::GuestMemory::DisarmEarlyResolve();
+    Require(thrown, "the abort stays armed after a barrier passed during an unwind");
+    AgcDriver::GuestMemory::ResolveBarrier(AgcDriver::GuestMemory::BarrierKind::Commands, nullptr);
+}
+
 }
 
 int main() {
@@ -88,6 +163,10 @@ int main() {
         BarrierOutsideTraceIsInert();
         FirstBarrierIsKept();
         GpuLockIsABarrier();
+        EarlyAbortFiresOnce();
+        EarlyAbortWithoutTrace();
+        EarlyAbortAtTheLock();
+        EarlyAbortNotWhileUnwinding();
     } catch (const std::exception& error) {
         std::cerr << "resolve barrier tests failed: " << error.what() << "\n";
         return 1;

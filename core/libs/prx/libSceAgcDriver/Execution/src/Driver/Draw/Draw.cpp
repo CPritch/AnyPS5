@@ -223,6 +223,18 @@ struct DrawAheadSlot {
     }
 };
 
+struct EarlyDraw {
+    Graphics::DrawPacketPtr packet;
+    std::shared_ptr<const DrawRecipe> built;
+    bool claimed = false;
+    std::uint64_t proof = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t open = 0;
+    std::uint64_t redo = 0;
+    Graphics::HostImportsProof imports{};
+    const VulkanDevice* device = nullptr;
+};
+
 namespace {
 
 void noteFinisherHandOff(bool handed) {
@@ -1325,15 +1337,19 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             ahead->result.walks.epoch = epoch;
             Graphics::CountDrawAhead(Graphics::DrawAheadEvent::Offered);
         }
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, ahead, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, ahead, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), early = std::make_shared<EarlyDraw>(), itemReads = reads](const DrawPipeline::EarlyOffer* offer) mutable {
+            if (offer != nullptr) return offer->writes != nullptr && resolveDrawEarly(localDevice, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, trace, shape, ahead.get(), epoch, itemReads, *offer->writes, offer->depth, *early);
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, shape, ahead.get());
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, shape, ahead.get(), early.get());
+            return false;
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         DrawPipeline::Prepare prepare;
         if (ahead != nullptr) prepare = [held, ahead] { ahead->Prepare(); };
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(prepare));
+        DrawPipeline::Early earlyHook;
+        if (DrawPipeline::ResolveSplit() == 1) earlyHook = [held](const DrawPipeline::EarlyOffer& offer) { return (*held)(&offer); };
+        DrawPipeline::Queue0().Enqueue([held] { (*held)(nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(prepare), std::move(earlyHook));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();
@@ -1359,9 +1375,56 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, std::uint64_t shape, DrawAheadSlot* ahead) {
-    const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
+bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape, DrawAheadSlot* ahead, std::uint64_t epoch, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& itemReads, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> depth, EarlyDraw& early) {
+    static const bool all = std::getenv("APS5_RESOLVE_SPLIT_ALL") != nullptr;
+    static const bool probe = (GuestMemory::SetResolveCompletionProbe(&Graphics::Recorder::InCompletion), true);
+    static_cast<void>(probe);
+    if (recipe != nullptr || graphics.stages.tessellationGeometry || early.packet != nullptr || early.claimed) return false;
+    if (DrawPipeline::FollowedEpoch() != epoch) return false;
+    const auto overlaps = [](std::span<const std::pair<std::uint64_t, std::uint64_t>> first, std::span<const std::pair<std::uint64_t, std::uint64_t>> second) {
+        return std::any_of(first.begin(), first.end(), [&](const auto& a) { return std::any_of(second.begin(), second.end(), [&](const auto& b) { return a.first < b.second && b.first < a.second; }); });
+    };
+    if (overlaps(writes, itemReads) || overlaps(depth, itemReads)) return false;
+    if (!depth.empty() && overlaps(depth, DrawColorRanges(graphics))) return false;
+    const auto* result = ahead != nullptr && ahead->phase.load(std::memory_order_acquire) == DrawAheadSlot::Ready ? &ahead->result : nullptr;
+    if (!all && !Graphics::PredictPureResolve(graphics, drawParameters, stages, result)) return false;
+    if (result != nullptr && result->found != nullptr && (result->found->DescribedRangesOverlap(writes) || result->found->DescribedRangesOverlap(depth))) return false;
+    if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     auto* prepared = ahead != nullptr ? ahead->Claim() : nullptr;
+    early.claimed = true;
+    early.proof = GuestMemory::ProofSerial();
+    early.pending = Graphics::StorageTexture::PendingSerial();
+    early.imports = localDevice->ImportsIdentity();
+    early.open = localDevice->RecorderOpenSerial();
+    early.redo = Graphics::DrawRedoSerial();
+    early.device = localDevice.get();
+    {
+        struct Disarm {
+            ~Disarm() { GuestMemory::DisarmEarlyResolve(); }
+        } disarm;
+        GuestMemory::ArmEarlyResolve();
+        try {
+            early.packet = localDevice->ResolveDraw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &early.built, trace.token != 0 ? &trace : nullptr, shape, prepared);
+        } catch (const GuestMemory::EarlyResolveAbort& abort) {
+            early.packet.reset();
+            early.built.reset();
+            DrawPipeline::NoteEarlyAbort(abort.kind);
+            return false;
+        }
+    }
+    if (Graphics::DrawPacketReadsOverlap(*early.packet, writes) || Graphics::DrawPacketReadsOverlap(*early.packet, depth)) {
+        localDevice->DiscardDraw(*early.packet);
+        early.packet.reset();
+        early.built.reset();
+        DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::OverlapAfter);
+        return false;
+    }
+    return true;
+}
+
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, std::uint64_t shape, DrawAheadSlot* ahead, EarlyDraw* early) {
+    const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
+    auto* prepared = ahead != nullptr && (early == nullptr || !early->claimed) ? ahead->Claim() : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
@@ -1382,8 +1445,58 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     if (graphics.stages.tessellationGeometry) {
         localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, prepared);
     } else {
-        auto packet = localDevice->ResolveDraw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, prepared);
+        Graphics::DrawPacketPtr packet;
+        bool fromEarly = false;
+        if (early != nullptr && early->packet != nullptr) {
+            using E = DrawPipeline::EarlyEvent;
+            auto stale = E::Used;
+            if (early->device != localDevice.get()) stale = E::StaleDevice;
+            else if (early->proof != GuestMemory::ProofSerial()) stale = E::StaleProof;
+            else if (early->pending != Graphics::StorageTexture::PendingSerial()) stale = E::StalePending;
+            else if (!localDevice->ImportsUnchanged(early->imports)) stale = E::StaleImports;
+            else if (early->open != localDevice->RecorderOpenSerial()) stale = E::StaleSubmit;
+            else if (early->redo != Graphics::DrawRedoSerial()) stale = E::StaleRedo;
+            DrawPipeline::NoteEarly(stale);
+            if (stale == E::Used) {
+                packet = std::move(early->packet);
+                fromEarly = true;
+            } else {
+                localDevice->DiscardDraw(*early->packet);
+                early->packet.reset();
+                early->built.reset();
+            }
+        }
+        if (fromEarly) {
+            static const unsigned verifyEvery = [] {
+                const char* text = std::getenv("APS5_VERIFY_RESOLVE_SPLIT");
+                return text == nullptr ? 0u : static_cast<unsigned>(std::strtoul(text, nullptr, 10));
+            }();
+            static unsigned verifyCount = 0;
+            if (verifyEvery != 0 && ++verifyCount % verifyEvery == 0) {
+                auto verify = localDevice->ResolveDraw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, nullptr);
+                const auto differs = Graphics::CompareDrawPackets(*packet, *verify);
+                DrawPipeline::NoteEarly(differs == 0 ? DrawPipeline::EarlyEvent::VerifyMatched : DrawPipeline::EarlyEvent::VerifyDiffered);
+                if (differs != 0) {
+                    std::string fields;
+                    for (unsigned field = 0; field < static_cast<unsigned>(Graphics::DrawPacketField::Count); ++field) {
+                        if ((differs >> field & 1u) != 0) fields += std::string(" ") + Graphics::DrawPacketFieldName(static_cast<Graphics::DrawPacketField>(field));
+                    }
+                    if (!DrawPipeline::EarlyStopped()) std::fprintf(stderr, "[draw] early-resolve verify: the early packet differs from a resolve in the old order in:%s; early resolves stopped\n", fields.c_str());
+                    DrawPipeline::StopEarly();
+                }
+                localDevice->DiscardDraw(*packet);
+                packet = std::move(verify);
+                fromEarly = false;
+                early->built.reset();
+            }
+        }
+        if (packet == nullptr) packet = localDevice->ResolveDraw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, prepared);
+        if (DrawPipeline::ResolveSplit() == 1) {
+            const auto depth = DrawDepthRanges(graphics);
+            DrawPipeline::OfferEarly(depth);
+        }
         localDevice->EmitDraw(*packet);
+        if (fromEarly) built = std::move(early->built);
     }
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }

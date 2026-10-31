@@ -97,9 +97,51 @@ bool ExactDrawWrites() {
     return exact;
 }
 
+namespace {
+
+constexpr std::uint64_t DrawSlack = 64 * 1024;
+constexpr std::uint64_t DrawUnknownBytes = 64ull * 1024 * 1024;
+
+void appendColorRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, const Graphics::ColorTarget& color, bool exact) {
+    const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
+        if (begin != 0) ranges.emplace_back(begin, begin + bytes);
+    };
+    if (exact && color.bytes != 0) {
+        const auto slices = static_cast<std::uint64_t>(std::max<std::uint32_t>(color.depth, 1));
+        const auto bytes = static_cast<std::uint64_t>(color.bytes) * slices;
+        add(color.address, bytes);
+        add(color.dccAddress, (bytes + 255) / 256);
+        add(color.cmaskAddress, static_cast<std::uint64_t>(color.cmaskBytes) * slices);
+        return;
+    }
+    const std::uint64_t bytes = color.bytes != 0 ? static_cast<std::uint64_t>(color.bytes) : DrawUnknownBytes;
+    const auto base = color.surfaceAddress != 0 ? std::min(color.surfaceAddress, color.address) : color.address;
+    if (base != 0) ranges.emplace_back(base, color.address + 2 * bytes + DrawSlack);
+    add(color.dccAddress, bytes / 16 + DrawSlack);
+    add(color.cmaskAddress, static_cast<std::uint64_t>(color.cmaskBytes) * std::max<std::uint32_t>(color.depth, 1));
+}
+
+void appendDepthRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, const Graphics::DepthTarget& depth, bool exact) {
+    const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
+        if (begin != 0) ranges.emplace_back(begin, begin + bytes);
+    };
+    if (exact && depth.extent.width != 0 && depth.extent.height != 0) {
+        const bool d16 = depth.format == VK_FORMAT_D16_UNORM || depth.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        add(depth.address, Graphics::DepthSliceBytes(depth.extent, d16 ? 2u : 4u));
+        add(depth.stencilAddress, Graphics::DepthSliceBytes(depth.extent, 1u));
+    } else {
+        const auto align = [](std::uint64_t value) { return (value + 255) & ~255ull; };
+        const auto pixels = align(depth.extent.width) * align(depth.extent.height);
+        const auto bytes = pixels != 0 ? pixels * 8 + DrawSlack : DrawUnknownBytes;
+        add(depth.address, bytes);
+        add(depth.stencilAddress, bytes);
+    }
+}
+
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact) {
-    constexpr std::uint64_t Slack = 64 * 1024;
-    constexpr std::uint64_t UnknownBytes = 64ull * 1024 * 1024;
+    constexpr std::uint64_t UnknownBytes = DrawUnknownBytes;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
         if (begin != 0) ranges.emplace_back(begin, begin + bytes);
@@ -122,37 +164,24 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
             }
         }
     }
-    const auto addColor = [&](const Graphics::ColorTarget& color) {
-        if (exact && color.bytes != 0) {
-            const auto slices = static_cast<std::uint64_t>(std::max<std::uint32_t>(color.depth, 1));
-            const auto bytes = static_cast<std::uint64_t>(color.bytes) * slices;
-            add(color.address, bytes);
-            add(color.dccAddress, (bytes + 255) / 256);
-            add(color.cmaskAddress, static_cast<std::uint64_t>(color.cmaskBytes) * slices);
-            return;
-        }
-        const std::uint64_t bytes = color.bytes != 0 ? static_cast<std::uint64_t>(color.bytes) : UnknownBytes;
-        const auto base = color.surfaceAddress != 0 ? std::min(color.surfaceAddress, color.address) : color.address;
-        if (base != 0) ranges.emplace_back(base, color.address + 2 * bytes + Slack);
-        add(color.dccAddress, bytes / 16 + Slack);
-        add(color.cmaskAddress, static_cast<std::uint64_t>(color.cmaskBytes) * std::max<std::uint32_t>(color.depth, 1));
-    };
-    if (graphics.hasColorTarget) addColor(graphics.color);
-    for (const auto& color : graphics.colors) addColor(color);
-    if (graphics.depth) {
-        const auto& depth = *graphics.depth;
-        if (exact && depth.extent.width != 0 && depth.extent.height != 0) {
-            const bool d16 = depth.format == VK_FORMAT_D16_UNORM || depth.format == VK_FORMAT_D16_UNORM_S8_UINT;
-            add(depth.address, Graphics::DepthSliceBytes(depth.extent, d16 ? 2u : 4u));
-            add(depth.stencilAddress, Graphics::DepthSliceBytes(depth.extent, 1u));
-        } else {
-            const auto align = [](std::uint64_t value) { return (value + 255) & ~255ull; };
-            const auto pixels = align(depth.extent.width) * align(depth.extent.height);
-            const auto bytes = pixels != 0 ? pixels * 8 + Slack : UnknownBytes;
-            add(depth.address, bytes);
-            add(depth.stencilAddress, bytes);
-        }
-    }
+    if (graphics.hasColorTarget) appendColorRanges(ranges, graphics.color, exact);
+    for (const auto& color : graphics.colors) appendColorRanges(ranges, color, exact);
+    if (graphics.depth) appendDepthRanges(ranges, *graphics.depth, exact);
+    return ranges;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawColorRanges(const Graphics::State& graphics) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    if (graphics.hasColorTarget) appendColorRanges(ranges, graphics.color, ExactDrawWrites());
+    for (const auto& color : graphics.colors) appendColorRanges(ranges, color, ExactDrawWrites());
+    return ranges;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawDepthRanges(const Graphics::State& graphics) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    if (!graphics.depth) return ranges;
+    appendDepthRanges(ranges, *graphics.depth, ExactDrawWrites());
+    if (graphics.depth->htileAddress != 0) ranges.emplace_back(graphics.depth->htileAddress, graphics.depth->htileAddress + Graphics::HtileMetadataBytes(graphics.depth->extent));
     return ranges;
 }
 

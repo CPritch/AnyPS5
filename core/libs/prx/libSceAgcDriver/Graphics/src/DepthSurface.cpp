@@ -232,6 +232,8 @@ std::optional<DepthPlaneOverwrite> decodeOverwrite(const StorageImageClear& clea
     std::uint32_t c0 = 0;
     try {
         GuestMemory::Read(base, std::as_writable_bytes(std::span(&c0, 1)), 4);
+    } catch (const GuestMemory::EarlyResolveAbort&) {
+        throw;
     } catch (...) {
         return decline(DeclineColor);
     }
@@ -396,6 +398,7 @@ public:
     }
 
     void ApplyFastClear() {
+        if (pendingClear != 0) GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::Commands, __builtin_return_address(0));
         if (samplingActive) {
             CheckCurrent();
             Require(pendingClear == 0u, "native multisample depth fast-clear transition is not implemented");
@@ -670,6 +673,8 @@ public:
         std::uint32_t current = 0;
         try {
             GuestMemory::Read(overwrite->colorAddress, std::as_writable_bytes(std::span(&current, 1)), 4);
+        } catch (const GuestMemory::EarlyResolveAbort&) {
+            throw;
         } catch (...) {
             return false;
         }

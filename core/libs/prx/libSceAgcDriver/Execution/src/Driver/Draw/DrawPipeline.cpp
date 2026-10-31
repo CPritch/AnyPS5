@@ -25,6 +25,19 @@
 namespace AgcDriver::DriverDetail {
 
 namespace {
+thread_local std::uint64_t followedEpoch = 0;
+std::atomic<std::uint64_t> earlyResolved{0}, earlyDeclined{0}, earlyFailed{0};
+std::atomic<bool> earlyStopped{false};
+struct PendingEarly {
+    DrawPipeline::Early hook;
+    const std::vector<DrawPipeline::Range>* writes = nullptr;
+};
+thread_local PendingEarly pendingEarly;
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::EarlyEvent::Count)> earlyEvents{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> earlyAborts{};
+}
+
+namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission"};
 
@@ -107,6 +120,18 @@ std::string QueueWaits::Text() {
     text += "; CPU-access GPU waits of the hot threads (largest):" + Graphics::Recorder::TakeHotHookSyncText();
     text += "; GPU waits of the hot threads by source and caller (largest):" + Graphics::Recorder::TakeHotWaitSiteText();
     text += "; GPU lock waits (count, waited):" + GuestMemory::TakeHotLockWaitText();
+    if (DrawPipeline::ResolveSplit() != 0) {
+        const auto take = [](std::atomic<std::uint64_t>& value) { return std::to_string(value.exchange(0, std::memory_order_relaxed)); };
+        const auto event = [&](DrawPipeline::EarlyEvent kind) { return take(earlyEvents[static_cast<std::size_t>(kind)]); };
+        using E = DrawPipeline::EarlyEvent;
+        text += "; early resolves (APS5_RESOLVE_SPLIT" + std::string(DrawPipeline::EarlyStopped() ? ", stopped by verify" : "") + "): resolved " + take(earlyResolved) + ", declined " + take(earlyDeclined) + ", failed " + take(earlyFailed) + ", never offered " + event(E::Unoffered) + "; packets used " + event(E::Used) + ", redone for proof " + event(E::StaleProof) + ", pending " + event(E::StalePending) + ", imports " + event(E::StaleImports) + ", device " + event(E::StaleDevice) + ", submit " + event(E::StaleSubmit) + ", redo " + event(E::StaleRedo) + "; dropped after resolve for reads overlapping the previous draw's writes " + event(E::OverlapAfter) + "; verified same " + event(E::VerifyMatched) + ", different " + event(E::VerifyDiffered) + "; aborted at a barrier:";
+        for (std::size_t kind = 1; kind < earlyAborts.size(); ++kind) {
+            const auto count = earlyAborts[kind].exchange(0, std::memory_order_relaxed);
+            if (count != 0) text += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
+        }
+        const auto [unwinding, completion] = GuestMemory::TakeEarlyBarriersPassed();
+        text += " barriers passed while unwinding " + std::to_string(unwinding) + ", in a completion " + std::to_string(completion);
+    }
     const auto [importedLayers, uploadedLayers] = Graphics::TakeDepthPlaneLayerCounts();
     char planes[128];
     std::snprintf(planes, sizeof(planes), "; depth plane copy layers detiled from their host import %llu, read on the CPU %llu", static_cast<unsigned long long>(importedLayers), static_cast<unsigned long long>(uploadedLayers));
@@ -431,9 +456,13 @@ std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
     return token;
 }
 
-namespace {
-thread_local std::uint64_t followedEpoch = 0;
-std::atomic<std::uint64_t> earlyResolved{0}, earlyDeclined{0}, earlyFailed{0};
+
+void DrawPipeline::NoteEarly(EarlyEvent event) {
+    earlyEvents[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawPipeline::NoteEarlyAbort(std::uint8_t kind) {
+    earlyAborts[std::min<std::size_t>(kind, earlyAborts.size() - 1)].fetch_add(1, std::memory_order_relaxed);
 }
 
 unsigned DrawPipeline::ResolveSplit() {
@@ -442,6 +471,28 @@ unsigned DrawPipeline::ResolveSplit() {
         return text == nullptr ? 0u : static_cast<unsigned>(std::strtoul(text, nullptr, 10));
     }();
     return mode;
+}
+
+bool DrawPipeline::EarlyStopped() {
+    return earlyStopped.load(std::memory_order_relaxed);
+}
+
+void DrawPipeline::StopEarly() {
+    earlyStopped.store(true, std::memory_order_relaxed);
+}
+
+void DrawPipeline::OfferEarly(std::span<const Range> depth) {
+    if (!pendingEarly.hook) return;
+    auto hook = std::move(pendingEarly.hook);
+    const auto* writes = pendingEarly.writes;
+    pendingEarly = {};
+    try {
+        (hook(EarlyOffer{writes, depth}) ? earlyResolved : earlyDeclined).fetch_add(1, std::memory_order_relaxed);
+    } catch (const ProcessShutdown&) {
+        throw;
+    } catch (...) {
+        earlyFailed.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 std::uint64_t DrawPipeline::FollowedEpoch() {
@@ -736,28 +787,22 @@ void DrawPipeline::run() {
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
-        Early nextEarly;
-        const std::vector<Range>* currentWrites = nullptr;
-        if (ResolveSplit() == 1 && isDraw && commit != nullptr) {
+        if (ResolveSplit() == 1 && isDraw && commit != nullptr && !EarlyStopped()) {
             std::lock_guard lock(mutex);
             if (items.size() >= 2 && items[1].draw && items[1].early) {
-                nextEarly = items[1].early;
-                currentWrites = &items.front().writes;
+                pendingEarly.hook = items[1].early;
+                pendingEarly.writes = &items.front().writes;
             }
         }
         try {
-            if (nextEarly) {
-                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-                std::lock_guard gpu(GuestMemory::GpuMutex());
-                try {
-                    (nextEarly(*currentWrites) ? earlyResolved : earlyDeclined).fetch_add(1, std::memory_order_relaxed);
-                } catch (const ProcessShutdown&) {
-                    throw;
-                } catch (...) {
-                    earlyFailed.fetch_add(1, std::memory_order_relaxed);
-                }
-                (*commit)();
-            } else if (commit != nullptr) {
+            if (commit != nullptr) {
+                struct ClearEarly {
+                    ~ClearEarly() {
+                        if (!pendingEarly.hook) return;
+                        pendingEarly = {};
+                        DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::Unoffered);
+                    }
+                } clearEarly;
                 (*commit)();
             }
             if (!isDraw) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Item);

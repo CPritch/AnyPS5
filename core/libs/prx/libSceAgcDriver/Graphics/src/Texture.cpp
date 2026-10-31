@@ -2838,6 +2838,7 @@ std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units
 }
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
+    GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::RecorderWrite, __builtin_return_address(0));
     const Recorder::GpuSiteTag siteTag(Recorder::GpuSitesEnabled() ? "upload " + Recorder::SiteHex(descriptor.baseAddress) + " " + std::to_string(descriptor.width) + "x" + std::to_string(descriptor.height) : std::string{});
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

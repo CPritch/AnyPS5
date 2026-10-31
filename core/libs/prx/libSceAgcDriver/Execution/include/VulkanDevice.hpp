@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ComputePipelineCapture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <array>
 #include <chrono>
@@ -353,6 +354,10 @@ public:
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, Graphics::DrawAhead* ahead = nullptr);
     Graphics::DrawPacketPtr ResolveDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, Graphics::DrawAhead* ahead = nullptr);
     void EmitDraw(Graphics::DrawPacket& packet);
+    void DiscardDraw(Graphics::DrawPacket& packet);
+    Graphics::HostImportsProof ImportsIdentity();
+    bool ImportsUnchanged(const Graphics::HostImportsProof& proof);
+    std::uint64_t RecorderOpenSerial();
     void PrepareDrawAhead(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::uint64_t shape, Graphics::DrawAhead& ahead) const;
     bool DrawInputsInPlace() const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;

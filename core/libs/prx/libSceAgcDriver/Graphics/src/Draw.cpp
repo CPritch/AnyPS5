@@ -1179,6 +1179,7 @@ struct DrawTimer {
     std::array<double, PhaseCount> us{};
     explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
     void phase(DrawPhase which) {
+        GuestMemory::ResolveCheckpoint();
         if (!profile && !counted) return;
         if (counted) GuestMemory::SetResolvePhase(static_cast<std::uint8_t>(which + 1));
         const auto now = std::chrono::steady_clock::now();
@@ -4111,6 +4112,57 @@ void DrawPacketDeleter::operator()(DrawPacket* packet) const {
     delete packet;
 }
 
+namespace {
+std::atomic<std::uint64_t> drawRedoSerial{0};
+}
+
+std::uint64_t DrawRedoSerial() {
+    return drawRedoSerial.load(std::memory_order_relaxed);
+}
+
+bool DrawPacketReadsOverlap(const DrawPacket& packet, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    const auto& resources = packet.prepared.resolved.resources;
+    return resources != nullptr && resources->DescribedRangesOverlap(ranges);
+}
+
+std::uint32_t CompareDrawPackets(const DrawPacket& first, const DrawPacket& second) {
+    const auto& a = first.prepared;
+    const auto& b = second.prepared;
+    std::uint32_t differs = 0;
+    const auto mark = [&](DrawPacketField field, bool same) {
+        if (!same) differs |= 1u << static_cast<unsigned>(field);
+    };
+    const bool resident = std::all_of(a.targets.begin(), a.targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr; });
+    const bool sameTargets = a.targets.size() == b.targets.size() && std::equal(a.targets.begin(), a.targets.end(), b.targets.begin(), [](const TargetBinding& left, const TargetBinding& right) {
+        return left.resident == right.resident && left.color.address == right.color.address && left.color.format == right.color.format && left.proxied == right.proxied && left.multisampled == right.multisampled;
+    });
+    mark(DrawPacketField::Template, a.resolved.resources == b.resolved.resources || (!a.resolved.contentKey.empty() && a.resolved.contentKey == b.resolved.contentKey) || (!resident && sameTargets));
+    mark(DrawPacketField::Pipeline, a.pipeline == b.pipeline);
+    mark(DrawPacketField::Targets, sameTargets && (!resident || a.targetViews == b.targetViews));
+    mark(DrawPacketField::Framebuffer, !resident || a.framebuffer == b.framebuffer);
+    mark(DrawPacketField::Inputs, a.inputs.nothing == b.inputs.nothing && a.inputs.indexBytes == b.inputs.indexBytes && a.inputs.indexCount == b.inputs.indexCount && a.inputs.maxIndex == b.inputs.maxIndex && a.inputs.inPlaceReads == b.inputs.inPlaceReads && a.inputs.vertexOffsets == b.inputs.vertexOffsets && a.inputs.vertexHandles.size() == b.inputs.vertexHandles.size() && (a.inputs.indices == nullptr) == (b.inputs.indices == nullptr) && a.inputs.expandedIndexCount == b.inputs.expandedIndexCount && a.deferredReads == b.deferredReads);
+    mark(DrawPacketField::Moved, a.resolved.moved.size() == b.resolved.moved.size());
+    mark(DrawPacketField::Depth, a.depthFound.view == b.depthFound.view);
+    mark(DrawPacketField::Refreshes, a.colorRefreshes == b.colorRefreshes);
+    mark(DrawPacketField::Flags, first.ready == second.ready && a.completion == b.completion && a.multisampled == b.multisampled && a.lean == b.lean && a.stencilReferences == b.stencilReferences);
+    return differs;
+}
+
+const char* DrawPacketFieldName(DrawPacketField field) {
+    constexpr std::array<const char*, static_cast<std::size_t>(DrawPacketField::Count)> names{"template", "pipeline", "targets", "framebuffer", "inputs", "moved", "depth", "refreshes", "flags"};
+    return names[std::min<std::size_t>(static_cast<std::size_t>(field), names.size() - 1)];
+}
+
+void DiscardDrawPacket(const Context& context, DrawPacket& packet) {
+    if (!packet.prepared.deferred.Empty() && context.recorder != nullptr) context.recorder->ApplyDeferred(packet.prepared.deferred);
+}
+
+bool PredictPureResolve(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawAhead* ahead) {
+    const bool singleSample = std::all_of(state.colors.begin(), state.colors.end(), [](const ColorTarget& color) { return color.samples <= 1; }) && (!state.depth || state.depth->samples <= 1);
+    const bool stencilReplay = std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); });
+    return singleSample && !stencilReplay && !state.quadList && !draw.indirect && ahead != nullptr && ahead->looked && ahead->found != nullptr && ahead->found->InResourceCache() && ahead->found->EpochProofCurrent() && ahead->movedPlanned && ahead->movedPlan.has_value();
+}
+
 DrawPacketPtr ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, DrawAhead* ahead) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4123,10 +4175,7 @@ DrawPacketPtr ResolveDraw(const Context& context, const State& state, const Pm4:
     if (DrawSplitCounted()) {
         static const bool probe = (GuestMemory::SetResolveCompletionProbe(&Recorder::InCompletion), true);
         static_cast<void>(probe);
-        const auto* slot = prepared.ahead.ahead;
-        const bool singleSample = std::all_of(state.colors.begin(), state.colors.end(), [](const ColorTarget& color) { return color.samples <= 1; }) && (!state.depth || state.depth->samples <= 1);
-        const bool stencilReplay = std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); });
-        resolvePredictedPure = singleSample && !stencilReplay && !state.quadList && !draw.indirect && slot != nullptr && slot->looked && slot->found != nullptr && slot->found->InResourceCache() && slot->found->EpochProofCurrent() && slot->movedPlanned && slot->movedPlan.has_value();
+        resolvePredictedPure = PredictPureResolve(state, draw, shaders, prepared.ahead.ahead);
     }
     std::optional<GuestMemory::PrecollectedScope> precollected;
     if (prepared.ahead.ahead != nullptr && !prepared.ahead.ahead->walks.walks.empty()) {
@@ -4217,6 +4266,7 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
     }
     if (redo) {
         redoneWhole.fetch_add(1, std::memory_order_relaxed);
+        drawRedoSerial.fetch_add(1, std::memory_order_relaxed);
         redoingWhole = true;
         struct Restore {
             ~Restore() { redoingWhole = false; }

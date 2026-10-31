@@ -69,6 +69,13 @@ struct DrawPacketDeleter {
 using DrawPacketPtr = std::unique_ptr<DrawPacket, DrawPacketDeleter>;
 DrawPacketPtr ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, DrawAhead* ahead = nullptr);
 void EmitDraw(const Context& context, DrawPacket& packet);
+void DiscardDrawPacket(const Context& context, DrawPacket& packet);
+std::uint64_t DrawRedoSerial();
+bool DrawPacketReadsOverlap(const DrawPacket& packet, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+enum class DrawPacketField : std::uint8_t { Template, Pipeline, Targets, Framebuffer, Inputs, Moved, Depth, Refreshes, Flags, Count };
+std::uint32_t CompareDrawPackets(const DrawPacket& first, const DrawPacket& second);
+const char* DrawPacketFieldName(DrawPacketField field);
+bool PredictPureResolve(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawAhead* ahead);
 enum class StaleViewSite : std::uint8_t { InputPending, InputLabel, MovedPending, Count };
 void CountStaleView(StaleViewSite site, bool live, std::uint64_t address, std::size_t bytes);
 

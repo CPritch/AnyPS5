@@ -230,13 +230,21 @@ struct ResolveLockTrace {
 };
 enum class ResolveEffect : std::uint8_t { Submit, Reap, ProofBreak, Import, CacheInsert, StorageCreate, Count };
 void NoteResolveEffect(ResolveEffect effect);
-enum class BarrierKind : std::uint8_t { None, Lock, HeldCheck, Commands, Submit, Reap, ProofBreak, Import, CacheInsert, StorageCreate, RecorderWrite, PendingSet, DepthRetire, StorageEvict, Count };
+enum class BarrierKind : std::uint8_t { None, Lock, HeldCheck, Commands, Submit, Reap, ProofBreak, Import, CacheInsert, StorageCreate, RecorderWrite, PendingSet, DepthRetire, StorageEvict, Forced, Count };
 const char* BarrierKindName(BarrierKind kind);
 void ResolveBarrier(BarrierKind kind, const void* site);
+void ResolveCheckpoint();
 void NoteResolveMemo();
 void SetResolvePhase(std::uint8_t phase);
 bool ResolveTraceActive();
 void SetResolveCompletionProbe(bool (*probe)());
+struct EarlyResolveAbort {
+    std::uint8_t kind = 0;
+    const void* site = nullptr;
+};
+void ArmEarlyResolve();
+void DisarmEarlyResolve();
+std::pair<std::uint64_t, std::uint64_t> TakeEarlyBarriersPassed();
 void BeginResolveLockTrace();
 ResolveLockTrace EndResolveLockTrace();
 void NoteResolveCommands(const void* site);

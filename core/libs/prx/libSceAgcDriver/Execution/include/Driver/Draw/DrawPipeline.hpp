@@ -59,8 +59,12 @@ class DrawPipeline {
 public:
     using Commit = std::function<void()>;
     using Prepare = std::function<void()>;
-    using Early = std::function<bool(const std::vector<std::pair<std::uint64_t, std::uint64_t>>&)>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
+    struct EarlyOffer {
+        const std::vector<Range>* writes = nullptr;
+        std::span<const Range> depth;
+    };
+    using Early = std::function<bool(const EarlyOffer&)>;
     struct Watch {
         std::uint64_t retired = 0;
         std::size_t items = 0;
@@ -83,6 +87,12 @@ public:
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {});
     static unsigned ResolveSplit();
+    enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, OverlapAfter, VerifyMatched, VerifyDiffered, Unoffered, Count };
+    static void NoteEarly(EarlyEvent event);
+    static void OfferEarly(std::span<const Range> depth);
+    static bool EarlyStopped();
+    static void StopEarly();
+    static void NoteEarlyAbort(std::uint8_t kind);
     static std::uint64_t FollowedEpoch();
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void WaitWritten(std::uint64_t address, std::size_t bytes, DrainReason reason, std::uint32_t opcode = 0x100);
