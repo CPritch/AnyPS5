@@ -1464,11 +1464,15 @@ void Recorder::AnnounceSyncSite(const void* site) {
     announcedSite = site;
 }
 
+namespace {
+
 void NoteHotWait(int source, const void* site, double ms) {
     std::lock_guard lock(hotWaitSitesMutex);
     auto& entry = hotWaitSites[{static_cast<int>(GuestMemory::CurrentHotThread()), source, site}];
     ++entry.first;
     entry.second += ms;
+}
+
 }
 
 std::string Recorder::TakeHotWaitSiteText() {
