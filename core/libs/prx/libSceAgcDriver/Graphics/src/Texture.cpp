@@ -2157,6 +2157,20 @@ struct CommitterRefreshSplit {
     std::atomic<std::uint64_t> stamped{0}, stampedNs{0};
 };
 
+// Why the last refreshProved on this thread failed (0 passed or not tried) and why the last
+// takeRefreshProof took none (0 took one): the committer's unproved refreshes by image.
+thread_local std::uint8_t lastProvedFail = 0;
+thread_local std::uint8_t lastProofRefusal = 0;
+
+struct UnprovedImage {
+    std::uint64_t count = 0, ns = 0, unchanged = 0;
+    std::array<std::uint64_t, 9> provedFail{};
+    std::array<std::uint64_t, 6> proofRefusal{};
+};
+
+std::mutex unprovedMutex;
+std::map<std::pair<std::uint64_t, std::uint64_t>, UnprovedImage> unprovedImages;
+
 CommitterRefreshSplit& CommitterRefreshes() {
     static CommitterRefreshSplit split;
     return split;
@@ -2175,7 +2189,34 @@ std::string StorageTexture::TakeCommitterRefreshText() {
     }
     char stamped[96];
     std::snprintf(stamped, sizeof(stamped), ", of the rest proved by stamps %llu/%.1f", static_cast<unsigned long long>(split.stamped.exchange(0, std::memory_order_relaxed)), static_cast<double>(split.stampedNs.exchange(0, std::memory_order_relaxed)) / 1e6);
-    return text + stamped;
+    text += stamped;
+    std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, UnprovedImage>> images;
+    {
+        std::lock_guard lock(unprovedMutex);
+        images.assign(unprovedImages.begin(), unprovedImages.end());
+        unprovedImages.clear();
+    }
+    std::sort(images.begin(), images.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    text += "; unproved image refreshes by image (count/ms, unchanged exits; refreshProved failed: 1 no proof, 2 generation, 3 keys, 4 lock, 5 unwatched, 6 dcc, 7 written, 8 other pending; proof refused: 1 aliased, 2 generation 0, 3 lock, 4 dcc, 5 other pending):";
+    for (std::size_t i = 0; i < images.size() && i < 4; ++i) {
+        const auto& [key, image] = images[i];
+        char item[160];
+        std::snprintf(item, sizeof(item), " [0x%llx+0x%llx: %llu/%.1f, %llu unchanged; failed", static_cast<unsigned long long>(key.first), static_cast<unsigned long long>(key.second), static_cast<unsigned long long>(image.count), static_cast<double>(image.ns) / 1e6, static_cast<unsigned long long>(image.unchanged));
+        text += item;
+        for (std::size_t code = 1; code < image.provedFail.size(); ++code) {
+            if (image.provedFail[code] == 0) continue;
+            std::snprintf(item, sizeof(item), " %zu:%llu", code, static_cast<unsigned long long>(image.provedFail[code]));
+            text += item;
+        }
+        text += "; refused";
+        for (std::size_t code = 1; code < image.proofRefusal.size(); ++code) {
+            if (image.proofRefusal[code] == 0) continue;
+            std::snprintf(item, sizeof(item), " %zu:%llu", code, static_cast<unsigned long long>(image.proofRefusal[code]));
+            text += item;
+        }
+        text += "]";
+    }
+    return text;
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
@@ -2187,6 +2228,8 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     struct CommitterRefresh {
         std::size_t reason = 5;
         bool stamped = false;
+        bool unchanged = false;
+        std::pair<std::uint64_t, std::uint64_t> image{};
         std::chrono::steady_clock::time_point start;
         ~CommitterRefresh() {
             if (reason >= 5) return;
@@ -2198,11 +2241,24 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
                 split.stamped.fetch_add(1, std::memory_order_relaxed);
                 split.stampedNs.fetch_add(ns, std::memory_order_relaxed);
             }
+            if (reason == 0 || stamped) return;
+            std::lock_guard lock(unprovedMutex);
+            auto& entry = unprovedImages[image];
+            ++entry.count;
+            entry.ns += ns;
+            ++entry.provedFail[lastProvedFail % entry.provedFail.size()];
+            if (unchanged) {
+                ++entry.unchanged;
+                ++entry.proofRefusal[lastProofRefusal % entry.proofRefusal.size()];
+            }
         }
     } committer;
     static const bool committerCounted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (committerCounted && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer) {
         committer.start = std::chrono::steady_clock::now();
+        committer.image = {descriptor.baseAddress, guestBytes};
+        lastProvedFail = 0;
+        lastProofRefusal = 0;
         const auto proved = provedEpoch.load(std::memory_order_relaxed);
         committer.reason = epoch == 0 || proved == 0 ? 1 : proved != epoch ? 2 : provedProof.load(std::memory_order_relaxed) != GuestMemory::ProofSerial() ? 3 : provedPending.load(std::memory_order_relaxed) != PendingSerial() ? 4 : 0;
     }
@@ -2427,6 +2483,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         refreshGeneration();
         if (layerBehind.empty()) takeRefreshProof(alias != nullptr);
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
+        committer.unchanged = true;
         return true;
     }
     CaptureTrace::Log("refresh image=%llx bytes=%llu generation=%llu dirty=%d keysChanged=%d cpuWrote=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), dirty, keysChanged, cpuWrote);
@@ -2554,34 +2611,48 @@ bool StorageTexture::otherPendingOverlaps() const {
 }
 
 bool StorageTexture::refreshProved() {
-    if (refreshProof.generation == 0) return false;
-    if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    const auto fail = [](std::uint8_t code) {
+        lastProvedFail = code;
+        return false;
+    };
+    if (refreshProof.generation == 0) return fail(1);
+    if (generation != refreshProof.generation) return fail(2);
+    if (uploadedKeys != refreshProof.keys) return fail(3);
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return fail(4);
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
+    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return fail(5);
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
-        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return false;
-        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
+        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return fail(6);
+        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return fail(6);
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
-    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
+    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return fail(7);
     const auto serial = PendingSerial();
     if (serial != refreshProof.pendingSerial) {
-        if (otherPendingOverlaps()) return false;
+        if (otherPendingOverlaps()) return fail(8);
         refreshProof.pendingSerial = serial;
     }
+    lastProvedFail = 0;
     return true;
 }
 
 void StorageTexture::takeRefreshProof(bool aliased) {
     refreshProof = {};
-    if (aliased || generation == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
-    if (descriptor.dccAddress != 0 && (keyProof.generation == 0 || keyProof.keys != uploadedKeys)) return;
+    lastProofRefusal = aliased ? 1 : generation == 0 ? 2 : !GuestMemory::GpuMutex().HeldByThisThread() ? 3 : 0;
+    if (lastProofRefusal != 0) return;
+    if (descriptor.dccAddress != 0 && (keyProof.generation == 0 || keyProof.keys != uploadedKeys)) {
+        lastProofRefusal = 4;
+        return;
+    }
     const auto serial = PendingSerial();
-    if (otherPendingOverlaps()) return;
+    if (otherPendingOverlaps()) {
+        lastProofRefusal = 5;
+        return;
+    }
     refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
 }
 
