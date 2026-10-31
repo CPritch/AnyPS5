@@ -3542,11 +3542,25 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 }
 
+namespace {
+thread_local ShaderResources::ProofReuse lastProofReuse = ShaderResources::ProofReuse::Off;
+}
+
+ShaderResources::ProofReuse ShaderResources::LastProofReuse() {
+    return lastProofReuse;
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    lastProofReuse = ProofReuse::Off;
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
+        if (epoch == 0 || provedEpoch == 0) lastProofReuse = ProofReuse::NeverProved;
+        else if (provedEpoch != epoch) lastProofReuse = ProofReuse::Epoch;
+        else if (provedProof != proof) lastProofReuse = ProofReuse::Proof;
+        else if (provedPending != pending) lastProofReuse = ProofReuse::Pending;
+        else lastProofReuse = ProofReuse::Reused;
         if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;

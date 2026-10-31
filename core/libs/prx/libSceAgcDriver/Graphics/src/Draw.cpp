@@ -1787,6 +1787,31 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
 
 // A draw's resources (resolveDrawResources): the resource-cache template a recordable draw's
 // stages repeat, or a fresh build.
+namespace {
+
+struct DrawSplitCounts {
+    std::atomic<std::uint64_t> full{0}, prepareNs{0}, recordNs{0}, recipe{0}, recipeNs{0}, tessellation{0};
+    std::array<std::atomic<std::uint64_t>, PhaseCount> phaseNs{};
+    std::array<std::atomic<std::uint64_t>, 6> proofs{}, proofNs{};
+    std::atomic<std::uint64_t> proofFailed{0}, findNs{0}, movedNs{0}, hits{0}, unmoved{0}, invalidated{0}, misses{0}, uncacheable{0};
+};
+
+DrawSplitCounts& DrawSplit() {
+    static DrawSplitCounts counts;
+    return counts;
+}
+
+bool DrawSplitCounted() {
+    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return counted;
+}
+
+std::uint64_t NanosecondsBetween(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+}
+
+}
+
 struct ResolvedResources {
     std::shared_ptr<ShaderResources> resources;
     std::vector<ShaderResources::MovedBuffer> moved;
@@ -1831,26 +1856,49 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         } else {
             cached = SharedResourceCache().Find(resolved.contentKey);
         }
+        const bool counted = timer.counted && DrawSplitCounted();
+        auto& split = DrawSplit();
+        auto mark = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto lap = [&](std::atomic<std::uint64_t>& total) {
+            if (!counted) return;
+            const auto now = std::chrono::steady_clock::now();
+            total.fetch_add(NanosecondsBetween(mark, now), std::memory_order_relaxed);
+            mark = now;
+        };
+        lap(split.findNs);
         if (cached != nullptr) {
             const bool valid = cached->Revalidate(shaders);
+            if (counted) {
+                const auto reuse = static_cast<std::size_t>(ShaderResources::LastProofReuse());
+                split.proofs[reuse].fetch_add(1, std::memory_order_relaxed);
+                lap(split.proofNs[reuse]);
+                if (!valid) split.proofFailed.fetch_add(1, std::memory_order_relaxed);
+            }
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
+            lap(split.movedNs);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
+                if (counted) split.hits.fetch_add(1, std::memory_order_relaxed);
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);
+                if (counted) split.unmoved.fetch_add(1, std::memory_order_relaxed);
             } else {
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
+                if (counted) split.invalidated.fetch_add(1, std::memory_order_relaxed);
             }
+        } else if (counted) {
+            split.misses.fetch_add(1, std::memory_order_relaxed);
         }
     } else {
         countCache(&DrawProfile::uncacheable);
+        if (timer.counted && DrawSplitCounted()) DrawSplit().uncacheable.fetch_add(1, std::memory_order_relaxed);
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
@@ -3708,28 +3756,6 @@ void drawTessellationGeometry(const Context& context, const State& state, const 
     Draw(context, meshed, captured, second, snapshots, nullptr, trace);
 }
 
-namespace {
-
-struct DrawSplitCounts {
-    std::atomic<std::uint64_t> full{0}, prepareNs{0}, recordNs{0}, recipe{0}, recipeNs{0}, tessellation{0};
-    std::array<std::atomic<std::uint64_t>, PhaseCount> phaseNs{};
-};
-
-DrawSplitCounts& DrawSplit() {
-    static DrawSplitCounts counts;
-    return counts;
-}
-
-bool DrawSplitCounted() {
-    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    return counted;
-}
-
-std::uint64_t NanosecondsBetween(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
-    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
-}
-
-}
 
 std::string TakeDrawSplitText() {
     auto& split = DrawSplit();
@@ -3749,6 +3775,20 @@ std::string TakeDrawSplitText() {
         std::snprintf(item, sizeof(item), " %s %.1f", DrawPhaseNames[i], static_cast<double>(ns) / 1e6);
         result += item;
     }
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto hits = take(split.hits), unmoved = take(split.unmoved), invalidated = take(split.invalidated);
+    char lookup[256];
+    std::snprintf(lookup, sizeof(lookup), "; lookup: templates found %llu (used %llu, not movable %llu, invalidated %llu), not found %llu, uncacheable %llu; find %.1f ms, moved-buffer checks %.1f ms; template proofs (count/ms):", hits + unmoved + invalidated, hits, unmoved, invalidated, take(split.misses), take(split.uncacheable), static_cast<double>(take(split.findNs)) / 1e6, static_cast<double>(take(split.movedNs)) / 1e6);
+    result += lookup;
+    constexpr std::array<const char*, 6> reuseNames{"reused", "full: never proved", "full: new epoch", "full: proofs broken", "full: pending images changed", "full: no epoch proofs"};
+    for (std::size_t i = 0; i < reuseNames.size(); ++i) {
+        char item[96];
+        std::snprintf(item, sizeof(item), "%s %s %llu/%.1f", i == 0 ? "" : ",", reuseNames[i], take(split.proofs[i]), static_cast<double>(take(split.proofNs[i])) / 1e6);
+        result += item;
+    }
+    char failed[48];
+    std::snprintf(failed, sizeof(failed), ", failed %llu", take(split.proofFailed));
+    result += failed;
     return result;
 }
 
