@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -206,7 +207,8 @@ GpuMutexType& GpuMutex();
 struct ResolveLockTrace {
     std::uint32_t touches = 0;
     std::uint32_t commands = 0;
-    const void* firstTouch = nullptr;
+    std::array<const void*, 8> touchSites{};
+    std::uint32_t touchSiteCount = 0;
     const void* firstCommands = nullptr;
 };
 void BeginResolveLockTrace();

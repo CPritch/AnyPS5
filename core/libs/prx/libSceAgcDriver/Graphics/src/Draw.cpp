@@ -2985,7 +2985,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                 return;
             }
             std::lock_guard lock(resolveSitesMutex);
-            if (trace.touches != 0) ++resolveTouchSites[trace.firstTouch];
+            for (std::uint32_t i = 0; i < trace.touchSiteCount; ++i) ++resolveTouchSites[trace.touchSites[i]];
             if (trace.commands != 0) ++resolveCommandSites[trace.firstCommands];
         }
     } resolveTrace{counted && DrawSplitCounted()};
@@ -3867,7 +3867,7 @@ std::string TakeDrawSplitText() {
     {
         const auto traced = take(split.traced), lockFree = take(split.lockFree), pairs = take(split.freePairs), touching = take(split.touching), recording = take(split.recording);
         char trace[256];
-        std::snprintf(trace, sizeof(trace), "; resolve's GPU-lock and recorder use: %llu draws traced, %llu touch neither, %llu of those right after another such draw; %llu touch the lock, %llu record commands; first lock touch by site:", traced, lockFree, pairs, touching, recording);
+        std::snprintf(trace, sizeof(trace), "; resolve's GPU-lock and recorder use: %llu draws traced, %llu touch neither, %llu of those right after another such draw; %llu touch the lock, %llu record commands; draws touching the lock by site:", traced, lockFree, pairs, touching, recording);
         result += trace;
         std::vector<std::pair<const void*, std::uint64_t>> touchSites, commandSites;
         {
@@ -3879,7 +3879,7 @@ std::string TakeDrawSplitText() {
         }
         const auto top = [&](std::vector<std::pair<const void*, std::uint64_t>>& sites) {
             std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-            for (std::size_t i = 0; i < sites.size() && i < 6; ++i) result += " " + ModuleOffsetText(sites[i].first) + ":" + std::to_string(sites[i].second);
+            for (std::size_t i = 0; i < sites.size() && i < 12; ++i) result += " " + ModuleOffsetText(sites[i].first) + ":" + std::to_string(sites[i].second);
         };
         top(touchSites);
         result += "; first command recording by site:";

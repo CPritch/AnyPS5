@@ -2695,7 +2695,10 @@ thread_local bool resolveTraceActive = false;
 thread_local ResolveLockTrace resolveTrace;
 
 void NoteResolveLockTouch(const void* site) {
-    if (resolveTrace.touches++ == 0) resolveTrace.firstTouch = site;
+    ++resolveTrace.touches;
+    const auto end = resolveTrace.touchSites.begin() + resolveTrace.touchSiteCount;
+    if (std::find(resolveTrace.touchSites.begin(), end, site) != end || resolveTrace.touchSiteCount == resolveTrace.touchSites.size()) return;
+    resolveTrace.touchSites[resolveTrace.touchSiteCount++] = site;
 }
 }
 
