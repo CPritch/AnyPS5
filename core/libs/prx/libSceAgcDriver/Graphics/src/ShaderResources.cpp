@@ -5722,28 +5722,9 @@ std::string ShaderResources::TakeCommitterMovedText() {
     return text;
 }
 
-std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target) const {
-    const bool counted = CommitterProofCounted();
-    struct Outcome {
-        bool counted;
-        std::uint64_t data = 0, buffers = 0;
-        bool refused = true;
-        ~Outcome() {
-            if (!counted) return;
-            auto& split = CommitterMoved();
-            split.calls.fetch_add(1, std::memory_order_relaxed);
-            if (refused) split.refused.fetch_add(1, std::memory_order_relaxed);
-            else if (data + buffers == 0) split.unchanged.fetch_add(1, std::memory_order_relaxed);
-            else split.movedHits.fetch_add(1, std::memory_order_relaxed);
-            split.dataMoved.fetch_add(data, std::memory_order_relaxed);
-            split.buffersMoved.fetch_add(buffers, std::memory_order_relaxed);
-        }
-    } outcome{counted};
-    std::vector<MovedBuffer> moved;
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) {
-        outcome.refused = false;
-        return moved;
-    }
+std::optional<ShaderResources::MovedPlan> ShaderResources::PlanMovedBuffers(std::span<const CompiledShader> shaders, const ColorTarget* target) const {
+    MovedPlan plan;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return plan;
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
@@ -5757,9 +5738,8 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
                 if (same) continue;
                 if (item.dataWords.empty() && patched) return std::nullopt;
-                if (moved.empty()) moved.reserve(allocations.size());
-                moved.push_back({index, 0, item.size, binding.guestDescriptor});
-                ++outcome.data;
+                if (plan.moved.empty()) plan.moved.reserve(allocations.size());
+                plan.moved.push_back({index, 0, item.size, binding.guestDescriptor});
                 continue;
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
@@ -5782,18 +5762,46 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-                const auto checkStart = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                const bool usable = GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) && !(guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes));
-                if (counted) CommitterMoved().checkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - checkStart).count()), std::memory_order_relaxed);
-                if (!usable) return std::nullopt;
-                if (moved.empty()) moved.reserve(allocations.size());
-                moved.push_back({index, address, static_cast<std::size_t>(size)});
-                ++outcome.buffers;
+                if (plan.moved.empty()) plan.moved.reserve(allocations.size());
+                plan.moved.push_back({index, address, static_cast<std::size_t>(size)});
+                plan.checks.emplace_back(begin, bytes);
             }
         }
     }
-    outcome.refused = false;
-    return moved;
+    return plan;
+}
+
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::CheckMovedPlan(MovedPlan plan, Recorder& recorder) const {
+    const bool counted = CommitterProofCounted();
+    const auto checkStart = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto usable = std::all_of(plan.checks.begin(), plan.checks.end(), [&](const std::pair<std::uint64_t, std::size_t>& check) {
+        const auto [begin, bytes] = check;
+        return GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) && !(guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes));
+    });
+    if (counted) {
+        auto& split = CommitterMoved();
+        split.checkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - checkStart).count()), std::memory_order_relaxed);
+        split.calls.fetch_add(1, std::memory_order_relaxed);
+        if (!usable) split.refused.fetch_add(1, std::memory_order_relaxed);
+        else if (plan.moved.empty()) split.unchanged.fetch_add(1, std::memory_order_relaxed);
+        else split.movedHits.fetch_add(1, std::memory_order_relaxed);
+        split.dataMoved.fetch_add(plan.moved.size() - plan.checks.size(), std::memory_order_relaxed);
+        split.buffersMoved.fetch_add(plan.checks.size(), std::memory_order_relaxed);
+    }
+    if (!usable) return std::nullopt;
+    return std::move(plan.moved);
+}
+
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target) const {
+    auto plan = PlanMovedBuffers(shaders, target);
+    if (!plan.has_value()) {
+        if (CommitterProofCounted()) {
+            CommitterMoved().calls.fetch_add(1, std::memory_order_relaxed);
+            CommitterMoved().refused.fetch_add(1, std::memory_order_relaxed);
+        }
+        return std::nullopt;
+    }
+    return CheckMovedPlan(std::move(*plan), recorder);
 }
 
 const char* ShaderResources::MoveRefusalName(MoveRefusal refusal) {

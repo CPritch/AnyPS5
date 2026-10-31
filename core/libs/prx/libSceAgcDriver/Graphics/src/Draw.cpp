@@ -1323,6 +1323,8 @@ struct alignas(64) DrawAheadCounter {
 std::array<DrawAheadCounter, DrawAheadEvents> drawAheadTotals{};
 std::atomic<bool> drawAheadDisabled{false};
 std::atomic<bool> drawAheadThrows{false};
+std::atomic<std::uint64_t> drawAheadNs{0};
+std::atomic<std::uint64_t> movedPlanNs{0};
 
 std::uint64_t VerifyDrawAheadEvery() {
     static const std::uint64_t every = [] {
@@ -1843,10 +1845,12 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             if (ahead.Checks() && !ahead.ahead->contentKey.empty()) checkAhead(resolved.contentKey == ahead.ahead->contentKey, "resource-cache key");
         }
         std::shared_ptr<ShaderResources> cached;
+        bool fromHint = false;
         if (ahead.ahead != nullptr && ahead.ahead->looked) {
             auto& hint = ahead.ahead->found;
             if (ahead.Takes() && hint != nullptr && hint->InResourceCache()) {
                 cached = std::move(hint);
+                fromHint = true;
                 CountDrawAhead(DrawAheadEvent::TemplateHinted);
             } else {
                 cached = SharedResourceCache().Find(resolved.contentKey, false);
@@ -1876,7 +1880,22 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             }
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
+            if (valid && recorder != nullptr) {
+                if (fromHint && ahead.ahead->movedPlanned) {
+                    auto& plan = ahead.ahead->movedPlan;
+                    if (plan.has_value()) moved = cached->CheckMovedPlan(std::move(*plan), *recorder);
+                    CountDrawAhead(DrawAheadEvent::MovedTaken);
+                } else {
+                    moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
+                    if (ahead.Checks() && ahead.ahead->movedPlanned && ahead.ahead->found == cached) {
+                        const auto& plan = ahead.ahead->movedPlan;
+                        const auto planned = plan.has_value() ? cached->CheckMovedPlan(*plan, *recorder) : std::nullopt;
+                        const auto same = [](const ShaderResources::MovedBuffer& a, const ShaderResources::MovedBuffer& b) { return a.allocation == b.allocation && a.address == b.address && a.size == b.size && a.words.data() == b.words.data() && a.words.size() == b.words.size(); };
+                        const bool movedSame = moved.has_value() == planned.has_value() && (!moved.has_value() || (planned->size() == moved->size() && std::equal(moved->begin(), moved->end(), planned->begin(), same)));
+                        checkAhead(movedSame, "moved buffers");
+                    }
+                }
+            }
             lap(split.movedNs);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
@@ -3268,7 +3287,6 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             noteShapeMemoVerified(true);
         }
         const bool repeated = pipeline != nullptr;
-        // A pipeline prepared ahead stands in for the store's lookup when the shape memo has none.
         std::shared_ptr<Pipeline> aheadPipeline;
         if (!repeated && prepared.ahead.ahead != nullptr && prepared.ahead.ahead->pipeline != nullptr) {
             const auto& ahead = *prepared.ahead.ahead;
@@ -3840,6 +3858,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 
 void PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t shape, DrawAhead& ahead) {
     if (drawAheadThrows.load(std::memory_order_relaxed)) throw std::runtime_error("prepare-ahead fault injected by the test");
+    struct Timed {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~Timed() { drawAheadNs.fetch_add(NanosecondsBetween(start, std::chrono::steady_clock::now()), std::memory_order_relaxed); }
+    } timed;
     ahead.device = context.device;
     ahead.pool = context.bufferPool;
     if (state.stages.tessellationGeometry || shaders.empty() || std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr; })) return;
@@ -3853,6 +3875,14 @@ void PrepareDrawAhead(const Context& context, const State& state, const Pm4::Dra
         ahead.looked = true;
         ahead.found = SharedResourceCache().Find(ahead.contentKey);
         if (ahead.found != nullptr) ahead.found->PrecollectSurfaces(ahead.walks);
+        static const bool movedAhead = std::getenv("APS5_NO_PREPARE_AHEAD_MOVED") == nullptr;
+        if (ahead.found != nullptr && movedAhead) {
+            const auto planStart = std::chrono::steady_clock::now();
+            ahead.movedPlan = ahead.found->PlanMovedBuffers(shaders, &state.color);
+            movedPlanNs.fetch_add(NanosecondsBetween(planStart, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+            ahead.movedPlanned = true;
+            CountDrawAhead(DrawAheadEvent::MovedPlanned);
+        }
     }
     static const bool precollect = std::getenv("APS5_NO_PREPARE_AHEAD_PRECOLLECT") == nullptr;
     if (precollect) {
@@ -3877,9 +3907,6 @@ void PrepareDrawAhead(const Context& context, const State& state, const Pm4::Dra
     ahead.laidOut = true;
     const bool stencilReplay = std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.program->stencilReferences.empty(); });
     if (context.descriptorCache == nullptr || stencilReplay) return;
-    // The commit takes a shaped draw's pipeline from the shape memo, which keeps the committer's
-    // own choices; one with a proxied or multisampled target is not memoized, so its pipeline is
-    // still prepared here.
     if (shape != 0 && ShapeMemoEnabled() && std::none_of(state.colors.begin(), state.colors.end(), [&](const ColorTarget& color) { return color.samples > 1 || AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED; })) {
         CountDrawAhead(DrawAheadEvent::ShapeMemo);
         return;
@@ -3917,7 +3944,7 @@ std::string DrawAheadReport() {
     reported = totals;
     const auto at = [&](DrawAheadEvent event) { return window[static_cast<std::size_t>(event)]; };
     char line[1024];
-    std::snprintf(line, sizeof(line), "[prepare-ahead] (10 s): %llu offered, %llu prepared, %llu used; not used: %llu not started, %llu unfinished, %llu exception, %llu device; pipeline redone: %llu not lean, %llu pipeline inputs; %llu pipelines left to the shape memo; templates: %llu hinted, %llu gone; %llu draws on precollected walks, %llu walks written since; %llu verified, %llu mismatches%s", at(DrawAheadEvent::Offered), at(DrawAheadEvent::Prepared), at(DrawAheadEvent::Used), at(DrawAheadEvent::NotStarted), at(DrawAheadEvent::Unfinished), at(DrawAheadEvent::Thrown), at(DrawAheadEvent::Device), at(DrawAheadEvent::NotLean), at(DrawAheadEvent::PipelineInputs), at(DrawAheadEvent::ShapeMemo), at(DrawAheadEvent::TemplateHinted), at(DrawAheadEvent::TemplateGone), at(DrawAheadEvent::Precollected), at(DrawAheadEvent::PrecollectStale), at(DrawAheadEvent::Verified), at(DrawAheadEvent::Mismatch), DrawAheadDisabled() ? " (off after a mismatch)" : "");
+    std::snprintf(line, sizeof(line), "[prepare-ahead] (10 s): %llu offered, %llu prepared, %llu used; not used: %llu not started, %llu unfinished, %llu exception, %llu device; pipeline redone: %llu not lean, %llu pipeline inputs; %llu pipelines left to the shape memo; templates: %llu hinted, %llu gone; %llu draws on precollected walks, %llu walks written since; moved-buffer plans: %llu made, %llu taken; preparation %.1f ms, of it moved-buffer plans %.1f ms; %llu verified, %llu mismatches%s", at(DrawAheadEvent::Offered), at(DrawAheadEvent::Prepared), at(DrawAheadEvent::Used), at(DrawAheadEvent::NotStarted), at(DrawAheadEvent::Unfinished), at(DrawAheadEvent::Thrown), at(DrawAheadEvent::Device), at(DrawAheadEvent::NotLean), at(DrawAheadEvent::PipelineInputs), at(DrawAheadEvent::ShapeMemo), at(DrawAheadEvent::TemplateHinted), at(DrawAheadEvent::TemplateGone), at(DrawAheadEvent::Precollected), at(DrawAheadEvent::PrecollectStale), at(DrawAheadEvent::MovedPlanned), at(DrawAheadEvent::MovedTaken), static_cast<double>(drawAheadNs.exchange(0, std::memory_order_relaxed)) / 1e6, static_cast<double>(movedPlanNs.exchange(0, std::memory_order_relaxed)) / 1e6, at(DrawAheadEvent::Verified), at(DrawAheadEvent::Mismatch), DrawAheadDisabled() ? " (off after a mismatch)" : "");
     return line;
 }
 

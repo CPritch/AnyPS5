@@ -41,11 +41,13 @@ struct DrawAhead {
     std::uint64_t storeHash = 0;
     bool looked = false;
     std::shared_ptr<ShaderResources> found;
+    bool movedPlanned = false;
+    std::optional<ShaderResources::MovedPlan> movedPlan;
     GuestMemory::PrecollectedWrites walks;
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
 
-enum class DrawAheadEvent : std::uint8_t { Offered, Prepared, Thrown, NotStarted, Unfinished, Device, Used, NotLean, PipelineInputs, ShapeMemo, TemplateHinted, TemplateGone, Precollected, PrecollectStale, Verified, Mismatch, Count };
+enum class DrawAheadEvent : std::uint8_t { Offered, Prepared, Thrown, NotStarted, Unfinished, Device, Used, NotLean, PipelineInputs, ShapeMemo, TemplateHinted, TemplateGone, Precollected, PrecollectStale, Verified, Mismatch, MovedPlanned, MovedTaken, Count };
 void PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t shape, DrawAhead& ahead);
 void CountDrawAhead(DrawAheadEvent event);
 std::array<std::uint64_t, static_cast<std::size_t>(DrawAheadEvent::Count)> DrawAheadTotals();

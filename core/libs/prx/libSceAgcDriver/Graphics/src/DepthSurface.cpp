@@ -1367,9 +1367,6 @@ public:
             uploadLayer(layer, current, geometry, uploads, uploadLayers);
             held = current;
         }
-        // A guest layer an existing host import covers is detiled from the import when the batch
-        // runs, after the results pending over it are stored there (recorded, not waited for): a
-        // CPU read would wait for those stores on the GPU first.
         for (const auto& [layer, current] : importCandidates) {
             const auto bytes = static_cast<std::size_t>(current.bytes);
             CompletePendingCpuWrites(context, current.address, bytes);

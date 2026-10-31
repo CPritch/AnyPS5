@@ -2157,8 +2157,6 @@ struct CommitterRefreshSplit {
     std::atomic<std::uint64_t> stamped{0}, stampedNs{0};
 };
 
-// Why the last refreshProved on this thread failed (0 passed or not tried) and why the last
-// takeRefreshProof took none (0 took one): the committer's unproved refreshes by image.
 thread_local std::uint8_t lastProvedFail = 0;
 thread_local std::uint8_t lastProofRefusal = 0;
 

@@ -214,6 +214,12 @@ public:
         std::span<const std::uint32_t> words;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
+    struct MovedPlan {
+        std::vector<MovedBuffer> moved;
+        std::vector<std::pair<std::uint64_t, std::size_t>> checks;
+    };
+    std::optional<MovedPlan> PlanMovedBuffers(std::span<const CompiledShader> shaders, const ColorTarget* target) const;
+    std::optional<std::vector<MovedBuffer>> CheckMovedPlan(MovedPlan plan, Recorder& recorder) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
