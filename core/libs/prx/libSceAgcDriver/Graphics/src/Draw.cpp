@@ -3594,9 +3594,45 @@ void drawTessellationGeometry(const Context& context, const State& state, const 
     Draw(context, meshed, captured, second, snapshots, nullptr, trace);
 }
 
+namespace {
+
+struct DrawSplitCounts {
+    std::atomic<std::uint64_t> full{0}, prepareNs{0}, recordNs{0}, recipe{0}, recipeNs{0}, tessellation{0};
+};
+
+DrawSplitCounts& DrawSplit() {
+    static DrawSplitCounts counts;
+    return counts;
+}
+
+bool DrawSplitCounted() {
+    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return counted;
+}
+
+std::uint64_t NanosecondsBetween(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+}
+
+}
+
+std::string TakeDrawSplitText() {
+    auto& split = DrawSplit();
+    const auto full = split.full.exchange(0, std::memory_order_relaxed);
+    const auto prepare = split.prepareNs.exchange(0, std::memory_order_relaxed);
+    const auto record = split.recordNs.exchange(0, std::memory_order_relaxed);
+    const auto recipe = split.recipe.exchange(0, std::memory_order_relaxed);
+    const auto recipeNs = split.recipeNs.exchange(0, std::memory_order_relaxed);
+    const auto tessellation = split.tessellation.exchange(0, std::memory_order_relaxed);
+    char text[256];
+    std::snprintf(text, sizeof(text), " full path %llu (prepare %.1f ms, record %.1f ms), recipe %llu (%.1f ms), tessellation %llu", static_cast<unsigned long long>(full), static_cast<double>(prepare) / 1e6, static_cast<double>(record) / 1e6, static_cast<unsigned long long>(recipe), static_cast<double>(recipeNs) / 1e6, static_cast<unsigned long long>(tessellation));
+    return text;
+}
+
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (state.stages.tessellationGeometry) {
+        if (DrawSplitCounted()) DrawSplit().tessellation.fetch_add(1, std::memory_order_relaxed);
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
         return;
     }
@@ -3605,11 +3641,29 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
     prepared.shape = shape;
-    if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
+    const bool counted = DrawSplitCounted();
+    const auto started = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool ready = prepareDraw(context, state, draw, shaders, snapshots, prepared);
+    const auto prepared_at = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (ready) recordPreparedDraw(context, state, draw, shaders, prepared);
+    if (!counted) return;
+    auto& split = DrawSplit();
+    split.full.fetch_add(1, std::memory_order_relaxed);
+    split.prepareNs.fetch_add(NanosecondsBetween(started, prepared_at), std::memory_order_relaxed);
+    split.recordNs.fetch_add(NanosecondsBetween(prepared_at, std::chrono::steady_clock::now()), std::memory_order_relaxed);
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
+    struct RecipeSplit {
+        bool counted = DrawSplitCounted();
+        std::chrono::steady_clock::time_point started = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~RecipeSplit() {
+            if (!counted) return;
+            DrawSplit().recipe.fetch_add(1, std::memory_order_relaxed);
+            DrawSplit().recipeNs.fetch_add(NanosecondsBetween(started, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+        }
+    } recipeSplit;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe");

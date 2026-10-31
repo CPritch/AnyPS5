@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -555,6 +556,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         std::snprintf(item, sizeof(item), " %s %llu %.1f", kindNames[kind], static_cast<unsigned long long>(kindCommits[kind]), static_cast<double>(kindCommitNs[kind]) / 1e6);
         drainText += item;
     }
+    drainText += "; draws in Graphics:" + Graphics::TakeDrawSplitText();
     drainText += "; committer GPU waits by item kind (ms):";
     for (std::size_t kind = 0; kind < kindNames.size(); ++kind) {
         if (kindGpuWaitNs[kind] == 0) continue;
