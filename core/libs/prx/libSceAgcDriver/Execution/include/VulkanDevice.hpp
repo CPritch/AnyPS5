@@ -355,6 +355,7 @@ public:
     Graphics::DrawPacketPtr ResolveDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, Graphics::DrawAhead* ahead = nullptr);
     void EmitDraw(Graphics::DrawPacket& packet);
     void DiscardDraw(Graphics::DrawPacket& packet);
+    void ApplyDrawMemoKeeps(Graphics::DrawPacket& packet);
     Graphics::HostImportsProof ImportsIdentity();
     bool ImportsUnchanged(const Graphics::HostImportsProof& proof);
     std::uint64_t RecorderOpenSerial();

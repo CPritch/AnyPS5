@@ -4328,6 +4328,10 @@ Graphics::DrawPacketPtr VulkanDevice::ResolveDraw(const Graphics::State& graphic
     return Graphics::ResolveDraw(context, graphics, draw, shaders, snapshots, recipe, trace, shape, ahead);
 }
 
+void VulkanDevice::ApplyDrawMemoKeeps(Graphics::DrawPacket& packet) {
+    Graphics::ApplyDrawMemoKeeps(graphicsContext(), packet);
+}
+
 void VulkanDevice::DiscardDraw(Graphics::DrawPacket& packet) {
     Graphics::DiscardDrawPacket(graphicsContext(), packet);
 }

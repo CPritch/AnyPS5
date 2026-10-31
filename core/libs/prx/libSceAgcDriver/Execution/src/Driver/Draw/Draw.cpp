@@ -1585,6 +1585,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
             }
         }
         if (packet == nullptr) packet = localDevice->ResolveDraw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, prepared);
+        if (fromEarly) localDevice->ApplyDrawMemoKeeps(*packet);
         struct JoinGuard {
             ~JoinGuard() noexcept(false) { DrawPipeline::JoinResolve(); }
         } joinGuard;

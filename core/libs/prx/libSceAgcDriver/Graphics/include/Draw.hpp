@@ -88,6 +88,7 @@ public:
     ResolverScope& operator=(const ResolverScope&) = delete;
 };
 void BuryPackets(std::vector<DrawPacket*>& packets);
+void ApplyDrawMemoKeeps(const Context& context, DrawPacket& packet);
 void SetRedoHook(void (*hook)());
 enum class DrawPacketField : std::uint8_t { Template, Pipeline, Targets, Framebuffer, Inputs, Moved, Depth, Refreshes, Flags, Count };
 std::uint32_t CompareDrawPackets(const DrawPacket& first, const DrawPacket& second);

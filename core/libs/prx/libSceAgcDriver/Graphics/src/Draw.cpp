@@ -4157,6 +4157,13 @@ ResolverScope::~ResolverScope() {
     Recorder::SetResolverState(nullptr, nullptr);
 }
 
+void ApplyDrawMemoKeeps(const Context& context, DrawPacket& packet) {
+    auto& keeps = packet.prepared.memoKeeps;
+    if (keeps.empty() || context.recorder == nullptr) return;
+    for (auto& keep : keeps) keep(*context.recorder);
+    keeps.clear();
+}
+
 void BuryPackets(std::vector<DrawPacket*>& packets) {
     for (auto* packet : packets) delete packet;
     packets.clear();
@@ -4348,10 +4355,6 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
         } restore;
         Draw(context, state, draw, shaders, snapshots, packet.recipeOut, packet.trace, packet.shape, nullptr);
         return;
-    }
-    if (!prepared.memoKeeps.empty() && context.recorder != nullptr) {
-        for (auto& keep : prepared.memoKeeps) keep(*context.recorder);
-        prepared.memoKeeps.clear();
     }
     if (prepared.deferredInsert.has_value()) {
         SharedResourceCache().Insert(prepared.deferredInsert->first, prepared.deferredInsert->second);
