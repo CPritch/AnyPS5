@@ -1363,11 +1363,12 @@ void Recorder::CountRecordedWork() {
 }
 
 Recorder* Recorder::Active() {
-    GuestMemory::NoteResolveRecorder(__builtin_return_address(0));
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     return activeRecorder;
 }
 
 void Recorder::Activate() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     activeRecorder = this;
     {
         std::lock_guard tableLock(labelTableMutex);
@@ -1388,6 +1389,7 @@ bool Recorder::WideLabelIn(std::uint64_t address, std::size_t bytes) {
 }
 
 bool Recorder::wideLabelInLocked(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (wideLabels.empty() || bytes == 0) return false;
     const auto end = address + bytes;
     for (auto it = wideLabels.lower_bound(address >= wideLabelBytes ? address - wideLabelBytes + 1 : 0); it != wideLabels.end() && it->first < end; ++it) {
@@ -1583,6 +1585,7 @@ std::uint64_t Recorder::ReapsWithWork() {
 }
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::NoteResolveCommands(__builtin_return_address(0));
     ensureOpen();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
@@ -1596,6 +1599,7 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
 }
 
 void Recorder::MarkCovered(VkAccessFlags access) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open != nullptr) open->coveredAccess = access;
 }
 
@@ -1622,6 +1626,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
 }
 
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;
     if (!pass.open) {
@@ -1635,10 +1640,12 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
 }
 
 void Recorder::SealPassWriteOnly() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open != nullptr) open->passHazards.SealWriteOnly();
 }
 
 void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     auto& pass = open->renderPass;
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
@@ -1657,6 +1664,7 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
 }
 
 void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     ensureOpen();
     // A queued label store over the keys lands first (program order: the key store is later).
     FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
@@ -1675,22 +1683,26 @@ void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize l
 }
 
 bool Recorder::QueuedKeyStoreOverlaps(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open == nullptr || bytes == 0) return false;
     const auto end = address + bytes;
     return std::any_of(open->keyStores.begin(), open->keyStores.end(), [&](const Batch::KeyStore& store) { return address < store.end && store.begin < end; });
 }
 
 bool Recorder::AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open == nullptr) return false;
     return std::any_of(open->keyStores.begin(), open->keyStores.end(), [&](const Batch::KeyStore& store) { return overlaps(store.begin, store.end); });
 }
 
 void Recorder::FlushKeyStores() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open == nullptr || open->keyStores.empty()) return;
     recordKeyStores(true);
 }
 
 void Recorder::recordKeyStores(bool forWriter) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     auto stores = std::move(open->keyStores);
     open->keyStores.clear();
     if (stores.empty()) return;
@@ -1724,6 +1736,7 @@ void Recorder::recordKeyStores(bool forWriter) {
 }
 
 void Recorder::ensureOpen() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
@@ -1765,6 +1778,7 @@ void Recorder::ensureOpen() {
 }
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes.empty()) return;
     ensureOpen();
     auto& run = open->run;
@@ -1839,6 +1853,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
 }
 
 void Recorder::recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (cmdPipelineBarrier == nullptr) {
         RecordMemoryBarrier(context, commands, sourceStage, destinationStage, sourceAccess, destinationAccess);
         return;
@@ -1848,6 +1863,7 @@ void Recorder::recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sour
 }
 
 void Recorder::flushPendingStore() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     auto& run = open->run;
     if (run.bytes.empty()) return;
     function(cmdUpdateBuffer, "vkCmdUpdateBuffer")(open->commands, run.buffer, run.offset, run.bytes.size(), run.bytes.data());
@@ -1857,6 +1873,7 @@ void Recorder::flushPendingStore() {
 }
 
 bool Recorder::closeStoreRun(bool atSubmit) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     auto& run = open->run;
     if (LabelRunsPerBatch()) {
         auto stores = std::move(run.queued);
@@ -1966,17 +1983,20 @@ bool Recorder::closeStoreRun(bool atSubmit) {
 }
 
 bool Recorder::QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open == nullptr || bytes == 0) return false;
     const auto end = address + bytes;
     return std::any_of(open->run.queued.begin(), open->run.queued.end(), [&](const Batch::StoreRun::Queued& store) { return address < store.End() && store.address < end; });
 }
 
 bool Recorder::AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open == nullptr) return false;
     return std::any_of(open->run.queued.begin(), open->run.queued.end(), [&](const Batch::StoreRun::Queued& store) { return overlaps(store.address, store.End()); });
 }
 
 void Recorder::FlushStores() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open == nullptr || open->run.queued.empty()) return;
     closeStoreRun(false);
 }
@@ -2102,6 +2122,7 @@ bool Recorder::BarrierValidate() {
 }
 
 void Recorder::NoteAccess(CommandClass which, const Access& access) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (!BarrierValidate()) return;
     ensureOpen();
     auto& tracker = open->tracker;
@@ -2163,6 +2184,7 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
 }
 
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (!GpuTimingEnabled()) return NoTiming;
     Commands();
     return beginTiming(key);
@@ -2175,11 +2197,13 @@ std::string Recorder::TimingKeyLabel(std::uint64_t key) {
 }
 
 std::uint32_t Recorder::BeginInPassGpuTiming(std::uint64_t key) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (!GpuTimingEnabled() || open == nullptr || open->queries == VK_NULL_HANDLE) return NoTiming;
     return beginTiming(key);
 }
 
 std::uint32_t Recorder::BeginGpuTiming(CommandClass which, std::source_location site) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (!GpuTimingEnabled()) return NoTiming;
     Commands();
     return beginTiming(ClassKey(which), site);
@@ -2227,6 +2251,7 @@ Recorder::GpuSiteTag::~GpuSiteTag() {
 }
 
 std::uint32_t Recorder::beginTiming(std::uint64_t key, std::source_location site) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && BatchStampsEnabled())) return NoTiming;
     const auto commands = open->commands;
@@ -2261,12 +2286,14 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key, std::source_location site
 }
 
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
 }
 
 bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     constexpr std::uint32_t PushBytes = 48;
     if (dispatchArgumentState == 0) {
         dispatchArgumentState = -1;
@@ -2314,6 +2341,7 @@ bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress
 }
 
 void Recorder::CountSamples() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::AssertGpuLockHeld("Recorder::CountSamples");
     gpuSampleCounter();
     countingSamples = true;
@@ -2323,6 +2351,7 @@ void Recorder::CountSamples() {
 }
 
 std::uint64_t Recorder::SamplesTotal() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (sampleCounterState <= 0) return samplesPassed.load(std::memory_order_acquire);
     if (segmentMode() && !Idle()) Sync();
     std::uint64_t total = 0;
@@ -2338,6 +2367,7 @@ std::uint64_t Recorder::SamplesTotal() {
 }
 
 void Recorder::NoteSampledDraw(VkCommandBuffer commands) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open == nullptr) return;
     if (segmentMode()) {
         if (countingSamples && commands == open->commands && !open->segmentActive) beginSegment(*open);
@@ -2363,6 +2393,7 @@ void Recorder::NoteDrawTraceToken(std::uint64_t token) noexcept {
 }
 
 bool Recorder::gpuSampleCounter() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (sampleCounterState != 0) return sampleCounterState > 0;
     sampleCounterState = -1;
     if (!context.bufferDeviceAddress) return false;
@@ -2488,10 +2519,12 @@ std::vector<std::size_t> Recorder::QueuedWriteGroups(std::span<const QueuedWrite
 }
 
 bool Recorder::segmentMode() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     return sampleCounterState > 0;
 }
 
 bool Recorder::QueuesSampleDumps() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     return segmentMode() && LabelRunsPerBatch();
 }
 
@@ -2500,10 +2533,12 @@ Recorder::SampleDumpStatistics Recorder::SampleDumpCounts() {
 }
 
 bool Recorder::segmentSlotReady(const Batch& batch) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     return batch.segmentActive || (batch.segments != VK_NULL_HANDLE && batch.segmentNext < SegmentSlots);
 }
 
 void Recorder::PrepareSampleSlot() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::AssertGpuLockHeld("Recorder::PrepareSampleSlot");
     if (!countingSamples || !segmentMode()) return;
     ensureOpen();
@@ -2512,10 +2547,12 @@ void Recorder::PrepareSampleSlot() {
 }
 
 void Recorder::EndPassSamples() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open != nullptr && open->segmentActive) endSegment(*open);
 }
 
 void Recorder::RecordUncounted(const std::function<void(VkCommandBuffer)>& record) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const auto commands = Commands();
     if (open->segmentActive) endSegment(*open);
     const bool counted = open->sampleActive;
@@ -2530,6 +2567,7 @@ void Recorder::RecordUncounted(const std::function<void(VkCommandBuffer)>& recor
 }
 
 void Recorder::takeSegmentPool(Batch& batch) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     auto cache = std::static_pointer_cast<SamplePoolCache>(segmentPools);
     if (cache == nullptr) {
         cache = std::make_shared<SamplePoolCache>();
@@ -2558,6 +2596,7 @@ void Recorder::takeSegmentPool(Batch& batch) {
 }
 
 void Recorder::beginSegment(Batch& batch) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     Require(batch.segments != VK_NULL_HANDLE && batch.segmentNext < SegmentSlots, "an occlusion segment begins without a reset query slot");
     batch.segmentSlot = batch.segmentNext++;
     function(cmdBeginQuery, "vkCmdBeginQuery")(batch.commands, batch.segments, batch.segmentSlot, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
@@ -2565,6 +2604,7 @@ void Recorder::beginSegment(Batch& batch) {
 }
 
 void Recorder::endSegment(Batch& batch) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     function(cmdEndQuery, "vkCmdEndQuery")(batch.commands, batch.segments, batch.segmentSlot);
     batch.segmentActive = false;
     pendingSamples.push_back({batch.segmentPool, batch.segments, batch.segmentSlot});
@@ -2572,6 +2612,7 @@ void Recorder::endSegment(Batch& batch) {
 }
 
 void Recorder::copySegments(VkCommandBuffer commands, std::uint32_t count) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     Require(count <= pendingSamples.size() && count <= SegmentFoldCapacity, "occlusion segments exceed the fold capacity");
     const auto copy = function(cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
     for (std::uint32_t i = 0; i < count;) {
@@ -2584,6 +2625,7 @@ void Recorder::copySegments(VkCommandBuffer commands, std::uint32_t count) {
 }
 
 void Recorder::retireSegments(std::uint32_t count) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     for (std::uint32_t i = 0; i < count; ++i) {
         if (pendingSamples[i].pool != nullptr) open->kept.push_back(std::move(pendingSamples[i].pool));
     }
@@ -2591,6 +2633,7 @@ void Recorder::retireSegments(std::uint32_t count) {
 }
 
 void Recorder::recordQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     std::uint32_t segments = 0;
     std::vector<std::uint32_t> list;
     for (const auto& write : writes) {
@@ -2604,6 +2647,7 @@ void Recorder::recordQueuedDumps(VkCommandBuffer commands, std::span<const Batch
 }
 
 void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, std::uint32_t dumps, std::uint32_t firstSegment, std::uint32_t lastSegment) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, dumpPipeline);
     struct {
@@ -2632,6 +2676,7 @@ void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, 
 }
 
 void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end, std::uint32_t& dumpIndex, std::uint32_t& consumed) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     std::uint32_t count = 0, segments = consumed;
     for (std::size_t i = first; i < end; ++i) {
         if (writes[i].dumpTarget == 0) continue;
@@ -2645,6 +2690,7 @@ void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::
 }
 
 void Recorder::foldSegments() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const auto commands = open->commands;
     const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(pendingSamples.size(), SegmentFoldCapacity));
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -2656,6 +2702,7 @@ void Recorder::foldSegments() {
 }
 
 void Recorder::endSamples(Batch& batch) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (!batch.sampleActive) return;
     function(cmdEndQuery, "vkCmdEndQuery")(batch.commands, batch.samples, 0);
     batch.sampleActive = false;
@@ -2664,6 +2711,7 @@ void Recorder::endSamples(Batch& batch) {
 }
 
 void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const auto commands = batch.commands;
     const auto copy = function(cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
     const auto bind = function(cmdBindPipeline, "vkCmdBindPipeline");
@@ -2708,6 +2756,7 @@ void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
 }
 
 bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::AssertGpuLockHeld("Recorder::DumpSamples");
     if (target == 0 || !gpuSampleCounter()) return false;
     countingSamples = true;
@@ -2742,6 +2791,7 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
 }
 
 bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     constexpr std::uint32_t PushBytes = 48;
     if (meshArgumentState == 0) {
         meshArgumentState = -1;
@@ -2787,6 +2837,7 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
 }
 
 void Recorder::beginSamples(Batch& batch) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     auto cache = std::static_pointer_cast<SamplePoolCache>(samplePools);
     if (sampleCounterState > 0 && cache == nullptr) {
         cache = std::make_shared<SamplePoolCache>();
@@ -2817,6 +2868,7 @@ void Recorder::beginSamples(Batch& batch) {
 }
 
 void Recorder::readSamples(Batch& batch) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (sampleCounterState > 0) return;
     if (batch.samples == VK_NULL_HANDLE || !batch.submitted) return;
     std::uint64_t total = 0;
@@ -2831,6 +2883,7 @@ void Recorder::readSamples(Batch& batch) {
 }
 
 void Recorder::readGpuTiming(Batch& batch) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
     std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
     const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
@@ -2929,6 +2982,7 @@ bool Recorder::FlipReadCheck() {
 }
 
 std::vector<Recorder::Completed> Recorder::CompletedBatches(std::uint64_t afterSerial, std::uint64_t throughSerial, std::size_t& missing) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     std::vector<Completed> found;
     missing = 0;
     if (throughSerial <= afterSerial) return found;
@@ -2942,22 +2996,26 @@ std::vector<Recorder::Completed> Recorder::CompletedBatches(std::uint64_t afterS
 }
 
 std::uint64_t Recorder::NewestSubmitted(std::chrono::steady_clock::time_point* submittedAt) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     std::lock_guard lock(completedMutex);
     if (submittedAt != nullptr) *submittedAt = newestSubmittedAt;
     return newestSubmitted;
 }
 
 std::size_t Recorder::UnsignaledBatches() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     return static_cast<std::size_t>(std::count_if(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return !signaled(*batch); }));
 }
 
 void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     ensureOpen();
     open->kept.push_back(std::move(object));
     open->keptBytes += bytes;
 }
 
 void Recorder::KeepThroughHold(std::shared_ptr<void> object) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::AssertGpuLockHeld("Recorder::KeepThroughHold");
     if (const auto hold = GuestMemory::GpuHoldSerial(); hold != holdKeptSerial) {
         holdKept.clear();
@@ -2968,16 +3026,19 @@ void Recorder::KeepThroughHold(std::shared_ptr<void> object) {
 }
 
 void Recorder::dropStaleHoldKept() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (!holdKept.empty() && holdKeptSerial != GuestMemory::GpuHoldSerial() && GuestMemory::GpuMutex().HeldByThisThread()) holdKept.clear();
 }
 
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (owner == nullptr || bytes == 0) return;
     ensureOpen();
     if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
 }
 
 void Recorder::BoundKeptBytes() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const HotWaitSiteScope hotSite{__builtin_return_address(0)};
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
@@ -2996,6 +3057,7 @@ std::size_t SnapshotPool(Recorder::SnapshotUse use) {
 }
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
@@ -3014,6 +3076,7 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
 }
 
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (stamp == unwrittenStamp) return;
     unwrittenSnapshots.clear();
     unwrittenBytes = 0;
@@ -3021,6 +3084,7 @@ void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stam
 }
 
 std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     retireUnwrittenSnapshots(stamp);
     const auto found = unwrittenSnapshots.find(address);
     if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return {};
@@ -3029,6 +3093,7 @@ std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, s
 }
 
 void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     retireUnwrittenSnapshots(stamp);
     if (const auto found = unwrittenSnapshots.find(address); found != unwrittenSnapshots.end()) {
         unwrittenBytes -= found->second.bytes;
@@ -3040,6 +3105,7 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, VkDeviceSize* offset) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) {
         if (use != SnapshotUse::Storage || offset == nullptr) return {};
@@ -3061,6 +3127,7 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
 }
 
 std::shared_ptr<Buffer> Recorder::containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     auto entry = drawSnapshots.upper_bound({address, SnapshotUse::Storage, std::numeric_limits<std::size_t>::max()});
@@ -3078,6 +3145,7 @@ std::shared_ptr<Buffer> Recorder::containingDrawSnapshot(std::uint64_t address, 
 }
 
 bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const auto held = entry.buffer->Bytes();
     if (held.size() != bytes || bytes == 0) return false;
     constexpr std::uint64_t block = 65536;
@@ -3125,6 +3193,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
 }
 
 void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const bool storage = use == SnapshotUse::Storage;
     const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
     const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
@@ -3148,6 +3217,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
 }
 
 bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const auto found = indexRanges.find({address, use, bytes});
     if (found == indexRanges.end()) return false;
     if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
@@ -3161,6 +3231,7 @@ bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, Snaps
 }
 
 void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     Require(use != SnapshotUse::Storage && use != SnapshotUse::Vertex, "a highest index belongs to an index buffer");
     if (generation == 0) return;
     const DrawSnapshotKey key{address, use, bytes};
@@ -3182,6 +3253,7 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
 }
 
 void Recorder::OnComplete(std::function<void()> action) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     ensureOpen();
     open->completions.push_back(std::move(action));
     ++open->writeBackCompletionCount;
@@ -3189,6 +3261,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 }
 
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word, std::uint64_t writer, std::uint64_t store) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
@@ -3213,6 +3286,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
 }
 
 void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t bytes, bool ownLabel) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes == 0) return;
     if (&batch == open.get()) {
         if (!noteWrite(address, bytes, ownLabel)) return;
@@ -3241,6 +3315,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
 }
 
 void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (recordedLabels.load(std::memory_order_relaxed) == 0) return;
     std::lock_guard tableLock(labelTableMutex);
     // A dword overlaps the range when it starts before the end and ends after the start.
@@ -3248,6 +3323,7 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
 }
 
 void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (!noteWrite(address, bytes)) return;
     const std::array ranges{std::pair{address, address + bytes}};
     publishPendingWrites(ranges);
@@ -3257,6 +3333,7 @@ void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
 }
 
 void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (!noteWrite(address, bytes, false, value, value * std::int64_t{0x01010101})) return;
     const std::array ranges{std::pair{address, address + bytes}};
     publishPendingWrites(ranges);
@@ -3264,6 +3341,7 @@ void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::ui
 }
 
 void Recorder::NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const int value = word == (word & 0xffu) * 0x01010101u ? static_cast<int>(word & 0xffu) : -1;
     if (!noteWrite(address, bytes, false, value, word)) return;
     const std::array ranges{std::pair{address, address + bytes}};
@@ -3272,6 +3350,7 @@ void Recorder::NotePendingWordFill(std::uint64_t address, std::size_t bytes, std
 }
 
 void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t writer) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     bool publish = false;
     for (const auto& [begin, end] : ranges) {
         if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin), false, -1, -1, writer)) publish = true;
@@ -3282,6 +3361,7 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
 }
 
 void Recorder::NotePendingStores(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t store) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     bool publish = false;
     for (const auto& [begin, end] : ranges) {
         if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin), false, -1, -1, 0, store)) publish = true;
@@ -3292,6 +3372,7 @@ void Recorder::NotePendingStores(std::span<const std::pair<std::uint64_t, std::u
 }
 
 void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (activeRecorder != this) {
         publishedWriteRangesValid = false;
         return;
@@ -3351,6 +3432,7 @@ bool Recorder::overlaps(const Batch& batch, std::uint64_t address, std::uint64_t
 }
 
 bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes == 0) return false;
     if (published != nullptr && !SnapshotOverlaps(published.get(), address, bytes)) return false;
     const auto end = address + bytes;
@@ -3362,10 +3444,12 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
 }
 
 bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     return bytes != 0 && open != nullptr && overlaps(*open, address, address + bytes);
 }
 
 std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes == 0) return 0;
     const auto end = address + bytes;
     const auto writes = [&](const Batch& batch) { return overlaps(batch, address, end) || readOverlap(batch, address, end, ReadKind::AddressBased).has_value(); };
@@ -3377,6 +3461,7 @@ std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t b
 }
 
 std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (exceptNotes.empty()) return PendingWriterSerial(address, bytes);
     if (bytes == 0) return 0;
     const auto end = address + bytes;
@@ -3397,10 +3482,12 @@ std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t b
 }
 
 bool Recorder::signaled(const Batch& batch) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     return batch.submitted && fenceStatus(batch.fence) == VK_SUCCESS;
 }
 
 bool Recorder::PendingWriteSettled(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes == 0) return true;
     const auto end = address + bytes;
     if (open != nullptr && overlaps(*open, address, end)) return false;
@@ -3411,12 +3498,14 @@ bool Recorder::PendingWriteSettled(std::uint64_t address, std::size_t bytes) con
 }
 
 std::uint64_t Recorder::LastWriteNote(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open == nullptr || open->writes.empty() || open->writeNotes.size() != open->writes.size()) return 0;
     if (open->writes.back() != std::pair<std::uint64_t, std::uint64_t>{address, address + bytes}) return 0;
     return open->writeNotes.back() == writeNoteCount ? writeNoteCount : 0;
 }
 
 std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes == 0) return 0;
     const auto end = address + bytes;
     std::uint64_t newest = 0;
@@ -3431,6 +3520,7 @@ std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes
 }
 
 std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     std::vector<PendingWrite> found;
     if (bytes == 0) return found;
     const auto end = address + bytes;
@@ -3445,6 +3535,7 @@ std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t ad
 }
 
 bool Recorder::PendingWritesOnlyStores(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> stores) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes == 0) return false;
     const auto end = address + bytes;
     bool any = false;
@@ -3466,6 +3557,7 @@ bool Recorder::PendingWritesOnlyStores(std::uint64_t address, std::size_t bytes,
 }
 
 void Recorder::PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     ranges.clear();
     if (open != nullptr) ranges.insert(ranges.end(), open->writes.begin(), open->writes.end());
     for (const auto& batch : inFlight) ranges.insert(ranges.end(), batch->writes.begin(), batch->writes.end());
@@ -3476,6 +3568,7 @@ bool Recorder::ReadTracking() {
 }
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
@@ -3484,6 +3577,7 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
     for (const auto& [begin, end] : ranges) {
@@ -3502,6 +3596,7 @@ bool Recorder::ValidReadList(const ReadList& ranges) {
 }
 
 void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (ranges == nullptr || ranges->empty() || !ReadTrackingEnabled()) return;
     if (CaptureTrace::Enabled() || FlipReadCheck()) {
         NotePendingReads(*ranges, kind);
@@ -3551,6 +3646,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> Recorder::notedReads(const 
 }
 
 bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, bool ignoreSignaled) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes == 0) return false;
     readQueries.fetch_add(1, std::memory_order_relaxed);
     const auto end = address + bytes;
@@ -3575,6 +3671,7 @@ bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, boo
 }
 
 std::optional<Recorder::PendingReadInfo> Recorder::DescribePendingRead(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes == 0) return std::nullopt;
     const auto end = address + bytes;
     if (open != nullptr) {
@@ -3593,6 +3690,7 @@ Recorder::ReadStatistics Recorder::ReadCounts() {
 }
 
 std::optional<Recorder::PendingWriteInfo> Recorder::DescribePendingWrite(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes == 0) return std::nullopt;
     const auto end = address + bytes;
     // The same choice SyncThrough makes: the open batch forces a full Sync, otherwise the newest
@@ -3624,6 +3722,7 @@ std::optional<Recorder::PendingWriteInfo> Recorder::DescribePendingWrite(std::ui
 }
 
 bool Recorder::HasCompletions() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (open != nullptr && !open->completions.empty()) return true;
     for (const auto& batch : inFlight) {
         if (!batch->completions.empty()) return true;
@@ -3632,6 +3731,7 @@ bool Recorder::HasCompletions() const {
 }
 
 void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     // One entry per dword; a label overlapping older entries (a 4-byte store inside an 8-byte one or
     // the reverse) replaces exactly the dwords it stores, so a lookup composes what memory will hold.
     std::lock_guard tableLock(labelTableMutex);
@@ -3647,6 +3747,7 @@ void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const 
 }
 
 void Recorder::markBehindCompletion(const Batch& batch, std::uint64_t begin, std::uint64_t end) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     std::lock_guard tableLock(labelTableMutex);
     for (auto it = labels.lower_bound(begin); it != labels.end() && it->first < end; ++it) {
         if (it->second.batch == &batch) it->second.behindCompletion = true;
@@ -3654,6 +3755,7 @@ void Recorder::markBehindCompletion(const Batch& batch, std::uint64_t begin, std
 }
 
 void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     ensureOpen();
     // The table entry before the write note: the note bumps the write generation a poller
     // watches, and a poller that sees the bump then finds the label without the GPU mutex.
@@ -3674,17 +3776,20 @@ void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes
 }
 
 std::optional<Recorder::LabelHit> Recorder::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     // Under the GPU mutex; the table mutex is taken too so this one path serves both lock regimes.
     std::lock_guard tableLock(labelTableMutex);
     return lookupLabel(address, bytes, afterStamp, refusal);
 }
 
 std::size_t Recorder::PendingLabels() const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     std::lock_guard tableLock(labelTableMutex);
     return labels.size();
 }
 
 bool Recorder::PendingLabelIn(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     std::lock_guard tableLock(labelTableMutex);
     if (bytes == 0) return false;
     const auto end = address + bytes;
@@ -3698,6 +3803,7 @@ bool Recorder::PendingLabelIn(std::uint64_t address, std::size_t bytes) const {
 }
 
 bool Recorder::CompletionLabelIn(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     std::lock_guard tableLock(labelTableMutex);
     if (bytes == 0) return false;
     const auto end = address + bytes;
@@ -3709,6 +3815,7 @@ bool Recorder::CompletionLabelIn(std::uint64_t address, std::size_t bytes) const
 }
 
 std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (refusal != nullptr) *refusal = LabelRefusal::None;
     if ((labels.empty() && queuedLabels.empty()) || (bytes != 4 && bytes != 8) || address % 4 != 0) return std::nullopt;
     LabelHit hit{0, 0, 0, false, std::numeric_limits<std::uint64_t>::max()};
@@ -3759,6 +3866,7 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
 }
 
 bool Recorder::unsignaled(std::uint64_t serial) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     for (const auto& batch : inFlight) {
         if (batch->serial == serial) return fenceStatus(batch->fence) != VK_SUCCESS;
     }
@@ -3766,6 +3874,7 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
 }
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     Require(open != nullptr || !inFlight.empty(), "no batch to append a completion label to");
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     std::vector<std::byte> copy(bytes.begin(), bytes.end());
@@ -3811,6 +3920,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
 }
 
 bool Recorder::AfterRecordedWork(std::function<void()> action) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     batch.completions.push_back(std::move(action));
@@ -3856,6 +3966,7 @@ void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
 }
 
 bool Recorder::writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std::uint64_t end) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     std::lock_guard ringLock(writtenBackMutex);
     if (writtenBack.empty() || writtenBack.back()[0] <= sequence) return false;
     if (writtenBack.front()[0] > sequence + 1) return true;
@@ -3866,11 +3977,13 @@ bool Recorder::writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std
 }
 
 void Recorder::HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     submitHold = semaphore;
     submitHoldValue = value;
 }
 
 void Recorder::Submit() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     PerformanceTimer frameTiming("Recorder.Submit");
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
@@ -3979,11 +4092,13 @@ void Recorder::Submit() {
 }
 
 std::uint64_t Recorder::SubmitAndEpoch() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     Submit();
     return inFlight.empty() ? 0 : submissions;
 }
 
 std::uint64_t Recorder::OpenBatchSerial() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     return open != nullptr ? submissions + 1 : 0;
 }
 
@@ -4027,6 +4142,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
 }
 
 void Recorder::WaitSerial(std::uint64_t serial) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     PerformanceTimer frameTiming("Recorder.WaitSerial");
     if (timeline == VK_NULL_HANDLE || serial == 0) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4041,6 +4157,7 @@ void Recorder::WaitSerial(std::uint64_t serial) {
 }
 
 bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     PerformanceTimer frameTiming("Recorder.WaitSerialFor");
     if (timeline == VK_NULL_HANDLE || serial == 0) return false;
     const UnlockedWaiter waiter{id};
@@ -4055,6 +4172,7 @@ bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
 }
 
 void Recorder::FinishUpTo(std::uint64_t serial) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const HotWaitSiteScope hotSite{__builtin_return_address(0)};
     // A drain: the wait already happened (unlocked), the fences are signaled, so the source-0 wait
     // recorded here is the bookkeeping only (a caller that did not wait first, WaitForLeases, shows
@@ -4072,6 +4190,7 @@ void Recorder::FinishUpTo(std::uint64_t serial) {
 }
 
 void Recorder::Sync() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const HotWaitSiteScope hotSite{__builtin_return_address(0)};
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
@@ -4089,11 +4208,13 @@ void Recorder::Sync() {
 }
 
 void Recorder::FlushDeferredReleases() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     holdKept.clear();
     ReleaseDeferredKeeps();
 }
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const HotWaitSiteScope hotSite{__builtin_return_address(0)};
     if (bytes == 0) return;
     const auto end = address + bytes;
@@ -4219,6 +4340,7 @@ void ReportSyncWaits(SyncWaitStats& stats) {
 }
 
 bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int source, const void* site) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     // Only for the outermost acquisition: a nested hook (inside a dispatch's hold) must not give
     // up the caller's mutex, and a thread that waits here holds nothing the relock could invert
     // (the hook took the mutex from a depth of 0 with the same locks held).
@@ -4354,6 +4476,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
 }
 
 bool Recorder::Reap() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     PerformanceTimer frameTiming("Recorder.Reap");
     dropStaleHoldKept();
     const bool profile = DrawProfiled();
@@ -4376,6 +4499,7 @@ bool Recorder::Reap() {
 }
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     inFlightKeptBytes -= batch->keptBytes;
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
@@ -4553,6 +4677,7 @@ void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
 }
 
 void Recorder::removeLabels(Batch& batch) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (!batch.labelDwords.empty() || !batch.wideLabels.empty()) {
         std::lock_guard tableLock(labelTableMutex);
         for (const auto dword : batch.labelDwords) {

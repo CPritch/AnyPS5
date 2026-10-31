@@ -1808,6 +1808,7 @@ std::mutex resolveSitesMutex;
 std::map<const void*, std::uint64_t> resolveTouchSites;
 std::map<const void*, std::uint64_t> resolveCommandSites;
 std::map<const void*, std::uint64_t> resolveRecorderSites;
+std::map<std::string, std::uint64_t> resolveRecorderMethods;
 
 std::string ModuleOffsetText(const void* site) {
     unsigned long long offset = reinterpret_cast<std::uintptr_t>(site);
@@ -2983,6 +2984,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             if (trace.recorderSiteCount != 0) {
                 std::lock_guard lock(resolveSitesMutex);
                 for (std::uint32_t i = 0; i < trace.recorderSiteCount; ++i) ++resolveRecorderSites[trace.recorderSites[i]];
+                for (std::uint32_t i = 0; i < trace.recorderMethodCount; ++i) ++resolveRecorderMethods[trace.recorderMethods[i]];
             }
             if (trace.touches == 0 && trace.commands == 0) {
                 const auto sequence = AgcDriver::DriverDetail::DrawPipeline::CommitSequence();
@@ -3886,7 +3888,7 @@ std::string TakeDrawSplitText() {
         }
         const auto top = [&](std::vector<std::pair<const void*, std::uint64_t>>& sites) {
             std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-            for (std::size_t i = 0; i < sites.size() && i < 12; ++i) result += " " + ModuleOffsetText(sites[i].first) + ":" + std::to_string(sites[i].second);
+            for (std::size_t i = 0; i < sites.size() && i < 20; ++i) result += " " + ModuleOffsetText(sites[i].first) + ":" + std::to_string(sites[i].second);
         };
         top(touchSites);
         result += "; first command recording by site:";
@@ -3899,6 +3901,15 @@ std::string TakeDrawSplitText() {
         }
         result += "; draws reaching the recorder by site:";
         top(recorderSites);
+        std::vector<std::pair<std::string, std::uint64_t>> methods;
+        {
+            std::lock_guard lock(resolveSitesMutex);
+            methods.assign(resolveRecorderMethods.begin(), resolveRecorderMethods.end());
+            resolveRecorderMethods.clear();
+        }
+        std::sort(methods.begin(), methods.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        result += "; draws by recorder method:";
+        for (std::size_t i = 0; i < methods.size() && i < 24; ++i) result += " " + methods[i].first + ":" + std::to_string(methods[i].second);
     }
     result += ShaderResources::TakeCommitterProofText();
     result += ShaderResources::TakeCommitterMovedText();

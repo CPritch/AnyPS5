@@ -2760,9 +2760,13 @@ ResolveLockTrace EndResolveLockTrace() {
     return resolveTrace;
 }
 
-void NoteResolveRecorder(const void* site) {
+void NoteResolveRecorder(const void* site, const char* method) {
     if (!resolveTraceActive) return;
     ++resolveTrace.recorderUses;
+    if (method != nullptr) {
+        const auto methodsEnd = resolveTrace.recorderMethods.begin() + resolveTrace.recorderMethodCount;
+        if (std::find(resolveTrace.recorderMethods.begin(), methodsEnd, method) == methodsEnd && resolveTrace.recorderMethodCount < resolveTrace.recorderMethods.size()) resolveTrace.recorderMethods[resolveTrace.recorderMethodCount++] = method;
+    }
     const auto end = resolveTrace.recorderSites.begin() + resolveTrace.recorderSiteCount;
     if (std::find(resolveTrace.recorderSites.begin(), end, site) != end || resolveTrace.recorderSiteCount == resolveTrace.recorderSites.size()) return;
     resolveTrace.recorderSites[resolveTrace.recorderSiteCount++] = site;
