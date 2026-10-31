@@ -398,6 +398,7 @@ public:
     // the range: false means no recorded work writes it, so a wait on it has nothing to submit.
     static bool SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes);
     static void CountSnapshotAgreement(bool live, std::uint64_t address, std::size_t bytes);
+    static void CountLabelSnapshotAgreement(bool live, std::uint64_t address, std::size_t bytes);
     static std::string TakeSnapshotAgreementText();
     // The snapshot itself (the sorted, merged union of the pending ranges; null when none), for a
     // reader that tests many ranges against one loaded snapshot: one atomic shared_ptr load per

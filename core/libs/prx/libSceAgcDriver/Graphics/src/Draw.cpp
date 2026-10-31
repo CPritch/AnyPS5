@@ -1262,7 +1262,9 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
         behind = recorder->PendingWriteOverlaps(address, bytes);
         Recorder::CountSnapshotAgreement(behind, address, bytes);
     }
-    if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
+    const bool labelled = recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes);
+    Recorder::CountLabelSnapshotAgreement(labelled, address, bytes);
+    if (labelled) return nullptr;
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
     if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
     const auto drawWriters = DrawCopiedWriters();
