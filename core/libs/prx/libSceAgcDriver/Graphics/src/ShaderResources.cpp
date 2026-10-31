@@ -3497,6 +3497,36 @@ bool AnyPendingCpuWrites(const Context& context) {
     return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
 }
 
+namespace {
+
+struct CopiedWaitSplit {
+    std::array<std::atomic<std::uint64_t>, 3> count{}, ns{}, bytes{};
+};
+
+CopiedWaitSplit& CommitterCopiedWaits() {
+    static CopiedWaitSplit split;
+    return split;
+}
+
+bool CommitterCopiedWaitCounted() {
+    static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return counted && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer;
+}
+
+}
+
+std::string TakeCommitterCopiedWaitText() {
+    auto& waits = CommitterCopiedWaits();
+    constexpr std::array<const char*, 3> names{"a copied writer of the context", "a draw's copied writer", "a completion label"};
+    std::string text = "; committer syncs for pending CPU writes over a resource (count/ms/MiB):";
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        char item[96];
+        std::snprintf(item, sizeof(item), "%s %s %llu/%.1f/%.1f", i == 0 ? "" : ",", names[i], static_cast<unsigned long long>(waits.count[i].exchange(0, std::memory_order_relaxed)), static_cast<double>(waits.ns[i].exchange(0, std::memory_order_relaxed)) / 1e6, static_cast<double>(waits.bytes[i].exchange(0, std::memory_order_relaxed)) / 1048576.0);
+        text += item;
+    }
+    return text;
+}
+
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || Recorder::InCompletion()) return false;
     auto* recorder = Recorder::Active();
@@ -3508,9 +3538,21 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); });
     };
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
+    const bool contextCopied = context.copiedWriters != nullptr && overlaps(*context.copiedWriters);
+    const bool drawCopied = !contextCopied && overlaps(*drawWriters);
+    const bool label = !contextCopied && !drawCopied && labels && recorder->PendingLabelIn(address, bytes);
+    if (contextCopied || drawCopied || label) {
         Recorder::CountSync(4);
+        const bool counted = CommitterCopiedWaitCounted();
+        const auto start = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         recorder->SyncThrough(address, bytes);
+        if (counted) {
+            auto& waits = CommitterCopiedWaits();
+            const auto kind = contextCopied ? 0u : drawCopied ? 1u : 2u;
+            waits.count[kind].fetch_add(1, std::memory_order_relaxed);
+            waits.ns[kind].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+            waits.bytes[kind].fetch_add(bytes, std::memory_order_relaxed);
+        }
         return true;
     }
     return false;

@@ -2169,6 +2169,14 @@ struct UnprovedImage {
 std::mutex unprovedMutex;
 std::map<std::pair<std::uint64_t, std::uint64_t>, UnprovedImage> unprovedImages;
 
+struct WriterWait {
+    std::uint64_t count = 0, ns = 0, stores = 0, shaders = 0, other = 0, open = 0;
+    std::map<std::uint64_t, std::uint64_t> programs;
+};
+
+std::mutex writerWaitMutex;
+std::map<std::string, WriterWait> writerWaits;
+
 CommitterRefreshSplit& CommitterRefreshes() {
     static CommitterRefreshSplit split;
     return split;
@@ -2188,6 +2196,29 @@ std::string StorageTexture::TakeCommitterRefreshText() {
     char stamped[96];
     std::snprintf(stamped, sizeof(stamped), ", of the rest proved by stamps %llu/%.1f", static_cast<unsigned long long>(split.stamped.exchange(0, std::memory_order_relaxed)), static_cast<double>(split.stampedNs.exchange(0, std::memory_order_relaxed)) / 1e6);
     text += stamped;
+    std::vector<std::pair<std::string, WriterWait>> waits;
+    {
+        std::lock_guard lock(writerWaitMutex);
+        waits.assign(writerWaits.begin(), writerWaits.end());
+        writerWaits.clear();
+    }
+    std::sort(waits.begin(), waits.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    text += "; committer image stores waiting for other writers by reason (count/ms; pending writes over the range: stores, shader writers [top programs], other, in the open batch):";
+    for (std::size_t i = 0; i < waits.size() && i < 4; ++i) {
+        const auto& [reason, wait] = waits[i];
+        char item[192];
+        std::snprintf(item, sizeof(item), " [%s %llu/%.1f; %llu, %llu", reason.c_str(), static_cast<unsigned long long>(wait.count), static_cast<double>(wait.ns) / 1e6, static_cast<unsigned long long>(wait.stores), static_cast<unsigned long long>(wait.shaders));
+        text += item;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> programs(wait.programs.begin(), wait.programs.end());
+        std::sort(programs.begin(), programs.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        for (std::size_t k = 0; k < programs.size() && k < 3; ++k) {
+            std::snprintf(item, sizeof(item), "%s0x%llx:%llu", k == 0 ? " [" : " ", static_cast<unsigned long long>(programs[k].first), static_cast<unsigned long long>(programs[k].second));
+            text += item;
+        }
+        if (!programs.empty()) text += "]";
+        std::snprintf(item, sizeof(item), ", %llu, %llu]", static_cast<unsigned long long>(wait.other), static_cast<unsigned long long>(wait.open));
+        text += item;
+    }
     std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, UnprovedImage>> images;
     {
         std::lock_guard lock(unprovedMutex);
@@ -4478,7 +4509,28 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 earlier.emplace(*recorder, address, bytes);
                 orderedFlushes.fetch_add(1, std::memory_order_relaxed);
             } else {
+                static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+                const bool committer = counted && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer;
+                const auto writes = committer ? recorder->PendingWritesOver(address, bytes) : std::vector<Recorder::PendingWrite>{};
+                const auto waitStart = committer ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 waitForWriters(*recorder, address, bytes, ownNotes);
+                if (committer) {
+                    const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count());
+                    std::lock_guard lock(writerWaitMutex);
+                    auto& wait = writerWaits[reason != nullptr ? reason : "unnamed"];
+                    ++wait.count;
+                    wait.ns += ns;
+                    for (const auto& write : writes) {
+                        if (write.open) ++wait.open;
+                        if (write.store != 0) ++wait.stores;
+                        else if (write.writer != 0) {
+                            ++wait.shaders;
+                            ++wait.programs[write.writer];
+                        } else {
+                            ++wait.other;
+                        }
+                    }
+                }
             }
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();

@@ -3822,6 +3822,7 @@ std::string TakeDrawSplitText() {
     result += ShaderResources::TakeCommitterProofText();
     result += ShaderResources::TakeCommitterMovedText();
     result += StorageTexture::TakeCommitterRefreshText();
+    result += TakeCommitterCopiedWaitText();
     return result;
 }
 
