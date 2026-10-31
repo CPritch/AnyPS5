@@ -35,6 +35,7 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <map>
 #include <limits>
 #include <exception>
@@ -2682,12 +2683,17 @@ void StorageTexture::takeRefreshProof(bool aliased) {
     if (otherPendingOverlaps()) {
         lastProofRefusal = 5;
         static const bool named = std::getenv("APS5_COMMIT_STATS") != nullptr;
-        static std::atomic<int> namesLeft{8};
-        if (named && namesLeft.load(std::memory_order_relaxed) > 0) {
+        static std::mutex namedMutex;
+        static std::set<std::pair<std::uint64_t, std::uint64_t>> namedPairs;
+        if (named) {
             auto& pending = Pending();
             std::lock_guard lock(pending.mutex);
             const auto describe = [&](const StorageTexture* texture, const char* list) {
-                if (texture == this || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) || namesLeft.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+                if (texture == this || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return;
+                {
+                    std::lock_guard namedLock(namedMutex);
+                    if (namedPairs.size() >= 32 || !namedPairs.emplace(descriptor.baseAddress, texture->descriptor.baseAddress).second) return;
+                }
                 std::fprintf(stderr, "[draw] refresh proof of 0x%llx+0x%llx (format %d) refused: %s image 0x%llx+0x%llx (format %d) overlaps it, dirty %d, pending units inside %d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<int>(descriptor.format), list, static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), static_cast<int>(texture->descriptor.format), texture->dirty ? 1 : 0, texture->pendingUnitInside(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? 1 : 0);
             };
             for (const auto* texture : pending.textures) describe(texture, "pending");
