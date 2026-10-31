@@ -294,6 +294,7 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     void PrecollectSurfaces(GuestMemory::PrecollectedWrites& into) const;
+    bool DescribedRangesOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
     bool InResourceCache() const { return inResourceCache.load(std::memory_order_acquire); }
     bool Reusable() const { return reusable; }
     void KeepStorageImageBytes(Recorder& recorder) const;

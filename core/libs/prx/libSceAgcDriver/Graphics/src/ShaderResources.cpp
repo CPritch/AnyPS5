@@ -4856,6 +4856,12 @@ void ShaderResources::PrecollectSurfaces() const {
     for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
 }
 
+bool ShaderResources::DescribedRangesOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {
+    return std::any_of(describedRanges.begin(), describedRanges.end(), [&](const DescribedRange& range) {
+        return std::any_of(ranges.begin(), ranges.end(), [&](const auto& other) { return range.address < other.second && other.first < range.address + range.bytes; });
+    });
+}
+
 void ShaderResources::PrecollectSurfaces(GuestMemory::PrecollectedWrites& into) const {
     for (const auto& range : describedRanges) GuestMemory::Precollect(into, range.address, static_cast<std::size_t>(range.bytes));
 }

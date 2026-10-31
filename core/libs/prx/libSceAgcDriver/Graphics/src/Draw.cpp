@@ -1808,6 +1808,7 @@ struct DrawSplitCounts {
     std::atomic<std::uint64_t> proofFailed{0}, findNs{0}, movedNs{0}, hits{0}, unmoved{0}, invalidated{0}, misses{0}, uncacheable{0};
     std::array<std::atomic<std::uint64_t>, 5> proofGap{}, pendingGap{};
     std::atomic<std::uint64_t> traced{0}, lockFree{0}, freePairs{0}, touching{0}, recording{0}, recorderUsing{0}, uncoupled{0};
+    std::atomic<std::uint64_t> afterNonDraw{0}, previousBrokeProofs{0}, previousChangedPending{0}, brokenBetween{0}, samplesPreviousTargets{0}, wouldSplit{0};
 };
 
 std::mutex resolveSitesMutex;
@@ -1815,6 +1816,17 @@ std::map<const void*, std::uint64_t> resolveTouchSites;
 std::map<const void*, std::uint64_t> resolveCommandSites;
 std::map<const void*, std::uint64_t> resolveRecorderSites;
 std::map<std::string, std::uint64_t> resolveRecorderMethods;
+
+thread_local bool lastResolveLockFree = false;
+
+struct LastEmit {
+    std::uint64_t sequence = 0;
+    bool proofStable = false;
+    bool pendingStable = false;
+    std::uint64_t proofAtEnd = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> targets;
+};
+thread_local LastEmit lastEmit;
 
 std::string ModuleOffsetText(const void* site) {
     unsigned long long offset = reinterpret_cast<std::uintptr_t>(site);
@@ -2990,6 +3002,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             if (trace.commands != 0) split.recording.fetch_add(1, std::memory_order_relaxed);
             if (trace.recorderUses != 0) split.recorderUsing.fetch_add(1, std::memory_order_relaxed);
             if (trace.touches == 0 && trace.commands == 0 && trace.recorderUses == 0) split.uncoupled.fetch_add(1, std::memory_order_relaxed);
+            lastResolveLockFree = trace.touches == 0 && trace.commands == 0;
             thread_local std::uint64_t lastFree = 0;
             if (trace.recorderSiteCount != 0) {
                 std::lock_guard lock(resolveSitesMutex);
@@ -3942,6 +3955,9 @@ std::string TakeDrawSplitText() {
             resolveRecorderMethods.clear();
         }
         std::sort(methods.begin(), methods.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        char split[320];
+        std::snprintf(split, sizeof(split), "; of the lock-free resolves, if resolved beside the previous item's emit: after a non-draw item %llu, the previous draw's emit broke proofs %llu, changed pending images %llu, proofs broken between %llu, samples the previous draw's targets %llu, would split %llu", static_cast<unsigned long long>(DrawSplit().afterNonDraw.exchange(0)), static_cast<unsigned long long>(DrawSplit().previousBrokeProofs.exchange(0)), static_cast<unsigned long long>(DrawSplit().previousChangedPending.exchange(0)), static_cast<unsigned long long>(DrawSplit().brokenBetween.exchange(0)), static_cast<unsigned long long>(DrawSplit().samplesPreviousTargets.exchange(0)), static_cast<unsigned long long>(DrawSplit().wouldSplit.exchange(0)));
+        result += split;
         result += "; draws by recorder method:";
         for (std::size_t i = 0; i < methods.size() && i < 24; ++i) result += " " + methods[i].first + ":" + std::to_string(methods[i].second);
     }
@@ -3982,7 +3998,21 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         prepared.timer.phaseStart = std::chrono::steady_clock::now();
     }
     const auto started = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto proofAtResolve = counted ? GuestMemory::ProofSerial() : 0;
+    lastResolveLockFree = false;
     const bool ready = prepareDraw(context, state, draw, shaders, snapshots, prepared);
+    const auto proofAtEmit = counted ? GuestMemory::ProofSerial() : 0;
+    const auto pendingAtEmit = counted ? StorageTexture::PendingSerial() : 0;
+    if (counted && lastResolveLockFree) {
+        auto& split = DrawSplit();
+        const auto sequence = AgcDriver::DriverDetail::DrawPipeline::CommitSequence();
+        if (lastEmit.sequence == 0 || lastEmit.sequence + 1 != sequence) split.afterNonDraw.fetch_add(1, std::memory_order_relaxed);
+        else if (!lastEmit.proofStable) split.previousBrokeProofs.fetch_add(1, std::memory_order_relaxed);
+        else if (!lastEmit.pendingStable) split.previousChangedPending.fetch_add(1, std::memory_order_relaxed);
+        else if (proofAtResolve != lastEmit.proofAtEnd) split.brokenBetween.fetch_add(1, std::memory_order_relaxed);
+        else if (prepared.resolved.resources != nullptr && prepared.resolved.resources->DescribedRangesOverlap(lastEmit.targets)) split.samplesPreviousTargets.fetch_add(1, std::memory_order_relaxed);
+        else split.wouldSplit.fetch_add(1, std::memory_order_relaxed);
+    }
     if (!prepared.deferred.Empty() && context.recorder != nullptr) context.recorder->ApplyDeferred(prepared.deferred);
     static const bool forceRedo = std::getenv("APS5_FORCE_DRAW_REDO") != nullptr;
     bool redo = forceRedo && !prepared.colorRefreshes.empty();
@@ -4018,6 +4048,20 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     }
     const auto prepared_at = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (ready) recordPreparedDraw(context, state, draw, shaders, prepared);
+    if (counted) {
+        lastEmit.sequence = AgcDriver::DriverDetail::DrawPipeline::CommitSequence();
+        lastEmit.proofAtEnd = GuestMemory::ProofSerial();
+        lastEmit.proofStable = lastEmit.proofAtEnd == proofAtEmit;
+        lastEmit.pendingStable = StorageTexture::PendingSerial() == pendingAtEmit;
+        lastEmit.targets.clear();
+        for (const auto& color : state.colors) lastEmit.targets.emplace_back(color.address, color.address + color.bytes);
+        if (state.depth) {
+            const auto planeBytes = static_cast<std::uint64_t>(state.depth->extent.width) * state.depth->extent.height * 4u * std::max<std::uint32_t>(state.depth->samples, 1u) * (state.depth->lastSlice - state.depth->firstSlice + 1u);
+            lastEmit.targets.emplace_back(state.depth->address, state.depth->address + planeBytes);
+            if (state.depth->stencilAddress != 0) lastEmit.targets.emplace_back(state.depth->stencilAddress, state.depth->stencilAddress + planeBytes / 4u);
+            if (state.depth->htileAddress != 0) lastEmit.targets.emplace_back(state.depth->htileAddress, state.depth->htileAddress + HtileMetadataBytes(state.depth->extent));
+        }
+    }
     if (!counted) return;
     auto& split = DrawSplit();
     split.full.fetch_add(1, std::memory_order_relaxed);
