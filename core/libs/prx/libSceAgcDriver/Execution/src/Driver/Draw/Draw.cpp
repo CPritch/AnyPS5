@@ -1533,7 +1533,17 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     } else {
         Graphics::DrawPacketPtr packet;
         bool fromEarly = false;
+        const bool timed = DrawSplitTimed();
+        const auto clock = [timed] { return timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
         if (early != nullptr && early->packet != nullptr) {
+            const auto checking = clock();
+            struct CheckTimer {
+                bool timed;
+                std::chrono::steady_clock::time_point since;
+                ~CheckTimer() {
+                    if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Check, since);
+                }
+            } checkTimer{timed, checking};
             using E = DrawPipeline::EarlyEvent;
             auto stale = E::Used;
             if (early->device != localDevice.get()) stale = E::StaleDevice;
@@ -1584,16 +1594,29 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
                 early->built.reset();
             }
         }
-        if (packet == nullptr) packet = localDevice->ResolveDraw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, prepared);
+        if (packet == nullptr) {
+            const auto resolving = clock();
+            packet = localDevice->ResolveDraw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, prepared);
+            if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::ResolveWhole, resolving);
+        }
         if (fromEarly) localDevice->ApplyDrawMemoKeeps(*packet);
         struct JoinGuard {
-            ~JoinGuard() noexcept(false) { DrawPipeline::JoinResolve(); }
-        } joinGuard;
+            bool timed;
+            ~JoinGuard() noexcept(false) {
+                const auto joining = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                DrawPipeline::JoinResolve();
+                if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Join, joining);
+            }
+        } joinGuard{timed};
         if (DrawPipeline::ResolveSplit() != 0) {
+            const auto offering = clock();
             const auto depth = DrawDepthRanges(graphics);
             DrawPipeline::OfferEarly(depth);
+            if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Offer, offering);
         }
+        const auto emitting = clock();
         localDevice->EmitDraw(*packet);
+        if (timed) DrawPipeline::NoteCommitterPart(fromEarly ? DrawPipeline::CommitterPart::EmitEarly : DrawPipeline::CommitterPart::EmitWhole, emitting);
         if (fromEarly) built = std::move(early->built);
     }
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));

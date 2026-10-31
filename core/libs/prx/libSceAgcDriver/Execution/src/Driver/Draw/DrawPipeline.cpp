@@ -45,6 +45,7 @@ thread_local PendingEarly pendingEarly;
 thread_local bool skipCommittingReads = false;
 enum ResolveJobState : int { ResolveIdle, ResolvePosted, ResolveRunning, ResolveDone };
 std::atomic<std::uint64_t> earlyResolveNs{0}, earlyResolveCount{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::CommitterPart::Count)> committerPartNs{}, committerPartCount{};
 std::atomic<std::uint64_t> resolvesPosted{0}, resolvesRevoked{0}, resolvesDoneBeforeJoin{0}, resolvesWaited{0}, resolveWaitNs{0}, resolveStartNs{0}, resolveBusyNs{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::EarlyEvent::Count)> earlyEvents{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> earlyAborts{};
@@ -141,6 +142,13 @@ std::string QueueWaits::Text() {
         for (std::size_t kind = 1; kind < earlyAborts.size(); ++kind) {
             const auto count = earlyAborts[kind].exchange(0, std::memory_order_relaxed);
             if (count != 0) text += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
+        }
+        text += " committer draw parts (count, ns each):";
+        constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitterPart::Count)> partNames{"early-packet checks", "resolves of its own", "offers", "emits of early packets", "emits of its own packets", "joins"};
+        for (std::size_t part = 0; part < partNames.size(); ++part) {
+            const auto count = committerPartCount[part].exchange(0, std::memory_order_relaxed);
+            const auto ns = committerPartNs[part].exchange(0, std::memory_order_relaxed);
+            text += std::string(" ") + partNames[part] + " " + std::to_string(count) + " " + std::to_string(count == 0 ? 0 : ns / count) + ",";
         }
         if (DrawPipeline::ResolveSplit() == 1) {
             const auto count = earlyResolveCount.exchange(0, std::memory_order_relaxed);
@@ -483,6 +491,12 @@ std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
 
 void DrawPipeline::NoteEarly(EarlyEvent event) {
     earlyEvents[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawPipeline::NoteCommitterPart(CommitterPart part, std::chrono::steady_clock::time_point since) {
+    const auto index = static_cast<std::size_t>(part);
+    committerPartNs[index].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count()), std::memory_order_relaxed);
+    committerPartCount[index].fetch_add(1, std::memory_order_relaxed);
 }
 
 void DrawPipeline::NoteEarlyResolveNs(std::uint64_t ns) {
