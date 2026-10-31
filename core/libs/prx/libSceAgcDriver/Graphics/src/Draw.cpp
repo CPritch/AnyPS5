@@ -2828,6 +2828,7 @@ struct PreparedDraw {
     Recorder::DeferredEffects deferred;
     FoundDepthView depthFound;
     std::vector<std::size_t> colorRefreshes;
+    std::optional<std::pair<ResourceCache::Key, std::shared_ptr<ShaderResources>>> deferredInsert;
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
     std::uint64_t shape = 0;
@@ -3395,7 +3396,11 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
-    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    if (cacheable && built != nullptr && recorded && resources->Reusable()) {
+        static const bool deferInsert = std::getenv("APS5_NO_DEFERRED_TEMPLATE_INSERT") == nullptr;
+        if (deferInsert && !redoingWhole) prepared.deferredInsert.emplace(contentKey, resources);
+        else SharedResourceCache().Insert(contentKey, resources);
+    }
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.
@@ -4218,6 +4223,10 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
         } restore;
         Draw(context, state, draw, shaders, snapshots, packet.recipeOut, packet.trace, packet.shape, nullptr);
         return;
+    }
+    if (prepared.deferredInsert.has_value()) {
+        SharedResourceCache().Insert(prepared.deferredInsert->first, prepared.deferredInsert->second);
+        prepared.deferredInsert.reset();
     }
     if (prepared.depthFound.view != VK_NULL_HANDLE) {
         const auto view = DepthSurfaceView(context, *state.depth, state.depthWrite);
