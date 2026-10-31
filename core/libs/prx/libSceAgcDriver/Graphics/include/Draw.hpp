@@ -94,6 +94,8 @@ void SetRedoHook(void (*hook)());
 enum class DrawPacketField : std::uint8_t { Template, Pipeline, Targets, Framebuffer, Inputs, Moved, Depth, Refreshes, Flags, Count };
 std::uint32_t CompareDrawPackets(const DrawPacket& first, const DrawPacket& second);
 const char* DrawPacketFieldName(DrawPacketField field);
+enum class PredictReason : std::uint8_t { Accepted, MultisampledColor, MultisampledDepth, StencilReplay, QuadList, Indirect, NoSlot, NotLooked, NoHint, HintGone, ProofNotCurrent, NoMovedPlan, Count };
+PredictReason PredictPureReason(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawAhead* ahead);
 bool PredictPureResolve(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawAhead* ahead);
 enum class StaleViewSite : std::uint8_t { InputPending, InputLabel, MovedPending, Count };
 void CountStaleView(StaleViewSite site, bool live, std::uint64_t address, std::size_t bytes);

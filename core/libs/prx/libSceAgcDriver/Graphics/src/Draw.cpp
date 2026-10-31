@@ -1358,6 +1358,8 @@ std::atomic<std::uint64_t> deferredColorRefreshes{0};
 std::atomic<std::uint64_t> redoneWhole{0};
 std::atomic<std::uint64_t> deferredDepthViews{0};
 std::atomic<std::uint64_t> deferredDepthViewsChanged{0};
+std::atomic<std::uint64_t> deferredDepthViewNs{0};
+std::atomic<std::uint64_t> deferredMultisampledDepthViews{0};
 std::atomic<std::uint64_t> movedPlanNs{0};
 
 std::uint64_t VerifyDrawAheadEvery() {
@@ -1840,6 +1842,7 @@ struct DrawSplitCounts {
     std::array<std::atomic<std::uint64_t>, 4> firstQuarter{};
     std::atomic<std::uint64_t> unbarred{0}, uncleanMutex{0}, uncleanCompletion{0}, memoDraws{0};
     std::array<std::atomic<std::uint64_t>, 4> prediction{};
+    std::array<std::array<std::atomic<std::uint64_t>, 2>, static_cast<std::size_t>(PredictReason::Count)> reasonPurity{};
     std::atomic<std::uint64_t> predictedPairs{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> mispredictedKind{};
 };
@@ -1851,6 +1854,7 @@ std::map<const void*, std::uint64_t> resolveRecorderSites;
 std::map<std::string, std::uint64_t> resolveRecorderMethods;
 std::map<const void*, std::uint64_t> resolveFirstBarrierSites;
 thread_local bool resolvePredictedPure = false;
+thread_local PredictReason resolvePredictReason = PredictReason::Accepted;
 
 thread_local bool lastResolveLockFree = false;
 
@@ -3079,6 +3083,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                 ++resolveFirstBarrierSites[trace.firstSite];
             }
             split.prediction[(resolvePredictedPure ? 2u : 0u) + (barred ? 0u : 1u)].fetch_add(1, std::memory_order_relaxed);
+            split.reasonPurity[static_cast<std::size_t>(resolvePredictReason)][barred ? 0u : 1u].fetch_add(1, std::memory_order_relaxed);
             if (resolvePredictedPure && barred) split.mispredictedKind[std::min<std::size_t>(trace.firstKind, split.mispredictedKind.size() - 1)].fetch_add(1, std::memory_order_relaxed);
             thread_local std::uint64_t lastPredicted = 0;
             if (resolvePredictedPure && !barred) {
@@ -4013,8 +4018,9 @@ std::string TakeDrawSplitText() {
     char failed[48];
     std::snprintf(failed, sizeof(failed), ", failed %llu", take(split.proofFailed));
     result += failed;
-    char depthViews[256];
-    std::snprintf(depthViews, sizeof(depthViews), "; depth views found in resolve and noted after it %llu, of them a different surface by then %llu; color targets refreshed after resolve %llu, draws redone whole %llu", static_cast<unsigned long long>(deferredDepthViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredDepthViewsChanged.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredColorRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(redoneWhole.exchange(0, std::memory_order_relaxed)));
+    char depthViews[384];
+    const auto viewed = deferredDepthViews.load(std::memory_order_relaxed);
+    std::snprintf(depthViews, sizeof(depthViews), "; depth views found in resolve and noted after it %llu (multisampled %llu, %.0f ns each at emit), of them a different surface by then %llu; color targets refreshed after resolve %llu, draws redone whole %llu", static_cast<unsigned long long>(deferredDepthViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredMultisampledDepthViews.exchange(0, std::memory_order_relaxed)), viewed == 0 ? 0.0 : static_cast<double>(deferredDepthViewNs.exchange(0, std::memory_order_relaxed)) / static_cast<double>(viewed), static_cast<unsigned long long>(deferredDepthViewsChanged.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredColorRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(redoneWhole.exchange(0, std::memory_order_relaxed)));
     result += depthViews;
     char gaps[256];
     std::snprintf(gaps, sizeof(gaps), "; hinted templates by proof breaks between the preparer's lookup and the commit (0, 1-4, 5-16, 17-64, more): %llu %llu %llu %llu %llu; by pending-image changes: %llu %llu %llu %llu %llu", take(split.proofGap[0]), take(split.proofGap[1]), take(split.proofGap[2]), take(split.proofGap[3]), take(split.proofGap[4]), take(split.pendingGap[0]), take(split.pendingGap[1]), take(split.pendingGap[2]), take(split.pendingGap[3]), take(split.pendingGap[4]));
@@ -4078,6 +4084,15 @@ std::string TakeDrawSplitText() {
             }
             result += " by quarter of the resolve " + std::to_string(drawSplit.firstQuarter[0].exchange(0)) + "/" + std::to_string(drawSplit.firstQuarter[1].exchange(0)) + "/" + std::to_string(drawSplit.firstQuarter[2].exchange(0)) + "/" + std::to_string(drawSplit.firstQuarter[3].exchange(0));
             result += ", with a driver mutex held " + std::to_string(drawSplit.uncleanMutex.exchange(0)) + ", inside a completion " + std::to_string(drawSplit.uncleanCompletion.exchange(0)) + "; resolves writing a snapshot or index memo " + std::to_string(drawSplit.memoDraws.exchange(0));
+            {
+                constexpr std::array<const char*, static_cast<std::size_t>(PredictReason::Count)> reasons{"accepted", "multisampled colour", "multisampled depth", "stencil replay", "quad list", "indirect", "no slot", "slot not looked", "no hint", "hint left the cache", "proof not current", "no moved plan"};
+                result += "; predictor by first failing condition (impure/pure):";
+                for (std::size_t reason = 0; reason < reasons.size(); ++reason) {
+                    const auto impure = drawSplit.reasonPurity[reason][0].exchange(0);
+                    const auto pure = drawSplit.reasonPurity[reason][1].exchange(0);
+                    if (impure + pure != 0) result += std::string(" ") + reasons[reason] + " " + std::to_string(impure) + "/" + std::to_string(pure) + ",";
+                }
+            }
             result += "; predictor (predicted-actual): impure-impure " + std::to_string(drawSplit.prediction[0].exchange(0)) + ", impure-pure " + std::to_string(drawSplit.prediction[1].exchange(0)) + ", pure-impure " + std::to_string(drawSplit.prediction[2].exchange(0)) + ", pure-pure " + std::to_string(drawSplit.prediction[3].exchange(0)) + " (pairs " + std::to_string(drawSplit.predictedPairs.exchange(0)) + "); mispredicted by first barrier:";
             for (std::size_t kind = 1; kind < drawSplit.mispredictedKind.size(); ++kind) {
                 const auto count = drawSplit.mispredictedKind[kind].exchange(0);
@@ -4223,10 +4238,23 @@ void DiscardDrawPacket(const Context& context, DrawPacket& packet) {
     if (!packet.prepared.deferred.Empty() && context.recorder != nullptr) context.recorder->ApplyDeferred(packet.prepared.deferred);
 }
 
+PredictReason PredictPureReason(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawAhead* ahead) {
+    if (!std::all_of(state.colors.begin(), state.colors.end(), [](const ColorTarget& color) { return color.samples <= 1; })) return PredictReason::MultisampledColor;
+    if (state.depth && state.depth->samples > 1) return PredictReason::MultisampledDepth;
+    if (std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); })) return PredictReason::StencilReplay;
+    if (state.quadList) return PredictReason::QuadList;
+    if (draw.indirect) return PredictReason::Indirect;
+    if (ahead == nullptr) return PredictReason::NoSlot;
+    if (!ahead->looked) return PredictReason::NotLooked;
+    if (ahead->found == nullptr) return PredictReason::NoHint;
+    if (!ahead->found->InResourceCache()) return PredictReason::HintGone;
+    if (!ahead->found->EpochProofCurrent()) return PredictReason::ProofNotCurrent;
+    if (!ahead->movedPlanned || !ahead->movedPlan.has_value()) return PredictReason::NoMovedPlan;
+    return PredictReason::Accepted;
+}
+
 bool PredictPureResolve(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawAhead* ahead) {
-    const bool singleSample = std::all_of(state.colors.begin(), state.colors.end(), [](const ColorTarget& color) { return color.samples <= 1; }) && (!state.depth || state.depth->samples <= 1);
-    const bool stencilReplay = std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); });
-    return singleSample && !stencilReplay && !state.quadList && !draw.indirect && ahead != nullptr && ahead->looked && ahead->found != nullptr && ahead->found->InResourceCache() && ahead->found->EpochProofCurrent() && ahead->movedPlanned && ahead->movedPlan.has_value();
+    return PredictPureReason(state, draw, shaders, ahead) == PredictReason::Accepted;
 }
 
 DrawPacketPtr ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, DrawAhead* ahead) {
@@ -4246,7 +4274,8 @@ DrawPacketPtr ResolveDraw(const Context& context, const State& state, const Pm4:
     if (DrawSplitCounted()) {
         static const bool probe = (GuestMemory::SetResolveCompletionProbe(&Recorder::InCompletion), true);
         static_cast<void>(probe);
-        resolvePredictedPure = PredictPureResolve(state, draw, shaders, prepared.ahead.ahead);
+        resolvePredictReason = PredictPureReason(state, draw, shaders, prepared.ahead.ahead);
+        resolvePredictedPure = resolvePredictReason == PredictReason::Accepted;
     }
     std::optional<GuestMemory::PrecollectedScope> precollected;
     if (prepared.ahead.ahead != nullptr && !prepared.ahead.ahead->walks.walks.empty()) {
@@ -4336,7 +4365,11 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
         materializeCmaskClear(context, binding.color, binding.resident);
     }
     if (!redo && prepared.depthFound.view != VK_NULL_HANDLE) {
+        const bool timed = DrawSplitCounted();
+        const auto viewing = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto view = DepthSurfaceView(context, *state.depth, state.depthWrite);
+        if (timed) deferredDepthViewNs.fetch_add(NanosecondsBetween(viewing, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+        if (state.depth->samples > 1u) deferredMultisampledDepthViews.fetch_add(1, std::memory_order_relaxed);
         deferredDepthViews.fetch_add(1, std::memory_order_relaxed);
         if (view != prepared.depthFound.view) {
             deferredDepthViewsChanged.fetch_add(1, std::memory_order_relaxed);

@@ -2198,7 +2198,8 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
 }
 
 FoundDepthView FindDepthSurfaceView(const Context& context, const DepthTarget& target) {
-    if (target.samples != 1u) return {};
+    static const bool multisampled = std::getenv("APS5_NO_DEFERRED_MSAA_DEPTH_VIEW") == nullptr;
+    if (target.samples != 1u && !multisampled) return {};
     std::lock_guard lock(surfacesMutex());
     for (const auto& candidate : surfaces()) {
         if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) return {candidate->view, candidate->owned};
@@ -2287,7 +2288,6 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
 }
 
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target) {
-    std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
     for (const auto& candidate : surfaces()) {
         if (!candidate->active->load(std::memory_order_acquire) || candidate->context.device != context.device || !sameSurface(candidate->target, target)) continue;
@@ -2298,7 +2298,6 @@ SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTar
 }
 
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target) {
-    std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
     for (const auto& candidate : surfaces()) {
         if (!candidate->active->load(std::memory_order_acquire) || candidate->context.device != context.device || !sameSurface(candidate->target, target)) continue;
@@ -2684,7 +2683,6 @@ bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resou
 
 void RequireNoNativeDepthFeedback_nid_no_patch(const Context& context, const DepthTarget& target, std::span<const std::shared_ptr<Texture>> sampled) {
     if (target.samples == 1u || sampled.empty()) return;
-    std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
         if (!surface->active->load(std::memory_order_acquire)) continue;
