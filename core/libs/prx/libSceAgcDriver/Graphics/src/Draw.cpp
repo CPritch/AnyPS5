@@ -1329,6 +1329,9 @@ std::array<DrawAheadCounter, DrawAheadEvents> drawAheadTotals{};
 std::atomic<bool> drawAheadDisabled{false};
 std::atomic<bool> drawAheadThrows{false};
 std::atomic<std::uint64_t> drawAheadNs{0};
+thread_local bool redoingWhole = false;
+std::atomic<std::uint64_t> deferredColorRefreshes{0};
+std::atomic<std::uint64_t> redoneWhole{0};
 std::atomic<std::uint64_t> deferredDepthViews{0};
 std::atomic<std::uint64_t> deferredDepthViewsChanged{0};
 std::atomic<std::uint64_t> movedPlanNs{0};
@@ -2771,6 +2774,7 @@ struct PreparedDraw {
     std::vector<std::pair<std::uint64_t, std::size_t>> deferredReads;
     Recorder::DeferredEffects deferred;
     FoundDepthView depthFound;
+    std::vector<std::size_t> colorRefreshes;
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
     std::uint64_t shape = 0;
@@ -3005,7 +3009,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
     } resolveTrace{counted && DrawSplitCounted()};
     static const bool deferEffects = std::getenv("APS5_NO_DEFERRED_RECORDER_EFFECTS") == nullptr;
-    const Recorder::DeferScope deferEffectsScope(deferEffects && context.recorder != nullptr ? &prepared.deferred : nullptr);
+    const Recorder::DeferScope deferEffectsScope(deferEffects && !redoingWhole && context.recorder != nullptr ? &prepared.deferred : nullptr);
     // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
     // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
     // draws, their inputs: per-draw string building at ~1400 draws per 10 s is itself a cost the
@@ -3021,7 +3025,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
     static const bool deferInputReads = std::getenv("APS5_NO_DEFERRED_INPUT_READS") == nullptr;
-    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared.ahead, deferInputReads ? &prepared.deferredReads : nullptr);
+    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared.ahead, deferInputReads && !redoingWhole ? &prepared.deferredReads : nullptr);
     if (inputs.nothing) return false;
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -3065,7 +3069,16 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
-            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+            static const bool deferColorRefresh = std::getenv("APS5_NO_DEFERRED_COLOR_REFRESH") == nullptr;
+            std::shared_ptr<StorageTexture> found;
+            if (deferColorRefresh && !redoingWhole && color.arrayLastSlice == 0 && !VerifyShapeMemo()) {
+                found = FindRepeatStorageSurface(context, SurfaceForTarget(color), shapeTarget(context, prepared.shape, index));
+                if (found != nullptr && (!found->Attachable() || !(color.mipCount > 1 || color.depth > 1 || found->GuestBytes() == colorLayout.Bytes()))) found = nullptr;
+            }
+            if (found != nullptr) {
+                binding.resident = std::move(found);
+                prepared.colorRefreshes.push_back(index);
+            } else binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -3151,7 +3164,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     if (state.depth) {
         static const bool deferDepth = std::getenv("APS5_NO_DEFERRED_DEPTH_VIEW") == nullptr;
-        if (deferDepth) prepared.depthFound = FindDepthSurfaceView(context, *state.depth);
+        if (deferDepth && !redoingWhole) prepared.depthFound = FindDepthSurfaceView(context, *state.depth);
         if (prepared.depthFound.view != VK_NULL_HANDLE) {
             targetViews.push_back(prepared.depthFound.view);
         } else {
@@ -3888,8 +3901,8 @@ std::string TakeDrawSplitText() {
     char failed[48];
     std::snprintf(failed, sizeof(failed), ", failed %llu", take(split.proofFailed));
     result += failed;
-    char depthViews[160];
-    std::snprintf(depthViews, sizeof(depthViews), "; depth views found in resolve and noted after it %llu, of them a different surface by then %llu", static_cast<unsigned long long>(deferredDepthViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredDepthViewsChanged.exchange(0, std::memory_order_relaxed)));
+    char depthViews[256];
+    std::snprintf(depthViews, sizeof(depthViews), "; depth views found in resolve and noted after it %llu, of them a different surface by then %llu; color targets refreshed after resolve %llu, draws redone whole %llu", static_cast<unsigned long long>(deferredDepthViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredDepthViewsChanged.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredColorRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(redoneWhole.exchange(0, std::memory_order_relaxed)));
     result += depthViews;
     char gaps[256];
     std::snprintf(gaps, sizeof(gaps), "; hinted templates by proof breaks between the preparer's lookup and the commit (0, 1-4, 5-16, 17-64, more): %llu %llu %llu %llu %llu; by pending-image changes: %llu %llu %llu %llu %llu", take(split.proofGap[0]), take(split.proofGap[1]), take(split.proofGap[2]), take(split.proofGap[3]), take(split.proofGap[4]), take(split.pendingGap[0]), take(split.pendingGap[1]), take(split.pendingGap[2]), take(split.pendingGap[3]), take(split.pendingGap[4]));
@@ -3971,6 +3984,32 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto started = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool ready = prepareDraw(context, state, draw, shaders, snapshots, prepared);
     if (!prepared.deferred.Empty() && context.recorder != nullptr) context.recorder->ApplyDeferred(prepared.deferred);
+    static const bool forceRedo = std::getenv("APS5_FORCE_DRAW_REDO") != nullptr;
+    bool redo = forceRedo && !prepared.colorRefreshes.empty();
+    for (const auto index : redo ? std::vector<std::size_t>{} : prepared.colorRefreshes) {
+        auto& binding = prepared.targets[index];
+        deferredColorRefreshes.fetch_add(1, std::memory_order_relaxed);
+        try {
+            if (!RefreshCachedStorage(context, binding.resident)) {
+                redo = true;
+                break;
+            }
+            materializeRegisterClear(context, binding.color, *binding.resident);
+        } catch (const std::exception&) {
+            redo = true;
+            break;
+        }
+        materializeCmaskClear(context, binding.color, binding.resident);
+    }
+    if (redo) {
+        redoneWhole.fetch_add(1, std::memory_order_relaxed);
+        redoingWhole = true;
+        struct Restore {
+            ~Restore() { redoingWhole = false; }
+        } restore;
+        Draw(context, state, draw, shaders, snapshots, recipeOut, trace, shape, nullptr);
+        return;
+    }
     if (prepared.depthFound.view != VK_NULL_HANDLE) {
         const auto view = DepthSurfaceView(context, *state.depth, state.depthWrite);
         if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);

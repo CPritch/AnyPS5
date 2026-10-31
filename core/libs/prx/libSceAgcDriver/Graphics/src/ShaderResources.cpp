@@ -1620,7 +1620,9 @@ bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddres
     return !MetadataMoved(image, resource);
 }
 
-std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
+namespace {
+
+std::shared_ptr<StorageTexture> repeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored, bool refresh) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled || stored == nullptr) return nullptr;
     const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
@@ -1639,11 +1641,30 @@ std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, con
     if (resource.mipCount > AllocatedLevels(resource)) return nullptr;
     const auto it = findStorageByImage(cache, context.device, stored.get());
     if (it == cache.entries.end() || MetadataMoved(*it->texture, resource)) return nullptr;
-    it->texture->Refresh();
+    if (refresh) it->texture->Refresh();
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
     TextureCounts().storageHits.fetch_add(1, std::memory_order_relaxed);
     if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
     return it->texture;
+}
+
+}
+
+std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
+    return repeatStorageSurface(context, requested, stored, true);
+}
+
+std::shared_ptr<StorageTexture> FindRepeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
+    return repeatStorageSurface(context, requested, stored, false);
+}
+
+bool RefreshCachedStorage(const Context& context, const std::shared_ptr<StorageTexture>& texture) {
+    auto& cache = StorageTextures();
+    std::lock_guard lock(cache.mutex);
+    const CacheHold held(storageCacheHeld);
+    if (findStorageByImage(cache, context.device, texture.get()) == cache.entries.end()) return false;
+    texture->Refresh();
+    return true;
 }
 
 namespace {
