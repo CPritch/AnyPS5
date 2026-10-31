@@ -3007,8 +3007,36 @@ std::size_t Recorder::UnsignaledBatches() const {
     return static_cast<std::size_t>(std::count_if(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return !signaled(*batch); }));
 }
 
+namespace {
+thread_local Recorder::DeferredEffects* deferringEffects = nullptr;
+}
+
+Recorder::DeferScope::DeferScope(DeferredEffects* into) : into(into), previous(deferringEffects), exceptions(std::uncaught_exceptions()) {
+    if (into != nullptr) deferringEffects = into;
+}
+
+Recorder::DeferScope::~DeferScope() {
+    if (into == nullptr) return;
+    deferringEffects = previous;
+    if (std::uncaught_exceptions() > exceptions && !into->Empty()) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->ApplyDeferred(*into);
+    }
+}
+
+void Recorder::ApplyDeferred(DeferredEffects& effects) {
+    if (effects.bound) BoundKeptBytes();
+    for (auto& [object, bytes] : effects.kept) Keep(std::move(object), bytes);
+    for (const auto& [owner, bytes] : effects.keptBytes) KeepBytes(owner, bytes);
+    for (const auto& [address, bytes, kind] : effects.reads) NotePendingRead(address, bytes, static_cast<ReadKind>(kind));
+    effects = {};
+}
+
 void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    if (deferringEffects != nullptr) {
+        deferringEffects->kept.emplace_back(std::move(object), bytes);
+        return;
+    }
     ensureOpen();
     open->kept.push_back(std::move(object));
     open->keptBytes += bytes;
@@ -3033,6 +3061,10 @@ void Recorder::dropStaleHoldKept() {
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (owner == nullptr || bytes == 0) return;
+    if (deferringEffects != nullptr) {
+        deferringEffects->keptBytes.emplace_back(owner, bytes);
+        return;
+    }
     ensureOpen();
     if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
 }
@@ -3041,6 +3073,10 @@ void Recorder::BoundKeptBytes() {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const HotWaitSiteScope hotSite{__builtin_return_address(0)};
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
+    if (deferringEffects != nullptr) {
+        deferringEffects->bound = true;
+        return;
+    }
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
     while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
@@ -3569,6 +3605,10 @@ bool Recorder::ReadTracking() {
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    if (deferringEffects != nullptr) {
+        deferringEffects->reads.emplace_back(address, bytes, static_cast<int>(kind));
+        return;
+    }
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();

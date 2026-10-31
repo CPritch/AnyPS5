@@ -2767,6 +2767,7 @@ struct PreparedDraw {
     PreparedDraw(const PreparedDraw&) = delete;
     PreparedDraw& operator=(const PreparedDraw&) = delete;
     std::vector<std::pair<std::uint64_t, std::size_t>> deferredReads;
+    Recorder::DeferredEffects deferred;
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
     std::uint64_t shape = 0;
@@ -3000,6 +3001,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             if (trace.commands != 0) ++resolveCommandSites[trace.firstCommands];
         }
     } resolveTrace{counted && DrawSplitCounted()};
+    static const bool deferEffects = std::getenv("APS5_NO_DEFERRED_RECORDER_EFFECTS") == nullptr;
+    const Recorder::DeferScope deferEffectsScope(deferEffects && context.recorder != nullptr ? &prepared.deferred : nullptr);
     // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
     // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
     // draws, their inputs: per-draw string building at ~1400 draws per 10 s is itself a cost the
@@ -3955,6 +3958,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     }
     const auto started = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool ready = prepareDraw(context, state, draw, shaders, snapshots, prepared);
+    if (!prepared.deferred.Empty() && context.recorder != nullptr) context.recorder->ApplyDeferred(prepared.deferred);
     const auto prepared_at = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (ready) recordPreparedDraw(context, state, draw, shaders, prepared);
     if (!counted) return;

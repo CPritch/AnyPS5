@@ -95,6 +95,26 @@ public:
     std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
+    struct DeferredEffects {
+        std::vector<std::pair<std::shared_ptr<void>, std::size_t>> kept;
+        std::vector<std::pair<const void*, std::size_t>> keptBytes;
+        std::vector<std::tuple<std::uint64_t, std::size_t, int>> reads;
+        bool bound = false;
+        bool Empty() const { return kept.empty() && keptBytes.empty() && reads.empty() && !bound; }
+    };
+    class DeferScope {
+    public:
+        explicit DeferScope(DeferredEffects* into);
+        ~DeferScope();
+        DeferScope(const DeferScope&) = delete;
+        DeferScope& operator=(const DeferScope&) = delete;
+
+    private:
+        DeferredEffects* into;
+        DeferredEffects* previous;
+        int exceptions;
+    };
+    void ApplyDeferred(DeferredEffects& effects);
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
