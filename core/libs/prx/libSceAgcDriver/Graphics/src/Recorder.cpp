@@ -34,6 +34,7 @@
 #include <map>
 #ifdef __linux__
 #include <dlfcn.h>
+#include <execinfo.h>
 #endif
 #include <mutex>
 #include <string>
@@ -147,8 +148,41 @@ struct HotWaitSiteScope {
     explicit HotWaitSiteScope(const void* site) : previous(std::exchange(hotWaitSite, site)) {}
     ~HotWaitSiteScope() { hotWaitSite = previous; }
 };
+using HotStack = std::array<std::uint64_t, 8>;
+
+HotStack CaptureHotStack() {
+    HotStack stack{};
+#ifdef __linux__
+    void* raw[32];
+    const int captured = backtrace(raw, static_cast<int>(std::size(raw)));
+    static const void* const driverBase = [] {
+        Dl_info self{};
+        return dladdr(reinterpret_cast<const void*>(&CaptureHotStack), &self) != 0 ? self.dli_fbase : nullptr;
+    }();
+    if (driverBase == nullptr) return stack;
+    std::size_t used = 0;
+    for (int i = 1; i < captured && used < stack.size(); ++i) {
+        Dl_info info{};
+        if (dladdr(raw[i], &info) == 0 || info.dli_fbase != driverBase) continue;
+        stack[used++] = reinterpret_cast<std::uintptr_t>(raw[i]) - reinterpret_cast<std::uintptr_t>(driverBase);
+    }
+#endif
+    return stack;
+}
+
+std::string HotStackText(const HotStack& stack) {
+    std::string text;
+    for (const auto frame : stack) {
+        if (frame == 0) break;
+        char item[24];
+        std::snprintf(item, sizeof(item), "%s0x%llx", text.empty() ? " via " : "<", static_cast<unsigned long long>(frame));
+        text += item;
+    }
+    return text;
+}
+
 std::mutex hotWaitSitesMutex;
-std::map<std::tuple<int, int, const void*>, std::pair<std::uint64_t, double>> hotWaitSites;
+std::map<std::tuple<int, int, const void*, HotStack>, std::pair<std::uint64_t, double>> hotWaitSites;
 
 void NoteHotWait(int source, const void* site, double ms);
 
@@ -779,7 +813,7 @@ struct HotHookSync {
     double ms = 0;
 };
 std::mutex hotHookSyncMutex;
-std::map<std::tuple<int, int, int, std::uint64_t, std::size_t>, HotHookSync> hotHookSyncs;
+std::map<std::tuple<int, int, int, std::uint64_t, std::size_t, HotStack>, HotHookSync> hotHookSyncs;
 
 bool HotHookSyncCounted() {
     static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
@@ -788,8 +822,9 @@ bool HotHookSyncCounted() {
 
 void NoteHotHookSync(int kind, std::uint64_t address, std::size_t bytes, std::chrono::steady_clock::time_point start) {
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const auto stack = CaptureHotStack();
     std::lock_guard lock(hotHookSyncMutex);
-    auto& entry = hotHookSyncs[{static_cast<int>(GuestMemory::CurrentHotThread()), kind, static_cast<int>(GuestMemory::CurrentReadSite()), address, bytes}];
+    auto& entry = hotHookSyncs[{static_cast<int>(GuestMemory::CurrentHotThread()), kind, static_cast<int>(GuestMemory::CurrentReadSite()), address, bytes, stack}];
     ++entry.count;
     entry.ms += ms;
 }
@@ -1470,8 +1505,9 @@ void Recorder::AnnounceSyncSite(const void* site) {
 namespace {
 
 void NoteHotWait(int source, const void* site, double ms) {
+    const auto stack = CaptureHotStack();
     std::lock_guard lock(hotWaitSitesMutex);
-    auto& entry = hotWaitSites[{static_cast<int>(GuestMemory::CurrentHotThread()), source, site}];
+    auto& entry = hotWaitSites[{static_cast<int>(GuestMemory::CurrentHotThread()), source, site, stack}];
     ++entry.first;
     entry.second += ms;
 }
@@ -1479,7 +1515,7 @@ void NoteHotWait(int source, const void* site, double ms) {
 }
 
 std::string Recorder::TakeHotWaitSiteText() {
-    std::vector<std::pair<std::tuple<int, int, const void*>, std::pair<std::uint64_t, double>>> entries;
+    std::vector<std::pair<std::tuple<int, int, const void*, HotStack>, std::pair<std::uint64_t, double>>> entries;
     {
         std::lock_guard lock(hotWaitSitesMutex);
         entries.assign(hotWaitSites.begin(), hotWaitSites.end());
@@ -1490,7 +1526,7 @@ std::string Recorder::TakeHotWaitSiteText() {
     std::string text;
     for (std::size_t i = 0; i < entries.size() && i < 8; ++i) {
         const auto& [key, wait] = entries[i];
-        const auto& [thread, source, site] = key;
+        const auto& [thread, source, site, stack] = key;
         char item[160];
         static const char* const sources[5] = {"idle", "pending-write", "recorded-store", "address-based", "other"};
         const char* module = "?";
@@ -1506,12 +1542,13 @@ std::string Recorder::TakeHotWaitSiteText() {
 #endif
         std::snprintf(item, sizeof(item), "%s %s %s from %s+0x%llx: %llu, %.1f ms", i == 0 ? "" : ";", threads[static_cast<std::size_t>(thread) % threads.size()], source >= 0 && source < 5 ? sources[source] : "unknown", module, offset, static_cast<unsigned long long>(wait.first), wait.second);
         text += item;
+        text += HotStackText(stack);
     }
     return text.empty() ? " none" : text;
 }
 
 std::string Recorder::TakeHotHookSyncText() {
-    std::vector<std::pair<std::tuple<int, int, int, std::uint64_t, std::size_t>, HotHookSync>> entries;
+    std::vector<std::pair<std::tuple<int, int, int, std::uint64_t, std::size_t, HotStack>, HotHookSync>> entries;
     {
         std::lock_guard lock(hotHookSyncMutex);
         entries.assign(hotHookSyncs.begin(), hotHookSyncs.end());
@@ -1523,10 +1560,11 @@ std::string Recorder::TakeHotHookSyncText() {
     std::string text;
     for (std::size_t i = 0; i < entries.size() && i < 6; ++i) {
         const auto& [key, sync] = entries[i];
-        const auto& [thread, kind, site, address, bytes] = key;
+        const auto& [thread, kind, site, address, bytes, stack] = key;
         char item[192];
         std::snprintf(item, sizeof(item), "%s %s %s at %s 0x%llx+0x%zx: %llu, %.1f ms", i == 0 ? "" : ";", threads[static_cast<std::size_t>(thread) % threads.size()], kinds[static_cast<std::size_t>(kind) % kinds.size()], GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(site)), static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(sync.count), sync.ms);
         text += item;
+        text += HotStackText(stack);
     }
     return text.empty() ? " none" : text;
 }
