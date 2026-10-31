@@ -439,7 +439,8 @@ unsigned DrawPipeline::Committers() {
 unsigned DrawPipeline::PrepareThreads() {
     static const unsigned threads = [] {
         const char* text = std::getenv("APS5_PREPARE_AHEAD");
-        if (text == nullptr || Depth() == 0) return 0u;
+        if (Depth() == 0) return 0u;
+        if (text == nullptr) return 1u;
         return static_cast<unsigned>(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 8));
     }();
     return threads;
