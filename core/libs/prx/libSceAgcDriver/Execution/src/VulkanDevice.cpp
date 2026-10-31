@@ -4316,6 +4316,25 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     if (traceDraws) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 
+Graphics::DrawPacketPtr VulkanDevice::ResolveDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const DrawTraceContext* trace, std::uint64_t shape, Graphics::DrawAhead* ahead) {
+    startJournalReplay();
+    for (const auto& shader : shaders) {
+        require(shader.program != nullptr, "missing compiled shader");
+        ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
+    }
+    static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
+    if (traceDraws) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
+    const auto context = graphicsContext();
+    return Graphics::ResolveDraw(context, graphics, draw, shaders, snapshots, recipe, trace, shape, ahead);
+}
+
+void VulkanDevice::EmitDraw(Graphics::DrawPacket& packet) {
+    const auto context = graphicsContext();
+    Graphics::EmitDraw(context, packet);
+    static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
+    if (traceDraws) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
+}
+
 bool VulkanDevice::DrawInputsInPlace() const {
     return state->drawInputsInPlace;
 }
