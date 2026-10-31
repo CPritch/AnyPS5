@@ -1248,7 +1248,7 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
     recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
 }
 
-const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
+const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite, std::vector<std::pair<std::uint64_t, std::size_t>>* deferredReads) {
     auto* recorder = context.recorder;
     if (recorder == nullptr || bytes == 0 || !context.drawInputsInPlace) return nullptr;
     bool behind = false;
@@ -1266,7 +1266,8 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
-    recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
+    if (deferredReads != nullptr) deferredReads->emplace_back(address, bytes);
+    else recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
     if (behindGpuWrite != nullptr && behind) *behindGpuWrite = true;
     return import;
 }
@@ -1391,7 +1392,7 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const AheadUse& ahead = {}) {
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const AheadUse& ahead = {}, std::vector<std::pair<std::uint64_t, std::size_t>>* deferredReads = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1594,7 +1595,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
-        const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
+        const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, nullptr, deferredReads);
         DrawInputCopy copy;
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
@@ -1717,7 +1718,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
         RequireNoMultisampleTarget(begin, bytes, "a vertex buffer read");
-        if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite)) {
+        if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite, deferredReads)) {
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(HostImportOffset(*import, begin));
             inputs.inPlaceReads.emplace_back(begin, end);
@@ -2765,6 +2766,7 @@ struct PreparedDraw {
     explicit PreparedDraw(bool profile) : timer(profile) {}
     PreparedDraw(const PreparedDraw&) = delete;
     PreparedDraw& operator=(const PreparedDraw&) = delete;
+    std::vector<std::pair<std::uint64_t, std::size_t>> deferredReads;
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
     std::uint64_t shape = 0;
@@ -3012,7 +3014,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
-    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared.ahead);
+    static const bool deferInputReads = std::getenv("APS5_NO_DEFERRED_INPUT_READS") == nullptr;
+    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared.ahead, deferInputReads ? &prepared.deferredReads : nullptr);
     if (inputs.nothing) return false;
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -3403,6 +3406,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
 }
 
 void recordPreparedDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, PreparedDraw& prepared) {
+    if (context.recorder != nullptr) {
+        for (const auto& [address, bytes] : prepared.deferredReads) context.recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     static AgcDriver::Mutex dumpMutex;
