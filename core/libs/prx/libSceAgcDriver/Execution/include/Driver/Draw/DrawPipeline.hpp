@@ -87,7 +87,7 @@ public:
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {});
     static unsigned ResolveSplit();
-    enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, DeclinedStores, DeclinedWriters, VerifyMatched, VerifyDiffered, Unoffered, Count };
+    enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, DeclinedWriters, VerifyMatched, VerifyDiffered, Unoffered, Count };
     static void NoteEarly(EarlyEvent event);
     static void OfferEarly(std::span<const Range> depth);
     static void PostResolve(std::function<void()> body, std::function<void(bool)> finish);
@@ -195,10 +195,12 @@ private:
     void resolveAhead();
     static void joinResolve(bool revoke);
     std::thread resolver;
-    std::atomic<int> resolveState{0};
+    alignas(64) std::atomic<int> resolveState{0};
+    std::atomic<bool> resolverClosing{false};
     std::function<void()> resolveBody;
     std::function<void(bool)> resolveFinish;
     std::chrono::steady_clock::time_point resolvePosted;
+    alignas(64) std::uint64_t resolveLineEnd = 0;
 };
 
 class DrawFinisher {

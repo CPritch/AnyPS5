@@ -1400,8 +1400,8 @@ bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const G
     if (result != nullptr && result->found != nullptr && (result->found->DescribedRangesOverlap(writes) || result->found->DescribedRangesOverlap(depth))) return false;
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     const auto split = DrawPipeline::ResolveSplit();
-    if (bool stores = false; split >= 2 && !localDevice->ResolverInputsClear(&stores)) {
-        DrawPipeline::NoteEarly(stores ? DrawPipeline::EarlyEvent::DeclinedStores : DrawPipeline::EarlyEvent::DeclinedWriters);
+    if (split >= 2 && !localDevice->ResolverInputsClear()) {
+        DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::DeclinedWriters);
         return false;
     }
     auto* prepared = ahead != nullptr ? ahead->Claim() : nullptr;
@@ -1425,7 +1425,7 @@ bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const G
             bool failed = false;
         };
         auto job = std::make_shared<Job>();
-        job->handoff = {Graphics::ShapeMemoHandle(), Graphics::Recorder::PendingWriteSnapshot(), &job->abandoned, &job->graveyard};
+        job->handoff = {Graphics::ShapeMemoHandle(), Graphics::Recorder::PendingWriteSnapshot(), localDevice->QueuedStoreRanges(), &job->abandoned, &job->graveyard};
         const auto collectEpoch = GuestMemory::ThreadCollectEpoch();
         const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
         auto* built = recipeStages.empty() ? nullptr : &early.built;

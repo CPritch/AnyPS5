@@ -408,7 +408,8 @@ public:
     using WriteRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     static std::shared_ptr<const WriteRanges> PendingWriteSnapshot();
     static bool SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::size_t bytes);
-    static void SetResolverState(const WriteRanges* snapshot, DeferredEffects* abandoned);
+    static void SetResolverState(bool active, const WriteRanges* snapshot, const WriteRanges* queuedStores, DeferredEffects* abandoned);
+    WriteRanges QueuedStoreRanges() const;
     // A label behind pending completions (CPU write-backs the label must not precede): stored to
     // guest memory by a completion action appended to the open batch, or to the newest in-flight
     // batch when none is open (no empty submission), so it runs after every earlier write-back in

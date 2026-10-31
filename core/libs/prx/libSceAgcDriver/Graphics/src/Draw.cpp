@@ -4148,13 +4148,13 @@ void* ShapeMemoHandle() {
 ResolverScope::ResolverScope(const ResolverHandoff& handoff) {
     borrowedShapeMemo = static_cast<std::unordered_map<std::uint64_t, ShapeEntry>*>(handoff.shapeMemo);
     packetGraveyard = handoff.graveyard;
-    Recorder::SetResolverState(handoff.snapshot.get(), handoff.abandoned);
+    Recorder::SetResolverState(true, handoff.snapshot.get(), &handoff.queuedStores, handoff.abandoned);
 }
 
 ResolverScope::~ResolverScope() {
     borrowedShapeMemo = nullptr;
     packetGraveyard = nullptr;
-    Recorder::SetResolverState(nullptr, nullptr);
+    Recorder::SetResolverState(false, nullptr, nullptr, nullptr);
 }
 
 void ApplyDrawMemoKeeps(const Context& context, DrawPacket& packet) {

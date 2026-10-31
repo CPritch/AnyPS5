@@ -4354,11 +4354,13 @@ void VulkanDevice::ApplyDeferredEffects(Graphics::Recorder::DeferredEffects& eff
     if (context.recorder != nullptr) context.recorder->ApplyDeferred(effects);
 }
 
-bool VulkanDevice::ResolverInputsClear(bool* queuedStores) {
+bool VulkanDevice::ResolverInputsClear() {
+    return state->copiedWriters->empty() && Graphics::DrawCopiedWriters()->empty();
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> VulkanDevice::QueuedStoreRanges() {
     const auto context = graphicsContext();
-    const bool stores = context.recorder != nullptr && context.recorder->HasQueuedStores();
-    if (queuedStores != nullptr) *queuedStores = stores;
-    return !stores && state->copiedWriters->empty() && Graphics::DrawCopiedWriters()->empty();
+    return context.recorder != nullptr ? context.recorder->QueuedStoreRanges() : std::vector<std::pair<std::uint64_t, std::uint64_t>>{};
 }
 
 std::uint64_t VulkanDevice::RecorderNotedSerial() {

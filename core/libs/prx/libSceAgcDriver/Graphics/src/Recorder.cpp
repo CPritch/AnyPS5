@@ -709,8 +709,13 @@ bool SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::s
     return it != snapshot->end() && it->first < address + bytes;
 }
 
+thread_local bool resolverState = false;
+thread_local const WriteRanges* resolverSnapshot = nullptr;
+thread_local const WriteRanges* resolverQueuedStores = nullptr;
+
 bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0) return false;
+    if (resolverState) return SnapshotOverlaps(resolverSnapshot, address, bytes);
     const auto snapshot = pendingWrites.load(std::memory_order_acquire);
     return SnapshotOverlaps(snapshot.get(), address, bytes);
 }
@@ -2065,7 +2070,11 @@ bool Recorder::HasQueuedStores() const {
 bool Recorder::QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) const {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::NoteEarlyRead(address, bytes);
-    if (GuestMemory::OnResolverThread()) return false;
+    if (GuestMemory::OnResolverThread()) {
+        if (resolverQueuedStores == nullptr || bytes == 0) return false;
+        const auto end = address + bytes;
+        return std::any_of(resolverQueuedStores->begin(), resolverQueuedStores->end(), [&](const auto& store) { return address < store.second && store.first < end; });
+    }
     if (open == nullptr || bytes == 0) return false;
     const auto end = address + bytes;
     return std::any_of(open->run.queued.begin(), open->run.queued.end(), [&](const Batch::StoreRun::Queued& store) { return address < store.End() && store.address < end; });
@@ -3092,12 +3101,20 @@ std::size_t Recorder::UnsignaledBatches() const {
 namespace {
 thread_local Recorder::DeferredEffects* deferringEffects = nullptr;
 thread_local Recorder::DeferredEffects* abandonedEffects = nullptr;
-thread_local const Recorder::WriteRanges* resolverSnapshot = nullptr;
 }
 
-void Recorder::SetResolverState(const WriteRanges* snapshot, DeferredEffects* abandoned) {
+void Recorder::SetResolverState(bool active, const WriteRanges* snapshot, const WriteRanges* queuedStores, DeferredEffects* abandoned) {
+    resolverState = active;
     resolverSnapshot = snapshot;
+    resolverQueuedStores = queuedStores;
     abandonedEffects = abandoned;
+}
+
+Recorder::WriteRanges Recorder::QueuedStoreRanges() const {
+    WriteRanges ranges;
+    if (open == nullptr) return ranges;
+    for (const auto& store : open->run.queued) ranges.emplace_back(store.address, store.End());
+    return ranges;
 }
 
 Recorder::DeferScope::DeferScope(DeferredEffects* into) : into(into), previous(deferringEffects), exceptions(std::uncaught_exceptions()) {

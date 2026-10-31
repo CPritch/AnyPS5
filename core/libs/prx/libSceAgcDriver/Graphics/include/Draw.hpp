@@ -76,6 +76,7 @@ bool DrawPacketTemplateGone(const DrawPacket& packet);
 struct ResolverHandoff {
     void* shapeMemo = nullptr;
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> snapshot;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> queuedStores;
     Recorder::DeferredEffects* abandoned = nullptr;
     std::vector<DrawPacket*>* graveyard = nullptr;
 };

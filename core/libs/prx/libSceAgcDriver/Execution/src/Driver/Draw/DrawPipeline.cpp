@@ -46,7 +46,9 @@ thread_local bool skipCommittingReads = false;
 enum ResolveJobState : int { ResolveIdle, ResolvePosted, ResolveRunning, ResolveDone };
 std::atomic<std::uint64_t> earlyResolveNs{0}, earlyResolveCount{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::CommitterPart::Count)> committerPartNs{}, committerPartCount{};
-std::atomic<std::uint64_t> resolvesPosted{0}, resolvesRevoked{0}, resolvesDoneBeforeJoin{0}, resolvesWaited{0}, resolveWaitNs{0}, resolveStartNs{0}, resolveBusyNs{0};
+std::atomic<std::uint64_t> resolvesPosted{0}, resolvesRevoked{0}, resolvesDoneBeforeJoin{0}, resolvesWaited{0}, resolveWaitNs{0};
+alignas(64) std::atomic<std::uint64_t> resolveStartNs{0};
+std::atomic<std::uint64_t> resolveBusyNs{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::EarlyEvent::Count)> earlyEvents{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> earlyAborts{};
 }
@@ -138,7 +140,7 @@ std::string QueueWaits::Text() {
         const auto take = [](std::atomic<std::uint64_t>& value) { return std::to_string(value.exchange(0, std::memory_order_relaxed)); };
         const auto event = [&](DrawPipeline::EarlyEvent kind) { return take(earlyEvents[static_cast<std::size_t>(kind)]); };
         using E = DrawPipeline::EarlyEvent;
-        text += "; early resolves (APS5_RESOLVE_SPLIT" + std::string(DrawPipeline::EarlyStopped() ? ", stopped by verify" : "") + "): resolved " + take(earlyResolved) + ", declined " + take(earlyDeclined) + ", failed " + take(earlyFailed) + ", never offered " + event(E::Unoffered) + "; packets used " + event(E::Used) + ", redone for proof " + event(E::StaleProof) + ", pending " + event(E::StalePending) + ", imports " + event(E::StaleImports) + ", device " + event(E::StaleDevice) + ", submit " + event(E::StaleSubmit) + ", redo " + event(E::StaleRedo) + ", a later note over its reads " + event(E::StaleNoted) + ", template left the cache " + event(E::StaleTemplate) + "; dropped after resolve for reads overlapping the previous draw's writes " + event(E::OverlapAfter) + ", failed on the resolver " + event(E::ResolverFailed) + "; declined for the resolver: queued stores " + event(E::DeclinedStores) + ", copied writers " + event(E::DeclinedWriters) + "; verified same " + event(E::VerifyMatched) + ", different " + event(E::VerifyDiffered) + "; aborted at a barrier:";
+        text += "; early resolves (APS5_RESOLVE_SPLIT" + std::string(DrawPipeline::EarlyStopped() ? ", stopped by verify" : "") + "): resolved " + take(earlyResolved) + ", declined " + take(earlyDeclined) + ", failed " + take(earlyFailed) + ", never offered " + event(E::Unoffered) + "; packets used " + event(E::Used) + ", redone for proof " + event(E::StaleProof) + ", pending " + event(E::StalePending) + ", imports " + event(E::StaleImports) + ", device " + event(E::StaleDevice) + ", submit " + event(E::StaleSubmit) + ", redo " + event(E::StaleRedo) + ", a later note over its reads " + event(E::StaleNoted) + ", template left the cache " + event(E::StaleTemplate) + "; dropped after resolve for reads overlapping the previous draw's writes " + event(E::OverlapAfter) + ", failed on the resolver " + event(E::ResolverFailed) + "; declined for the resolver's copied writers " + event(E::DeclinedWriters) + "; verified same " + event(E::VerifyMatched) + ", different " + event(E::VerifyDiffered) + "; aborted at a barrier:";
         for (std::size_t kind = 1; kind < earlyAborts.size(); ++kind) {
             const auto count = earlyAborts[kind].exchange(0, std::memory_order_relaxed);
             if (count != 0) text += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
@@ -520,7 +522,7 @@ void DrawPipeline::PostResolve(std::function<void()> body, std::function<void(bo
     auto& pipeline = Queue0();
     if (!pipeline.resolver.joinable()) {
         std::lock_guard lock(pipeline.prepareMutex);
-        if (!pipeline.preparersClosing.load(std::memory_order_relaxed) && !pipeline.resolver.joinable()) pipeline.resolver = std::thread([&pipeline] { pipeline.resolveAhead(); });
+        if (!pipeline.resolverClosing.load(std::memory_order_relaxed) && !pipeline.resolver.joinable()) pipeline.resolver = std::thread([&pipeline] { pipeline.resolveAhead(); });
     }
     pipeline.resolveBody = std::move(body);
     pipeline.resolveFinish = std::move(finish);
@@ -634,21 +636,22 @@ void DrawPipeline::resolveAhead() {
     PerformanceTimer::UntraceThisThread();
     constexpr std::chrono::microseconds idleNap{20};
     for (;;) {
-        const auto posted = [&] { return resolveState.load(std::memory_order_acquire) == ResolvePosted || preparersClosing.load(std::memory_order_relaxed); };
+        const auto posted = [&] { return resolveState.load(std::memory_order_acquire) == ResolvePosted || resolverClosing.load(std::memory_order_relaxed); };
         if (!SpinUntil(HandoffSpinWindow(), posted)) {
             std::this_thread::sleep_for(idleNap);
             continue;
         }
-        if (preparersClosing.load(std::memory_order_acquire)) return;
+        if (resolverClosing.load(std::memory_order_acquire)) return;
         int expected = ResolvePosted;
         if (!resolveState.compare_exchange_strong(expected, ResolveRunning, std::memory_order_acq_rel)) continue;
-        const auto start = std::chrono::steady_clock::now();
-        resolveStartNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - resolvePosted).count()), std::memory_order_relaxed);
+        static const bool timed = std::getenv("APS5_COMMIT_STATS") != nullptr;
+        const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (timed) resolveStartNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - resolvePosted).count()), std::memory_order_relaxed);
         try {
             resolveBody();
         } catch (...) {
         }
-        resolveBusyNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+        if (timed) resolveBusyNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
         resolveState.store(ResolveDone, std::memory_order_release);
     }
 }
@@ -1045,6 +1048,7 @@ void DrawPipeline::Stop() {
     std::thread resolving;
     {
         std::lock_guard lock(prepareMutex);
+        resolverClosing.store(true, std::memory_order_release);
         resolving = std::move(resolver);
     }
     if (resolving.joinable()) {
