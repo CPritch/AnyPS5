@@ -137,6 +137,7 @@ AgcDriver::Mutex threadSyncsMutex;
 // This thread's fence and timeline waits in total (Recorder::ThreadWaitedMs): a caller times a span
 // of its own work and reads the difference to learn how much of it was waiting for the GPU.
 thread_local double threadWaitedMs = 0;
+thread_local double hotGpuWaitedMs = 0;
 
 void CountThreadSync(int source, double ms) {
     threadWaitedMs += ms;
@@ -1472,6 +1473,10 @@ std::string Recorder::TakeHotHookSyncText() {
         text += item;
     }
     return text.empty() ? " none" : text;
+}
+
+double Recorder::HotGpuWaitedMs() {
+    return hotGpuWaitedMs;
 }
 
 double Recorder::ThreadWaitedMs() {
@@ -4175,7 +4180,8 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
             }
         }
     }
-    const auto start = profile || trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool hot = HotHookSyncCounted();
+    const auto start = profile || trace || hot ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto waited = start;
     auto& mutex = GuestMemory::GpuMutex();
     VkResult result = VK_SUCCESS;
@@ -4185,11 +4191,12 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         mutex.unlock();
         result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
-        if (profile || trace) waited = std::chrono::steady_clock::now();
+        if (profile || trace || hot) waited = std::chrono::steady_clock::now();
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
     mutex.lock();
     const auto ms = std::chrono::duration<double, std::milli>(waited - start).count();
+    if (hot) hotGpuWaitedMs += ms;
     if (profile) {
         // The GPU wait is charged like a locked wait, so the per-source, per-thread and per-site
         // totals of the [recorder] line keep their meaning; the unlocked count says how many were
@@ -4295,6 +4302,13 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         static std::uint64_t waits = 0;
         static auto lastReport = std::chrono::steady_clock::now();
         const auto waitStart = std::chrono::steady_clock::now();
+        struct HotWait {
+            bool counted;
+            std::chrono::steady_clock::time_point start;
+            ~HotWait() {
+                if (counted) hotGpuWaitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            }
+        } hotWait{HotHookSyncCounted(), waitStart};
         // A fence still unsignaled here makes this a real GPU wait under the mutex (finish runs
         // under it): the [lock] line's 'locked GPU waits'.
         const bool signaledAtStart = !profile || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;

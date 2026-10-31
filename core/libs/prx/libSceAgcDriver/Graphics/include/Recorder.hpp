@@ -455,6 +455,7 @@ public:
     // when not profiling): a caller reads it around a span of its own work to learn how much of
     // that span waited for the GPU (a resource build's nested flush-hook waits, a draw's).
     static double ThreadWaitedMs();
+    static double HotGpuWaitedMs();
     static std::string TakeHotHookSyncText();
     // The calling thread's flush-hook syncs (SyncThrough) that waited for a target batch whose
     // fence had not signaled when the wait began: a read whose bytes are compared around such a

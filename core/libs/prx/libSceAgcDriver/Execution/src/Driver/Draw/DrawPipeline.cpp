@@ -614,7 +614,7 @@ void DrawPipeline::run() {
             QueueWaits::Note(QueueWaits::Site::CommitterIdleBlocked, spun, start);
             if (idleBehindWait) QueueWaits::Note(QueueWaits::Site::CommitterIdleBehindWait, idleStart, start);
         }
-        const double gpuWaitedBefore = counted ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+        const double gpuWaitedBefore = counted ? Graphics::Recorder::HotGpuWaitedMs() : 0.0;
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
@@ -632,7 +632,7 @@ void DrawPipeline::run() {
         }
         const auto committed = std::chrono::steady_clock::now();
         const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(committed - start).count());
-        const auto gpuWaitedNs = counted ? static_cast<std::uint64_t>((Graphics::Recorder::ThreadWaitedMs() - gpuWaitedBefore) * 1e6) : 0;
+        const auto gpuWaitedNs = counted ? static_cast<std::uint64_t>((Graphics::Recorder::HotGpuWaitedMs() - gpuWaitedBefore) * 1e6) : 0;
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
