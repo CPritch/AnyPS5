@@ -2033,6 +2033,7 @@ std::pair<std::uint64_t, std::uint64_t> stalePlaneRange(const DepthSurface& surf
 }
 
 void retire(DepthSurface& surface) {
+    if (!surface.retired) GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::DepthRetire, __builtin_return_address(0));
     surface.retired = true;
     for (auto* owners : {&depthOwners(), &stencilOwners()}) {
         std::erase_if(*owners, [&](const auto& entry) { return entry.second.surface == &surface; });

@@ -1986,6 +1986,7 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
 }
 
 const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict, ImportRequester requester) {
+    GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::Import, __builtin_return_address(0));
     auto& counts = state.counts[static_cast<std::size_t>(requester)];
     const auto base = run.base;
     const auto bytes = run.bytes;

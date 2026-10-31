@@ -1298,10 +1298,14 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         if (resource.mipCount > AllocatedLevels(resource)) {
             auto allocated = resource;
             allocated.mipCount = AllocatedLevels(resource);
-            if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evicted.push_back(evictStorage(cache, found));
+            if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) {
+                GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::StorageEvict, __builtin_return_address(0));
+                evicted.push_back(evictStorage(cache, found));
+            }
         }
         auto it = findStorage(cache, key);
         if (it != cache.entries.end() && MetadataMoved(*it->texture, resource)) {
+            GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::StorageEvict, __builtin_return_address(0));
             evicted.push_back(evictStorage(cache, it));
             it = cache.entries.end();
         }
@@ -4855,6 +4859,11 @@ void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t alloc
 
 void ShaderResources::PrecollectSurfaces() const {
     for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
+}
+
+bool ShaderResources::EpochProofCurrent() const {
+    const auto epoch = GuestMemory::CollectEpoch();
+    return epoch != 0 && provedEpoch == epoch && provedProof == GuestMemory::ProofSerial() && provedPending == StorageTexture::PendingSerial();
 }
 
 bool ShaderResources::DescribedRangesOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {

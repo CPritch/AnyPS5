@@ -25,19 +25,32 @@ public:
     Mutex& operator=(const Mutex&) = delete;
 
     void lock() noexcept {
-        if (!try_lock()) lockContended();
+        if (!tryAcquire()) lockContended();
+        ++HeldOnThisThread();
     }
 
     bool try_lock() noexcept {
+        if (!tryAcquire()) return false;
+        ++HeldOnThisThread();
+        return true;
+    }
+
+    void unlock() noexcept {
+        --HeldOnThisThread();
+        if (state.exchange(Unlocked, std::memory_order_release) == Contended) WakeOne(state);
+    }
+
+    static std::int32_t& HeldOnThisThread() noexcept {
+        static thread_local std::int32_t held = 0;
+        return held;
+    }
+
+private:
+    bool tryAcquire() noexcept {
         std::uint32_t expected = Unlocked;
         return state.compare_exchange_strong(expected, Locked, std::memory_order_acquire, std::memory_order_relaxed);
     }
 
-    void unlock() noexcept {
-        if (state.exchange(Unlocked, std::memory_order_release) == Contended) WakeOne(state);
-    }
-
-private:
     static constexpr std::uint32_t Unlocked = 0;
     static constexpr std::uint32_t Locked = 1;
     static constexpr std::uint32_t Contended = 2;

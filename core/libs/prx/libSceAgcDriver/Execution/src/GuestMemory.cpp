@@ -2698,8 +2698,26 @@ void GpuMutexType::acquired() {
 namespace {
 thread_local bool resolveTraceActive = false;
 thread_local ResolveLockTrace resolveTrace;
+thread_local std::uint8_t resolvePhase = 0;
+bool (*resolveCompletionProbe)() = nullptr;
 
-void NoteResolveLockTouch(const void* site) {
+std::uint64_t ResolveNowNs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void ResolveBarrierAt(BarrierKind kind, const void* site) {
+    if (!resolveTraceActive) return;
+    if (resolveTrace.barriers++ != 0) return;
+    resolveTrace.firstKind = static_cast<std::uint8_t>(kind);
+    resolveTrace.firstSite = site;
+    resolveTrace.firstPhase = resolvePhase;
+    resolveTrace.firstNs = ResolveNowNs() - resolveTrace.startNs;
+    resolveTrace.firstMutexes = Mutex::HeldOnThisThread() - resolveTrace.mutexBaseline;
+    resolveTrace.firstInCompletion = resolveCompletionProbe != nullptr && resolveCompletionProbe();
+}
+
+void NoteResolveLockTouch(const void* site, BarrierKind kind) {
+    ResolveBarrierAt(kind, site);
     ++resolveTrace.touches;
     const auto end = resolveTrace.touchSites.begin() + resolveTrace.touchSiteCount;
     if (std::find(resolveTrace.touchSites.begin(), end, site) != end || resolveTrace.touchSiteCount == resolveTrace.touchSites.size()) return;
@@ -2708,7 +2726,7 @@ void NoteResolveLockTouch(const void* site) {
 }
 
 bool GpuMutexType::try_lock() {
-    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0));
+    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0), BarrierKind::Lock);
     if (!GpuLockProfiled()) {
         if (!tryEnter()) return false;
         acquired();
@@ -2757,7 +2775,36 @@ void GpuMutexType::unlock() {
 
 void BeginResolveLockTrace() {
     resolveTrace = {};
+    resolveTrace.mutexBaseline = Mutex::HeldOnThisThread();
+    resolveTrace.startNs = ResolveNowNs();
+    resolvePhase = 0;
     resolveTraceActive = true;
+}
+
+const char* BarrierKindName(BarrierKind kind) {
+    constexpr std::array<const char*, static_cast<std::size_t>(BarrierKind::Count)> names{"none", "GPU lock", "lock-held check", "commands", "submit", "batch reap", "proof break", "import made or retired", "template inserted", "storage image created", "recorder write", "pending images changed", "depth surface retired", "storage image evicted"};
+    const auto index = static_cast<std::size_t>(kind);
+    return index < names.size() ? names[index] : "?";
+}
+
+void ResolveBarrier(BarrierKind kind, const void* site) {
+    ResolveBarrierAt(kind, site);
+}
+
+void NoteResolveMemo() {
+    if (resolveTraceActive) ++resolveTrace.memoWrites;
+}
+
+void SetResolvePhase(std::uint8_t phase) {
+    resolvePhase = phase;
+}
+
+bool ResolveTraceActive() {
+    return resolveTraceActive;
+}
+
+void SetResolveCompletionProbe(bool (*probe)()) {
+    resolveCompletionProbe = probe;
 }
 
 ResolveLockTrace EndResolveLockTrace() {
@@ -2769,6 +2816,13 @@ void NoteResolveRecorder(const void* site, const char* method) {
     if (!resolveTraceActive) return;
     ++resolveTrace.recorderUses;
     if (method != nullptr) {
+        static const std::array<std::string_view, 33> reads{"Active", "PendingWriteOverlaps", "PendingLabelIn", "wideLabelInLocked", "QueuedStoreOverlaps", "PendingWritesOver", "NewestWriteNote", "PendingWriterSerial", "DescribePendingWrite", "PendingReadOverlaps", "DescribePendingRead", "OpenSerial", "Device", "Idle", "Recording", "InFlightBatches", "HasQueuedStores", "HasQueuedKeyStores", "AnyQueuedStore", "AnyQueuedKeyStore", "CompletionLabelIn", "PendingWriteSettled", "PendingWritesOnlyStores", "OpenWriteOverlaps", "CountingSamples", "OpenBatchSerial", "RecordedWorkSinceSubmit", "readOverlap", "overlaps", "signaled", "unsignaled", "fenceStatus", "QueuedStoreSerial"};
+        static const std::array<std::string_view, 6> memos{"KnownHighestIndex", "KeepHighestIndex", "KeepDrawSnapshot", "eraseDrawSnapshot", "ReusableDrawSnapshot", "DrawUpload"};
+        const std::string_view name(method);
+        if (std::find(memos.begin(), memos.end(), name) != memos.end() || name.starts_with("Unwritten")) ++resolveTrace.memoWrites;
+        else if (std::find(reads.begin(), reads.end(), name) == reads.end()) ResolveBarrierAt(BarrierKind::RecorderWrite, site);
+    }
+    if (method != nullptr) {
         const auto methodsEnd = resolveTrace.recorderMethods.begin() + resolveTrace.recorderMethodCount;
         if (std::find(resolveTrace.recorderMethods.begin(), methodsEnd, method) == methodsEnd && resolveTrace.recorderMethodCount < resolveTrace.recorderMethods.size()) resolveTrace.recorderMethods[resolveTrace.recorderMethodCount++] = method;
     }
@@ -2778,21 +2832,25 @@ void NoteResolveRecorder(const void* site, const char* method) {
 }
 
 void NoteResolveEffect(ResolveEffect effect) {
-    if (resolveTraceActive) resolveTrace.effects |= 1u << static_cast<unsigned>(effect);
+    if (!resolveTraceActive) return;
+    resolveTrace.effects |= 1u << static_cast<unsigned>(effect);
+    constexpr std::array<BarrierKind, static_cast<std::size_t>(ResolveEffect::Count)> kinds{BarrierKind::Submit, BarrierKind::Reap, BarrierKind::ProofBreak, BarrierKind::Import, BarrierKind::CacheInsert, BarrierKind::StorageCreate};
+    ResolveBarrierAt(kinds[static_cast<std::size_t>(effect)], __builtin_return_address(0));
 }
 
 void NoteResolveCommands(const void* site) {
     if (!resolveTraceActive) return;
+    ResolveBarrierAt(BarrierKind::Commands, site);
     if (resolveTrace.commands++ == 0) resolveTrace.firstCommands = site;
 }
 
 bool GpuMutexType::HeldByThisThread() const {
-    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0));
+    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0), BarrierKind::HeldCheck);
     return owner.load(std::memory_order_relaxed) == CurrentThreadToken();
 }
 
 std::uint32_t GpuMutexType::DepthOnThisThread() const {
-    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0));
+    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0), BarrierKind::HeldCheck);
     // `depth` is written by the holder only, so it is read only when that is this thread.
     return owner.load(std::memory_order_relaxed) == CurrentThreadToken() ? depth : 0;
 }
@@ -2805,7 +2863,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
-    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0));
+    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0), BarrierKind::Lock);
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr && hotThread == HotThread::None) {

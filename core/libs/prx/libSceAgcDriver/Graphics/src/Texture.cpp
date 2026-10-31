@@ -4424,6 +4424,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         queuedReadHeld.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::PendingSet, __builtin_return_address(0));
     std::unique_lock<GuestMemory::GpuMutexType> drawnHold;
     if (auto& drawnPending = Pending(); drawnPending.drawnCount.load(std::memory_order_acquire) != 0 && !GuestMemory::GpuMutex().HeldByThisThread()) {
         bool overlap = false;

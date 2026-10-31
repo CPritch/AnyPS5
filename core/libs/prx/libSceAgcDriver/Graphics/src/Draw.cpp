@@ -1180,6 +1180,7 @@ struct DrawTimer {
     explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
     void phase(DrawPhase which) {
         if (!profile && !counted) return;
+        if (counted) GuestMemory::SetResolvePhase(static_cast<std::uint8_t>(which + 1));
         const auto now = std::chrono::steady_clock::now();
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
         phaseStart = now;
@@ -1819,6 +1820,13 @@ struct DrawSplitCounts {
     std::atomic<std::uint64_t> afterNonDraw{0}, previousBrokeProofs{0}, previousChangedPending{0}, brokenBetween{0}, samplesPreviousTargets{0}, wouldSplit{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::ResolveEffect::Count)> effectDraws{};
     std::atomic<std::uint64_t> pure{0}, purePairs{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> firstKind{};
+    std::array<std::atomic<std::uint64_t>, PhaseCount + 1> firstPhase{};
+    std::array<std::atomic<std::uint64_t>, 4> firstQuarter{};
+    std::atomic<std::uint64_t> unbarred{0}, uncleanMutex{0}, uncleanCompletion{0}, memoDraws{0};
+    std::array<std::atomic<std::uint64_t>, 4> prediction{};
+    std::atomic<std::uint64_t> predictedPairs{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> mispredictedKind{};
 };
 
 std::mutex resolveSitesMutex;
@@ -1826,6 +1834,8 @@ std::map<const void*, std::uint64_t> resolveTouchSites;
 std::map<const void*, std::uint64_t> resolveCommandSites;
 std::map<const void*, std::uint64_t> resolveRecorderSites;
 std::map<std::string, std::uint64_t> resolveRecorderMethods;
+std::map<const void*, std::uint64_t> resolveFirstBarrierSites;
+thread_local bool resolvePredictedPure = false;
 
 thread_local bool lastResolveLockFree = false;
 
@@ -3011,7 +3021,6 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         recipeOut = nullptr;
     }
     if (state.quadList || StripPatches(state, shaders)) recipeOut = nullptr;
-    if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     auto& timing = prepared.timing.emplace("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3034,6 +3043,28 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             if (trace.recorderUses != 0) split.recorderUsing.fetch_add(1, std::memory_order_relaxed);
             if (trace.touches == 0 && trace.commands == 0 && trace.recorderUses == 0) split.uncoupled.fetch_add(1, std::memory_order_relaxed);
             lastResolveLockFree = trace.touches == 0 && trace.commands == 0;
+            if (trace.memoWrites != 0) split.memoDraws.fetch_add(1, std::memory_order_relaxed);
+            const bool barred = trace.barriers != 0;
+            if (!barred) {
+                split.unbarred.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                split.firstKind[std::min<std::size_t>(trace.firstKind, split.firstKind.size() - 1)].fetch_add(1, std::memory_order_relaxed);
+                split.firstPhase[std::min<std::size_t>(trace.firstPhase, PhaseCount)].fetch_add(1, std::memory_order_relaxed);
+                const auto total = std::max<std::uint64_t>(1, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) - trace.startNs);
+                split.firstQuarter[std::min<std::uint64_t>(3, trace.firstNs * 4 / total)].fetch_add(1, std::memory_order_relaxed);
+                if (trace.firstMutexes > 0) split.uncleanMutex.fetch_add(1, std::memory_order_relaxed);
+                if (trace.firstInCompletion) split.uncleanCompletion.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard lock(resolveSitesMutex);
+                ++resolveFirstBarrierSites[trace.firstSite];
+            }
+            split.prediction[(resolvePredictedPure ? 2u : 0u) + (barred ? 0u : 1u)].fetch_add(1, std::memory_order_relaxed);
+            if (resolvePredictedPure && barred) split.mispredictedKind[std::min<std::size_t>(trace.firstKind, split.mispredictedKind.size() - 1)].fetch_add(1, std::memory_order_relaxed);
+            thread_local std::uint64_t lastPredicted = 0;
+            if (resolvePredictedPure && !barred) {
+                const auto sequence = AgcDriver::DriverDetail::DrawPipeline::CommitSequence();
+                if (lastPredicted != 0 && sequence == lastPredicted + 1) split.predictedPairs.fetch_add(1, std::memory_order_relaxed);
+                lastPredicted = sequence;
+            }
             for (std::size_t effect = 0; effect < split.effectDraws.size(); ++effect) {
                 if ((trace.effects >> effect) & 1u) split.effectDraws[effect].fetch_add(1, std::memory_order_relaxed);
             }
@@ -3064,6 +3095,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     } resolveTrace{counted && DrawSplitCounted()};
     static const bool deferEffects = std::getenv("APS5_NO_DEFERRED_RECORDER_EFFECTS") == nullptr;
     const Recorder::DeferScope deferEffectsScope(deferEffects && !redoingWhole && context.recorder != nullptr ? &prepared.deferred : nullptr);
+    if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
     // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
     // draws, their inputs: per-draw string building at ~1400 draws per 10 s is itself a cost the
@@ -4006,6 +4038,35 @@ std::string TakeDrawSplitText() {
             for (std::size_t effect = 0; effect < effectNames.size(); ++effect) result += std::string(effect == 0 ? " " : ", ") + effectNames[effect] + " " + std::to_string(drawSplit.effectDraws[effect].exchange(0));
             result += "; resolves with no lock touch, no commands and none of these effects " + std::to_string(drawSplit.pure.exchange(0)) + ", of them right after another such draw " + std::to_string(drawSplit.purePairs.exchange(0));
         }
+        {
+            auto& drawSplit = DrawSplit();
+            result += "; barriers (step A, counted only): resolves with none " + std::to_string(drawSplit.unbarred.exchange(0)) + "; first barrier by kind:";
+            for (std::size_t kind = 1; kind < drawSplit.firstKind.size(); ++kind) {
+                const auto count = drawSplit.firstKind[kind].exchange(0);
+                if (count != 0) result += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
+            }
+            result += " by phase:";
+            for (std::size_t phase = 0; phase <= PhaseCount; ++phase) {
+                const auto count = drawSplit.firstPhase[phase].exchange(0);
+                if (count != 0) result += std::string(" ") + (phase < PhaseCount ? DrawPhaseNames[phase] : "after") + " " + std::to_string(count) + ",";
+            }
+            result += " by quarter of the resolve " + std::to_string(drawSplit.firstQuarter[0].exchange(0)) + "/" + std::to_string(drawSplit.firstQuarter[1].exchange(0)) + "/" + std::to_string(drawSplit.firstQuarter[2].exchange(0)) + "/" + std::to_string(drawSplit.firstQuarter[3].exchange(0));
+            result += ", with a driver mutex held " + std::to_string(drawSplit.uncleanMutex.exchange(0)) + ", inside a completion " + std::to_string(drawSplit.uncleanCompletion.exchange(0)) + "; resolves writing a snapshot or index memo " + std::to_string(drawSplit.memoDraws.exchange(0));
+            result += "; predictor (predicted-actual): impure-impure " + std::to_string(drawSplit.prediction[0].exchange(0)) + ", impure-pure " + std::to_string(drawSplit.prediction[1].exchange(0)) + ", pure-impure " + std::to_string(drawSplit.prediction[2].exchange(0)) + ", pure-pure " + std::to_string(drawSplit.prediction[3].exchange(0)) + " (pairs " + std::to_string(drawSplit.predictedPairs.exchange(0)) + "); mispredicted by first barrier:";
+            for (std::size_t kind = 1; kind < drawSplit.mispredictedKind.size(); ++kind) {
+                const auto count = drawSplit.mispredictedKind[kind].exchange(0);
+                if (count != 0) result += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
+            }
+            std::vector<std::pair<const void*, std::uint64_t>> firstSites;
+            {
+                std::lock_guard lock(resolveSitesMutex);
+                firstSites.assign(resolveFirstBarrierSites.begin(), resolveFirstBarrierSites.end());
+                resolveFirstBarrierSites.clear();
+            }
+            std::sort(firstSites.begin(), firstSites.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            result += " first barrier sites:";
+            for (std::size_t i = 0; i < firstSites.size() && i < 12; ++i) result += " " + ModuleOffsetText(firstSites[i].first) + ":" + std::to_string(firstSites[i].second);
+        }
         result += "; draws by recorder method:";
         for (std::size_t i = 0; i < methods.size() && i < 24; ++i) result += " " + methods[i].first + ":" + std::to_string(methods[i].second);
     }
@@ -4054,6 +4115,14 @@ DrawPacketPtr ResolveDraw(const Context& context, const State& state, const Pm4:
     prepared.trace = trace;
     prepared.shape = shape;
     prepared.ahead = aheadFor(context, ahead);
+    if (DrawSplitCounted()) {
+        static const bool probe = (GuestMemory::SetResolveCompletionProbe(&Recorder::InCompletion), true);
+        static_cast<void>(probe);
+        const auto* slot = prepared.ahead.ahead;
+        const bool singleSample = std::all_of(state.colors.begin(), state.colors.end(), [](const ColorTarget& color) { return color.samples <= 1; }) && (!state.depth || state.depth->samples <= 1);
+        const bool stencilReplay = std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); });
+        resolvePredictedPure = singleSample && !stencilReplay && !state.quadList && !draw.indirect && slot != nullptr && slot->looked && slot->found != nullptr && slot->found->InResourceCache() && slot->found->EpochProofCurrent() && slot->movedPlanned && slot->movedPlan.has_value();
+    }
     std::optional<GuestMemory::PrecollectedScope> precollected;
     if (prepared.ahead.ahead != nullptr && !prepared.ahead.ahead->walks.walks.empty()) {
         if (prepared.ahead.verify) {

@@ -3061,11 +3061,11 @@ void Recorder::ApplyDeferred(DeferredEffects& effects) {
 }
 
 void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
-    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (deferringEffects != nullptr) {
         deferringEffects->kept.emplace_back(std::move(object), bytes);
         return;
     }
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     ensureOpen();
     open->kept.push_back(std::move(object));
     open->keptBytes += bytes;
@@ -3088,22 +3088,22 @@ void Recorder::dropStaleHoldKept() {
 }
 
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
-    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (owner == nullptr || bytes == 0) return;
     if (deferringEffects != nullptr) {
         deferringEffects->keptBytes.emplace_back(owner, bytes);
         return;
     }
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     ensureOpen();
     if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
 }
 
 void Recorder::BoundKeptBytes() {
-    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (deferringEffects != nullptr) {
         deferringEffects->bound = true;
         return;
     }
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const HotWaitSiteScope hotSite{__builtin_return_address(0)};
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
@@ -3633,11 +3633,11 @@ bool Recorder::ReadTracking() {
 }
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
-    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (deferringEffects != nullptr) {
         deferringEffects->reads.emplace_back(address, bytes, static_cast<int>(kind));
         return;
     }
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
@@ -4052,8 +4052,6 @@ void Recorder::HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value) {
 }
 
 void Recorder::Submit() {
-    GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Submit);
-    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     PerformanceTimer frameTiming("Recorder.Submit");
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
@@ -4062,6 +4060,8 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     dropStaleHoldKept();
     if (open == nullptr) return;
+    GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Submit);
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass(PassBreak::NewBatch);
