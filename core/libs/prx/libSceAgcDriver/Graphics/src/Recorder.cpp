@@ -3071,12 +3071,12 @@ void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
 
 void Recorder::BoundKeptBytes() {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
-    const HotWaitSiteScope hotSite{__builtin_return_address(0)};
-    if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (deferringEffects != nullptr) {
         deferringEffects->bound = true;
         return;
     }
+    const HotWaitSiteScope hotSite{__builtin_return_address(0)};
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
     while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
