@@ -4424,6 +4424,33 @@ private:
     bool pending = true;
 };
 
+namespace {
+std::array<std::array<std::atomic<std::uint64_t>, 3>, 5> pendingCleanCounts{};
+std::size_t pendingThreadKind() {
+    if (GuestMemory::OnResolverThread()) return 1;
+    return GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer ? 0 : 2;
+}
+void countPendingEvent(std::size_t event) {
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    if (counted) pendingCleanCounts[event][pendingThreadKind()].fetch_add(1, std::memory_order_relaxed);
+}
+}
+
+std::string TakePendingCleanText() {
+    constexpr std::array<const char*, 5> names{"images cleaned by FlushPending", "FlushPending with nothing to store", "FlushPending held by queued reads", "hook accesses kept by the CPU", "images discarded inside a fill"};
+    std::string text;
+    for (std::size_t event = 0; event < names.size(); ++event) {
+        text += std::string(" ") + names[event] + " (committer/resolver/other)";
+        for (std::size_t kind = 0; kind < 3; ++kind) text += std::string(kind == 0 ? " " : "/") + std::to_string(pendingCleanCounts[event][kind].exchange(0, std::memory_order_relaxed));
+        text += ",";
+    }
+    return text;
+}
+
+void CountHookKeptByCpu() {
+    countPendingEvent(3);
+}
+
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool waited) {
     static_cast<void>(FlushDepthPlanes(address, bytes));
     if (published != nullptr) *published = false;
@@ -4438,9 +4465,13 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         }
         return scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes);
     };
-    if (nothingToStore()) return false;
+    if (nothingToStore()) {
+        countPendingEvent(1);
+        return false;
+    }
     if (AgcDriver::DriverDetail::DrawPipeline::HeldReads(address, bytes)) {
         queuedReadHeld.fetch_add(1, std::memory_order_relaxed);
+        countPendingEvent(2);
         return false;
     }
     GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::PendingSet, __builtin_return_address(0));
@@ -4473,6 +4504,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     continue;
                 }
                 texture->dirty = false;
+                countPendingEvent(0);
                 if (const auto skips = texture->hookSkips.exchange(0, std::memory_order_relaxed); skips != 0 && texture->skippedResultsInside(address, bytes)) {
                     flushedAfterSkip.fetch_add(1, std::memory_order_relaxed);
                     if (PublishReasonFor(reason) == PublishReason::Hook && texture->hookSkipSite.load(std::memory_order_relaxed) == static_cast<std::uint8_t>(GuestMemory::CurrentReadSite())) flushedAfterSkipSameSite.fetch_add(1, std::memory_order_relaxed);
@@ -5363,6 +5395,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             // fill stamped the range, never from a matching `original` (the fill may not have
             // touched the bytes a CPU-path upload copied).
             texture->dirty = false;
+            countPendingEvent(4);
             texture->layerPending.assign(texture->trackedLayers, false);
             texture->layerOriginal.assign(texture->trackedLayers, false);
             texture->cancelStoredSaves();
@@ -5386,6 +5419,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             if (dropped) ++discarded;
             if (dropped && !texture->anyLayerPending()) {
                 texture->dirty = false;
+            countPendingEvent(4);
                 it = pending.textures.erase(it);
                 continue;
             }

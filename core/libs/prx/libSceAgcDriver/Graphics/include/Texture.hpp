@@ -731,6 +731,9 @@ struct LookupOutcomes {
 };
 LookupOutcomes& ThreadLookupOutcomes();
 
+std::string TakePendingCleanText();
+void CountHookKeptByCpu();
+
 }
 
 #endif

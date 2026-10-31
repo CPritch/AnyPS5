@@ -166,6 +166,7 @@ std::string QueueWaits::Text() {
         const auto [unwinding, handler, completion] = GuestMemory::TakeEarlyBarriersPassed();
         text += " barriers passed while unwinding " + std::to_string(unwinding) + ", in an exception handler " + std::to_string(handler) + ", in a completion " + std::to_string(completion);
     }
+    text += "; pending images:" + Graphics::TakePendingCleanText();
     const auto [importedLayers, uploadedLayers] = Graphics::TakeDepthPlaneLayerCounts();
     char planes[128];
     std::snprintf(planes, sizeof(planes), "; depth plane copy layers detiled from their host import %llu, read on the CPU %llu", static_cast<unsigned long long>(importedLayers), static_cast<unsigned long long>(uploadedLayers));
