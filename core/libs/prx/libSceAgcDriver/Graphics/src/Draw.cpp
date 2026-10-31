@@ -1329,6 +1329,8 @@ std::array<DrawAheadCounter, DrawAheadEvents> drawAheadTotals{};
 std::atomic<bool> drawAheadDisabled{false};
 std::atomic<bool> drawAheadThrows{false};
 std::atomic<std::uint64_t> drawAheadNs{0};
+std::atomic<std::uint64_t> deferredDepthViews{0};
+std::atomic<std::uint64_t> deferredDepthViewsChanged{0};
 std::atomic<std::uint64_t> movedPlanNs{0};
 
 std::uint64_t VerifyDrawAheadEvery() {
@@ -2768,6 +2770,7 @@ struct PreparedDraw {
     PreparedDraw& operator=(const PreparedDraw&) = delete;
     std::vector<std::pair<std::uint64_t, std::size_t>> deferredReads;
     Recorder::DeferredEffects deferred;
+    FoundDepthView depthFound;
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
     std::uint64_t shape = 0;
@@ -3147,8 +3150,14 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         targetViews.push_back(binding.target->View());
     }
     if (state.depth) {
-        targetViews.push_back(DepthSurfaceView(context, *state.depth, state.depthWrite));
-        if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+        static const bool deferDepth = std::getenv("APS5_NO_DEFERRED_DEPTH_VIEW") == nullptr;
+        if (deferDepth) prepared.depthFound = FindDepthSurfaceView(context, *state.depth);
+        if (prepared.depthFound.view != VK_NULL_HANDLE) {
+            targetViews.push_back(prepared.depthFound.view);
+        } else {
+            targetViews.push_back(DepthSurfaceView(context, *state.depth, state.depthWrite));
+            if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+        }
     }
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
@@ -3879,6 +3888,9 @@ std::string TakeDrawSplitText() {
     char failed[48];
     std::snprintf(failed, sizeof(failed), ", failed %llu", take(split.proofFailed));
     result += failed;
+    char depthViews[160];
+    std::snprintf(depthViews, sizeof(depthViews), "; depth views found in resolve and noted after it %llu, of them a different surface by then %llu", static_cast<unsigned long long>(deferredDepthViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredDepthViewsChanged.exchange(0, std::memory_order_relaxed)));
+    result += depthViews;
     char gaps[256];
     std::snprintf(gaps, sizeof(gaps), "; hinted templates by proof breaks between the preparer's lookup and the commit (0, 1-4, 5-16, 17-64, more): %llu %llu %llu %llu %llu; by pending-image changes: %llu %llu %llu %llu %llu", take(split.proofGap[0]), take(split.proofGap[1]), take(split.proofGap[2]), take(split.proofGap[3]), take(split.proofGap[4]), take(split.pendingGap[0]), take(split.pendingGap[1]), take(split.pendingGap[2]), take(split.pendingGap[3]), take(split.pendingGap[4]));
     result += gaps;
@@ -3959,6 +3971,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto started = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool ready = prepareDraw(context, state, draw, shaders, snapshots, prepared);
     if (!prepared.deferred.Empty() && context.recorder != nullptr) context.recorder->ApplyDeferred(prepared.deferred);
+    if (prepared.depthFound.view != VK_NULL_HANDLE) {
+        const auto view = DepthSurfaceView(context, *state.depth, state.depthWrite);
+        if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+        deferredDepthViews.fetch_add(1, std::memory_order_relaxed);
+        if (view != prepared.depthFound.view) deferredDepthViewsChanged.fetch_add(1, std::memory_order_relaxed);
+    }
     const auto prepared_at = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (ready) recordPreparedDraw(context, state, draw, shaders, prepared);
     if (!counted) return;

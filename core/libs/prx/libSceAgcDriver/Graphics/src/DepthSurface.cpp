@@ -2191,6 +2191,15 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
     return constant * 256.0f;
 }
 
+FoundDepthView FindDepthSurfaceView(const Context& context, const DepthTarget& target) {
+    if (target.samples != 1u) return {};
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& candidate : surfaces()) {
+        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) return {candidate->view, candidate->owned};
+    }
+    return {};
+}
+
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten) {
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
     std::lock_guard gpu(GuestMemory::GpuMutex());

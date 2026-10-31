@@ -20,6 +20,11 @@ class Texture;
 class StorageTexture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten = true);
+struct FoundDepthView {
+    VkImageView view = VK_NULL_HANDLE;
+    std::shared_ptr<void> owner;
+};
+FoundDepthView FindDepthSurfaceView(const Context& context, const DepthTarget& target);
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target);
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target);
 enum class DepthPlaneScope { Overlapped, Whole };
