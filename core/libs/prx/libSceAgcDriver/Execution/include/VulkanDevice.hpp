@@ -362,6 +362,14 @@ public:
     std::uint64_t RecorderNotedSerial();
     void ApplyDeferredEffects(Graphics::Recorder::DeferredEffects& effects);
     bool ResolverInputsClear();
+    struct EarlySerials {
+        Graphics::HostImportsProof imports{};
+        std::uint64_t open = 0;
+        std::uint64_t noted = 0;
+    };
+    EarlySerials TakeEarlySerials(std::vector<std::pair<std::uint64_t, std::uint64_t>>* queuedStores);
+    enum class EarlyChange : std::uint8_t { None, Imports, Open, Noted };
+    EarlyChange CheckEarlySerials(const EarlySerials& serials, std::vector<std::pair<std::uint64_t, std::uint64_t>>& noted, bool& overrun);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedStoreRanges();
     bool RecorderNotedSince(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
     void PrepareDrawAhead(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::uint64_t shape, Graphics::DrawAhead& ahead) const;

@@ -4354,6 +4354,29 @@ void VulkanDevice::ApplyDeferredEffects(Graphics::Recorder::DeferredEffects& eff
     if (context.recorder != nullptr) context.recorder->ApplyDeferred(effects);
 }
 
+VulkanDevice::EarlySerials VulkanDevice::TakeEarlySerials(std::vector<std::pair<std::uint64_t, std::uint64_t>>* queuedStores) {
+    const auto context = graphicsContext();
+    EarlySerials serials;
+    serials.imports = Graphics::HostImportsIdentity(context);
+    if (context.recorder != nullptr) {
+        serials.open = context.recorder->OpenSerial();
+        serials.noted = context.recorder->NotedSerial();
+        if (queuedStores != nullptr) *queuedStores = context.recorder->QueuedStoreRanges();
+    }
+    return serials;
+}
+
+VulkanDevice::EarlyChange VulkanDevice::CheckEarlySerials(const EarlySerials& serials, std::vector<std::pair<std::uint64_t, std::uint64_t>>& noted, bool& overrun) {
+    const auto context = graphicsContext();
+    overrun = false;
+    if (!Graphics::HostImportsUnchanged(context, serials.imports)) return EarlyChange::Imports;
+    if (context.recorder == nullptr) return EarlyChange::None;
+    if (serials.open != context.recorder->OpenSerial()) return EarlyChange::Open;
+    if (serials.noted == context.recorder->NotedSerial()) return EarlyChange::None;
+    overrun = !context.recorder->NotedSince(serials.noted, noted);
+    return EarlyChange::Noted;
+}
+
 bool VulkanDevice::ResolverInputsClear() {
     return state->copiedWriters->empty() && Graphics::DrawCopiedWriters()->empty();
 }

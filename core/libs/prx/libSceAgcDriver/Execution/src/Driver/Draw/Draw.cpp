@@ -229,12 +229,28 @@ struct EarlyDraw {
     bool claimed = false;
     std::uint64_t proof = 0;
     std::uint64_t pending = 0;
-    std::uint64_t open = 0;
     std::uint64_t redo = 0;
-    std::uint64_t noted = 0;
+    VulkanDevice::EarlySerials serials;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
-    Graphics::HostImportsProof imports{};
     const VulkanDevice* device = nullptr;
+    VulkanDevice* resolver = nullptr;
+    const Graphics::State* graphics = nullptr;
+    const Pm4::DrawParameters* draw = nullptr;
+    std::span<const Graphics::CompiledShader> stages;
+    std::span<const Graphics::GuestMemorySnapshot> snapshots;
+    std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
+    const VulkanDevice::DrawTraceContext* trace = nullptr;
+    std::uint64_t shape = 0;
+    Graphics::DrawAhead* prepared = nullptr;
+    std::uint64_t epoch = 0;
+    std::uint64_t collectEpoch = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> depth;
+    Graphics::Recorder::DeferredEffects abandoned;
+    std::vector<Graphics::DrawPacket*> graveyard;
+    Graphics::ResolverHandoff handoff;
+    std::uint8_t abort = 0;
+    bool failed = false;
 };
 
 namespace {
@@ -1384,6 +1400,57 @@ bool DrawSplitTimed() {
 }
 }
 
+void resolveEarlyJob(void* context) {
+    auto& early = *static_cast<EarlyDraw*>(context);
+    GuestMemory::AdoptCollectEpoch(early.collectEpoch);
+    GuestMemory::FollowCollectToken(early.epoch);
+    early.handoff.snapshot = Graphics::Recorder::PendingWriteSnapshot();
+    const Graphics::ResolverScope scope(early.handoff);
+    struct Disarm {
+        ~Disarm() {
+            GuestMemory::DisarmEarlyResolve();
+            GuestMemory::SetEarlyReadLog(nullptr);
+            DrawPipeline::SkipCommittingReads(false);
+        }
+    } disarm;
+    GuestMemory::SetEarlyReadLog(&early.reads);
+    DrawPipeline::SkipCommittingReads(true);
+    GuestMemory::ArmEarlyResolve();
+    try {
+        early.packet = early.resolver->ResolveDraw(*early.graphics, *early.draw, early.stages, early.snapshots, early.recipeOut, early.trace, early.shape, early.prepared);
+    } catch (const GuestMemory::EarlyResolveAbort& abort) {
+        early.packet.reset();
+        early.abort = abort.kind;
+    } catch (...) {
+        early.packet.reset();
+        early.failed = true;
+    }
+}
+
+void finishEarlyJob(void* context, bool ran) {
+    auto& early = *static_cast<EarlyDraw*>(context);
+    early.handoff.snapshot.reset();
+    if (!early.abandoned.Empty()) early.resolver->ApplyDeferredEffects(early.abandoned);
+    Graphics::BuryPackets(early.graveyard);
+    if (!ran) {
+        early.claimed = false;
+        return;
+    }
+    if (early.abort != 0 || early.failed || early.packet == nullptr) {
+        early.packet.reset();
+        early.built.reset();
+        if (early.abort != 0) DrawPipeline::NoteEarlyAbort(early.abort);
+        else DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::ResolverFailed);
+        return;
+    }
+    if (Graphics::DrawPacketReadsOverlap(*early.packet, early.writes) || Graphics::DrawPacketReadsOverlap(*early.packet, early.depth)) {
+        early.resolver->DiscardDraw(*early.packet);
+        early.packet.reset();
+        early.built.reset();
+        DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::OverlapAfter);
+    }
+}
+
 bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape, DrawAheadSlot* ahead, std::uint64_t epoch, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& itemReads, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> depth, EarlyDraw& early) {
     static const bool all = std::getenv("APS5_RESOLVE_SPLIT_ALL") != nullptr;
     static const bool probe = (GuestMemory::SetResolveCompletionProbe(&Graphics::Recorder::InCompletion), true);
@@ -1398,7 +1465,6 @@ bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const G
     const auto* result = ahead != nullptr && ahead->phase.load(std::memory_order_acquire) == DrawAheadSlot::Ready ? &ahead->result : nullptr;
     if (!all && !Graphics::PredictPureResolve(graphics, drawParameters, stages, result)) return false;
     if (result != nullptr && result->found != nullptr && (result->found->DescribedRangesOverlap(writes) || result->found->DescribedRangesOverlap(depth))) return false;
-    if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     const auto split = DrawPipeline::ResolveSplit();
     if (split >= 2 && !localDevice->ResolverInputsClear()) {
         DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::DeclinedWriters);
@@ -1408,71 +1474,32 @@ bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const G
     early.claimed = true;
     early.proof = GuestMemory::ProofSerial();
     early.pending = Graphics::StorageTexture::PendingSerial();
-    early.imports = localDevice->ImportsIdentity();
-    early.open = localDevice->RecorderOpenSerial();
+    early.serials = localDevice->TakeEarlySerials(split >= 2 ? &early.handoff.queuedStores : nullptr);
     early.redo = Graphics::DrawRedoSerial();
-    early.noted = localDevice->RecorderNotedSerial();
     early.device = localDevice.get();
     early.reads.clear();
     if (split >= 2) {
         static const bool hooked = (Graphics::SetRedoHook(&DrawPipeline::JoinResolve), true);
         static_cast<void>(hooked);
-        struct Job {
-            Graphics::Recorder::DeferredEffects abandoned;
-            std::vector<Graphics::DrawPacket*> graveyard;
-            Graphics::ResolverHandoff handoff;
-            std::uint8_t abort = 0;
-            bool failed = false;
-        };
-        auto job = std::make_shared<Job>();
-        job->handoff = {Graphics::ShapeMemoHandle(), Graphics::Recorder::PendingWriteSnapshot(), localDevice->QueuedStoreRanges(), &job->abandoned, &job->graveyard};
-        const auto collectEpoch = GuestMemory::ThreadCollectEpoch();
-        const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
-        auto* built = recipeStages.empty() ? nullptr : &early.built;
-        DrawPipeline::PostResolve([job, localDevice, &graphics, &drawParameters, stages, snapshots, built, tracePtr, shape, prepared, epoch, collectEpoch, &early] {
-            GuestMemory::AdoptCollectEpoch(collectEpoch);
-            GuestMemory::FollowCollectToken(epoch);
-            const Graphics::ResolverScope scope(job->handoff);
-            struct Disarm {
-                ~Disarm() {
-                    GuestMemory::DisarmEarlyResolve();
-                    GuestMemory::SetEarlyReadLog(nullptr);
-                    DrawPipeline::SkipCommittingReads(false);
-                }
-            } disarm;
-            GuestMemory::SetEarlyReadLog(&early.reads);
-            DrawPipeline::SkipCommittingReads(true);
-            GuestMemory::ArmEarlyResolve();
-            try {
-                early.packet = localDevice->ResolveDraw(graphics, drawParameters, stages, snapshots, built, tracePtr, shape, prepared);
-            } catch (const GuestMemory::EarlyResolveAbort& abort) {
-                early.packet.reset();
-                job->abort = abort.kind;
-            } catch (...) {
-                early.packet.reset();
-                job->failed = true;
-            }
-        }, [job, localDevice, writes = std::vector(writes.begin(), writes.end()), depth = std::vector(depth.begin(), depth.end()), &early](bool ran) {
-            if (!job->abandoned.Empty()) localDevice->ApplyDeferredEffects(job->abandoned);
-            Graphics::BuryPackets(job->graveyard);
-            if (!ran) {
-                early.claimed = false;
-                return;
-            }
-            if (job->abort != 0 || job->failed || early.packet == nullptr) {
-                early.packet.reset();
-                early.built.reset();
-                if (job->abort != 0) DrawPipeline::NoteEarlyAbort(job->abort);
-                else DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::ResolverFailed);
-                return;
-            }
-            if (Graphics::DrawPacketReadsOverlap(*early.packet, writes) || Graphics::DrawPacketReadsOverlap(*early.packet, depth)) {
-                localDevice->DiscardDraw(*early.packet);
-                early.packet.reset();
-                early.built.reset();
-                DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::OverlapAfter);
-            }
-        });
+        early.resolver = localDevice.get();
+        early.graphics = &graphics;
+        early.draw = &drawParameters;
+        early.stages = stages;
+        early.snapshots = snapshots;
+        early.recipeOut = recipeStages.empty() ? nullptr : &early.built;
+        early.trace = trace.token != 0 ? &trace : nullptr;
+        early.shape = shape;
+        early.prepared = prepared;
+        early.epoch = epoch;
+        early.collectEpoch = GuestMemory::ThreadCollectEpoch();
+        early.writes.assign(writes.begin(), writes.end());
+        early.depth.assign(depth.begin(), depth.end());
+        early.abort = 0;
+        early.failed = false;
+        early.handoff.shapeMemo = Graphics::ShapeMemoHandle();
+        early.handoff.abandoned = &early.abandoned;
+        early.handoff.graveyard = &early.graveyard;
+        DrawPipeline::PostResolve(&resolveEarlyJob, &finishEarlyJob, &early);
         if (split == 3) DrawPipeline::WaitResolve();
         return true;
     }
@@ -1549,16 +1576,19 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
             if (early->device != localDevice.get()) stale = E::StaleDevice;
             else if (early->proof != GuestMemory::ProofSerial()) stale = E::StaleProof;
             else if (early->pending != Graphics::StorageTexture::PendingSerial()) stale = E::StalePending;
-            else if (!localDevice->ImportsUnchanged(early->imports)) stale = E::StaleImports;
-            else if (early->open != localDevice->RecorderOpenSerial()) stale = E::StaleSubmit;
             else if (early->redo != Graphics::DrawRedoSerial()) stale = E::StaleRedo;
             else if (Graphics::DrawPacketTemplateGone(*early->packet)) stale = E::StaleTemplate;
-            else if (early->noted != localDevice->RecorderNotedSerial()) {
-                std::vector<std::pair<std::uint64_t, std::uint64_t>> noted;
+            else {
+                thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> noted;
+                noted.clear();
+                bool overrun = false;
+                const auto change = localDevice->CheckEarlySerials(early->serials, noted, overrun);
                 const auto overlaps = [](const auto& first, const auto& second) {
                     return std::any_of(first.begin(), first.end(), [&](const auto& a) { return std::any_of(second.begin(), second.end(), [&](const auto& b) { return a.first < b.second && b.first < a.second; }); });
                 };
-                if (!localDevice->RecorderNotedSince(early->noted, noted) || overlaps(noted, early->reads) || Graphics::DrawPacketReadsOverlap(*early->packet, noted)) stale = E::StaleNoted;
+                if (change == VulkanDevice::EarlyChange::Imports) stale = E::StaleImports;
+                else if (change == VulkanDevice::EarlyChange::Open) stale = E::StaleSubmit;
+                else if (change == VulkanDevice::EarlyChange::Noted && (overrun || overlaps(noted, early->reads) || Graphics::DrawPacketReadsOverlap(*early->packet, noted))) stale = E::StaleNoted;
             }
             DrawPipeline::NoteEarly(stale);
             if (stale == E::Used) {

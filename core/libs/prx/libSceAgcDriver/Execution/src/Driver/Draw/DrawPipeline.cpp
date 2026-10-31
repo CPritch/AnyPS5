@@ -519,14 +519,15 @@ unsigned DrawPipeline::ResolveSplit() {
     return mode;
 }
 
-void DrawPipeline::PostResolve(std::function<void()> body, std::function<void(bool)> finish) {
+void DrawPipeline::PostResolve(void (*body)(void*), void (*finish)(void*, bool), void* context) {
     auto& pipeline = Queue0();
     if (!pipeline.resolver.joinable()) {
         std::lock_guard lock(pipeline.prepareMutex);
         if (!pipeline.resolverClosing.load(std::memory_order_relaxed) && !pipeline.resolver.joinable()) pipeline.resolver = std::thread([&pipeline] { pipeline.resolveAhead(); });
     }
-    pipeline.resolveBody = std::move(body);
-    pipeline.resolveFinish = std::move(finish);
+    pipeline.resolveBody = body;
+    pipeline.resolveFinish = finish;
+    pipeline.resolveContext = context;
     pipeline.resolvePosted = std::chrono::steady_clock::now();
     resolvesPosted.fetch_add(1, std::memory_order_relaxed);
     pipeline.resolveState.store(ResolvePosted, std::memory_order_release);
@@ -560,16 +561,16 @@ void DrawPipeline::joinResolve(bool revoke) {
         }
         pipeline.resolveState.store(ResolveIdle, std::memory_order_relaxed);
     }
-    auto finish = std::move(pipeline.resolveFinish);
-    pipeline.resolveFinish = nullptr;
+    const auto finish = std::exchange(pipeline.resolveFinish, nullptr);
+    auto* context = std::exchange(pipeline.resolveContext, nullptr);
     pipeline.resolveBody = nullptr;
-    if (!finish) return;
+    if (finish == nullptr) return;
     if (std::uncaught_exceptions() == 0) {
-        finish(ran);
+        finish(context, ran);
         return;
     }
     try {
-        finish(ran);
+        finish(context, ran);
     } catch (...) {
     }
 }
@@ -649,7 +650,7 @@ void DrawPipeline::resolveAhead() {
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (timed) resolveStartNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - resolvePosted).count()), std::memory_order_relaxed);
         try {
-            resolveBody();
+            resolveBody(resolveContext);
         } catch (...) {
         }
         if (timed) resolveBusyNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);

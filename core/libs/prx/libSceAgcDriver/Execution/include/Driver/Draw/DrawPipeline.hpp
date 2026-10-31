@@ -90,7 +90,7 @@ public:
     enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, DeclinedWriters, VerifyMatched, VerifyDiffered, Unoffered, Count };
     static void NoteEarly(EarlyEvent event);
     static void OfferEarly(std::span<const Range> depth);
-    static void PostResolve(std::function<void()> body, std::function<void(bool)> finish);
+    static void PostResolve(void (*body)(void*), void (*finish)(void*, bool), void* context);
     static void JoinResolve();
     static void WaitResolve();
     static bool EarlyStopped();
@@ -197,8 +197,9 @@ private:
     std::thread resolver;
     alignas(64) std::atomic<int> resolveState{0};
     std::atomic<bool> resolverClosing{false};
-    std::function<void()> resolveBody;
-    std::function<void(bool)> resolveFinish;
+    void (*resolveBody)(void*) = nullptr;
+    void (*resolveFinish)(void*, bool) = nullptr;
+    void* resolveContext = nullptr;
     std::chrono::steady_clock::time_point resolvePosted;
     alignas(64) std::uint64_t resolveLineEnd = 0;
 };
