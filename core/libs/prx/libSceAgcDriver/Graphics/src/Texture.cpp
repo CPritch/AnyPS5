@@ -1439,11 +1439,11 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
         totals.storageBytes += texture->guestBytes;
         if (++totals.storageCount % 50 == 0) std::fprintf(stderr, "[texture] %llu storage images (%.0f MiB): create %.0f ms, write-back %.0f ms (alloc %.0f, host copy %.0f, gpu %.0f, store %.0f), %llu reused, %llu direct uploads, %llu direct write-backs, clears %llu recorded / %llu waited\n", static_cast<unsigned long long>(totals.storageCount), totals.storageBytes / 1048576.0, totals.storageCreate, totals.storageWriteBack, totals.storageAlloc, totals.storageHostCopy, totals.storageGpu, totals.storageStore, static_cast<unsigned long long>(totals.storageReused), static_cast<unsigned long long>(totals.storageDirectUploads), static_cast<unsigned long long>(totals.storageDirectWriteBacks), static_cast<unsigned long long>(totals.storageRecordedClears), static_cast<unsigned long long>(totals.storageWaitedClears));
     }
-    if (static const bool named = std::getenv("APS5_COMMIT_STATS") != nullptr; named && texture->guestBytes >= (std::uint64_t{16} << 20u)) {
+    if (static const bool named = std::getenv("APS5_COMMIT_STATS") != nullptr; named && texture->guestBytes >= (std::uint64_t{8} << 20u)) {
         static std::mutex namedMutex;
         static std::set<std::uint64_t> namedImages;
         std::lock_guard lock(namedMutex);
-        if (namedImages.size() < 64 && namedImages.insert(texture->descriptor.baseAddress).second) std::fprintf(stderr, "[draw] large storage image created: 0x%llx+0x%llx format %d on the %s\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), static_cast<int>(texture->descriptor.format), GuestMemory::OnResolverThread() ? "resolver" : GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer ? "committer" : "another thread");
+        if (namedImages.size() < 64 && namedImages.insert(texture->descriptor.baseAddress).second) std::fprintf(stderr, "[draw] large storage image created: 0x%llx+0x%llx format %d on the %s, present %llu\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), static_cast<int>(texture->descriptor.format), GuestMemory::OnResolverThread() ? "resolver" : GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer ? "committer" : "another thread", static_cast<unsigned long long>(Recorder::Presents()));
     }
     return texture;
 }
@@ -2709,6 +2709,12 @@ void StorageTexture::takeRefreshProof(bool aliased) {
         return;
     }
     refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
+    if (static const bool named = std::getenv("APS5_COMMIT_STATS") != nullptr; named && guestBytes >= (std::uint64_t{8} << 20u)) {
+        static std::mutex namedMutex;
+        static std::set<std::uint64_t> namedImages;
+        std::lock_guard lock(namedMutex);
+        if (namedImages.size() < 64 && namedImages.insert(descriptor.baseAddress).second) std::fprintf(stderr, "[draw] large storage image first refresh proof: 0x%llx+0x%llx, present %llu\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(Recorder::Presents()));
+    }
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {
@@ -4116,13 +4122,13 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     dirty = true;
     pending.textures.push_back(this);
     BumpPendingSerial();
-    if (static const bool named = std::getenv("APS5_COMMIT_STATS") != nullptr; named && guestBytes >= (std::uint64_t{16} << 20u)) {
+    if (static const bool named = std::getenv("APS5_COMMIT_STATS") != nullptr; named && guestBytes >= (std::uint64_t{8} << 20u)) {
         static std::mutex namedMutex;
         static std::set<std::uint64_t> namedImages;
         std::lock_guard lock(namedMutex);
         if (namedImages.size() < 64 && namedImages.insert(descriptor.baseAddress).second) {
             const auto packet = GuestMemory::CurrentPacket();
-            std::fprintf(stderr, "[draw] large storage image first dirty: 0x%llx+0x%llx format %d, layers %u+%u, on the %s, packet 0x%x\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<int>(descriptor.format), first, count, GuestMemory::OnResolverThread() ? "resolver" : GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer ? "committer" : "another thread", static_cast<unsigned>(packet.opcode));
+            std::fprintf(stderr, "[draw] large storage image first dirty: 0x%llx+0x%llx format %d, layers %u+%u, on the %s, packet 0x%x, present %llu\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<int>(descriptor.format), first, count, GuestMemory::OnResolverThread() ? "resolver" : GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer ? "committer" : "another thread", static_cast<unsigned>(packet.opcode), static_cast<unsigned long long>(Recorder::Presents()));
         }
     }
 }
