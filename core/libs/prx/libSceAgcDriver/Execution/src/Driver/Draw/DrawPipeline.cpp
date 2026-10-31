@@ -50,6 +50,7 @@ constexpr std::array<const char*, QueueWaitSites> QueueWaitNames{"relocation", "
 std::array<std::atomic<std::uint64_t>, QueueWaitSites> queueWaitCounts{}, queueWaitNs{};
 std::atomic<std::uint64_t> shadowCaptures{0}, shadowOverlaps{0};
 std::atomic<std::uint64_t> heldWaitLabels{0}, heldWaitUnknown{0}, heldWaitOther{0};
+std::atomic<std::uint64_t> commitSequence{0};
 std::atomic<std::uint64_t> queuedLabelReads{0};
 
 std::string QueueWaitText(QueueWaits::Site site) {
@@ -441,6 +442,10 @@ unsigned DrawPipeline::Committers() {
     return runningCommitters.load(std::memory_order_acquire);
 }
 
+std::uint64_t DrawPipeline::CommitSequence() {
+    return commitSequence.load(std::memory_order_relaxed);
+}
+
 unsigned DrawPipeline::PrepareThreads() {
     static const unsigned threads = [] {
         const char* text = std::getenv("APS5_PREPARE_AHEAD");
@@ -687,6 +692,7 @@ void DrawPipeline::run() {
             QueueWaits::Note(QueueWaits::Site::CommitterIdleBlocked, spun, start);
             if (idleBehindWait) QueueWaits::Note(QueueWaits::Site::CommitterIdleBehindWait, idleStart, start);
         }
+        commitSequence.fetch_add(1, std::memory_order_relaxed);
         const double gpuWaitedBefore = counted ? Graphics::Recorder::HotGpuWaitedMs() : 0.0;
         std::exception_ptr fatal;
         bool failed = false;

@@ -1582,6 +1582,7 @@ std::uint64_t Recorder::ReapsWithWork() {
 }
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+    GuestMemory::NoteResolveCommands(__builtin_return_address(0));
     ensureOpen();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or

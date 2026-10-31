@@ -2690,7 +2690,17 @@ void GpuMutexType::acquired() {
     }
 }
 
+namespace {
+thread_local bool resolveTraceActive = false;
+thread_local ResolveLockTrace resolveTrace;
+
+void NoteResolveLockTouch(const void* site) {
+    if (resolveTrace.touches++ == 0) resolveTrace.firstTouch = site;
+}
+}
+
 bool GpuMutexType::try_lock() {
+    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0));
     if (!GpuLockProfiled()) {
         if (!tryEnter()) return false;
         acquired();
@@ -2737,13 +2747,30 @@ void GpuMutexType::unlock() {
     }
 }
 
+void BeginResolveLockTrace() {
+    resolveTrace = {};
+    resolveTraceActive = true;
+}
+
+ResolveLockTrace EndResolveLockTrace() {
+    resolveTraceActive = false;
+    return resolveTrace;
+}
+
+void NoteResolveCommands(const void* site) {
+    if (!resolveTraceActive) return;
+    if (resolveTrace.commands++ == 0) resolveTrace.firstCommands = site;
+}
+
 bool GpuMutexType::HeldByThisThread() const {
+    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0));
     return owner.load(std::memory_order_relaxed) == CurrentThreadToken();
 }
 
 std::uint32_t GpuMutexType::DepthOnThisThread() const {
+    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0));
     // `depth` is written by the holder only, so it is read only when that is this thread.
-    return HeldByThisThread() ? depth : 0;
+    return owner.load(std::memory_order_relaxed) == CurrentThreadToken() ? depth : 0;
 }
 
 void AssertGpuLockHeld(const char* where) {
@@ -2754,6 +2781,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    if (resolveTraceActive) NoteResolveLockTouch(__builtin_return_address(0));
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr && hotThread == HotThread::None) {

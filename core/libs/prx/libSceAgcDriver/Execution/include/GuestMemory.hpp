@@ -203,6 +203,15 @@ private:
     std::uint32_t depth = 0;
 };
 GpuMutexType& GpuMutex();
+struct ResolveLockTrace {
+    std::uint32_t touches = 0;
+    std::uint32_t commands = 0;
+    const void* firstTouch = nullptr;
+    const void* firstCommands = nullptr;
+};
+void BeginResolveLockTrace();
+ResolveLockTrace EndResolveLockTrace();
+void NoteResolveCommands(const void* site);
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.

@@ -70,6 +70,7 @@ public:
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
+    static std::uint64_t CommitSequence();
     static std::size_t QueuedItems();
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();

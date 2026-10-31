@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -39,6 +40,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -1797,7 +1801,23 @@ struct DrawSplitCounts {
     std::array<std::atomic<std::uint64_t>, 6> proofs{}, proofNs{};
     std::atomic<std::uint64_t> proofFailed{0}, findNs{0}, movedNs{0}, hits{0}, unmoved{0}, invalidated{0}, misses{0}, uncacheable{0};
     std::array<std::atomic<std::uint64_t>, 5> proofGap{}, pendingGap{};
+    std::atomic<std::uint64_t> traced{0}, lockFree{0}, freePairs{0}, touching{0}, recording{0};
 };
+
+std::mutex resolveSitesMutex;
+std::map<const void*, std::uint64_t> resolveTouchSites;
+std::map<const void*, std::uint64_t> resolveCommandSites;
+
+std::string ModuleOffsetText(const void* site) {
+    unsigned long long offset = reinterpret_cast<std::uintptr_t>(site);
+#ifdef __linux__
+    Dl_info info{};
+    if (site != nullptr && dladdr(site, &info) != 0 && info.dli_fbase != nullptr) offset = reinterpret_cast<std::uintptr_t>(site) - reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+#endif
+    char text[32];
+    std::snprintf(text, sizeof(text), "+0x%llx", offset);
+    return text;
+}
 
 std::size_t GapBucket(std::uint64_t gap) {
     return gap == 0 ? 0 : gap <= 4 ? 1 : gap <= 16 ? 2 : gap <= 64 ? 3 : 4;
@@ -2944,6 +2964,31 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     const bool counted = timer.counted;
     timer = DrawTimer(profile);
     timer.counted = counted;
+    struct ResolveTraceScope {
+        bool on;
+        explicit ResolveTraceScope(bool traced) : on(traced) {
+            if (on) GuestMemory::BeginResolveLockTrace();
+        }
+        ~ResolveTraceScope() {
+            if (!on) return;
+            const auto trace = GuestMemory::EndResolveLockTrace();
+            auto& split = DrawSplit();
+            split.traced.fetch_add(1, std::memory_order_relaxed);
+            if (trace.touches != 0) split.touching.fetch_add(1, std::memory_order_relaxed);
+            if (trace.commands != 0) split.recording.fetch_add(1, std::memory_order_relaxed);
+            thread_local std::uint64_t lastFree = 0;
+            if (trace.touches == 0 && trace.commands == 0) {
+                const auto sequence = AgcDriver::DriverDetail::DrawPipeline::CommitSequence();
+                split.lockFree.fetch_add(1, std::memory_order_relaxed);
+                if (lastFree != 0 && sequence == lastFree + 1) split.freePairs.fetch_add(1, std::memory_order_relaxed);
+                lastFree = sequence;
+                return;
+            }
+            std::lock_guard lock(resolveSitesMutex);
+            if (trace.touches != 0) ++resolveTouchSites[trace.firstTouch];
+            if (trace.commands != 0) ++resolveCommandSites[trace.firstCommands];
+        }
+    } resolveTrace{counted && DrawSplitCounted()};
     // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
     // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
     // draws, their inputs: per-draw string building at ~1400 draws per 10 s is itself a cost the
@@ -3819,6 +3864,27 @@ std::string TakeDrawSplitText() {
     char gaps[256];
     std::snprintf(gaps, sizeof(gaps), "; hinted templates by proof breaks between the preparer's lookup and the commit (0, 1-4, 5-16, 17-64, more): %llu %llu %llu %llu %llu; by pending-image changes: %llu %llu %llu %llu %llu", take(split.proofGap[0]), take(split.proofGap[1]), take(split.proofGap[2]), take(split.proofGap[3]), take(split.proofGap[4]), take(split.pendingGap[0]), take(split.pendingGap[1]), take(split.pendingGap[2]), take(split.pendingGap[3]), take(split.pendingGap[4]));
     result += gaps;
+    {
+        const auto traced = take(split.traced), lockFree = take(split.lockFree), pairs = take(split.freePairs), touching = take(split.touching), recording = take(split.recording);
+        char trace[256];
+        std::snprintf(trace, sizeof(trace), "; resolve's GPU-lock and recorder use: %llu draws traced, %llu touch neither, %llu of those right after another such draw; %llu touch the lock, %llu record commands; first lock touch by site:", traced, lockFree, pairs, touching, recording);
+        result += trace;
+        std::vector<std::pair<const void*, std::uint64_t>> touchSites, commandSites;
+        {
+            std::lock_guard lock(resolveSitesMutex);
+            touchSites.assign(resolveTouchSites.begin(), resolveTouchSites.end());
+            commandSites.assign(resolveCommandSites.begin(), resolveCommandSites.end());
+            resolveTouchSites.clear();
+            resolveCommandSites.clear();
+        }
+        const auto top = [&](std::vector<std::pair<const void*, std::uint64_t>>& sites) {
+            std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            for (std::size_t i = 0; i < sites.size() && i < 6; ++i) result += " " + ModuleOffsetText(sites[i].first) + ":" + std::to_string(sites[i].second);
+        };
+        top(touchSites);
+        result += "; first command recording by site:";
+        top(commandSites);
+    }
     result += ShaderResources::TakeCommitterProofText();
     result += ShaderResources::TakeCommitterMovedText();
     result += StorageTexture::TakeCommitterRefreshText();
