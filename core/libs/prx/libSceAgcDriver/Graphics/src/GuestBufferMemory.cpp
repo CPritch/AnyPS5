@@ -434,6 +434,7 @@ bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::u
 bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
 void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, bool hold = true) {
+    GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Import);
 #ifdef _WIN32
     auto* reading = forgetSettle(state, it->first);
 #endif
@@ -2235,6 +2236,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
 #endif
     const auto inserted = state.imports.emplace(base, entry);
+    GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Import);
     owner.armed = false;
     return &inserted.first->second;
 }

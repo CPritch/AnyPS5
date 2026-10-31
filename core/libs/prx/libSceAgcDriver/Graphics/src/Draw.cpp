@@ -1817,6 +1817,8 @@ struct DrawSplitCounts {
     std::array<std::atomic<std::uint64_t>, 5> proofGap{}, pendingGap{};
     std::atomic<std::uint64_t> traced{0}, lockFree{0}, freePairs{0}, touching{0}, recording{0}, recorderUsing{0}, uncoupled{0};
     std::atomic<std::uint64_t> afterNonDraw{0}, previousBrokeProofs{0}, previousChangedPending{0}, brokenBetween{0}, samplesPreviousTargets{0}, wouldSplit{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::ResolveEffect::Count)> effectDraws{};
+    std::atomic<std::uint64_t> pure{0}, purePairs{0};
 };
 
 std::mutex resolveSitesMutex;
@@ -3032,6 +3034,16 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             if (trace.recorderUses != 0) split.recorderUsing.fetch_add(1, std::memory_order_relaxed);
             if (trace.touches == 0 && trace.commands == 0 && trace.recorderUses == 0) split.uncoupled.fetch_add(1, std::memory_order_relaxed);
             lastResolveLockFree = trace.touches == 0 && trace.commands == 0;
+            for (std::size_t effect = 0; effect < split.effectDraws.size(); ++effect) {
+                if ((trace.effects >> effect) & 1u) split.effectDraws[effect].fetch_add(1, std::memory_order_relaxed);
+            }
+            thread_local std::uint64_t lastPure = 0;
+            if (trace.touches == 0 && trace.commands == 0 && trace.effects == 0) {
+                const auto sequence = AgcDriver::DriverDetail::DrawPipeline::CommitSequence();
+                split.pure.fetch_add(1, std::memory_order_relaxed);
+                if (lastPure != 0 && sequence == lastPure + 1) split.purePairs.fetch_add(1, std::memory_order_relaxed);
+                lastPure = sequence;
+            }
             thread_local std::uint64_t lastFree = 0;
             if (trace.recorderSiteCount != 0) {
                 std::lock_guard lock(resolveSitesMutex);
@@ -3987,6 +3999,13 @@ std::string TakeDrawSplitText() {
         char split[320];
         std::snprintf(split, sizeof(split), "; of the lock-free resolves, if resolved beside the previous item's emit: after a non-draw item %llu, the previous draw's emit broke proofs %llu, changed pending images %llu, proofs broken between %llu, samples the previous draw's targets %llu, would split %llu", static_cast<unsigned long long>(DrawSplit().afterNonDraw.exchange(0)), static_cast<unsigned long long>(DrawSplit().previousBrokeProofs.exchange(0)), static_cast<unsigned long long>(DrawSplit().previousChangedPending.exchange(0)), static_cast<unsigned long long>(DrawSplit().brokenBetween.exchange(0)), static_cast<unsigned long long>(DrawSplit().samplesPreviousTargets.exchange(0)), static_cast<unsigned long long>(DrawSplit().wouldSplit.exchange(0)));
         result += split;
+        {
+            auto& drawSplit = DrawSplit();
+            constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::ResolveEffect::Count)> effectNames{"submit", "batch reap", "proof break", "import made or retired", "template inserted", "storage image created"};
+            result += "; resolves with an effect a redo cannot undo, by effect (draws):";
+            for (std::size_t effect = 0; effect < effectNames.size(); ++effect) result += std::string(effect == 0 ? " " : ", ") + effectNames[effect] + " " + std::to_string(drawSplit.effectDraws[effect].exchange(0));
+            result += "; resolves with no lock touch, no commands and none of these effects " + std::to_string(drawSplit.pure.exchange(0)) + ", of them right after another such draw " + std::to_string(drawSplit.purePairs.exchange(0));
+        }
         result += "; draws by recorder method:";
         for (std::size_t i = 0; i < methods.size() && i < 24; ++i) result += " " + methods[i].first + ":" + std::to_string(methods[i].second);
     }

@@ -4229,6 +4229,7 @@ void ResourceCache::noteMiss(const Key& key) {
 }
 
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::CacheInsert);
     std::lock_guard lock(mutex);
     dropReleasedTextures(evicted);
     if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;

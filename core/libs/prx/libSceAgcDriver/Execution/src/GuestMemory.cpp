@@ -1931,6 +1931,7 @@ std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ProofBreak::Coun
 }
 
 void BreakProofs(ProofBreak cause) {
+    NoteResolveEffect(ResolveEffect::ProofBreak);
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
     proofBreaks[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -2774,6 +2775,10 @@ void NoteResolveRecorder(const void* site, const char* method) {
     const auto end = resolveTrace.recorderSites.begin() + resolveTrace.recorderSiteCount;
     if (std::find(resolveTrace.recorderSites.begin(), end, site) != end || resolveTrace.recorderSiteCount == resolveTrace.recorderSites.size()) return;
     resolveTrace.recorderSites[resolveTrace.recorderSiteCount++] = site;
+}
+
+void NoteResolveEffect(ResolveEffect effect) {
+    if (resolveTraceActive) resolveTrace.effects |= 1u << static_cast<unsigned>(effect);
 }
 
 void NoteResolveCommands(const void* site) {

@@ -1442,6 +1442,7 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
 }
 
 StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor), storeSerial(storeSerials.fetch_add(1, std::memory_order_relaxed) + 1) {
+    GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::StorageCreate);
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
         Require(mipLevel < descriptor.mipCount, "storage texture mip level is outside the texture");

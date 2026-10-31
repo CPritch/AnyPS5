@@ -4052,6 +4052,7 @@ void Recorder::HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value) {
 }
 
 void Recorder::Submit() {
+    GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Submit);
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     PerformanceTimer frameTiming("Recorder.Submit");
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
@@ -4568,6 +4569,7 @@ bool Recorder::Reap() {
 }
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
+    GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Reap);
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     inFlightKeptBytes -= batch->keptBytes;
     // The batch's writes stay published until its completions ran, on every exit path.

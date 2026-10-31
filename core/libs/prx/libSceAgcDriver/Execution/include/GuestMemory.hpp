@@ -216,7 +216,10 @@ struct ResolveLockTrace {
     std::uint32_t recorderSiteCount = 0;
     std::array<const char*, 32> recorderMethods{};
     std::uint32_t recorderMethodCount = 0;
+    std::uint32_t effects = 0;
 };
+enum class ResolveEffect : std::uint8_t { Submit, Reap, ProofBreak, Import, CacheInsert, StorageCreate, Count };
+void NoteResolveEffect(ResolveEffect effect);
 void BeginResolveLockTrace();
 ResolveLockTrace EndResolveLockTrace();
 void NoteResolveCommands(const void* site);
