@@ -94,6 +94,7 @@ std::vector<KnownHtilePass> TrustedHtilePasses(const MetadataTrust& trust, std::
 void PassTrustedHtiles(std::span<const KnownHtilePass> passes);
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
 std::size_t DepthPlaneCopyCount();
+std::pair<std::uint64_t, std::uint64_t> TakeDepthPlaneLayerCounts();
 VkDeviceSize DepthPlaneCopyBytes();
 VkFormat HostDepthFormat(const Context& context, VkFormat format);
 float HostDepthBiasConstant(const Context& context, VkFormat format, float constant);

@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
@@ -1278,6 +1279,14 @@ struct DepthPlaneSlice {
     std::uint64_t written = 0;
 };
 
+std::atomic<std::uint64_t> importedLayerCount{0};
+std::atomic<std::uint64_t> uploadedLayerCount{0};
+
+bool PlaneCopyImports() {
+    static const bool enabled = std::getenv("APS5_NO_PLANE_COPY_IMPORT") == nullptr;
+    return enabled;
+}
+
 class DepthPlaneCopy {
 public:
     DepthPlaneCopy(const Context& context, VkExtent2D extent, VkFormat format, std::uint32_t layers) : context(context), extent(extent), format(format), layers(layers), guestLayers(layers), surfaceLayers(layers) {
@@ -1329,6 +1338,9 @@ public:
         std::vector<std::shared_ptr<Buffer>> uploads;
         std::vector<std::uint32_t> uploadLayers;
         std::vector<std::uint32_t> copiedLayers;
+        std::vector<std::pair<std::uint32_t, GuestLayer>> importCandidates;
+        std::vector<ImportedLayer> importedLayers;
+        auto* recorder = PlaneCopyImports() ? RecorderFor(context) : nullptr;
         for (std::uint32_t layer = 0; layer < requested; ++layer) {
             auto& held = guestLayers[layer];
             auto& surface = surfaceLayers[layer];
@@ -1347,15 +1359,36 @@ public:
                 held.generation = current.generation;
                 continue;
             }
-            auto upload = std::make_shared<Buffer>(context, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            GuestMemory::ReadCommitted(current.address, upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
-            uploads.push_back(std::move(upload));
-            uploadLayers.push_back(layer);
+            if (recorder != nullptr && !current.uncommitted) {
+                importCandidates.emplace_back(layer, current);
+                held = current;
+                continue;
+            }
+            uploadLayer(layer, current, geometry, uploads, uploadLayers);
             held = current;
         }
-        if (!copiedLayers.empty() || !uploads.empty()) {
+        // A guest layer an existing host import covers is detiled from the import when the batch
+        // runs, after the results pending over it are stored there (recorded, not waited for): a
+        // CPU read would wait for those stores on the GPU first.
+        for (const auto& [layer, current] : importCandidates) {
+            const auto bytes = static_cast<std::size_t>(current.bytes);
+            CompletePendingCpuWrites(context, current.address, bytes);
+            static_cast<void>(StorageTexture::FlushPending(current.address, bytes, nullptr, "depth plane copy", PublishScope::Whole));
+            recorder->FlushStoresOverlapping(current.address, bytes);
+        }
+        for (const auto& [layer, current] : importCandidates) {
+            const auto bytes = static_cast<std::size_t>(current.bytes);
+            if (const auto* import = ExistingHostImportFor(context, current.address, bytes)) {
+                importedLayers.push_back({layer, import->buffer, HostImportOffset(*import, current.address)});
+                recorder->NotePendingRead(current.address, bytes, Recorder::ReadKind::StorageUpload);
+                importedLayerCount.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                uploadLayer(layer, current, geometry, uploads, uploadLayers);
+            }
+        }
+        if (!copiedLayers.empty() || !uploads.empty() || !importedLayers.empty()) {
             if (staging == nullptr || stagingBytes > staging->Size()) staging = std::make_shared<DeviceBuffer>(context, stagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            record(slices, resource, geometry, copiedLayers, uploads, uploadLayers, staging);
+            record(slices, resource, geometry, copiedLayers, uploads, uploadLayers, importedLayers, staging);
         }
         const auto viewLayers = viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : requested - baseLayer;
         const std::array<std::uint32_t, 7> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType), baseLayer, viewLayers};
@@ -1386,6 +1419,20 @@ private:
         bool uncommitted = false;
     };
 
+    struct ImportedLayer {
+        std::uint32_t layer = 0;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+    };
+
+    void uploadLayer(std::uint32_t layer, const GuestLayer& current, const SurfaceGeometry& geometry, std::vector<std::shared_ptr<Buffer>>& uploads, std::vector<std::uint32_t>& uploadLayers) {
+        auto upload = std::make_shared<Buffer>(context, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        GuestMemory::ReadCommitted(current.address, upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
+        uploads.push_back(std::move(upload));
+        uploadLayers.push_back(layer);
+        uploadedLayerCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     std::shared_ptr<OwnedImage> owned;
@@ -1395,8 +1442,8 @@ private:
     std::vector<DepthPlaneSlice> surfaceLayers;
     bool filled = false;
 
-    void record(std::span<const DepthPlaneSlice> slices, const GuestTextureResource& resource, const SurfaceGeometry& geometry, std::span<const std::uint32_t> copiedLayers, std::span<const std::shared_ptr<Buffer>> uploads, std::span<const std::uint32_t> uploadLayers, const std::shared_ptr<DeviceBuffer>& staging) {
-        if (!uploads.empty()) {
+    void record(std::span<const DepthPlaneSlice> slices, const GuestTextureResource& resource, const SurfaceGeometry& geometry, std::span<const std::uint32_t> copiedLayers, std::span<const std::shared_ptr<Buffer>> uploads, std::span<const std::uint32_t> uploadLayers, std::span<const ImportedLayer> importedLayers, const std::shared_ptr<DeviceBuffer>& staging) {
+        if (!uploads.empty() || !importedLayers.empty()) {
             Require(context.detiler != nullptr, "depth plane copy requires a texture detiler");
             context.detiler->BeginBatch();
         }
@@ -1420,6 +1467,13 @@ private:
             const auto copy = region(layer, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
             context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, slices[layer].image, VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &copy);
             regions.push_back(region(layer, aspect(), layer));
+        }
+        if (!importedLayers.empty()) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            for (const auto& imported : importedLayers) {
+                context.detiler->Dispatch(commands, resource.tileMode, format == VK_FORMAT_D32_SFLOAT ? 4u : 2u, imported.buffer, imported.offset, staging->Handle(), geometry.LinearLayerOffset(imported.layer), geometry.mips.front(), false, imported.layer, geometry.thick);
+                regions.push_back(region(imported.layer, aspect(), imported.layer));
+            }
         }
         if (!uploads.empty()) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
@@ -2504,6 +2558,10 @@ void ClearDepthSurfaces(VkDevice device) {
     std::erase_if(depthGuards(), [&](const auto& range) { return range.device == device; });
     anyDepthGuard().store(!depthGuards().empty(), std::memory_order_release);
     UpdateResidentImageUnmapObserver_nid_no_patch();
+}
+
+std::pair<std::uint64_t, std::uint64_t> TakeDepthPlaneLayerCounts() {
+    return {importedLayerCount.exchange(0, std::memory_order_relaxed), uploadedLayerCount.exchange(0, std::memory_order_relaxed)};
 }
 
 std::size_t DepthPlaneCopyCount() {

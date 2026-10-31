@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -104,6 +105,10 @@ std::string QueueWaits::Text() {
     text += "; CPU-access GPU waits of the hot threads (largest):" + Graphics::Recorder::TakeHotHookSyncText();
     text += "; GPU waits of the hot threads by source and caller (largest):" + Graphics::Recorder::TakeHotWaitSiteText();
     text += "; GPU lock waits (count, waited):" + GuestMemory::TakeHotLockWaitText();
+    const auto [importedLayers, uploadedLayers] = Graphics::TakeDepthPlaneLayerCounts();
+    char planes[128];
+    std::snprintf(planes, sizeof(planes), "; depth plane copy layers detiled from their host import %llu, read on the CPU %llu", static_cast<unsigned long long>(importedLayers), static_cast<unsigned long long>(uploadedLayers));
+    text += planes;
     char held[128];
     std::snprintf(held, sizeof(held), "; targeted finisher waits for a held label %llu, a held job with unknown writes %llu, another held job %llu", static_cast<unsigned long long>(heldWaitLabels.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(heldWaitUnknown.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(heldWaitOther.exchange(0, std::memory_order_relaxed)));
     text += held;
