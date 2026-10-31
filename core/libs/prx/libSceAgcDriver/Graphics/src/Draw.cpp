@@ -1801,12 +1801,13 @@ struct DrawSplitCounts {
     std::array<std::atomic<std::uint64_t>, 6> proofs{}, proofNs{};
     std::atomic<std::uint64_t> proofFailed{0}, findNs{0}, movedNs{0}, hits{0}, unmoved{0}, invalidated{0}, misses{0}, uncacheable{0};
     std::array<std::atomic<std::uint64_t>, 5> proofGap{}, pendingGap{};
-    std::atomic<std::uint64_t> traced{0}, lockFree{0}, freePairs{0}, touching{0}, recording{0};
+    std::atomic<std::uint64_t> traced{0}, lockFree{0}, freePairs{0}, touching{0}, recording{0}, recorderUsing{0}, uncoupled{0};
 };
 
 std::mutex resolveSitesMutex;
 std::map<const void*, std::uint64_t> resolveTouchSites;
 std::map<const void*, std::uint64_t> resolveCommandSites;
+std::map<const void*, std::uint64_t> resolveRecorderSites;
 
 std::string ModuleOffsetText(const void* site) {
     unsigned long long offset = reinterpret_cast<std::uintptr_t>(site);
@@ -2976,7 +2977,13 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             split.traced.fetch_add(1, std::memory_order_relaxed);
             if (trace.touches != 0) split.touching.fetch_add(1, std::memory_order_relaxed);
             if (trace.commands != 0) split.recording.fetch_add(1, std::memory_order_relaxed);
+            if (trace.recorderUses != 0) split.recorderUsing.fetch_add(1, std::memory_order_relaxed);
+            if (trace.touches == 0 && trace.commands == 0 && trace.recorderUses == 0) split.uncoupled.fetch_add(1, std::memory_order_relaxed);
             thread_local std::uint64_t lastFree = 0;
+            if (trace.recorderSiteCount != 0) {
+                std::lock_guard lock(resolveSitesMutex);
+                for (std::uint32_t i = 0; i < trace.recorderSiteCount; ++i) ++resolveRecorderSites[trace.recorderSites[i]];
+            }
             if (trace.touches == 0 && trace.commands == 0) {
                 const auto sequence = AgcDriver::DriverDetail::DrawPipeline::CommitSequence();
                 split.lockFree.fetch_add(1, std::memory_order_relaxed);
@@ -3865,9 +3872,9 @@ std::string TakeDrawSplitText() {
     std::snprintf(gaps, sizeof(gaps), "; hinted templates by proof breaks between the preparer's lookup and the commit (0, 1-4, 5-16, 17-64, more): %llu %llu %llu %llu %llu; by pending-image changes: %llu %llu %llu %llu %llu", take(split.proofGap[0]), take(split.proofGap[1]), take(split.proofGap[2]), take(split.proofGap[3]), take(split.proofGap[4]), take(split.pendingGap[0]), take(split.pendingGap[1]), take(split.pendingGap[2]), take(split.pendingGap[3]), take(split.pendingGap[4]));
     result += gaps;
     {
-        const auto traced = take(split.traced), lockFree = take(split.lockFree), pairs = take(split.freePairs), touching = take(split.touching), recording = take(split.recording);
-        char trace[256];
-        std::snprintf(trace, sizeof(trace), "; resolve's GPU-lock and recorder use: %llu draws traced, %llu touch neither, %llu of those right after another such draw; %llu touch the lock, %llu record commands; draws touching the lock by site:", traced, lockFree, pairs, touching, recording);
+        const auto traced = take(split.traced), lockFree = take(split.lockFree), pairs = take(split.freePairs), touching = take(split.touching), recording = take(split.recording), recorderUsing = take(split.recorderUsing), uncoupled = take(split.uncoupled);
+        char trace[320];
+        std::snprintf(trace, sizeof(trace), "; resolve's GPU-lock and recorder use: %llu draws traced, %llu touch neither, %llu of those right after another such draw; %llu touch the lock, %llu record commands, %llu reach the recorder, %llu do none of the three; draws touching the lock by site:", traced, lockFree, pairs, touching, recording, recorderUsing, uncoupled);
         result += trace;
         std::vector<std::pair<const void*, std::uint64_t>> touchSites, commandSites;
         {
@@ -3884,6 +3891,14 @@ std::string TakeDrawSplitText() {
         top(touchSites);
         result += "; first command recording by site:";
         top(commandSites);
+        std::vector<std::pair<const void*, std::uint64_t>> recorderSites;
+        {
+            std::lock_guard lock(resolveSitesMutex);
+            recorderSites.assign(resolveRecorderSites.begin(), resolveRecorderSites.end());
+            resolveRecorderSites.clear();
+        }
+        result += "; draws reaching the recorder by site:";
+        top(recorderSites);
     }
     result += ShaderResources::TakeCommitterProofText();
     result += ShaderResources::TakeCommitterMovedText();

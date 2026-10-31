@@ -1363,6 +1363,7 @@ void Recorder::CountRecordedWork() {
 }
 
 Recorder* Recorder::Active() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0));
     return activeRecorder;
 }
 

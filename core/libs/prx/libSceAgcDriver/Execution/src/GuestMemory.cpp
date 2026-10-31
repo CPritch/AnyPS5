@@ -2760,6 +2760,14 @@ ResolveLockTrace EndResolveLockTrace() {
     return resolveTrace;
 }
 
+void NoteResolveRecorder(const void* site) {
+    if (!resolveTraceActive) return;
+    ++resolveTrace.recorderUses;
+    const auto end = resolveTrace.recorderSites.begin() + resolveTrace.recorderSiteCount;
+    if (std::find(resolveTrace.recorderSites.begin(), end, site) != end || resolveTrace.recorderSiteCount == resolveTrace.recorderSites.size()) return;
+    resolveTrace.recorderSites[resolveTrace.recorderSiteCount++] = site;
+}
+
 void NoteResolveCommands(const void* site) {
     if (!resolveTraceActive) return;
     if (resolveTrace.commands++ == 0) resolveTrace.firstCommands = site;
