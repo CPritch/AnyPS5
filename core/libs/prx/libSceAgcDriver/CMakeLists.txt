@@ -2368,10 +2368,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_address_passes_targets_split PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    add_test(NAME agc_driver_linear_target_draw_bindings_bda_writer COMMAND agc_driver_linear_target_draw_bindings_tests)
-    set_tests_properties(agc_driver_linear_target_draw_bindings_bda_writer PROPERTIES ENVIRONMENT "APS5_READ_ONLY_BDA_AS_WRITER=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME agc_driver_linear_target_draw_bindings_bda_reads COMMAND agc_driver_linear_target_draw_bindings_tests)
+    set_tests_properties(agc_driver_linear_target_draw_bindings_bda_reads PROPERTIES ENVIRONMENT "APS5_READ_ONLY_BDA_AS_READS=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME agc_driver_storage_flush_ordering_bda_reads COMMAND agc_driver_storage_flush_ordering_tests)
+    set_tests_properties(agc_driver_storage_flush_ordering_bda_reads PROPERTIES ENVIRONMENT "APS5_READ_ONLY_BDA_AS_READS=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
     if(WIN32)
-        set_tests_properties(agc_driver_linear_target_draw_bindings_bda_writer PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_storage_flush_ordering_bda_reads PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_tests_properties(agc_driver_linear_target_draw_bindings_bda_reads PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_address_passes_draw_transitions COMMAND agc_driver_address_passes_tests --targets)

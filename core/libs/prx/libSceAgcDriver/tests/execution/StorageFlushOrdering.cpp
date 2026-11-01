@@ -153,7 +153,9 @@ void ReadOnlyRun(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::
     const std::string what = "storage flush ordering, read-only address-based reader: ";
     const auto read = PendingHeapRead(image);
     Require(read.has_value(), what + "the build's leased heaps were not noted as read");
-    Require(read->kind == AgcDriver::Graphics::Recorder::ReadKind::DispatchElement, what + "the read-only build's leased heaps were noted as an address-based writer's, which makes a flush of a pending image wait for its batch");
+    const bool asReads = std::getenv("APS5_READ_ONLY_BDA_AS_READS") != nullptr;
+    const auto expected = asReads ? AgcDriver::Graphics::Recorder::ReadKind::DispatchElement : AgcDriver::Graphics::Recorder::ReadKind::AddressBased;
+    Require(read->kind == expected, what + (asReads ? "the read-only build's leased heaps were noted as an address-based writer's under APS5_READ_ONLY_BDA_AS_READS" : "the read-only build's leased heaps were not noted as address-based reads"));
     Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "test"), what + "the image store left no results pending");
     device.WaitIdle();
     Require(words[FarDword] == Stored, what + "the pending image's texel away from the read was not stored");

@@ -295,8 +295,8 @@ bool Expect(AgcDriver::VulkanDevice& device, bool unwatch) {
     Draw(device, copied, PixelCopy, firstCopy, {{0, 0}, {Width / 2u, Height}});
     Require(!pending(drawn.address), "the draw writing a copied buffer did not store the drawn linear target first");
     Require(pending(copied.address), "the first copying draw did not leave its linear target pending");
-    const std::uint64_t storeSubmits = std::getenv("APS5_READ_ONLY_BDA_AS_WRITER") != nullptr ? 1u : 0u;
-    Require(recorder->Recording() && recorder->Submissions() == submitted + storeSubmits, "storing the drawn linear target submitted " + std::to_string(recorder->Submissions() - submitted) + " batches, expected " + std::to_string(storeSubmits) + ": the batch the read-only address-based draw read it in is synced only when such builds count as writers (APS5_READ_ONLY_BDA_AS_WRITER)");
+    const std::uint64_t storeSubmits = std::getenv("APS5_READ_ONLY_BDA_AS_READS") != nullptr ? 0u : 1u;
+    Require(recorder->Recording() && recorder->Submissions() == submitted + storeSubmits, "storing the drawn linear target submitted " + std::to_string(recorder->Submissions() - submitted) + " batches, expected " + std::to_string(storeSubmits) + ": the batch the read-only address-based draw read it in is synced unless such builds' heaps are noted as plain reads (APS5_READ_ONLY_BDA_AS_READS)");
     const auto setsBetween = context.descriptorCache->Counters().sets;
     const auto secondCopy = CopyUserData(block.Address() + SecondSourceOffset, SecondOutput);
     Draw(device, copied, PixelCopy, secondCopy, {{static_cast<std::int32_t>(Width / 2u), 0}, {Width / 2u, Height}});
