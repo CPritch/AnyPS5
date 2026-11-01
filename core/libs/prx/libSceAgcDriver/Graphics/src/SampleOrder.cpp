@@ -240,6 +240,7 @@ public:
         sampleLocations.pPostSubpassSampleLocations = &post;
         if (located) begin.pNext = &sampleLocations;
         context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
+        BumpGraphicsStateEpoch();
         const VkViewport viewport{0.0f, 0.0f, static_cast<float>(region.width), static_cast<float>(region.height), 0.0f, 1.0f};
         const VkRect2D scissor{{0, 0}, region};
         context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &viewport);

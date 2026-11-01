@@ -4,6 +4,7 @@
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
+#include <cstdlib>
 #include <mutex>
 #include <vulkan/vulkan.h>
 #include <array>
@@ -304,6 +305,17 @@ struct Context {
             if ((mask & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & flags) == flags) return i;
         }
         throw std::runtime_error("AGC graphics: required Vulkan memory type is unavailable");
+    }
+
+    VkMemoryPropertyFlags UploadProperties() const {
+        constexpr VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        constexpr VkMemoryPropertyFlags local = coherent | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        static const bool requested = std::getenv("APS5_DEVICE_LOCAL_UPLOADS") != nullptr;
+        if (!requested) return coherent;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            if ((memory.memoryTypes[i].propertyFlags & local) == local) return local;
+        }
+        return coherent;
     }
 
     std::uint32_t BufferMemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags, VkDeviceSize bytes) const {

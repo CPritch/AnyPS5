@@ -30,6 +30,8 @@ private:
     std::vector<VkImageView> views;
 };
 
+void BumpGraphicsStateEpoch();
+
 // The shader modules, layout, render pass and VkPipeline of one draw configuration. Viewport,
 // scissor, depth bounds and depth bias are dynamic state set at Begin, so pipelines are shared by draws that differ only there
 // (see CachedPipeline).
