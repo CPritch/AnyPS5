@@ -151,7 +151,7 @@ std::string QueueWaits::Text() {
                 if (count != 0) kinds += (kinds.empty() ? "" : ", ") + std::string(kindNames[kind]) + " " + std::to_string(count);
             }
             return kinds;
-        }() + "), offered once the committer's own resolve was done " + event(E::LateOffered) + ", a draw without an early hook " + event(E::NextNoHook) + "; kept by the gate: recipe " + event(E::KeptRecipe) + ", tessellation " + event(E::KeptTessellation) + ", another epoch " + event(E::KeptEpoch) + ", reads the previous draw's writes " + event(E::KeptReadsWritten) + ", depth over colour " + event(E::KeptDepthColour) + ", predictor " + event(E::KeptPredictor) + ", the template being emitted " + event(E::KeptCurrentTemplate) + ", described ranges written " + event(E::KeptDescribed) + "; aborted at a barrier:";
+        }() + "), offered once the committer's own resolve was done " + event(E::LateOffered) + ", offered across a seal " + event(E::AcrossSeal) + ", a draw without an early hook " + event(E::NextNoHook) + "; kept by the gate: recipe " + event(E::KeptRecipe) + ", tessellation " + event(E::KeptTessellation) + ", another epoch " + event(E::KeptEpoch) + ", reads the previous draw's writes " + event(E::KeptReadsWritten) + ", depth over colour " + event(E::KeptDepthColour) + ", predictor " + event(E::KeptPredictor) + ", the template being emitted " + event(E::KeptCurrentTemplate) + ", described ranges written " + event(E::KeptDescribed) + "; aborted at a barrier:";
         for (std::size_t kind = 1; kind < earlyAborts.size(); ++kind) {
             const auto count = earlyAborts[kind].exchange(0, std::memory_order_relaxed);
             if (count != 0) text += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
@@ -677,13 +677,25 @@ void DrawPipeline::StopEarly() {
     earlyStopped.store(true, std::memory_order_relaxed);
 }
 
+bool DrawPipeline::SealsBreakProofs() {
+    static const bool breaks = std::getenv("APS5_SEALS_BREAK_PROOFS") != nullptr;
+    return breaks;
+}
+
+std::size_t DrawPipeline::EarlyIndex(const std::deque<Item>& items) {
+    if (items.size() >= 2 && items[1].draw) return items[1].early ? 1 : 0;
+    if (items.size() >= 3 && items[1].kind == ItemKind::Seal && !SealsBreakProofs() && items[2].draw && items[2].early) return 2;
+    return 0;
+}
+
 void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentTemplate) {
     if (!pendingEarly.hook && pendingEarly.late && committingPipeline != nullptr) {
         auto& pipeline = *committingPipeline;
         std::lock_guard lock(pipeline.mutex);
-        if (pipeline.items.size() >= 2 && pipeline.items[1].draw && pipeline.items[1].early) {
-            pendingEarly.hook = pipeline.items[1].early;
+        if (const auto next = EarlyIndex(pipeline.items); next != 0) {
+            pendingEarly.hook = pipeline.items[next].early;
             NoteEarly(EarlyEvent::LateOffered);
+            if (next == 2) NoteEarly(EarlyEvent::AcrossSeal);
         }
     }
     if (!pendingEarly.hook) {
@@ -996,14 +1008,16 @@ void DrawPipeline::run() {
         bool shutdown = false;
         if (ResolveSplit() != 0 && isDraw && commit != nullptr && !EarlyStopped()) {
             std::lock_guard lock(mutex);
-            if (items.size() >= 2 && items[1].draw && items[1].early) {
-                pendingEarly.hook = items[1].early;
+            if (const auto next = EarlyIndex(items); next != 0) {
+                pendingEarly.hook = items[next].early;
                 pendingEarly.writes = &items.front().writes;
+                if (next == 2) NoteEarly(EarlyEvent::AcrossSeal);
             } else {
-                NoteEarly(items.size() < 2 ? EarlyEvent::NextMissing : !items[1].draw ? EarlyEvent::NextNotDraw : EarlyEvent::NextNoHook);
-                if (items.size() >= 2 && !items[1].draw) nextNotDrawKinds[static_cast<std::size_t>(items[1].kind)].fetch_add(1, std::memory_order_relaxed);
+                const bool sealLast = items.size() == 2 && items[1].kind == ItemKind::Seal && !SealsBreakProofs();
+                NoteEarly(items.size() < 2 || sealLast ? EarlyEvent::NextMissing : !items[1].draw ? EarlyEvent::NextNotDraw : EarlyEvent::NextNoHook);
+                if (items.size() >= 2 && !items[1].draw && !sealLast) nextNotDrawKinds[static_cast<std::size_t>(items[1].kind)].fetch_add(1, std::memory_order_relaxed);
                 static const bool late = std::getenv("APS5_NO_LATE_EARLY_OFFER") == nullptr;
-                if (late && items.size() < 2) {
+                if (late && (items.size() < 2 || sealLast)) {
                     pendingEarly.late = true;
                     pendingEarly.writes = &items.front().writes;
                 }
@@ -1023,7 +1037,7 @@ void DrawPipeline::run() {
                 } clearEarly;
                 (*commit)();
             }
-            if (!isDraw) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Item);
+            if (!isDraw && (kind != static_cast<std::size_t>(ItemKind::Seal) || SealsBreakProofs())) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Item);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();
