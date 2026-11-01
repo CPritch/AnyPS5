@@ -695,6 +695,12 @@ using WriteRanges = Recorder::WriteRanges;
 // reader that sees no overlap either precedes the note (the queues are unordered then, as on the
 // GPU) or follows the write-back.
 AtomicSharedPtr<const WriteRanges> pendingWrites;
+std::atomic<const WriteRanges*> lockedPendingWrites{nullptr};
+
+bool LockedSnapshotReads() {
+    static const bool enabled = std::getenv("APS5_SHARED_SNAPSHOT_LOADS") == nullptr;
+    return enabled;
+}
 
 bool HookSnapshotEnabled() {
     // Debug aid: APS5_NO_HOOK_SNAPSHOT=1 takes the GpuMutex on every access as before.
@@ -716,6 +722,7 @@ thread_local const WriteRanges* resolverQueuedStores = nullptr;
 bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0) return false;
     if (resolverState) return SnapshotOverlaps(resolverSnapshot, address, bytes);
+    if (LockedSnapshotReads() && GuestMemory::GpuMutex().OwnedByThisThread()) return SnapshotOverlaps(lockedPendingWrites.load(std::memory_order_relaxed), address, bytes);
     const auto snapshot = pendingWrites.load(std::memory_order_acquire);
     return SnapshotOverlaps(snapshot.get(), address, bytes);
 }
@@ -1263,6 +1270,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
 }
 
 Recorder::~Recorder() {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
     try {
         Sync();
     } catch (const std::exception& error) {
@@ -1272,6 +1280,7 @@ Recorder::~Recorder() {
     holdKept.clear();
     if (activeRecorder == this) {
         activeRecorder = nullptr;
+        lockedPendingWrites.store(nullptr, std::memory_order_relaxed);
         pendingWrites.store(nullptr, std::memory_order_release);
         publishGeneration.fetch_add(1, std::memory_order_release);
         pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
@@ -3529,6 +3538,7 @@ void Recorder::NotePendingStores(std::span<const std::pair<std::uint64_t, std::u
 
 void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    GuestMemory::AssertGpuLockHeld("Recorder::publishPendingWrites");
     if (activeRecorder != this) {
         publishedWriteRangesValid = false;
         return;
@@ -3574,6 +3584,7 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     publishedWriteRangesValid = std::all_of(merged->begin(), merged->end(), [](const auto& range) { return range.second > range.first; });
     publishedWriteRanges = merged;
     published = merged;
+    lockedPendingWrites.store(merged.get(), std::memory_order_relaxed);
     pendingWrites.store(std::move(merged), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;

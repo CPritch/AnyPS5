@@ -2335,6 +2335,10 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
     return true;
 }
 
+std::uint64_t PublishedTrackerGeneration() {
+    return Tracker().stable.load(std::memory_order_acquire);
+}
+
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();
     // Under the mutex: a collect bumps the generation before its walk, and a walk still running
@@ -2958,6 +2962,9 @@ bool GpuMutexType::HeldByThisThread() const {
     return owner.load(std::memory_order_relaxed) == CurrentThreadToken();
 }
 
+bool GpuMutexType::OwnedByThisThread() const {
+    return owner.load(std::memory_order_relaxed) == CurrentThreadToken();
+}
 std::uint32_t GpuMutexType::DepthOnThisThread() const {
     if (!resolveHooksIdle() && (resolveTraceActive || earlyAbortArmed)) NoteResolveLockTouch(__builtin_return_address(0), BarrierKind::HeldCheck);
     // `depth` is written by the holder only, so it is read only when that is this thread.

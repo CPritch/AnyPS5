@@ -153,6 +153,7 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
+std::uint64_t PublishedTrackerGeneration();
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
@@ -189,6 +190,7 @@ public:
     // Whether the calling thread holds the mutex (at any depth): the APS5_ASSERT_GPU_LOCK checks
     // (AssertGpuLockHeld) and code that must know whether it runs inside the device lock.
     bool HeldByThisThread() const;
+    bool OwnedByThisThread() const;
     // The calling thread's recursion depth (0 when it does not hold the mutex): 1 means its
     // current acquisition is the outermost, so code that releases the mutex around a wait
     // (Recorder::SyncThrough for the flush hook) gives up no caller's hold.
