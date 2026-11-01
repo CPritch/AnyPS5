@@ -1364,6 +1364,7 @@ std::atomic<std::uint64_t> deferredMultisampledDepthViews{0};
 std::atomic<std::uint64_t> deferredMultisampleTargets{0};
 std::atomic<std::uint64_t> deferredMultisampleChanged{0};
 std::atomic<std::uint64_t> deferredMultisampleNs{0};
+std::array<std::atomic<std::uint64_t>, 7> recordDrawParts{};
 std::atomic<std::uint64_t> movedPlanNs{0};
 
 std::uint64_t VerifyDrawAheadEvery() {
@@ -2538,6 +2539,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
+    const bool partsTimed = DrawSplitCounted();
+    auto partMark = partsTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto part = [&](std::size_t index) {
+        if (!partsTimed) return;
+        const auto now = std::chrono::steady_clock::now();
+        recordDrawParts[index].fetch_add(NanosecondsBetween(partMark, now), std::memory_order_relaxed);
+        partMark = now;
+    };
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
     using CommandClass = Recorder::CommandClass;
@@ -2589,7 +2598,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     for (const auto image : record.multisampleImages) passAttachments.emplace_back(image, true);
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
+    part(0);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    part(1);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -2618,7 +2629,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
+    part(2);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    part(3);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -2757,7 +2770,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     timer.phase(PhaseRecord);
+    part(4);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
+    part(5);
+    if (partsTimed) recordDrawParts[6].fetch_add(1, std::memory_order_relaxed);
     timer.phase(PhaseKeep);
     if (record.waited) {
         // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -4044,6 +4060,10 @@ std::string TakeDrawSplitText() {
     {
         const auto acquired = deferredMultisampleTargets.exchange(0, std::memory_order_relaxed);
         const auto ns = deferredMultisampleNs.exchange(0, std::memory_order_relaxed);
+        const auto recorded = recordDrawParts[6].exchange(0, std::memory_order_relaxed);
+        constexpr std::array<const char*, 6> partNames{"before the bindings", "bindings", "pass access", "pass start", "commands", "keep"};
+        result += "; recorded draws " + std::to_string(recorded) + ", ns each:";
+        for (std::size_t index = 0; index < partNames.size(); ++index) result += std::string(" ") + partNames[index] + " " + std::to_string(recorded == 0 ? 0 : recordDrawParts[index].exchange(0, std::memory_order_relaxed) / recorded) + ",";
         result += "; multisampled colour targets found before resolve and acquired at emit " + std::to_string(acquired) + " (" + std::to_string(acquired == 0 ? 0 : ns / acquired) + " ns each), of them a different target by then " + std::to_string(deferredMultisampleChanged.exchange(0, std::memory_order_relaxed));
     }
     char gaps[256];
