@@ -4377,6 +4377,19 @@ VulkanDevice::EarlyChange VulkanDevice::CheckEarlySerials(const EarlySerials& se
     return EarlyChange::Noted;
 }
 
+bool VulkanDevice::FindMultisampleTargets(const Graphics::State& graphics, std::vector<Graphics::FoundMultisampleTarget>& found) {
+    const auto context = graphicsContext();
+    found.clear();
+    for (std::size_t index = 0; index < graphics.colors.size(); ++index) {
+        if (graphics.colors[index].samples <= 1) continue;
+        auto target = Graphics::FindMultisampleTargetView(context, graphics.colors[index]);
+        if (!target) return false;
+        target->index = static_cast<std::uint32_t>(index);
+        found.push_back(std::move(*target));
+    }
+    return !graphics.depth || graphics.depth->samples <= 1 || Graphics::FindDepthSurfaceView(context, *graphics.depth).view != VK_NULL_HANDLE;
+}
+
 bool VulkanDevice::ResolverInputsClear() {
     return state->copiedWriters->empty() && Graphics::DrawCopiedWriters()->empty();
 }

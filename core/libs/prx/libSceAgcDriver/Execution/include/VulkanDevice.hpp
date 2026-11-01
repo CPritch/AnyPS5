@@ -362,6 +362,7 @@ public:
     std::uint64_t RecorderNotedSerial();
     void ApplyDeferredEffects(Graphics::Recorder::DeferredEffects& effects);
     bool ResolverInputsClear();
+    bool FindMultisampleTargets(const Graphics::State& graphics, std::vector<Graphics::FoundMultisampleTarget>& found);
     struct EarlySerials {
         Graphics::HostImportsProof imports{};
         std::uint64_t open = 0;

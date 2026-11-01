@@ -249,6 +249,7 @@ struct EarlyDraw {
     Graphics::Recorder::DeferredEffects abandoned;
     std::vector<Graphics::DrawPacket*> graveyard;
     Graphics::ResolverHandoff handoff;
+    std::vector<Graphics::FoundMultisampleTarget> multisample;
     std::uint8_t abort = 0;
     bool failed = false;
 };
@@ -1463,9 +1464,13 @@ bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const G
     if (overlaps(writes, itemReads) || overlaps(depth, itemReads)) return false;
     if (!depth.empty() && overlaps(depth, DrawColorRanges(graphics))) return false;
     const auto* result = ahead != nullptr && ahead->phase.load(std::memory_order_acquire) == DrawAheadSlot::Ready ? &ahead->result : nullptr;
+    const bool multisampled = std::any_of(graphics.colors.begin(), graphics.colors.end(), [](const Graphics::ColorTarget& color) { return color.samples > 1; }) || (graphics.depth && graphics.depth->samples > 1);
+    early.multisample.clear();
+    const bool multisampleFound = multisampled && localDevice->FindMultisampleTargets(graphics, early.multisample);
+    if (multisampled) DrawPipeline::NoteEarly(multisampleFound ? DrawPipeline::EarlyEvent::MultisampleFound : DrawPipeline::EarlyEvent::MultisampleMissed);
     if (!all) {
         using R = Graphics::PredictReason;
-        const auto reason = Graphics::PredictPureReason(graphics, drawParameters, stages, result);
+        const auto reason = Graphics::PredictPureReason(graphics, drawParameters, stages, result, multisampleFound);
         const bool proofOnly = reason == R::ProofNotCurrent || reason == R::NoSlot || reason == R::NotLooked || reason == R::NoHint;
         if (reason != R::Accepted && !proofOnly) return false;
         if (proofOnly && result != nullptr && result->found != nullptr && result->found.get() == currentTemplate) return false;
@@ -1505,6 +1510,7 @@ bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const G
         early.handoff.shapeMemo = Graphics::ShapeMemoHandle();
         early.handoff.abandoned = &early.abandoned;
         early.handoff.graveyard = &early.graveyard;
+        early.handoff.multisampleTargets = multisampleFound ? &early.multisample : nullptr;
         DrawPipeline::PostResolve(&resolveEarlyJob, &finishEarlyJob, &early);
         if (split == 3) DrawPipeline::WaitResolve();
         return true;
@@ -1515,10 +1521,12 @@ bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const G
                 GuestMemory::DisarmEarlyResolve();
                 GuestMemory::SetEarlyReadLog(nullptr);
                 DrawPipeline::SkipCommittingReads(false);
+                Graphics::SetFoundMultisampleTargets(nullptr);
             }
         } disarm;
         GuestMemory::SetEarlyReadLog(&early.reads);
         DrawPipeline::SkipCommittingReads(true);
+        Graphics::SetFoundMultisampleTargets(multisampleFound ? &early.multisample : nullptr);
         GuestMemory::ArmEarlyResolve();
         const auto started = DrawSplitTimed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         try {

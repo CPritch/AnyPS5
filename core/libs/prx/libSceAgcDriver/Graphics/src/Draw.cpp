@@ -1354,12 +1354,16 @@ std::atomic<bool> drawAheadDisabled{false};
 std::atomic<bool> drawAheadThrows{false};
 std::atomic<std::uint64_t> drawAheadNs{0};
 thread_local bool redoingWhole = false;
+thread_local const std::vector<FoundMultisampleTarget>* foundMultisampleTargets = nullptr;
 std::atomic<std::uint64_t> deferredColorRefreshes{0};
 std::atomic<std::uint64_t> redoneWhole{0};
 std::atomic<std::uint64_t> deferredDepthViews{0};
 std::atomic<std::uint64_t> deferredDepthViewsChanged{0};
 std::atomic<std::uint64_t> deferredDepthViewNs{0};
 std::atomic<std::uint64_t> deferredMultisampledDepthViews{0};
+std::atomic<std::uint64_t> deferredMultisampleTargets{0};
+std::atomic<std::uint64_t> deferredMultisampleChanged{0};
+std::atomic<std::uint64_t> deferredMultisampleNs{0};
 std::atomic<std::uint64_t> movedPlanNs{0};
 
 std::uint64_t VerifyDrawAheadEvery() {
@@ -2850,6 +2854,7 @@ struct PreparedDraw {
     std::vector<std::size_t> colorRefreshes;
     std::optional<std::pair<ResourceCache::Key, std::shared_ptr<ShaderResources>>> deferredInsert;
     std::vector<std::function<void(Recorder&)>> memoKeeps;
+    std::vector<std::uint32_t> deferredMultisample;
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
     std::uint64_t shape = 0;
@@ -3155,6 +3160,20 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         if (color.samples > 1) {
             binding.multisampled = true;
             timer.phase(PhaseSetup);
+            const FoundMultisampleTarget* found = nullptr;
+            if (foundMultisampleTargets != nullptr && !redoingWhole) {
+                for (const auto& candidate : *foundMultisampleTargets) {
+                    if (candidate.index == index) found = &candidate;
+                }
+            }
+            if (found != nullptr) {
+                binding.multisampleOwner = found->owner;
+                binding.multisampleImage = found->image;
+                targetViews.push_back(found->view);
+                prepared.deferredMultisample.push_back(static_cast<std::uint32_t>(index));
+                timer.phase(PhaseReadTarget);
+                continue;
+            }
             if (color.partialWriteMask != 0) {
                 static_cast<void>(MultisampleTargetView(context, color));
                 static_cast<void>(MultisampleTargetStorageView(context, TargetMergeSurface(color)));
@@ -4022,6 +4041,11 @@ std::string TakeDrawSplitText() {
     const auto viewed = deferredDepthViews.load(std::memory_order_relaxed);
     std::snprintf(depthViews, sizeof(depthViews), "; depth views found in resolve and noted after it %llu (multisampled %llu, %.0f ns each at emit), of them a different surface by then %llu; color targets refreshed after resolve %llu, draws redone whole %llu", static_cast<unsigned long long>(deferredDepthViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredMultisampledDepthViews.exchange(0, std::memory_order_relaxed)), viewed == 0 ? 0.0 : static_cast<double>(deferredDepthViewNs.exchange(0, std::memory_order_relaxed)) / static_cast<double>(viewed), static_cast<unsigned long long>(deferredDepthViewsChanged.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredColorRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(redoneWhole.exchange(0, std::memory_order_relaxed)));
     result += depthViews;
+    {
+        const auto acquired = deferredMultisampleTargets.exchange(0, std::memory_order_relaxed);
+        const auto ns = deferredMultisampleNs.exchange(0, std::memory_order_relaxed);
+        result += "; multisampled colour targets found before resolve and acquired at emit " + std::to_string(acquired) + " (" + std::to_string(acquired == 0 ? 0 : ns / acquired) + " ns each), of them a different target by then " + std::to_string(deferredMultisampleChanged.exchange(0, std::memory_order_relaxed));
+    }
     char gaps[256];
     std::snprintf(gaps, sizeof(gaps), "; hinted templates by proof breaks between the preparer's lookup and the commit (0, 1-4, 5-16, 17-64, more): %llu %llu %llu %llu %llu; by pending-image changes: %llu %llu %llu %llu %llu", take(split.proofGap[0]), take(split.proofGap[1]), take(split.proofGap[2]), take(split.proofGap[3]), take(split.proofGap[4]), take(split.pendingGap[0]), take(split.pendingGap[1]), take(split.pendingGap[2]), take(split.pendingGap[3]), take(split.pendingGap[4]));
     result += gaps;
@@ -4160,13 +4184,19 @@ void* ShapeMemoHandle() {
     return &shapeMemo();
 }
 
+void SetFoundMultisampleTargets(const std::vector<FoundMultisampleTarget>* found) {
+    foundMultisampleTargets = found;
+}
+
 ResolverScope::ResolverScope(const ResolverHandoff& handoff) {
+    foundMultisampleTargets = handoff.multisampleTargets;
     borrowedShapeMemo = static_cast<std::unordered_map<std::uint64_t, ShapeEntry>*>(handoff.shapeMemo);
     packetGraveyard = handoff.graveyard;
     Recorder::SetResolverState(true, handoff.snapshot.get(), &handoff.queuedStores, handoff.abandoned);
 }
 
 ResolverScope::~ResolverScope() {
+    foundMultisampleTargets = nullptr;
     borrowedShapeMemo = nullptr;
     packetGraveyard = nullptr;
     Recorder::SetResolverState(false, nullptr, nullptr, nullptr);
@@ -4217,9 +4247,9 @@ std::uint32_t CompareDrawPackets(const DrawPacket& first, const DrawPacket& seco
     const auto mark = [&](DrawPacketField field, bool same) {
         if (!same) differs |= 1u << static_cast<unsigned>(field);
     };
-    const bool resident = std::all_of(a.targets.begin(), a.targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr; });
+    const bool resident = std::all_of(a.targets.begin(), a.targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     const bool sameTargets = a.targets.size() == b.targets.size() && std::equal(a.targets.begin(), a.targets.end(), b.targets.begin(), [](const TargetBinding& left, const TargetBinding& right) {
-        return left.resident == right.resident && left.color.address == right.color.address && left.color.format == right.color.format && left.proxied == right.proxied && left.multisampled == right.multisampled;
+        return left.resident == right.resident && left.color.address == right.color.address && left.color.format == right.color.format && left.proxied == right.proxied && left.multisampled == right.multisampled && left.multisampleOwner == right.multisampleOwner && left.multisampleImage == right.multisampleImage;
     });
     mark(DrawPacketField::Template, a.resolved.resources == b.resolved.resources || (!a.resolved.contentKey.empty() && a.resolved.contentKey == b.resolved.contentKey) || (!resident && sameTargets));
     mark(DrawPacketField::Pipeline, a.pipeline == b.pipeline);
@@ -4242,9 +4272,9 @@ void DiscardDrawPacket(const Context& context, DrawPacket& packet) {
     if (!packet.prepared.deferred.Empty() && context.recorder != nullptr) context.recorder->ApplyDeferred(packet.prepared.deferred);
 }
 
-PredictReason PredictPureReason(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawAhead* ahead) {
-    if (!std::all_of(state.colors.begin(), state.colors.end(), [](const ColorTarget& color) { return color.samples <= 1; })) return PredictReason::MultisampledColor;
-    if (state.depth && state.depth->samples > 1) return PredictReason::MultisampledDepth;
+PredictReason PredictPureReason(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawAhead* ahead, bool multisampleFound) {
+    if (!multisampleFound && !std::all_of(state.colors.begin(), state.colors.end(), [](const ColorTarget& color) { return color.samples <= 1; })) return PredictReason::MultisampledColor;
+    if (!multisampleFound && state.depth && state.depth->samples > 1) return PredictReason::MultisampledDepth;
     if (std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); })) return PredictReason::StencilReplay;
     if (state.quadList) return PredictReason::QuadList;
     if (draw.indirect) return PredictReason::Indirect;
@@ -4367,6 +4397,23 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
             break;
         }
         materializeCmaskClear(context, binding.color, binding.resident);
+    }
+    if (!redo && !prepared.deferredMultisample.empty()) {
+        const bool timed = DrawSplitCounted();
+        const auto acquiring = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        for (const auto index : prepared.deferredMultisample) {
+            auto& binding = prepared.targets[index];
+            std::shared_ptr<void> owner;
+            VkImage image = VK_NULL_HANDLE;
+            const auto view = MultisampleTargetView(context, binding.color, owner, &image);
+            deferredMultisampleTargets.fetch_add(1, std::memory_order_relaxed);
+            if (view != prepared.targetViews[index] || owner != binding.multisampleOwner || image != binding.multisampleImage) {
+                deferredMultisampleChanged.fetch_add(1, std::memory_order_relaxed);
+                redo = true;
+                break;
+            }
+        }
+        if (timed) deferredMultisampleNs.fetch_add(NanosecondsBetween(acquiring, std::chrono::steady_clock::now()), std::memory_order_relaxed);
     }
     if (!redo && prepared.depthFound.view != VK_NULL_HANDLE) {
         const bool timed = DrawSplitCounted();

@@ -70,6 +70,13 @@ std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const 
 std::shared_ptr<Texture> MultisampleTargetFirstSample(const Context& context, const GuestTextureResource& resource, VkComponentMapping components);
 VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, VkImage* image = nullptr);
 VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, std::shared_ptr<void>& owner, VkImage* image = nullptr);
+struct FoundMultisampleTarget {
+    std::uint32_t index = 0;
+    VkImageView view = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
+    std::shared_ptr<void> owner;
+};
+std::optional<FoundMultisampleTarget> FindMultisampleTargetView(const Context& context, const ColorTarget& target);
 void KeepMultisampleTarget_nid_no_patch(const std::shared_ptr<void>& owner);
 void MaterializeMultisampleTargetClear(const Context& context, const ColorTarget& target);
 VkImageView MultisampleTargetStorageView(const Context& context, const GuestTextureResource& resource, bool uintStorage = false);

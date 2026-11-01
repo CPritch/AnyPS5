@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include <array>
 #include <memory>
 #include <vector>
@@ -80,7 +81,9 @@ struct ResolverHandoff {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> queuedStores;
     Recorder::DeferredEffects* abandoned = nullptr;
     std::vector<DrawPacket*>* graveyard = nullptr;
+    const std::vector<FoundMultisampleTarget>* multisampleTargets = nullptr;
 };
+void SetFoundMultisampleTargets(const std::vector<FoundMultisampleTarget>* found);
 void* ShapeMemoHandle();
 class ResolverScope {
 public:
@@ -96,7 +99,7 @@ enum class DrawPacketField : std::uint8_t { Template, Pipeline, Targets, Framebu
 std::uint32_t CompareDrawPackets(const DrawPacket& first, const DrawPacket& second);
 const char* DrawPacketFieldName(DrawPacketField field);
 enum class PredictReason : std::uint8_t { Accepted, MultisampledColor, MultisampledDepth, StencilReplay, QuadList, Indirect, NoSlot, NotLooked, NoHint, HintGone, ProofNotCurrent, NoMovedPlan, Count };
-PredictReason PredictPureReason(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawAhead* ahead);
+PredictReason PredictPureReason(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawAhead* ahead, bool multisampleFound = false);
 bool PredictPureResolve(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawAhead* ahead);
 enum class StaleViewSite : std::uint8_t { InputPending, InputLabel, MovedPending, Count };
 void CountStaleView(StaleViewSite site, bool live, std::uint64_t address, std::size_t bytes);
