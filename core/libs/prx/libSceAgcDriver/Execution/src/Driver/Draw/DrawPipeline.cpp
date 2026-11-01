@@ -40,8 +40,12 @@ std::atomic<bool> earlyStopped{false};
 struct PendingEarly {
     DrawPipeline::Early hook;
     const std::vector<DrawPipeline::Range>* writes = nullptr;
+    bool late = false;
 };
 thread_local PendingEarly pendingEarly;
+thread_local DrawPipeline* committingPipeline = nullptr;
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> kindNames{"other", "draw", "indirect draw", "dispatch", "dispatch miss", "dispatch without recipe", "label", "fill", "copy", "store", "pass", "seal", "completion", "occlusion dump"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> nextNotDrawKinds{};
 thread_local bool skipCommittingReads = false;
 enum ResolveJobState : int { ResolveIdle, ResolvePosted, ResolveRunning, ResolveDone };
 std::atomic<std::uint64_t> earlyResolveNs{0}, earlyResolveCount{0};
@@ -140,7 +144,14 @@ std::string QueueWaits::Text() {
         const auto take = [](std::atomic<std::uint64_t>& value) { return std::to_string(value.exchange(0, std::memory_order_relaxed)); };
         const auto event = [&](DrawPipeline::EarlyEvent kind) { return take(earlyEvents[static_cast<std::size_t>(kind)]); };
         using E = DrawPipeline::EarlyEvent;
-        text += "; early resolves (APS5_RESOLVE_SPLIT" + std::string(DrawPipeline::EarlyStopped() ? ", stopped by verify" : "") + "): resolved " + take(earlyResolved) + ", declined " + take(earlyDeclined) + ", failed " + take(earlyFailed) + ", never offered " + event(E::Unoffered) + "; packets used " + event(E::Used) + ", redone for proof " + event(E::StaleProof) + ", pending " + event(E::StalePending) + ", imports " + event(E::StaleImports) + ", device " + event(E::StaleDevice) + ", submit " + event(E::StaleSubmit) + ", redo " + event(E::StaleRedo) + ", a later note over its reads " + event(E::StaleNoted) + ", template left the cache " + event(E::StaleTemplate) + "; dropped after resolve for reads overlapping the previous draw's writes " + event(E::OverlapAfter) + ", failed on the resolver " + event(E::ResolverFailed) + "; declined for the resolver's copied writers " + event(E::DeclinedWriters) + "; multisampled draws whose targets were found before resolve " + event(E::MultisampleFound) + ", not found " + event(E::MultisampleMissed) + "; verified same " + event(E::VerifyMatched) + ", different " + event(E::VerifyDiffered) + "; draws not offered, by the next item: none queued " + event(E::NextMissing) + ", not a draw " + event(E::NextNotDraw) + ", a draw without an early hook " + event(E::NextNoHook) + "; kept by the gate: recipe " + event(E::KeptRecipe) + ", tessellation " + event(E::KeptTessellation) + ", another epoch " + event(E::KeptEpoch) + ", reads the previous draw's writes " + event(E::KeptReadsWritten) + ", depth over colour " + event(E::KeptDepthColour) + ", predictor " + event(E::KeptPredictor) + ", the template being emitted " + event(E::KeptCurrentTemplate) + ", described ranges written " + event(E::KeptDescribed) + "; aborted at a barrier:";
+        text += "; early resolves (APS5_RESOLVE_SPLIT" + std::string(DrawPipeline::EarlyStopped() ? ", stopped by verify" : "") + "): resolved " + take(earlyResolved) + ", declined " + take(earlyDeclined) + ", failed " + take(earlyFailed) + ", never offered " + event(E::Unoffered) + "; packets used " + event(E::Used) + ", redone for proof " + event(E::StaleProof) + ", pending " + event(E::StalePending) + ", imports " + event(E::StaleImports) + ", device " + event(E::StaleDevice) + ", submit " + event(E::StaleSubmit) + ", redo " + event(E::StaleRedo) + ", a later note over its reads " + event(E::StaleNoted) + ", template left the cache " + event(E::StaleTemplate) + "; dropped after resolve for reads overlapping the previous draw's writes " + event(E::OverlapAfter) + ", failed on the resolver " + event(E::ResolverFailed) + "; declined for the resolver's copied writers " + event(E::DeclinedWriters) + "; multisampled draws whose targets were found before resolve " + event(E::MultisampleFound) + ", not found " + event(E::MultisampleMissed) + "; verified same " + event(E::VerifyMatched) + ", different " + event(E::VerifyDiffered) + "; draws not offered, by the next item: none queued " + event(E::NextMissing) + ", not a draw " + event(E::NextNotDraw) + " (" + [&] {
+            std::string kinds;
+            for (std::size_t kind = 0; kind < kindNames.size(); ++kind) {
+                const auto count = nextNotDrawKinds[kind].exchange(0, std::memory_order_relaxed);
+                if (count != 0) kinds += (kinds.empty() ? "" : ", ") + std::string(kindNames[kind]) + " " + std::to_string(count);
+            }
+            return kinds;
+        }() + "), offered once the committer's own resolve was done " + event(E::LateOffered) + ", a draw without an early hook " + event(E::NextNoHook) + "; kept by the gate: recipe " + event(E::KeptRecipe) + ", tessellation " + event(E::KeptTessellation) + ", another epoch " + event(E::KeptEpoch) + ", reads the previous draw's writes " + event(E::KeptReadsWritten) + ", depth over colour " + event(E::KeptDepthColour) + ", predictor " + event(E::KeptPredictor) + ", the template being emitted " + event(E::KeptCurrentTemplate) + ", described ranges written " + event(E::KeptDescribed) + "; aborted at a barrier:";
         for (std::size_t kind = 1; kind < earlyAborts.size(); ++kind) {
             const auto count = earlyAborts[kind].exchange(0, std::memory_order_relaxed);
             if (count != 0) text += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
@@ -667,7 +678,18 @@ void DrawPipeline::StopEarly() {
 }
 
 void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentTemplate) {
-    if (!pendingEarly.hook) return;
+    if (!pendingEarly.hook && pendingEarly.late && committingPipeline != nullptr) {
+        auto& pipeline = *committingPipeline;
+        std::lock_guard lock(pipeline.mutex);
+        if (pipeline.items.size() >= 2 && pipeline.items[1].draw && pipeline.items[1].early) {
+            pendingEarly.hook = pipeline.items[1].early;
+            NoteEarly(EarlyEvent::LateOffered);
+        }
+    }
+    if (!pendingEarly.hook) {
+        pendingEarly = {};
+        return;
+    }
     auto hook = std::move(pendingEarly.hook);
     const auto* writes = pendingEarly.writes;
     pendingEarly = {};
@@ -888,7 +910,6 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     }
     drainOpcodes = {};
     drainOpcodeNs = {};
-    constexpr std::array<const char*, static_cast<std::size_t>(ItemKind::Count)> kindNames{"other", "draw", "indirect draw", "dispatch", "dispatch miss", "dispatch without recipe", "label", "fill", "copy", "store", "pass", "seal", "completion", "occlusion dump"};
     drainText += "; committer by item kind (items, ms):";
     for (std::size_t kind = 0; kind < kindNames.size(); ++kind) {
         if (kindCommits[kind] == 0) continue;
@@ -937,6 +958,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 
 
 void DrawPipeline::run() {
+    committingPipeline = this;
     PinCommitterThread("draw committer");
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
@@ -979,13 +1001,22 @@ void DrawPipeline::run() {
                 pendingEarly.writes = &items.front().writes;
             } else {
                 NoteEarly(items.size() < 2 ? EarlyEvent::NextMissing : !items[1].draw ? EarlyEvent::NextNotDraw : EarlyEvent::NextNoHook);
+                if (items.size() >= 2 && !items[1].draw) nextNotDrawKinds[static_cast<std::size_t>(items[1].kind)].fetch_add(1, std::memory_order_relaxed);
+                static const bool late = std::getenv("APS5_NO_LATE_EARLY_OFFER") == nullptr;
+                if (late && items.size() < 2) {
+                    pendingEarly.late = true;
+                    pendingEarly.writes = &items.front().writes;
+                }
             }
         }
         try {
             if (commit != nullptr) {
                 struct ClearEarly {
                     ~ClearEarly() {
-                        if (!pendingEarly.hook) return;
+                        if (!pendingEarly.hook) {
+                            pendingEarly = {};
+                            return;
+                        }
                         pendingEarly = {};
                         DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::Unoffered);
                     }
