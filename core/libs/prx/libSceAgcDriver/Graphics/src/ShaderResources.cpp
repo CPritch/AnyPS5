@@ -3517,9 +3517,18 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
     return OwnRefreshFallback::Count;
 }
 
+namespace {
+
+bool completionStoresMatter() {
+    static const bool anyLabel = std::getenv("APS5_WAIT_FOR_GPU_LABELS") != nullptr;
+    return anyLabel ? Recorder::PendingCompletionLabels() != 0 : Recorder::PendingCompletionStores() != 0;
+}
+
+}
+
 bool AnyPendingCpuWrites(const Context& context) {
     if (Recorder::InCompletion() || Recorder::Active() == nullptr) return false;
-    return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
+    return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || completionStoresMatter();
 }
 
 namespace {
@@ -3557,7 +3566,7 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return false;
     const auto drawWriters = DrawCopiedWriters();
-    const bool labels = Recorder::PendingCompletionLabels() != 0;
+    const bool labels = completionStoresMatter();
     if ((context.copiedWriters == nullptr || context.copiedWriters->empty()) && drawWriters->empty() && !labels) return false;
     if (!recorder->PendingWriteOverlaps(address, bytes)) return false;
     const auto overlaps = [&](const auto& writers) {
@@ -3565,7 +3574,8 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     };
     const bool contextCopied = context.copiedWriters != nullptr && overlaps(*context.copiedWriters);
     const bool drawCopied = !contextCopied && overlaps(*drawWriters);
-    const bool label = !contextCopied && !drawCopied && labels && recorder->PendingLabelIn(address, bytes);
+    static const bool anyLabel = std::getenv("APS5_WAIT_FOR_GPU_LABELS") != nullptr;
+    const bool label = !contextCopied && !drawCopied && labels && (anyLabel ? recorder->PendingLabelIn(address, bytes) : recorder->CompletionLabelIn(address, bytes));
     if (contextCopied || drawCopied || label) {
         Recorder::CountSync(4);
         const bool counted = CommitterCopiedWaitCounted();

@@ -726,6 +726,16 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     Require(*block == 45, "direct consumers lost GPU-ordered updates");
     {
+        const std::uint32_t gpuLabel = 50;
+        static_cast<void>(recorder.Commands());
+        recorder.AfterCompletions(address, std::as_bytes(std::span(&gpuLabel, 1)), 1001, 0, true);
+        Require(recorder.AfterRecordedWork([] {}), "no recorded work held the end-of-pipe action");
+        Require(Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, 4), "the GPU-stored label or the end-of-pipe action was not pending");
+        const auto before = recorder.Submissions();
+        Require(!CompletePendingCpuWrites(context, address, 4) && recorder.Submissions() == before, "a label the GPU stores caused a CPU write-back wait");
+        recorder.Sync();
+    }
+    {
         std::array<std::uint32_t, 1024> unregistered{};
         struct Finish {
             Recorder& recorder;
