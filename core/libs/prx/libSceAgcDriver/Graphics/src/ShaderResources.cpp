@@ -3621,6 +3621,8 @@ CommitterProofSplit& CommitterProofs() {
     return split;
 }
 
+std::atomic<std::uint64_t> staleCopyReuses{0};
+
 bool CommitterProofCounted() {
     static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
     return counted && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer;
@@ -3651,7 +3653,7 @@ std::string ShaderResources::TakeCommitterProofText() {
     const auto proofs = take(split.proofs), total = take(split.totalNs), pending = take(split.pendingNs), fast = take(split.fastNs), walks = take(split.fullWalks), walkNs = take(split.fullWalkNs), passed = take(split.fastPassed);
     char text[256];
     std::snprintf(text, sizeof(text), "; committer full template proofs %llu, %.1f ms: pending-write checks %.1f ms, stamp proof %.1f ms (%llu passed), full walks %llu %.1f ms, rest %.1f ms", static_cast<unsigned long long>(proofs), static_cast<double>(total) / 1e6, static_cast<double>(pending) / 1e6, static_cast<double>(fast) / 1e6, static_cast<unsigned long long>(passed), static_cast<unsigned long long>(walks), static_cast<double>(walkNs) / 1e6, static_cast<double>(total - std::min(total, pending + fast + walkNs)) / 1e6);
-    return text;
+    return std::string(text) + ", proofs reused holding an out-of-date per-use copy " + std::to_string(staleCopyReuses.exchange(0, std::memory_order_relaxed));
 }
 
 ShaderResources::ProofReuse ShaderResources::LastProofReuse() {
@@ -3679,6 +3681,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             }
             if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
             noteEpochProof(true, false, false);
+            static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+            if (counted && std::any_of(textures.begin(), textures.end(), [](const auto& texture) { return texture != nullptr && texture->CopyOutOfDate(); })) staleCopyReuses.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
         const bool ok = revalidateFull(shaders, report);

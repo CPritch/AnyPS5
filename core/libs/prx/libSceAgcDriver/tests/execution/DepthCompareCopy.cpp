@@ -233,6 +233,10 @@ void RequireNewerVersion(std::uint64_t before, std::uint64_t after, const std::s
     Require(after > before, what + ": the storage image version stayed at " + std::to_string(before));
 }
 
+void RequirePendingSerialMoved(std::uint64_t before, const std::string& what) {
+    Require(AgcDriver::Graphics::StorageTexture::PendingSerial() != before, what + ": the pending serial stayed at " + std::to_string(before) + ", so a reused proof would keep the out-of-date copy");
+}
+
 float Texel(const std::uint8_t* texels, std::uint32_t x) {
     float value = 0.0f;
     std::memcpy(&value, texels + static_cast<std::size_t>(x) * sizeof(float), sizeof(float));
@@ -258,8 +262,10 @@ void SingleLevelCase(AgcDriver::VulkanDevice& device, const Shape& shape, const 
     Sample(device, program, shape, 1.0f / 32.0f, name + ": comparison sample of pending results");
     RequireCounts(1, 1, name + ": first comparison sample");
     const auto before = PendingVersion(texels, bytes, name);
+    const auto serial = AgcDriver::Graphics::StorageTexture::PendingSerial();
     Store(device, texels, shape, StoreQuarterCode);
     RequireNewerVersion(before, PendingVersion(texels, bytes, name), name + ": second store");
+    RequirePendingSerialMoved(serial, name + ": second store into the copied image");
     Sample(device, program, shape, 1.0f / 64.0f, name + ": comparison sample of the same descriptor set after a second store");
     RequireCounts(0, 1, name + ": comparison sample after a second store");
     AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(texels), bytes, nullptr, "test");
@@ -287,8 +293,10 @@ void LayersAndMipsCase(AgcDriver::VulkanDevice& device) {
     Sample(device, third, shape, 1.0f / 128.0f, name + ": layer 3 mip 2", 3, 2);
     RequireCounts(1, 1, name + ": first comparison samples");
     const auto before = PendingVersion(texels, bytes, name);
+    const auto serial = AgcDriver::Graphics::StorageTexture::PendingSerial();
     Store(device, texels, shape, StoreLayerMipCode, 2, 1, 1.0f / 256.0f);
     RequireNewerVersion(before, PendingVersion(texels, bytes, name), name + ": second store");
+    RequirePendingSerialMoved(serial, name + ": second store into the copied image");
     Sample(device, second, shape, 1.0f / 256.0f, name + ": layer 2 mip 1 after a second store", 2, 1);
     Sample(device, first, shape, 1.0f / 32.0f, name + ": layer 0 mip 0 after a second store", 0, 0);
     RequireCounts(0, 1, name + ": comparison samples after a second store");

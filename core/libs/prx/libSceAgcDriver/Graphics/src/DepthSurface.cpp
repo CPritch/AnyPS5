@@ -2003,6 +2003,7 @@ void noteStalePlane(std::uint64_t begin, std::uint64_t end) {
     if (std::find(planes.ranges.begin(), planes.ranges.end(), std::pair{begin, end}) != planes.ranges.end()) return;
     planes.ranges.emplace_back(begin, end);
     publishStaleHull(planes);
+    StorageTexture::BumpPendingSerial();
 }
 
 bool overlapsStalePlane(std::uint64_t begin, std::uint64_t end) {

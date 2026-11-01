@@ -904,7 +904,12 @@ bool Texture::refreshSrgbExpand() {
     if (batch) batch->SubmitAndWait();
     copiedOnce = true;
     copiedVersion = storageSource->Version();
+    storageSource->MarkLent();
     return true;
+}
+
+bool Texture::CopyOutOfDate() const {
+    return IsDepthCopy() && storageSource != nullptr && (!copiedOnce || storageSource->Version() != copiedVersion);
 }
 
 bool Texture::RefreshDepthCopy() {
@@ -992,6 +997,7 @@ bool Texture::RefreshDepthCopy() {
     if (batch) batch->SubmitAndWait();
     copiedOnce = true;
     copiedVersion = storageSource->Version();
+    storageSource->MarkLent();
     if (!repackCopy) depthCopyRefreshes.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -1038,6 +1044,7 @@ bool Texture::refreshBlockCopy() {
     if (batch) batch->SubmitAndWait();
     copiedOnce = true;
     copiedVersion = storageSource->Version();
+    storageSource->MarkLent();
     return true;
 }
 
