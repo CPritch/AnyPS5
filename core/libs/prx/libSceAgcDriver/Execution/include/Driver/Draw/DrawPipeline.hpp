@@ -195,6 +195,8 @@ private:
     std::vector<std::thread> preparers;
     std::atomic<std::size_t> queuedPrepares{0};
     std::atomic<bool> preparersClosing{false};
+    std::atomic<std::uint32_t> prepareWake{0};
+    std::atomic<std::uint32_t> preparersSleeping{0};
     void resolveAhead();
     static void joinResolve(bool revoke);
     std::thread resolver;

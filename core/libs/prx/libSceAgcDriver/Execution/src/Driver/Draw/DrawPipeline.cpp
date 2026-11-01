@@ -798,6 +798,9 @@ void DrawPipeline::queuePrepare(Prepare prepare) {
     if (preparersClosing.load(std::memory_order_relaxed)) return;
     prepares.push_back(std::move(prepare));
     queuedPrepares.fetch_add(1, std::memory_order_release);
+    prepareWake.fetch_add(1, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (preparersSleeping.load(std::memory_order_seq_cst) != 0) prepareWake.notify_all();
     while (preparers.size() < PrepareThreads()) preparers.emplace_back([this] { prepareAhead(); });
 }
 
@@ -805,10 +808,23 @@ void DrawPipeline::prepareAhead() {
     PinPreparerThread("draw preparer");
     PerformanceTrace::BindThread("draw preparer", std::size_t{1} << 17u);
     constexpr std::chrono::microseconds idleNap{200};
+    static const bool naps = std::getenv("APS5_PREPARER_NAPS") != nullptr;
+    static const auto window = [] {
+        const char* text = std::getenv("APS5_PREPARER_SPIN_US");
+        return std::chrono::nanoseconds(std::chrono::microseconds(text != nullptr ? std::strtoll(text, nullptr, 10) : 20));
+    }();
     for (;;) {
         const auto queued = [&] { return queuedPrepares.load(std::memory_order_acquire) != 0 || preparersClosing.load(std::memory_order_relaxed); };
-        if (!SpinUntil(HandoffSpinWindow(), queued)) {
+        if (naps && !SpinUntil(HandoffSpinWindow(), queued)) {
             std::this_thread::sleep_for(idleNap);
+            continue;
+        }
+        if (!naps && !SpinUntil(window, queued)) {
+            const auto wake = prepareWake.load(std::memory_order_acquire);
+            preparersSleeping.fetch_add(1, std::memory_order_seq_cst);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (!queued()) prepareWake.wait(wake, std::memory_order_acquire);
+            preparersSleeping.fetch_sub(1, std::memory_order_relaxed);
             continue;
         }
         if (preparersClosing.load(std::memory_order_acquire)) return;
@@ -1110,6 +1126,8 @@ void DrawPipeline::Stop() {
     {
         std::lock_guard lock(prepareMutex);
         preparersClosing.store(true, std::memory_order_release);
+        prepareWake.fetch_add(1, std::memory_order_seq_cst);
+        prepareWake.notify_all();
         stopped = std::move(preparers);
     }
     for (auto& preparer : stopped) {
