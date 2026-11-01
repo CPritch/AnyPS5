@@ -302,6 +302,37 @@ void LayersAndMipsCase(AgcDriver::VulkanDevice& device) {
     RequireCounts(0, 1, name + ": comparison samples after a second store");
 }
 
+void AliasLayerCase(AgcDriver::VulkanDevice& device, std::uint32_t size, std::uint32_t layers, bool epoch) {
+    const std::string name = "alias layer, " + std::to_string(size) + "x" + std::to_string(size) + (epoch ? ", across a collect epoch" : "");
+    const Shape layered{Format32Float, size, size, layers, 1, true};
+    const Shape single{Format32Float, size, size, 1, 1, false};
+    GuestBlock block;
+    auto* texels = block.Data();
+    const auto describe = [](const void* data, const Shape& shape) { return AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(data, shape))).guestBytes; };
+    const auto layerBytes = describe(texels, single);
+    Require(describe(texels, layered) == layers * layerBytes && layers * layerBytes <= BlockBytes, name + ": the layered image is not single-layer images back to back in the guest block");
+    auto* inside = texels + layerBytes;
+    Store(device, texels, layered, StoreLayerMipCode, 0, 0, 1.0f / 8.0f);
+    Store(device, inside, single, StoreQuarterCode);
+    Settle(device, inside, layerBytes);
+    Require(AgcDriver::Graphics::StorageTexture::FindPending(reinterpret_cast<std::uintptr_t>(texels), layerBytes) != nullptr, name + ": the layered image's first layer is not pending");
+    AgcDriver::Graphics::Texture::TakeDepthCopyCounts();
+    const auto program = SampleProgram(device, inside, single);
+    Sample(device, program, single, 1.0f / 64.0f, name + ": the single-layer image before the layered image stores into it");
+    Sample(device, program, single, 1.0f / 64.0f, name + ": the single-layer image sampled again");
+    const auto serial = AgcDriver::Graphics::StorageTexture::PendingSerial();
+    Store(device, texels, layered, StoreLayerMipCode, 1, 0, 1.0f / 16.0f);
+    RequirePendingSerialMoved(serial, name + ": the layered image's store into the single-layer image");
+    if (epoch) AgcDriver::GuestMemory::BumpCollectEpoch();
+    Sample(device, program, single, 1.0f / 16.0f, name + ": the single-layer image after the layered image stored into it");
+    Store(device, texels, layered, StoreLayerMipCode, 0, 0, 1.0f / 32.0f);
+    if (epoch) AgcDriver::GuestMemory::BumpCollectEpoch();
+    Sample(device, program, single, 1.0f / 16.0f, name + ": the single-layer image after the layered image stored another layer");
+    const auto counts = AgcDriver::Graphics::Texture::TakeDepthCopyCounts();
+    Require(layerBytes < (1u << 20u) ? counts.textures == 0 : counts.textures + counts.refreshes != 0, name + ": " + std::to_string(counts.textures) + " depth copy textures and " + std::to_string(counts.refreshes) + " refreshes, so the sample did not take the path this case is for");
+    Settle(device, texels, layers * layerBytes);
+}
+
 }
 
 int main() {
@@ -314,6 +345,10 @@ int main() {
         SingleLevelCase(*device, {Format32Float, 512, 512, 1, 1, false}, "R32F 512x512");
         SingleLevelCase(*device, {Format16Unorm, 1024, 512, 1, 1, false}, "R16 unorm 1024x512");
         LayersAndMipsCase(*device);
+        AliasLayerCase(*device, 256, 4, false);
+        AliasLayerCase(*device, 256, 4, true);
+        AliasLayerCase(*device, 512, 2, false);
+        AliasLayerCase(*device, 512, 2, true);
         std::puts("depth compare copy tests passed");
         return 0;
     } catch (const std::exception& error) {

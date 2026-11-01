@@ -592,6 +592,8 @@ private:
     // saying whether any live image overlaps the fill (see Texture.cpp).
     bool keysFillMatches(std::uint64_t address, std::size_t bytes, bool overlapped) const;
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
+    bool unitsRelied(std::uint32_t first, std::uint32_t count) const;
+    void relyOnUnits() const;
     VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format) const;
     bool singlePass();
     VkImageView elementLayerView(std::uint32_t level, std::uint32_t layer);
@@ -642,6 +644,7 @@ private:
     std::vector<std::uint64_t> layerGeneration;
     std::vector<std::uint64_t> completionKept;
     std::vector<bool> layerPending;
+    mutable std::vector<std::uint64_t> unitsReliedAt;
     std::vector<bool> layerBehind;
     bool blockUnits = false;
     // Write-back hysteresis (block units, see writeBack): partial stores in the current window of

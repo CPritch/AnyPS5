@@ -2365,6 +2365,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     handedOver.clear();
     handedUnits.clear();
     const auto handOverKeys = alias == nullptr && !scoped ? clearHandOver() : std::nullopt;
+    if (alias != nullptr) alias->relyOnUnits();
     const bool flushed = !handOverKeys.has_value() && FlushPending(scopeBegin, scopeBytes, alias.get(), "storage refresh", PublishScope::None);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
@@ -4060,6 +4061,15 @@ void StorageTexture::noteLayersBehind(std::uint32_t firstLayer, std::uint32_t la
     if (std::none_of(layerBehind.begin(), layerBehind.end(), [](bool behind) { return behind; })) layerBehind.clear();
 }
 
+namespace {
+
+bool NewlyPendingBumpsAll() {
+    static const bool all = std::getenv("APS5_NEWLY_PENDING_BUMP_ALL") != nullptr;
+    return all;
+}
+
+}
+
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
@@ -4127,7 +4137,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
         static const bool newlyPendingBumps = std::getenv("APS5_NO_NEWLY_PENDING_BUMP") == nullptr;
-        if (wasLent || (newlyPending && newlyPendingBumps)) BumpPendingSerial();
+        if (wasLent || (newlyPending && newlyPendingBumps && (NewlyPendingBumpsAll() || unitsRelied(first, count)))) BumpPendingSerial();
         return;
     }
     dirty = true;
@@ -4142,6 +4152,15 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
             std::fprintf(stderr, "[draw] large storage image first dirty: 0x%llx+0x%llx format %d, layers %u+%u, on the %s, packet 0x%x, present %llu\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<int>(descriptor.format), first, count, GuestMemory::OnResolverThread() ? "resolver" : GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer ? "committer" : "another thread", static_cast<unsigned>(packet.opcode), static_cast<unsigned long long>(Recorder::Presents()));
         }
     }
+}
+
+bool StorageTexture::unitsRelied(std::uint32_t first, std::uint32_t count) const {
+    const auto serial = PendingSerial();
+    const auto end = std::min<std::size_t>(first + count, unitsReliedAt.size());
+    for (std::size_t layer = first; layer < end; ++layer) {
+        if (unitsReliedAt[layer] == serial) return true;
+    }
+    return false;
 }
 
 void StorageTexture::reconcilePending() {
@@ -4400,13 +4419,33 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     static const bool pretest = std::getenv("APS5_NO_FLUSH_PRETEST") == nullptr;
     if (!pretest) return true;
     const bool whole = descriptor.dccAddress != 0 && uploadedKeys != DccKeys::Uncompressed;
+    const bool relied = !NewlyPendingBumpsAll();
+    const auto serial = relied ? PendingSerial() : 0;
+    if (relied && unitsReliedAt.size() != trackedLayers) unitsReliedAt.assign(trackedLayers, 0);
+    bool found = false;
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-        if (!layerPending[layer]) continue;
-        if (whole) return true;
         const auto begin = layerBegin(layer);
-        if (address < begin + layerBytes(layer) && begin < address + bytes) return true;
+        const bool inside = whole || (address < begin + layerBytes(layer) && begin < address + bytes);
+        if (!inside) continue;
+        if (layerPending[layer]) {
+            if (!relied) return true;
+            found = true;
+        } else if (relied && unitsReliedAt[layer] != serial) {
+            unitsReliedAt[layer] = serial;
+        }
     }
-    return false;
+    return found;
+}
+
+void StorageTexture::relyOnUnits() const {
+    if (NewlyPendingBumpsAll()) return;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    const auto serial = PendingSerial();
+    if (unitsReliedAt.size() != trackedLayers) unitsReliedAt.assign(trackedLayers, 0);
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (!layerPending[layer] && unitsReliedAt[layer] != serial) unitsReliedAt[layer] = serial;
+    }
 }
 
 namespace {
