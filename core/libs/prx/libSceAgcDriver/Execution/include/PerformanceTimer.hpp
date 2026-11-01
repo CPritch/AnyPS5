@@ -261,7 +261,7 @@ private:
 
 class PerformanceTimer {
 public:
-    explicit PerformanceTimer(const char* scope) : frame(PerformanceContext::Current()), trace(PerformanceTrace::Recording() && !untraced ? PerformanceTrace::Thread() : nullptr), scope(scope) {
+    explicit PerformanceTimer(const char* scope) : frame(PerformanceContext::Current()), trace(PerformanceTrace::RecordingSlices() && !untraced ? PerformanceTrace::Thread() : nullptr), scope(scope) {
         if (frame != nullptr) {
             total = frame->Get(scope, "total");
         }

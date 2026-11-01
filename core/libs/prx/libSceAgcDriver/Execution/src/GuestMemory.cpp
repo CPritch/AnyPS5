@@ -2981,7 +2981,7 @@ void AssertGpuLockHeld(const char* where) {
 void GpuMutexType::lock() {
     if (!resolveHooksIdle() && (resolveTraceActive || earlyAbortArmed)) NoteResolveLockTouch(__builtin_return_address(0), BarrierKind::Lock);
     if (!GpuLockProfiled()) {
-        auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
+        auto* trace = PerformanceTrace::RecordingSlices() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr && hotThread == HotThread::None) {
             enter();
         } else {
@@ -3011,7 +3011,7 @@ void GpuMutexType::lock() {
         LockSpinning(mutex, HandoffSpinWindow());
         acquired();
         const auto now = std::chrono::steady_clock::now();
-        if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
+        if (auto* trace = PerformanceTrace::RecordingSlices() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
         if (hotThread != HotThread::None) NoteHotLockWait(site, start, now);
         if (holders) {
             HolderMatrixValues after{};

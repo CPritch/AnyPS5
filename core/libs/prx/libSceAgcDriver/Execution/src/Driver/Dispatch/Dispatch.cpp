@@ -54,6 +54,8 @@ constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)>
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
 std::atomic<std::uint64_t> itemCommits{0};
 std::atomic<std::uint64_t> missItemCommits{0};
+constexpr std::array<const char*, static_cast<std::size_t>(DispatchUnbounded::Count)> UnboundedNames{"none", "gds", "address writes", "address reads only", "image descriptor", "special"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DispatchUnbounded::Count)> unboundedItems{};
 std::atomic<std::uint64_t> noRecipeItemCommits{0};
 std::atomic<std::uint64_t> itemRebuilds{0};
 
@@ -71,6 +73,12 @@ void ReportDispatchItems(bool profile) {
     for (std::size_t i = 0; i < ItemFallbackNames.size(); ++i) {
         char item[48];
         std::snprintf(item, sizeof(item), " %s %llu", ItemFallbackNames[i], static_cast<unsigned long long>(itemFallbacks[i].load(std::memory_order_relaxed)));
+        drained += item;
+    }
+    drained += "; misses and dispatches without a recipe left unqueued, by why their writes are unbounded (cumulative):";
+    for (std::size_t i = 0; i < UnboundedNames.size(); ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", UnboundedNames[i], static_cast<unsigned long long>(unboundedItems[i].load(std::memory_order_relaxed)));
         drained += item;
     }
     std::fprintf(stderr, "[dispatch-item] %llu commit items, %llu of them cache misses and %llu without a recipe (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(missItemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(noRecipeItemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
@@ -535,7 +543,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             }
         }
         bool bounded = false;
-        if (!special && compiledResult != nullptr) itemWrites = DispatchWriteRanges(*compiledResult, bounded);
+        auto unbounded = special ? DispatchUnbounded::Special : DispatchUnbounded::None;
+        if (!special && compiledResult != nullptr) itemWrites = DispatchWriteRanges(*compiledResult, bounded, &unbounded);
+        if (!bounded) unboundedItems[static_cast<std::size_t>(unbounded)].fetch_add(1, std::memory_order_relaxed);
         pipelined = bounded;
         if (pipelined) {
             (missItem ? missItemCommits : noRecipeItemCommits).fetch_add(1, std::memory_order_relaxed);

@@ -507,7 +507,7 @@ struct PatchMemoEntry {
 std::size_t PatchMemoSlots() {
     static const std::size_t slots = [] {
         const char* text = std::getenv("APS5_PATCH_MEMO_SLOTS");
-        const auto requested = text == nullptr ? std::size_t{8192} : static_cast<std::size_t>(std::strtoull(text, nullptr, 10));
+        const auto requested = text == nullptr ? std::size_t{1024} : static_cast<std::size_t>(std::strtoull(text, nullptr, 10));
         return std::max<std::size_t>(requested, 1);
     }();
     return slots;

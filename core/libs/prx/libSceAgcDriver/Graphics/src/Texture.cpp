@@ -4063,6 +4063,8 @@ void StorageTexture::noteLayersBehind(std::uint32_t firstLayer, std::uint32_t la
 
 namespace {
 
+std::uint64_t pendingAdds = 0;
+
 bool NewlyPendingBumpsAll() {
     static const bool all = std::getenv("APS5_NEWLY_PENDING_BUMP_ALL") != nullptr;
     return all;
@@ -4142,6 +4144,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     }
     dirty = true;
     pending.textures.push_back(this);
+    ++pendingAdds;
     BumpPendingSerial();
     if (static const bool named = std::getenv("APS5_COMMIT_STATS") != nullptr; named && guestBytes >= (std::uint64_t{8} << 20u)) {
         static std::mutex namedMutex;
@@ -4170,8 +4173,12 @@ void StorageTexture::reconcilePending() {
     if (!any) forgetDrawn();
     if (any == dirty) return;
     dirty = any;
-    if (any) pending.textures.push_back(this);
-    else pending.textures.remove(this);
+    if (any) {
+        pending.textures.push_back(this);
+        ++pendingAdds;
+    } else {
+        pending.textures.remove(this);
+    }
     BumpPendingSerial();
 }
 
@@ -5013,15 +5020,24 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
 void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
     static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
     if (disabled) return;
+    static const bool memo = std::getenv("APS5_NO_LABEL_STORE_MEMO") == nullptr;
+    static std::uint64_t cleanAt = ~std::uint64_t{0};
+    const auto qualifies = [](const StorageTexture* texture) { return texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes; };
+    std::uint64_t seenAt = 0;
+    auto& pending = Pending();
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     {
-        auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
+        if (memo && pendingAdds == cleanAt) return;
+        seenAt = pendingAdds;
         for (const auto* texture : pending.textures) {
-            if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
+            if (qualifies(texture)) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
         }
     }
     for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
+    if (!memo) return;
+    std::lock_guard lock(pending.mutex);
+    if (std::none_of(pending.textures.begin(), pending.textures.end(), qualifies)) cleanAt = seenAt;
 }
 
 std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {

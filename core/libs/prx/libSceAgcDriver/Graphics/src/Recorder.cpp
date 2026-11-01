@@ -3652,7 +3652,7 @@ std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t b
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (bytes == 0) return 0;
     const auto end = address + bytes;
-    const auto writes = [&](const Batch& batch) { return overlaps(batch, address, end) || readOverlap(batch, address, end, ReadKind::AddressBased).has_value(); };
+    const auto writes = [&](const Batch& batch) { return overlaps(batch, address, end) || readOverlap(batch, address, end, ReadKind::AddressBased).has_value() || readOverlap(batch, address, end, ReadKind::AddressReadOnly).has_value(); };
     if (open != nullptr && writes(*open)) return OpenSerial();
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
         if (writes(**it)) return (*it)->serial;
@@ -3672,7 +3672,7 @@ std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t b
             if (index < batch.writeNotes.size() && std::find(exceptNotes.begin(), exceptNotes.end(), batch.writeNotes[index]) != exceptNotes.end()) continue;
             return true;
         }
-        return readOverlap(batch, address, end, ReadKind::AddressBased).has_value();
+        return readOverlap(batch, address, end, ReadKind::AddressBased).has_value() || readOverlap(batch, address, end, ReadKind::AddressReadOnly).has_value();
     };
     if (open != nullptr && writes(*open)) return OpenSerial();
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {

@@ -805,12 +805,17 @@ public:
         return AgcDriverTraceRecording_nid_postfix();
     }
 
+    static bool RecordingSlices() {
+        static const bool lean = std::getenv("APS5_TRACE_LEAN") != nullptr;
+        return !lean && Recording();
+    }
+
     static TraceThread* Thread() {
         return AgcDriverTraceThread_nid_postfix();
     }
 
     static void Count(const char* scope) {
-        if (Recording()) AgcDriverTraceCount_nid_postfix(scope);
+        if (RecordingSlices()) AgcDriverTraceCount_nid_postfix(scope);
     }
 
     static void SetOverlayTotals(bool on);

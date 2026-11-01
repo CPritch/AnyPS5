@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
@@ -53,18 +54,28 @@ void Driver::noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, cons
     while (writtenBuffers.size() > WrittenBufferRing) writtenBuffers.pop_front();
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded) {
-    bounded = compiled.bdaAbiVersion == 0;
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded, DispatchUnbounded* reason) {
+    static const bool boundReadOnly = std::getenv("APS5_BOUND_READ_ONLY_ADDRESS_DISPATCHES") != nullptr;
+    const bool addressBased = compiled.bdaAbiVersion != 0;
+    const bool readOnly = addressBased && !compiled.bdaWrites && !Graphics::ShaderStoresThroughAddresses(compiled.spirv);
+    const bool addressesBounded = !addressBased || (readOnly && boundReadOnly);
+    auto why = !addressBased ? DispatchUnbounded::None : readOnly ? DispatchUnbounded::AddressReadOnly : DispatchUnbounded::AddressWrites;
+    bounded = addressesBounded;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     constexpr std::uint64_t UnknownImageBytes = 64ull * 1024 * 1024;
     for (const auto& binding : compiled.bindings) {
-        if (binding.role == ShaderRecompiler::DescriptorRole::Gds || binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) bounded = false;
+        if (binding.role == ShaderRecompiler::DescriptorRole::Gds) {
+            bounded = false;
+            why = DispatchUnbounded::Gds;
+        }
+        if ((binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) && !addressesBounded) bounded = false;
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
             const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
             if (!written) continue;
             if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) {
                 bounded = false;
+                if (why == DispatchUnbounded::None || why == DispatchUnbounded::AddressReadOnly) why = DispatchUnbounded::ImageDescriptor;
                 continue;
             }
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
@@ -76,6 +87,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const S
         }
     }
     visitWrittenBuffers(compiled, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { ranges.emplace_back(begin, end); });
+    if (reason != nullptr) *reason = bounded ? DispatchUnbounded::None : why;
     return ranges;
 }
 

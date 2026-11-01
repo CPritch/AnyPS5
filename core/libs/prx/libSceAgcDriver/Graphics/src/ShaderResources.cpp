@@ -6165,7 +6165,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder, std::uint64_t writer) {
     // one of them (the copy HLE) must not land before the recorded work read it.
     static const bool readOnlyAsReads = std::getenv("APS5_READ_ONLY_BDA_AS_READS") != nullptr;
     const bool addressBased = guestMemory.HoldsLease();
-    const auto kind = addressBased && (!readOnlyAsReads || !BdaReadOnly()) ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+    static const bool readOnlyOrdered = std::getenv("APS5_READ_ONLY_BDA_ORDERED") != nullptr;
+    const auto kind = !addressBased || (readOnlyAsReads && BdaReadOnly()) ? Recorder::ReadKind::DispatchElement : readOnlyOrdered && BdaReadOnly() ? Recorder::ReadKind::AddressReadOnly : Recorder::ReadKind::AddressBased;
     static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
     if (counted && addressBased) addressBasedUses[BdaReadOnly() ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
     if (auto split = guestMemory.SplitInPlaceReads()) {

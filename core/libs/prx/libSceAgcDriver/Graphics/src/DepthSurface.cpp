@@ -2943,10 +2943,24 @@ bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t 
 }
 
 void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
-    std::lock_guard lock(surfacesMutex());
-    for (const auto& surface : surfaces()) {
-        if (surface->context.device == device && !surface->retired && surface->Overlaps(address, bytes)) retire(*surface);
+    struct Retired {
+        VkDevice device = VK_NULL_HANDLE;
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t serial = ~std::uint64_t{0};
+    };
+    static const bool memo = std::getenv("APS5_NO_RETIRE_MEMO") == nullptr;
+    thread_local std::array<Retired, 4> clear{};
+    thread_local std::size_t next = 0;
+    const auto serial = surfacesSerial.load(std::memory_order_acquire);
+    if (memo && std::any_of(clear.begin(), clear.end(), [&](const Retired& entry) { return entry.serial == serial && entry.device == device && entry.address == address && entry.bytes == bytes; })) return;
+    {
+        std::lock_guard lock(surfacesMutex());
+        for (const auto& surface : surfaces()) {
+            if (surface->context.device == device && !surface->retired && surface->Overlaps(address, bytes)) retire(*surface);
+        }
     }
+    if (memo) clear[next++ % clear.size()] = {device, address, bytes, serial};
 }
 
 void RetireCoveredDepthSurfaces(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::span<const WrittenStorageExtent> extents) {
