@@ -298,7 +298,7 @@ inline const Placement& GetPlacement() {
 #ifdef __linux__
         const auto& layout = Get();
         const char* split = std::getenv("APS5_RESOLVE_SPLIT");
-        const bool resolver = split != nullptr && std::strtoul(split, nullptr, 10) >= 2 && MaskFromEnvironment("APS5_RESOLVER_AFFINITY_MASK") == 0;
+        const bool resolver = (split == nullptr || std::strtoul(split, nullptr, 10) >= 2) && MaskFromEnvironment("APS5_RESOLVER_AFFINITY_MASK") == 0;
         return PlacementFor(layout, CoresFromSysfs("/sys/devices/system/cpu", layout.performant & layout.process), resolver, std::getenv("APS5_RESOLVER_WHOLE_CORE") != nullptr);
 #else
         return Placement{};

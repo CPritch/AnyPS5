@@ -534,7 +534,7 @@ void DrawPipeline::NoteEarlyAbort(std::uint8_t kind) {
 unsigned DrawPipeline::ResolveSplit() {
     static const unsigned mode = [] {
         const char* text = std::getenv("APS5_RESOLVE_SPLIT");
-        return text == nullptr ? 0u : static_cast<unsigned>(std::strtoul(text, nullptr, 10));
+        return text == nullptr ? 2u : static_cast<unsigned>(std::strtoul(text, nullptr, 10));
     }();
     return mode;
 }
