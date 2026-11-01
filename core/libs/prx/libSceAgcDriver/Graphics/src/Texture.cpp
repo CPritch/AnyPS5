@@ -4126,7 +4126,8 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     ++version;
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
-        if (wasLent || newlyPending) BumpPendingSerial();
+        static const bool newlyPendingBumps = std::getenv("APS5_NO_NEWLY_PENDING_BUMP") == nullptr;
+        if (wasLent || (newlyPending && newlyPendingBumps)) BumpPendingSerial();
         return;
     }
     dirty = true;
