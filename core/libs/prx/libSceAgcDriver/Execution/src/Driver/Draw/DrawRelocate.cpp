@@ -504,7 +504,14 @@ struct PatchMemoEntry {
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> info;
 };
 
-constexpr std::size_t PatchMemoSlots = 1024;
+std::size_t PatchMemoSlots() {
+    static const std::size_t slots = [] {
+        const char* text = std::getenv("APS5_PATCH_MEMO_SLOTS");
+        const auto requested = text == nullptr ? std::size_t{8192} : static_cast<std::size_t>(std::strtoull(text, nullptr, 10));
+        return std::max<std::size_t>(requested, 1);
+    }();
+    return slots;
+}
 std::array<std::array<std::atomic<std::uint64_t>, 2>, 2> patchMemoCounts{};
 
 bool patchMemoEnabled() {
@@ -513,7 +520,7 @@ bool patchMemoEnabled() {
 }
 
 std::vector<PatchMemoEntry>& patchMemo() {
-    thread_local std::vector<PatchMemoEntry> slots(PatchMemoSlots);
+    thread_local std::vector<PatchMemoEntry> slots(PatchMemoSlots());
     return slots;
 }
 
@@ -523,7 +530,7 @@ std::size_t patchMemoSlot(std::size_t kind, const void* base, const void* baseIn
     mix(reinterpret_cast<std::uintptr_t>(base));
     mix(reinterpret_cast<std::uintptr_t>(baseInfo));
     for (const auto word : key) mix(word);
-    return static_cast<std::size_t>((hash ^ (hash >> 29u)) % PatchMemoSlots);
+    return static_cast<std::size_t>((hash ^ (hash >> 29u)) % PatchMemoSlots());
 }
 
 thread_local std::vector<std::uint32_t> patchKey;
