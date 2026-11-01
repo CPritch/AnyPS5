@@ -295,12 +295,13 @@ bool Expect(AgcDriver::VulkanDevice& device, bool unwatch) {
     Draw(device, copied, PixelCopy, firstCopy, {{0, 0}, {Width / 2u, Height}});
     Require(!pending(drawn.address), "the draw writing a copied buffer did not store the drawn linear target first");
     Require(pending(copied.address), "the first copying draw did not leave its linear target pending");
-    Require(recorder->Recording() && recorder->Submissions() == submitted + 1, "storing the drawn linear target did not submit the batch the address-based draw read it in (" + std::to_string(recorder->Submissions() - submitted) + " submissions)");
+    const std::uint64_t storeSubmits = std::getenv("APS5_READ_ONLY_BDA_AS_WRITER") != nullptr ? 1u : 0u;
+    Require(recorder->Recording() && recorder->Submissions() == submitted + storeSubmits, "storing the drawn linear target submitted " + std::to_string(recorder->Submissions() - submitted) + " batches, expected " + std::to_string(storeSubmits) + ": the batch the read-only address-based draw read it in is synced only when such builds count as writers (APS5_READ_ONLY_BDA_AS_WRITER)");
     const auto setsBetween = context.descriptorCache->Counters().sets;
     const auto secondCopy = CopyUserData(block.Address() + SecondSourceOffset, SecondOutput);
     Draw(device, copied, PixelCopy, secondCopy, {{static_cast<std::int32_t>(Width / 2u), 0}, {Width / 2u, Height}});
-    if (watched) Require(recorder->Recording() && recorder->Submissions() == submitted + 1, "the second copying draw submitted recorded work");
-    else Require(recorder->Submissions() == submitted + 2, "the second copying draw into a stored target outside the write watch did not submit once to capture its bytes (" + std::to_string(recorder->Submissions() - submitted - 1) + " submissions)");
+    if (watched) Require(recorder->Recording() && recorder->Submissions() == submitted + storeSubmits, "the second copying draw submitted recorded work");
+    else Require(recorder->Submissions() == submitted + storeSubmits + 1, "the second copying draw into a stored target outside the write watch did not submit once to capture its bytes (" + std::to_string(recorder->Submissions() - submitted - 1) + " submissions)");
     const auto setsAfter = context.descriptorCache->Counters().sets;
     device.WaitIdle();
     Require(FirstOutput[0] == FirstSource, "the first copying draw's output holds " + Hex(FirstOutput[0]) + ", not its source's " + Hex(FirstSource));

@@ -22,6 +22,7 @@
 #include <iostream>
 #include <mutex>
 #include <span>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,7 @@ constexpr std::size_t FarDword = 100u * Width;
 
 alignas(256) constexpr std::array<std::uint32_t, 11> StoreImageCode{0x7e000280u, 0x7e020280u, 0x7e0402ffu, Stored, 0xf0200108u, 0x00010200u, 0x7e0202ffu, 0x00000064u, 0xf0200108u, 0x00010200u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 7> StoreGlobalCode{0x7e000208u, 0x7e020209u, 0x7e0402ffu, Overwritten, 0xdc708100u, 0x007d0200u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 10> LoadGlobalCode{0x7e00020cu, 0x7e02020du, 0xdc308100u, 0x037d0000u, 0xbf8c3f70u, 0x7e000280u, 0x7e020280u, 0xf0200108u, 0x00010300u, 0xbf810000u};
 
 class GuestBlock {
 public:
@@ -121,11 +123,40 @@ std::vector<std::uint32_t> GlobalUserData(std::uint64_t base) {
     return userData;
 }
 
-bool AddressBasedStorePending(std::uint64_t image, bool open) {
+std::optional<AgcDriver::Graphics::Recorder::PendingReadInfo> PendingHeapRead(std::uint64_t image) {
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     const auto* recorder = AgcDriver::Graphics::Recorder::Active();
-    const auto read = recorder != nullptr ? recorder->DescribePendingRead(image + ImageBytes, 4u) : std::nullopt;
+    return recorder != nullptr ? recorder->DescribePendingRead(image + ImageBytes, 4u) : std::nullopt;
+}
+
+bool AddressBasedStorePending(std::uint64_t image, bool open) {
+    const auto read = PendingHeapRead(image);
     return read.has_value() && read->kind == AgcDriver::Graphics::Recorder::ReadKind::AddressBased && read->open == open;
+}
+
+std::vector<std::uint32_t> ImageAndGlobalUserData(std::uint64_t image, std::uint64_t global) {
+    auto userData = ImageUserData(image);
+    userData.resize(14, 0u);
+    userData[12] = static_cast<std::uint32_t>(global);
+    userData[13] = static_cast<std::uint32_t>(global >> 32u);
+    return userData;
+}
+
+void ReadOnlyRun(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
+    const auto* words = guest.Words() + offset / 4u;
+    const auto image = guest.Address() + offset;
+    const auto target = device.Target();
+    const auto storeImage = Compile(StoreImageCode, ImageUserData(image), target);
+    const auto loadGlobal = Compile(LoadGlobalCode, ImageAndGlobalUserData(image, image), target);
+    device.Dispatch(storeImage, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
+    device.Dispatch(loadGlobal, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(LoadGlobalCode.data()));
+    const std::string what = "storage flush ordering, read-only address-based reader: ";
+    const auto read = PendingHeapRead(image);
+    Require(read.has_value(), what + "the build's leased heaps were not noted as read");
+    Require(read->kind == AgcDriver::Graphics::Recorder::ReadKind::DispatchElement, what + "the read-only build's leased heaps were noted as an address-based writer's, which makes a flush of a pending image wait for its batch");
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "test"), what + "the image store left no results pending");
+    device.WaitIdle();
+    Require(words[FarDword] == Stored, what + "the pending image's texel away from the read was not stored");
 }
 
 void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, bool submit, const char* name) {
@@ -164,6 +195,7 @@ int main() {
         else if (!device->CanWaitUnlocked()) std::puts("the recorder cannot wait for the GPU without running completions: the writer-in-flight case is skipped");
         else Run(*device, guest, 0, true, "writer in flight");
         Run(*device, guest, BlockBytes / 2u, false, "writer in the open batch");
+        ReadOnlyRun(*device, guest, BlockBytes / 4u);
         std::puts("storage flush ordering tests passed");
         return 0;
     } catch (const std::exception& error) {
