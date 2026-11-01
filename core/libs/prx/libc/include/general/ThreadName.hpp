@@ -36,6 +36,23 @@ inline HRESULT SetCurrent(const char* name) {
 }
 
 }
+#elif defined(__linux__)
+#include <cstring>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+namespace ThreadName {
+
+inline bool SetCurrent(const char* name) {
+    if (name == nullptr || name[0] == '\0' || ::syscall(SYS_gettid) == ::getpid()) return false;
+    char shortName[16];
+    std::strncpy(shortName, name, sizeof(shortName) - 1);
+    shortName[sizeof(shortName) - 1] = '\0';
+    return pthread_setname_np(pthread_self(), shortName) == 0;
+}
+
+}
 #endif
 
 #endif

@@ -11,6 +11,7 @@
 #include "prx/libc/include/general/AsmMacros.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
+#include "prx/libc/include/general/ThreadName.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include <algorithm>
@@ -935,6 +936,7 @@ static void* StartNativeThread(void* opaque) {
                 std::lock_guard lock(self->nameLock);
                 name = self->name;
             }
+            static_cast<void>(ThreadName::SetCurrent(name.empty() ? "guest thread" : name.c_str()));
             CpuTopology::PinGuestThread(name.empty() ? "guest thread" : name.c_str());
         }
 #endif
@@ -1316,6 +1318,8 @@ int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
     const std::wstring description(thread->name.begin(), thread->name.end());
     SetThreadDescription(static_cast<HANDLE>(thread->nativeHandle), description.c_str());
     ApplyJobAffinity(*thread, thread->nativeHandle);
+#elif defined(__linux__)
+    if (thread == scePthreadSelf()) static_cast<void>(ThreadName::SetCurrent(thread->name.c_str()));
 #endif
     return SCE_OK;
 }

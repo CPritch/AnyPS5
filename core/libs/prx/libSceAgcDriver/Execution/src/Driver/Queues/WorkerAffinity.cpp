@@ -14,6 +14,8 @@ void NameThread(const char* role) {
 #ifdef _WIN32
     const HRESULT nameResult = ThreadName::SetCurrent(role);
     if (FAILED(nameResult)) std::fprintf(stderr, "[thread-name] could not name %s (0x%08lx)\n", role, static_cast<unsigned long>(nameResult));
+#elif defined(__linux__)
+    static_cast<void>(ThreadName::SetCurrent(role));
 #endif
 }
 
