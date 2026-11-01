@@ -10,6 +10,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <vector>
+#include <string>
+#include <span>
+#include <optional>
+#include <atomic>
 
 namespace AgcDriver::DriverDetail {
 
@@ -488,8 +493,92 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
     decode = donor->decode;
 }
 
+namespace {
+
+struct PatchMemoEntry {
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> base;
+    std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> baseInfo;
+    std::size_t kind = 0;
+    std::vector<std::uint32_t> key;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> info;
+};
+
+constexpr std::size_t PatchMemoSlots = 1024;
+std::array<std::array<std::atomic<std::uint64_t>, 2>, 2> patchMemoCounts{};
+
+bool patchMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_PATCH_MEMO") == nullptr;
+    return enabled;
+}
+
+std::vector<PatchMemoEntry>& patchMemo() {
+    thread_local std::vector<PatchMemoEntry> slots(PatchMemoSlots);
+    return slots;
+}
+
+std::size_t patchMemoSlot(std::size_t kind, const void* base, const void* baseInfo, std::span<const std::uint32_t> key) {
+    std::uint64_t hash = 0xcbf29ce484222325ull ^ kind;
+    const auto mix = [&](std::uint64_t value) { hash = (hash ^ value) * 0x100000001b3ull; };
+    mix(reinterpret_cast<std::uintptr_t>(base));
+    mix(reinterpret_cast<std::uintptr_t>(baseInfo));
+    for (const auto word : key) mix(word);
+    return static_cast<std::size_t>((hash ^ (hash >> 29u)) % PatchMemoSlots);
+}
+
+thread_local std::vector<std::uint32_t> patchKey;
+
+}
+
+std::optional<Driver::PatchMemoHit> Driver::findPatchMemo(std::size_t kind, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& base, const std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo>& baseInfo, std::span<const std::uint32_t> key) {
+    if (!patchMemoEnabled()) return std::nullopt;
+    patchMemoCounts[kind][0].fetch_add(1, std::memory_order_relaxed);
+    const auto& entry = patchMemo()[patchMemoSlot(kind, base.get(), baseInfo.get(), key)];
+    if (entry.kind != kind || entry.base != base || entry.baseInfo != baseInfo || !std::equal(entry.key.begin(), entry.key.end(), key.begin(), key.end())) return std::nullopt;
+    patchMemoCounts[kind][1].fetch_add(1, std::memory_order_relaxed);
+    return PatchMemoHit{entry.result, entry.info};
+}
+
+void Driver::storePatchMemo(std::size_t kind, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& base, const std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo>& baseInfo, std::span<const std::uint32_t> key, PatchMemoHit hit) {
+    if (!patchMemoEnabled()) return;
+    auto& entry = patchMemo()[patchMemoSlot(kind, base.get(), baseInfo.get(), key)];
+    entry.base = base;
+    entry.baseInfo = baseInfo;
+    entry.kind = kind;
+    entry.key.assign(key.begin(), key.end());
+    entry.result = std::move(hit.result);
+    entry.info = std::move(hit.info);
+}
+
+std::string TakePatchMemoText() {
+    const auto take = [](std::atomic<std::uint64_t>& value) { return std::to_string(value.exchange(0, std::memory_order_relaxed)); };
+    return "; patched shader results (lookups/hits): rebased " + take(patchMemoCounts[0][0]) + "/" + take(patchMemoCounts[0][1]) + ", data words " + take(patchMemoCounts[1][0]) + "/" + take(patchMemoCounts[1][1]);
+}
+
 void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     if (variant.shaderDataPatches.empty() && variant.rebasedWords.empty()) return;
+    auto& key = patchKey;
+    key.clear();
+    key.push_back(static_cast<std::uint32_t>(variant.shaderDataPatches.size()));
+    for (const auto& [slot, value] : variant.shaderDataPatches) {
+        key.push_back(slot);
+        key.push_back(value);
+    }
+    for (const auto& patch : variant.rebasedWords) {
+        key.push_back(static_cast<std::uint32_t>(patch.kind));
+        key.push_back(patch.target);
+        key.push_back(patch.word);
+        key.push_back(patch.value);
+    }
+    if (auto hit = findPatchMemo(0, variant.compiled, variant.vertexInfo, key)) {
+        if (hit->info != nullptr) variant.vertexInfo = std::move(hit->info);
+        variant.compiled = std::move(hit->result);
+        variant.shaderDataPatches.clear();
+        variant.rebasedWords.clear();
+        return;
+    }
+    const auto base = variant.compiled;
+    const auto baseInfo = variant.vertexInfo;
     auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
     for (const auto& [slot, value] : variant.shaderDataPatches) {
         const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
@@ -511,6 +600,7 @@ void Driver::applyShaderDataPatches(DispatchVariant& variant) {
         if (info == nullptr) info = std::make_shared<ShaderRecompiler::ShaderVertexStageInfo>(*variant.vertexInfo);
         info->resources[attribute.location].fields[patch.word] = patch.value;
     }
+    storePatchMemo(0, base, baseInfo, key, {rebased, info});
     if (info != nullptr) variant.vertexInfo = std::move(info);
     variant.compiled = std::move(rebased);
     variant.shaderDataPatches.clear();
