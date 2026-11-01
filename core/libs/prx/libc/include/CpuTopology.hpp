@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBC_INCLUDE_CPUTOPOLOGY_HPP
 #define CORE_LIBS_PRX_LIBC_INCLUDE_CPUTOPOLOGY_HPP
 
+#include <bit>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -250,15 +251,21 @@ struct Placement {
     }
 };
 
-inline Placement PlacementFor(const Layout& layout, const std::vector<std::uint64_t>& performantCores, bool resolver = false) {
+inline Placement PlacementFor(const Layout& layout, const std::vector<std::uint64_t>& performantCores, bool resolver = false, bool resolverWholeCore = false) {
     constexpr std::size_t dedicated = 3;
     if (!layout.hybrid || performantCores.size() <= dedicated) return {};
     Placement result{};
     result.worker = performantCores[0];
     result.finisher = performantCores[1];
     result.committer = performantCores[2];
-    if (resolver && performantCores.size() > dedicated) result.resolver = performantCores[dedicated];
-    result.shared = layout.process & ~(result.worker | result.finisher | result.committer);
+    std::uint64_t reserved = result.worker | result.finisher | result.committer;
+    if (resolver && performantCores.size() > dedicated) {
+        const auto core = performantCores[dedicated];
+        const bool siblings = std::popcount(core) > 1;
+        result.resolver = siblings && !resolverWholeCore ? std::uint64_t{1} << (63 - std::countl_zero(core)) : core;
+        if (siblings && !resolverWholeCore) reserved |= result.resolver;
+    }
+    result.shared = layout.process & ~reserved;
     if (result.shared == 0) return {};
     return result;
 }
@@ -292,7 +299,7 @@ inline const Placement& GetPlacement() {
         const auto& layout = Get();
         const char* split = std::getenv("APS5_RESOLVE_SPLIT");
         const bool resolver = split != nullptr && std::strtoul(split, nullptr, 10) >= 2 && MaskFromEnvironment("APS5_RESOLVER_AFFINITY_MASK") == 0;
-        return PlacementFor(layout, CoresFromSysfs("/sys/devices/system/cpu", layout.performant & layout.process), resolver);
+        return PlacementFor(layout, CoresFromSysfs("/sys/devices/system/cpu", layout.performant & layout.process), resolver, std::getenv("APS5_RESOLVER_WHOLE_CORE") != nullptr);
 #else
         return Placement{};
 #endif

@@ -154,6 +154,13 @@ int main() {
         const auto placement = CpuTopology::PlacementFor(zen5, cores);
         Require(placement.Active() && placement.worker == 0x401ull && placement.finisher == 0x802ull && placement.committer == 0x1004ull, "a performant core each for the worker, finisher and committer");
         Require(placement.shared == 0xfe3f8ull, "every other thread on the fourth performant core and the efficient cores");
+        const auto split = CpuTopology::PlacementFor(zen5, cores, true);
+        Require(split.resolver == 0x2000ull && split.committer == 0x1004ull, "the resolver on the fourth performant core's second sibling");
+        Require(split.shared == 0xfc3f8ull, "every other thread keeps the fourth performant core's first sibling and the efficient cores");
+        const auto whole = CpuTopology::PlacementFor(zen5, cores, true, true);
+        Require(whole.resolver == 0x2008ull && whole.shared == 0xfe3f8ull, "a whole-core resolver shares its core with every other thread");
+        const auto single = CpuTopology::PlacementFor(zen5, {0x401ull, 0x802ull, 0x1004ull, 0x8ull}, true);
+        Require(single.resolver == 0x8ull && (single.shared & 0x8ull) != 0, "a resolver core without a second sibling stays shared");
 
         Require(!CpuTopology::PlacementFor(zen5, {0x401ull, 0x802ull, 0x1004ull}).Active(), "no placement without a performant core left to share");
         auto uniform = zen5;

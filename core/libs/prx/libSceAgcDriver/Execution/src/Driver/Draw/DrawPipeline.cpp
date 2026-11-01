@@ -551,6 +551,8 @@ void DrawPipeline::PostResolve(void (*body)(void*), void (*finish)(void*, bool),
     pipeline.resolvePosted = std::chrono::steady_clock::now();
     resolvesPosted.fetch_add(1, std::memory_order_relaxed);
     pipeline.resolveState.store(ResolvePosted, std::memory_order_release);
+    pipeline.resolverWake.fetch_add(1, std::memory_order_release);
+    pipeline.resolverWake.notify_one();
 }
 
 void DrawPipeline::JoinResolve() {
@@ -657,10 +659,20 @@ void DrawPipeline::resolveAhead() {
     PinResolverThread("draw resolver");
     PerformanceTimer::UntraceThisThread();
     constexpr std::chrono::microseconds idleNap{20};
+    static const bool spins = std::getenv("APS5_RESOLVER_SPINS") != nullptr;
+    static const auto window = [] {
+        const char* text = std::getenv("APS5_RESOLVER_SPIN_US");
+        return std::chrono::nanoseconds(std::chrono::microseconds(text != nullptr ? std::strtoll(text, nullptr, 10) : 20));
+    }();
     for (;;) {
         const auto posted = [&] { return resolveState.load(std::memory_order_acquire) == ResolvePosted || resolverClosing.load(std::memory_order_relaxed); };
-        if (!SpinUntil(HandoffSpinWindow(), posted)) {
+        if (spins && !SpinUntil(HandoffSpinWindow(), posted)) {
             std::this_thread::sleep_for(idleNap);
+            continue;
+        }
+        if (!spins && !SpinUntil(window, posted)) {
+            const auto wake = resolverWake.load(std::memory_order_acquire);
+            if (!posted()) resolverWake.wait(wake, std::memory_order_acquire);
             continue;
         }
         if (resolverClosing.load(std::memory_order_acquire)) return;
@@ -1108,6 +1120,8 @@ void DrawPipeline::Stop() {
     {
         std::lock_guard lock(prepareMutex);
         resolverClosing.store(true, std::memory_order_release);
+        resolverWake.fetch_add(1, std::memory_order_release);
+        resolverWake.notify_all();
         resolving = std::move(resolver);
     }
     if (resolving.joinable()) {
