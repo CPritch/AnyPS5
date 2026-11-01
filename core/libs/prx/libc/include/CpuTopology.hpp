@@ -307,16 +307,67 @@ inline const Placement& GetPlacement() {
     return placement;
 }
 
+struct NamedPin {
+    std::string name;
+    std::uint64_t mask = 0;
+};
+
+inline std::vector<NamedPin> ParseNamedPins(const char* text) {
+    std::vector<NamedPin> pins;
+    if (text == nullptr) return pins;
+    const std::string all(text);
+    std::size_t start = 0;
+    while (start < all.size()) {
+        const auto end = all.find(',', start);
+        const auto item = all.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        const auto colon = item.rfind(':');
+        if (colon != std::string::npos && colon != 0) {
+            const auto mask = std::strtoull(item.c_str() + colon + 1, nullptr, 16);
+            if (mask != 0) pins.push_back({item.substr(0, colon), mask});
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return pins;
+}
+
+inline const std::vector<NamedPin>& NamedPins() {
+    static const std::vector<NamedPin> pins = ParseNamedPins(std::getenv("APS5_PIN_GUEST_THREADS"));
+    return pins;
+}
+
+inline std::uint64_t NamedPinMask(const char* role) {
+    if (role == nullptr) return 0;
+    for (const auto& pin : NamedPins())
+        if (pin.name == role) return pin.mask;
+    return 0;
+}
+
+inline std::uint64_t SharedWithoutNamedPins(std::uint64_t shared) {
+    std::uint64_t reserved = 0;
+    for (const auto& pin : NamedPins()) reserved |= pin.mask;
+    const auto rest = shared & ~reserved;
+    return rest != 0 ? rest : shared;
+}
+
 inline void PinHelperThread(const char* role) {
     static const std::uint64_t mask = [] {
         const auto requested = MaskFromEnvironment("APS5_HELPER_AFFINITY_MASK");
-        return requested != 0 ? requested : GetPlacement().shared;
+        return requested != 0 ? requested : SharedWithoutNamedPins(GetPlacement().shared);
     }();
+    if (const auto named = NamedPinMask(role); named != 0) {
+        PinTraced(role, nullptr, named);
+        return;
+    }
     if (mask != 0) PinTraced(role, nullptr, mask);
 }
 
 inline void PinGuestThread(const char* role) {
-    const auto mask = GetPlacement().shared;
+    if (const auto named = NamedPinMask(role); named != 0) {
+        PinTraced(role, nullptr, named);
+        return;
+    }
+    const auto mask = SharedWithoutNamedPins(GetPlacement().shared);
     if (mask != 0) PinTraced(role, nullptr, mask);
 }
 

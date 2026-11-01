@@ -161,6 +161,9 @@ int main() {
         Require(whole.resolver == 0x2008ull && whole.shared == 0xfe3f8ull, "a whole-core resolver shares its core with every other thread");
         const auto single = CpuTopology::PlacementFor(zen5, {0x401ull, 0x802ull, 0x1004ull, 0x8ull}, true);
         Require(single.resolver == 0x8ull && (single.shared & 0x8ull) != 0, "a resolver core without a second sibling stays shared");
+        const auto pins = CpuTopology::ParseNamedPins("RenderThread:2008,bad,:4,Other:0,Main Thread:30");
+        Require(pins.size() == 2 && pins[0].name == "RenderThread" && pins[0].mask == 0x2008ull && pins[1].name == "Main Thread" && pins[1].mask == 0x30ull, "named pins parse name:hexmask pairs and skip malformed ones");
+        Require(CpuTopology::ParseNamedPins(nullptr).empty() && CpuTopology::ParseNamedPins("").empty(), "no named pins without the switch");
 
         Require(!CpuTopology::PlacementFor(zen5, {0x401ull, 0x802ull, 0x1004ull}).Active(), "no placement without a performant core left to share");
         auto uniform = zen5;

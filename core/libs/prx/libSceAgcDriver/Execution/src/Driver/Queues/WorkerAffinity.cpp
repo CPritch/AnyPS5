@@ -73,7 +73,7 @@ std::uint64_t PreparerAffinityMask() {
         const auto requested = CpuTopology::MaskFromEnvironment("APS5_PREPARE_AHEAD_AFFINITY_MASK");
         if (requested != 0) return requested;
         const auto& placement = CpuTopology::GetPlacement();
-        return placement.Active() ? placement.shared : CpuTopology::Get().process;
+        return placement.Active() ? CpuTopology::SharedWithoutNamedPins(placement.shared) : CpuTopology::Get().process;
     }();
     return mask;
 }
