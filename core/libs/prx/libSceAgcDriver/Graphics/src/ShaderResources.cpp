@@ -3570,8 +3570,11 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
         Recorder::CountSync(4);
         const bool counted = CommitterCopiedWaitCounted();
         const auto start = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool behind = label && counted && recorder->CompletionLabelIn(address, bytes);
         recorder->SyncThrough(address, bytes);
         if (counted) {
+            static std::atomic<int> logged{0};
+            if (label && logged.fetch_add(1, std::memory_order_relaxed) < 24) std::fprintf(stderr, "[draw] committer sync for a pending label over 0x%llx+0x%zx: %s, %.2f ms\n", static_cast<unsigned long long>(address), bytes, behind ? "a label stored at completion" : "only labels stored on the GPU or queued", static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()) / 1000.0);
             auto& waits = CommitterCopiedWaits();
             const auto kind = contextCopied ? 0u : drawCopied ? 1u : 2u;
             waits.count[kind].fetch_add(1, std::memory_order_relaxed);

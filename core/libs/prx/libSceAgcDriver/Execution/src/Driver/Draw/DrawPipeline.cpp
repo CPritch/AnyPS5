@@ -46,6 +46,7 @@ thread_local PendingEarly pendingEarly;
 thread_local DrawPipeline* committingPipeline = nullptr;
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> kindNames{"other", "draw", "indirect draw", "dispatch", "dispatch miss", "dispatch without recipe", "label", "fill", "copy", "store", "pass", "seal", "completion", "occlusion dump"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> nextNotDrawKinds{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::ItemKind::Count) + 1> afterSealKinds{};
 thread_local bool skipCommittingReads = false;
 enum ResolveJobState : int { ResolveIdle, ResolvePosted, ResolveRunning, ResolveDone };
 std::atomic<std::uint64_t> earlyResolveNs{0}, earlyResolveCount{0};
@@ -149,6 +150,13 @@ std::string QueueWaits::Text() {
             for (std::size_t kind = 0; kind < kindNames.size(); ++kind) {
                 const auto count = nextNotDrawKinds[kind].exchange(0, std::memory_order_relaxed);
                 if (count != 0) kinds += (kinds.empty() ? "" : ", ") + std::string(kindNames[kind]) + " " + std::to_string(count);
+            }
+            return kinds;
+        }() + "), after such a seal (" + [&] {
+            std::string kinds;
+            for (std::size_t kind = 0; kind < afterSealKinds.size(); ++kind) {
+                const auto count = afterSealKinds[kind].exchange(0, std::memory_order_relaxed);
+                if (count != 0) kinds += (kinds.empty() ? "" : ", ") + std::string(kind < kindNames.size() ? kindNames[kind] : "a draw without an early hook") + " " + std::to_string(count);
             }
             return kinds;
         }() + "), offered once the committer's own resolve was done " + event(E::LateOffered) + ", offered across a seal " + event(E::AcrossSeal) + ", a draw without an early hook " + event(E::NextNoHook) + "; kept by the gate: recipe " + event(E::KeptRecipe) + ", tessellation " + event(E::KeptTessellation) + ", another epoch " + event(E::KeptEpoch) + ", reads the previous draw's writes " + event(E::KeptReadsWritten) + ", depth over colour " + event(E::KeptDepthColour) + ", predictor " + event(E::KeptPredictor) + ", the template being emitted " + event(E::KeptCurrentTemplate) + ", described ranges written " + event(E::KeptDescribed) + "; aborted at a barrier:";
@@ -1016,6 +1024,7 @@ void DrawPipeline::run() {
                 const bool sealLast = items.size() == 2 && items[1].kind == ItemKind::Seal && !SealsBreakProofs();
                 NoteEarly(items.size() < 2 || sealLast ? EarlyEvent::NextMissing : !items[1].draw ? EarlyEvent::NextNotDraw : EarlyEvent::NextNoHook);
                 if (items.size() >= 2 && !items[1].draw && !sealLast) nextNotDrawKinds[static_cast<std::size_t>(items[1].kind)].fetch_add(1, std::memory_order_relaxed);
+                if (items.size() >= 3 && items[1].kind == ItemKind::Seal) afterSealKinds[items[2].draw ? static_cast<std::size_t>(ItemKind::Count) : static_cast<std::size_t>(items[2].kind)].fetch_add(1, std::memory_order_relaxed);
                 static const bool late = std::getenv("APS5_NO_LATE_EARLY_OFFER") == nullptr;
                 if (late && (items.size() < 2 || sealLast)) {
                     pendingEarly.late = true;
