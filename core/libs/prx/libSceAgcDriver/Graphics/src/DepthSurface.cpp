@@ -1805,6 +1805,18 @@ std::mutex& htileReadsMutex() {
     return mutex;
 }
 
+struct MixedHtile {
+    std::uint64_t publish = 0;
+    std::uint64_t write = 0;
+    std::uint64_t collected = 0;
+    std::size_t bytes = 0;
+};
+
+std::map<std::uint64_t, MixedHtile>& mixedHtiles() {
+    static auto* mixed = new std::map<std::uint64_t, MixedHtile>();
+    return *mixed;
+}
+
 std::map<std::uint64_t, std::uint64_t>& htileReads() {
     static auto* reads = new std::map<std::uint64_t, std::uint64_t>();
     return *reads;
@@ -1845,6 +1857,7 @@ bool RoutesToNativeDepthOwner(const DepthTarget& target) {
 
 struct HtileLanding {
     std::optional<std::uint32_t> word;
+    std::vector<std::uint32_t> words;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> passed;
     bool settled = true;
 };
@@ -1855,6 +1868,8 @@ HtileLanding htileAfterPendingWrites(std::span<const Recorder::PendingWrite> wri
     std::vector<const Recorder::PendingWrite*> passed;
     HtileLanding landing;
     std::optional<std::uint32_t> landed;
+    static const bool mixed = std::getenv("APS5_NO_MIXED_HTILE_WORDS") == nullptr;
+    std::vector<std::uint32_t> distinct;
     for (const auto& write : writes) {
         if (unwritten.empty()) break;
         if (write.writer != 0 && std::binary_search(skipped.begin(), skipped.end(), write.writer)) {
@@ -1874,8 +1889,14 @@ HtileLanding htileAfterPendingWrites(std::span<const Recorder::PendingWrite> wri
         }
         unwritten = std::move(rest);
         if (!covered) continue;
-        if (write.word < 0 || (landed.has_value() && *landed != static_cast<std::uint32_t>(write.word))) return landing;
-        landed = static_cast<std::uint32_t>(write.word);
+        if (write.word < 0) return landing;
+        const auto word = static_cast<std::uint32_t>(write.word);
+        if (landed.has_value() && *landed != word) {
+            if (!mixed || distinct.size() >= 8) return landing;
+            if (std::find(distinct.begin(), distinct.end(), word) == distinct.end()) distinct.push_back(word);
+            continue;
+        }
+        landed = word;
     }
     const bool remembered = !landed.has_value() && known.has_value();
     if (remembered) landed = known;
@@ -1885,10 +1906,18 @@ HtileLanding htileAfterPendingWrites(std::span<const Recorder::PendingWrite> wri
         if (from % 4u != 0 || to % 4u != 0) return landing;
         const auto* words = reinterpret_cast<const volatile std::uint32_t*>(from);
         for (std::uint64_t index = 0; index < (to - from) / 4u; ++index) {
-            if (words[index] != *landed) return landing;
+            const std::uint32_t word = words[index];
+            if (word == *landed) continue;
+            if (!mixed || distinct.size() >= 8) return landing;
+            if (std::find(distinct.begin(), distinct.end(), word) == distinct.end()) distinct.push_back(word);
         }
     }
-    landing.word = landed;
+    if (distinct.empty()) {
+        landing.word = landed;
+    } else {
+        if (std::find(distinct.begin(), distinct.end(), *landed) == distinct.end()) distinct.push_back(*landed);
+        landing.words = std::move(distinct);
+    }
     for (const auto* write : passed) {
         if (!write->open && reaches(*write)) landing.settled = false;
         const auto found = std::find_if(landing.passed.begin(), landing.passed.end(), [&](const auto& entry) { return entry.first == write->writer; });
@@ -1936,6 +1965,13 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     PendingHtile resolved;
     if (pending && pendingFills) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
+        const auto publish = Recorder::PublishGeneration();
+        const auto written = Recorder::WriteGeneration();
+        {
+            std::lock_guard lock(htileReadsMutex());
+            const auto found = mixedHtiles().find(target.htileAddress);
+            if (found != mixedHtiles().end() && found->second.publish == publish && found->second.write == written && found->second.collected == collected && found->second.bytes == bytes) return 0;
+        }
         const auto known = remember ? KnownHtileWord(target.htileAddress, bytes) : std::nullopt;
         resolved = ResolvePendingHtile(recorder->PendingWritesOver(target.htileAddress, bytes), target.htileAddress, bytes, MetadataTrust::Enabled() ? &MetadataTrust::Process() : nullptr, known);
         if (const auto landed = resolved.word) {
@@ -1953,6 +1989,16 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
                 htileReads()[target.htileAddress] = generation;
                 if (remember) noteKnownHtileLocked(target.htileAddress, bytes, expanded, generation);
                 return cleared;
+            }
+        } else if (!resolved.words.empty()) {
+            VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+            for (const auto word : resolved.words) cleared &= HtileFillClears(word, target.htileStencil);
+            if (cleared == 0) {
+                std::lock_guard lock(htileReadsMutex());
+                htileReads()[target.htileAddress] = collected;
+                mixedHtiles()[target.htileAddress] = {publish, written, collected, bytes};
+                if (remember) noteKnownHtileLocked(target.htileAddress, bytes, std::nullopt, collected);
+                return 0;
             }
         }
     }
@@ -2712,17 +2758,20 @@ PendingHtile ResolvePendingHtile(std::span<const Recorder::PendingWrite> pending
     std::vector<Recorder::PendingWrite> writes(pending.begin(), pending.end());
     std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
     PendingHtile resolved;
-    resolved.word = htileAfterPendingWrites(writes, address, bytes, {}).word;
-    if (resolved.word.has_value() || trust == nullptr) return resolved;
+    auto direct = htileAfterPendingWrites(writes, address, bytes, {});
+    resolved.word = direct.word;
+    resolved.words = std::move(direct.words);
+    if (resolved.word.has_value() || !resolved.words.empty() || trust == nullptr) return resolved;
     std::vector<std::uint64_t> writers(writes.size());
     std::transform(writes.begin(), writes.end(), writers.begin(), [](const Recorder::PendingWrite& write) { return write.writer; });
     if (const auto trusted = trust->Writers(writers, address, bytes, false); !trusted.empty()) {
-        const auto landing = htileAfterPendingWrites(writes, address, bytes, trusted, known);
-        if (landing.word.has_value()) {
+        auto landing = htileAfterPendingWrites(writes, address, bytes, trusted, known);
+        if (landing.word.has_value() || !landing.words.empty()) {
             bool audit = false;
             for (const auto& [writer, note] : landing.passed) audit = trust->Consult({writer, address, bytes}, note) != MetadataTrust::Use::Skip || audit;
             if (!audit) {
                 resolved.word = landing.word;
+                resolved.words = std::move(landing.words);
                 return resolved;
             }
         }

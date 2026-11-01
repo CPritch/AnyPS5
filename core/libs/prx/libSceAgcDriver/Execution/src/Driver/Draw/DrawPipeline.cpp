@@ -1018,26 +1018,55 @@ void DrawPipeline::run() {
     StartCommitterSampler();
     GuestMemory::CountGpuLockWaits(GuestMemory::HotThread::Committer);
     const bool counted = QueueWaits::Enabled();
-    auto idleStart = std::chrono::steady_clock::now();
+    static const bool timed = counted || std::getenv("APS5_COMMIT_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto clock = [] { return timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
+    auto idleStart = clock();
     bool idleBehindWait = false;
+    static const bool prefetch = std::getenv("APS5_NO_COMMIT_PREFETCH") == nullptr;
+    Commit* commit = nullptr;
+    bool isDraw = false;
+    std::size_t kind = 0;
+    bool taken = false;
+    const auto take = [&] {
+        commit = stopped ? nullptr : &items.front().commit;
+        committingWrites = &items.front().writes;
+        isDraw = items.front().draw;
+        kind = static_cast<std::size_t>(items.front().kind);
+        if (ResolveSplit() == 0 || !isDraw || commit == nullptr || EarlyStopped()) return;
+        if (const auto next = EarlyIndex(items); next != 0) {
+            pendingEarly.hook = items[next].early;
+            pendingEarly.writes = &items.front().writes;
+            if (next == 2) NoteEarly(EarlyEvent::AcrossSeal);
+            return;
+        }
+        const bool sealLast = items.size() == 2 && items[1].kind == ItemKind::Seal && !SealsBreakProofs();
+        NoteEarly(items.size() < 2 || sealLast ? EarlyEvent::NextMissing : !items[1].draw ? EarlyEvent::NextNotDraw : EarlyEvent::NextNoHook);
+        if (items.size() >= 2 && !items[1].draw && !sealLast) nextNotDrawKinds[static_cast<std::size_t>(items[1].kind)].fetch_add(1, std::memory_order_relaxed);
+        if (items.size() >= 3 && items[1].kind == ItemKind::Seal) afterSealKinds[items[2].draw ? static_cast<std::size_t>(ItemKind::Count) : static_cast<std::size_t>(items[2].kind)].fetch_add(1, std::memory_order_relaxed);
+        static const bool late = std::getenv("APS5_NO_LATE_EARLY_OFFER") == nullptr;
+        if (late && (items.size() < 2 || sealLast)) {
+            pendingEarly.late = true;
+            pendingEarly.writes = &items.front().writes;
+        }
+    };
     for (;;) {
-        Commit* commit = nullptr;
-        bool isDraw = false;
-        std::size_t kind = 0;
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+        if (!taken) {
+            commit = nullptr;
+            isDraw = false;
+            kind = 0;
+            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+        }
         const auto spun = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        {
+        if (!taken) {
             std::unique_lock lock(mutex);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
             if (items.empty()) break;
-            commit = stopped ? nullptr : &items.front().commit;
-            committingWrites = &items.front().writes;
-            isDraw = items.front().draw;
-            kind = static_cast<std::size_t>(items.front().kind);
+            take();
         }
-        const auto start = std::chrono::steady_clock::now();
+        taken = false;
+        const auto start = clock();
         if (counted) {
             QueueWaits::Note(QueueWaits::Site::CommitterIdleSpin, idleStart, spun);
             QueueWaits::Note(QueueWaits::Site::CommitterIdleBlocked, spun, start);
@@ -1048,24 +1077,6 @@ void DrawPipeline::run() {
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
-        if (ResolveSplit() != 0 && isDraw && commit != nullptr && !EarlyStopped()) {
-            std::lock_guard lock(mutex);
-            if (const auto next = EarlyIndex(items); next != 0) {
-                pendingEarly.hook = items[next].early;
-                pendingEarly.writes = &items.front().writes;
-                if (next == 2) NoteEarly(EarlyEvent::AcrossSeal);
-            } else {
-                const bool sealLast = items.size() == 2 && items[1].kind == ItemKind::Seal && !SealsBreakProofs();
-                NoteEarly(items.size() < 2 || sealLast ? EarlyEvent::NextMissing : !items[1].draw ? EarlyEvent::NextNotDraw : EarlyEvent::NextNoHook);
-                if (items.size() >= 2 && !items[1].draw && !sealLast) nextNotDrawKinds[static_cast<std::size_t>(items[1].kind)].fetch_add(1, std::memory_order_relaxed);
-                if (items.size() >= 3 && items[1].kind == ItemKind::Seal) afterSealKinds[items[2].draw ? static_cast<std::size_t>(ItemKind::Count) : static_cast<std::size_t>(items[2].kind)].fetch_add(1, std::memory_order_relaxed);
-                static const bool late = std::getenv("APS5_NO_LATE_EARLY_OFFER") == nullptr;
-                if (late && (items.size() < 2 || sealLast)) {
-                    pendingEarly.late = true;
-                    pendingEarly.writes = &items.front().writes;
-                }
-            }
-        }
         try {
             if (commit != nullptr) {
                 struct ClearEarly {
@@ -1090,7 +1101,7 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
-        const auto committed = std::chrono::steady_clock::now();
+        const auto committed = clock();
         const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(committed - start).count());
         const auto gpuWaitedNs = counted ? static_cast<std::uint64_t>((Graphics::Recorder::HotGpuWaitedMs() - gpuWaitedBefore) * 1e6) : 0;
         if (fatal != nullptr && !stopped) {
@@ -1118,8 +1129,12 @@ void DrawPipeline::run() {
                 targetWake = ~std::uint64_t{0};
                 retiredWake.notify_all();
             }
+            if (prefetch && !items.empty()) {
+                take();
+                taken = true;
+            }
         }
-        idleStart = std::chrono::steady_clock::now();
+        idleStart = clock();
         if (counted) QueueWaits::Note(QueueWaits::Site::CommitterRetire, committed, idleStart);
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);

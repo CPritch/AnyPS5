@@ -1356,7 +1356,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             ahead->result.walks.epoch = epoch;
             Graphics::CountDrawAhead(Graphics::DrawAheadEvent::Offered);
         }
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, ahead, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), early = DrawPipeline::ResolveSplit() != 0 ? std::make_shared<EarlyDraw>() : std::shared_ptr<EarlyDraw>(), itemReads = reads](const DrawPipeline::EarlyOffer* offer) mutable {
+        auto earlyDraw = DrawPipeline::ResolveSplit() != 0 ? std::make_shared<EarlyDraw>() : std::shared_ptr<EarlyDraw>();
+        if (earlyDraw != nullptr) {
+            earlyDraw->writes.reserve(8);
+            earlyDraw->depth.reserve(4);
+            earlyDraw->reads.reserve(32);
+        }
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, ahead, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), early = std::move(earlyDraw), itemReads = reads](const DrawPipeline::EarlyOffer* offer) mutable {
             if (offer != nullptr) return offer->writes != nullptr && resolveDrawEarly(localDevice, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, trace, shape, ahead.get(), epoch, itemReads, *offer->writes, offer->depth, offer->currentTemplate, *early);
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);

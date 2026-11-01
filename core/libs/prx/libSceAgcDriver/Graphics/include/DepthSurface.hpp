@@ -83,6 +83,7 @@ std::uint64_t HtileMetadataBytes(VkExtent2D extent);
 bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t address, std::size_t bytes);
 struct PendingHtile {
     std::optional<std::uint32_t> word;
+    std::vector<std::uint32_t> words;
     std::uint32_t predicted = 0;
     std::vector<MetadataTrust::Key> checks;
 };
