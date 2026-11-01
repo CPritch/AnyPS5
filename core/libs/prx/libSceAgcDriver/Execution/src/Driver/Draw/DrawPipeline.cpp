@@ -666,13 +666,13 @@ void DrawPipeline::StopEarly() {
     earlyStopped.store(true, std::memory_order_relaxed);
 }
 
-void DrawPipeline::OfferEarly(std::span<const Range> depth) {
+void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentTemplate) {
     if (!pendingEarly.hook) return;
     auto hook = std::move(pendingEarly.hook);
     const auto* writes = pendingEarly.writes;
     pendingEarly = {};
     try {
-        (hook(EarlyOffer{writes, depth}) ? earlyResolved : earlyDeclined).fetch_add(1, std::memory_order_relaxed);
+        (hook(EarlyOffer{writes, depth, currentTemplate}) ? earlyResolved : earlyDeclined).fetch_add(1, std::memory_order_relaxed);
     } catch (const ProcessShutdown&) {
         throw;
     } catch (...) {

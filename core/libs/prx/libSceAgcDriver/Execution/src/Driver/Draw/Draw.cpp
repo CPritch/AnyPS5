@@ -1356,7 +1356,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             Graphics::CountDrawAhead(Graphics::DrawAheadEvent::Offered);
         }
         auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, ahead, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), early = std::make_shared<EarlyDraw>(), itemReads = reads](const DrawPipeline::EarlyOffer* offer) mutable {
-            if (offer != nullptr) return offer->writes != nullptr && resolveDrawEarly(localDevice, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, trace, shape, ahead.get(), epoch, itemReads, *offer->writes, offer->depth, *early);
+            if (offer != nullptr) return offer->writes != nullptr && resolveDrawEarly(localDevice, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, trace, shape, ahead.get(), epoch, itemReads, *offer->writes, offer->depth, offer->currentTemplate, *early);
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, shape, ahead.get(), early.get());
@@ -1451,7 +1451,7 @@ void finishEarlyJob(void* context, bool ran) {
     }
 }
 
-bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape, DrawAheadSlot* ahead, std::uint64_t epoch, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& itemReads, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> depth, EarlyDraw& early) {
+bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape, DrawAheadSlot* ahead, std::uint64_t epoch, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& itemReads, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> depth, const void* currentTemplate, EarlyDraw& early) {
     static const bool all = std::getenv("APS5_RESOLVE_SPLIT_ALL") != nullptr;
     static const bool probe = (GuestMemory::SetResolveCompletionProbe(&Graphics::Recorder::InCompletion), true);
     static_cast<void>(probe);
@@ -1463,7 +1463,13 @@ bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const G
     if (overlaps(writes, itemReads) || overlaps(depth, itemReads)) return false;
     if (!depth.empty() && overlaps(depth, DrawColorRanges(graphics))) return false;
     const auto* result = ahead != nullptr && ahead->phase.load(std::memory_order_acquire) == DrawAheadSlot::Ready ? &ahead->result : nullptr;
-    if (!all && !Graphics::PredictPureResolve(graphics, drawParameters, stages, result)) return false;
+    if (!all) {
+        using R = Graphics::PredictReason;
+        const auto reason = Graphics::PredictPureReason(graphics, drawParameters, stages, result);
+        const bool proofOnly = reason == R::ProofNotCurrent || reason == R::NoSlot || reason == R::NotLooked || reason == R::NoHint;
+        if (reason != R::Accepted && !proofOnly) return false;
+        if (proofOnly && result != nullptr && result->found != nullptr && result->found.get() == currentTemplate) return false;
+    }
     if (result != nullptr && result->found != nullptr && (result->found->DescribedRangesOverlap(writes) || result->found->DescribedRangesOverlap(depth))) return false;
     const auto split = DrawPipeline::ResolveSplit();
     if (split >= 2 && !localDevice->ResolverInputsClear()) {
@@ -1641,7 +1647,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         if (DrawPipeline::ResolveSplit() != 0) {
             const auto offering = clock();
             const auto depth = DrawDepthRanges(graphics);
-            DrawPipeline::OfferEarly(depth);
+            DrawPipeline::OfferEarly(depth, Graphics::DrawPacketTemplate(*packet));
             if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Offer, offering);
         }
         const auto emitting = clock();

@@ -63,6 +63,7 @@ public:
     struct EarlyOffer {
         const std::vector<Range>* writes = nullptr;
         std::span<const Range> depth;
+        const void* currentTemplate = nullptr;
     };
     using Early = std::function<bool(const EarlyOffer&)>;
     struct Watch {
@@ -89,7 +90,7 @@ public:
     static unsigned ResolveSplit();
     enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, DeclinedWriters, VerifyMatched, VerifyDiffered, Unoffered, Count };
     static void NoteEarly(EarlyEvent event);
-    static void OfferEarly(std::span<const Range> depth);
+    static void OfferEarly(std::span<const Range> depth, const void* currentTemplate);
     static void PostResolve(void (*body)(void*), void (*finish)(void*, bool), void* context);
     static void JoinResolve();
     static void WaitResolve();

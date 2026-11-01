@@ -3696,7 +3696,6 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
-    GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverPath);
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
