@@ -3635,6 +3635,7 @@ CommitterProofSplit& CommitterProofs() {
 }
 
 std::atomic<std::uint64_t> staleCopyReuses{0};
+std::array<std::atomic<std::uint64_t>, 2> addressBasedUses{};
 
 bool CommitterProofCounted() {
     static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
@@ -3666,7 +3667,7 @@ std::string ShaderResources::TakeCommitterProofText() {
     const auto proofs = take(split.proofs), total = take(split.totalNs), pending = take(split.pendingNs), fast = take(split.fastNs), walks = take(split.fullWalks), walkNs = take(split.fullWalkNs), passed = take(split.fastPassed);
     char text[256];
     std::snprintf(text, sizeof(text), "; committer full template proofs %llu, %.1f ms: pending-write checks %.1f ms, stamp proof %.1f ms (%llu passed), full walks %llu %.1f ms, rest %.1f ms", static_cast<unsigned long long>(proofs), static_cast<double>(total) / 1e6, static_cast<double>(pending) / 1e6, static_cast<double>(fast) / 1e6, static_cast<unsigned long long>(passed), static_cast<unsigned long long>(walks), static_cast<double>(walkNs) / 1e6, static_cast<double>(total - std::min(total, pending + fast + walkNs)) / 1e6);
-    return std::string(text) + ", proofs reused holding an out-of-date per-use copy " + std::to_string(staleCopyReuses.exchange(0, std::memory_order_relaxed));
+    return std::string(text) + ", proofs reused holding an out-of-date per-use copy " + std::to_string(staleCopyReuses.exchange(0, std::memory_order_relaxed)) + "; address-based uses noting their leased heaps as read: read-only " + std::to_string(addressBasedUses[0].exchange(0, std::memory_order_relaxed)) + ", writing through addresses " + std::to_string(addressBasedUses[1].exchange(0, std::memory_order_relaxed));
 }
 
 ShaderResources::ProofReuse ShaderResources::LastProofReuse() {
@@ -6161,6 +6162,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder, std::uint64_t writer) {
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    if (counted && kind == Recorder::ReadKind::AddressBased) addressBasedUses[BdaReadOnly() ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
     if (auto split = guestMemory.SplitInPlaceReads()) {
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);
