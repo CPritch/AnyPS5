@@ -88,7 +88,7 @@ public:
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {});
     static unsigned ResolveSplit();
-    enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, DeclinedWriters, MultisampleFound, MultisampleMissed, VerifyMatched, VerifyDiffered, Unoffered, Count };
+    enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, DeclinedWriters, MultisampleFound, MultisampleMissed, VerifyMatched, VerifyDiffered, Unoffered, KeptRecipe, KeptTessellation, KeptEpoch, KeptReadsWritten, KeptDepthColour, KeptPredictor, KeptCurrentTemplate, KeptDescribed, NextMissing, NextNotDraw, NextNoHook, Count };
     static void NoteEarly(EarlyEvent event);
     static void OfferEarly(std::span<const Range> depth, const void* currentTemplate);
     static void PostResolve(void (*body)(void*), void (*finish)(void*, bool), void* context);

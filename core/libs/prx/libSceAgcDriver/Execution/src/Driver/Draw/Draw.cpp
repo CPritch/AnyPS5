@@ -1456,13 +1456,16 @@ bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const G
     static const bool all = std::getenv("APS5_RESOLVE_SPLIT_ALL") != nullptr;
     static const bool probe = (GuestMemory::SetResolveCompletionProbe(&Graphics::Recorder::InCompletion), true);
     static_cast<void>(probe);
-    if (recipe != nullptr || graphics.stages.tessellationGeometry || early.packet != nullptr || early.claimed) return false;
-    if (DrawPipeline::FollowedEpoch() != epoch) return false;
+    using E = DrawPipeline::EarlyEvent;
+    if (early.packet != nullptr || early.claimed) return false;
+    if (recipe != nullptr) return DrawPipeline::NoteEarly(E::KeptRecipe), false;
+    if (graphics.stages.tessellationGeometry) return DrawPipeline::NoteEarly(E::KeptTessellation), false;
+    if (DrawPipeline::FollowedEpoch() != epoch) return DrawPipeline::NoteEarly(E::KeptEpoch), false;
     const auto overlaps = [](std::span<const std::pair<std::uint64_t, std::uint64_t>> first, std::span<const std::pair<std::uint64_t, std::uint64_t>> second) {
         return std::any_of(first.begin(), first.end(), [&](const auto& a) { return std::any_of(second.begin(), second.end(), [&](const auto& b) { return a.first < b.second && b.first < a.second; }); });
     };
-    if (overlaps(writes, itemReads) || overlaps(depth, itemReads)) return false;
-    if (!depth.empty() && overlaps(depth, DrawColorRanges(graphics))) return false;
+    if (overlaps(writes, itemReads) || overlaps(depth, itemReads)) return DrawPipeline::NoteEarly(E::KeptReadsWritten), false;
+    if (!depth.empty() && overlaps(depth, DrawColorRanges(graphics))) return DrawPipeline::NoteEarly(E::KeptDepthColour), false;
     const auto* result = ahead != nullptr && ahead->phase.load(std::memory_order_acquire) == DrawAheadSlot::Ready ? &ahead->result : nullptr;
     const bool multisampled = std::any_of(graphics.colors.begin(), graphics.colors.end(), [](const Graphics::ColorTarget& color) { return color.samples > 1; }) || (graphics.depth && graphics.depth->samples > 1);
     early.multisample.clear();
@@ -1472,10 +1475,10 @@ bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const G
         using R = Graphics::PredictReason;
         const auto reason = Graphics::PredictPureReason(graphics, drawParameters, stages, result, multisampleFound);
         const bool proofOnly = reason == R::ProofNotCurrent || reason == R::NoSlot || reason == R::NotLooked || reason == R::NoHint;
-        if (reason != R::Accepted && !proofOnly) return false;
-        if (proofOnly && result != nullptr && result->found != nullptr && result->found.get() == currentTemplate) return false;
+        if (reason != R::Accepted && !proofOnly) return DrawPipeline::NoteEarly(E::KeptPredictor), false;
+        if (proofOnly && result != nullptr && result->found != nullptr && result->found.get() == currentTemplate) return DrawPipeline::NoteEarly(E::KeptCurrentTemplate), false;
     }
-    if (result != nullptr && result->found != nullptr && (result->found->DescribedRangesOverlap(writes) || result->found->DescribedRangesOverlap(depth))) return false;
+    if (result != nullptr && result->found != nullptr && (result->found->DescribedRangesOverlap(writes) || result->found->DescribedRangesOverlap(depth))) return DrawPipeline::NoteEarly(E::KeptDescribed), false;
     const auto split = DrawPipeline::ResolveSplit();
     if (split >= 2 && !localDevice->ResolverInputsClear()) {
         DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::DeclinedWriters);
