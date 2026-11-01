@@ -548,11 +548,13 @@ void DrawPipeline::PostResolve(void (*body)(void*), void (*finish)(void*, bool),
     pipeline.resolveBody = body;
     pipeline.resolveFinish = finish;
     pipeline.resolveContext = context;
-    pipeline.resolvePosted = std::chrono::steady_clock::now();
+    static const bool timed = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    if (timed) pipeline.resolvePosted = std::chrono::steady_clock::now();
     resolvesPosted.fetch_add(1, std::memory_order_relaxed);
     pipeline.resolveState.store(ResolvePosted, std::memory_order_release);
-    pipeline.resolverWake.fetch_add(1, std::memory_order_release);
-    pipeline.resolverWake.notify_one();
+    pipeline.resolverWake.fetch_add(1, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (pipeline.resolverSleeping.load(std::memory_order_seq_cst) != 0) pipeline.resolverWake.notify_one();
 }
 
 void DrawPipeline::JoinResolve() {
@@ -672,7 +674,10 @@ void DrawPipeline::resolveAhead() {
         }
         if (!spins && !SpinUntil(window, posted)) {
             const auto wake = resolverWake.load(std::memory_order_acquire);
+            resolverSleeping.fetch_add(1, std::memory_order_seq_cst);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
             if (!posted()) resolverWake.wait(wake, std::memory_order_acquire);
+            resolverSleeping.fetch_sub(1, std::memory_order_relaxed);
             continue;
         }
         if (resolverClosing.load(std::memory_order_acquire)) return;

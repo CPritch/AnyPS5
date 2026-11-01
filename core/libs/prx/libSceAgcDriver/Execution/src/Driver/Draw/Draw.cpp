@@ -1452,7 +1452,7 @@ void finishEarlyJob(void* context, bool ran) {
     }
 }
 
-bool Driver::resolveDrawEarly(std::shared_ptr<VulkanDevice> localDevice, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape, DrawAheadSlot* ahead, std::uint64_t epoch, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& itemReads, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> depth, const void* currentTemplate, EarlyDraw& early) {
+bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape, DrawAheadSlot* ahead, std::uint64_t epoch, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& itemReads, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> depth, const void* currentTemplate, EarlyDraw& early) {
     static const bool all = std::getenv("APS5_RESOLVE_SPLIT_ALL") != nullptr;
     static const bool probe = (GuestMemory::SetResolveCompletionProbe(&Graphics::Recorder::InCompletion), true);
     static_cast<void>(probe);

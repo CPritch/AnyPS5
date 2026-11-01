@@ -719,10 +719,26 @@ thread_local bool resolverState = false;
 thread_local const WriteRanges* resolverSnapshot = nullptr;
 thread_local const WriteRanges* resolverQueuedStores = nullptr;
 
+struct SnapshotCache {
+    std::uint64_t generation = ~std::uint64_t{0};
+    std::shared_ptr<const WriteRanges> snapshot;
+};
+
+const WriteRanges* currentPendingWrites() {
+    if (GuestMemory::GpuMutex().OwnedByThisThread()) return lockedPendingWrites.load(std::memory_order_relaxed);
+    auto& cache = HostThreadLocal<SnapshotCache, SnapshotCache>();
+    const auto generation = publishGeneration.load(std::memory_order_acquire);
+    if (cache.generation != generation) {
+        cache.snapshot = pendingWrites.load(std::memory_order_acquire);
+        cache.generation = generation;
+    }
+    return cache.snapshot.get();
+}
+
 bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0) return false;
     if (resolverState) return SnapshotOverlaps(resolverSnapshot, address, bytes);
-    if (LockedSnapshotReads() && GuestMemory::GpuMutex().OwnedByThisThread()) return SnapshotOverlaps(lockedPendingWrites.load(std::memory_order_relaxed), address, bytes);
+    if (LockedSnapshotReads()) return SnapshotOverlaps(currentPendingWrites(), address, bytes);
     const auto snapshot = pendingWrites.load(std::memory_order_acquire);
     return SnapshotOverlaps(snapshot.get(), address, bytes);
 }
@@ -735,6 +751,7 @@ bool SnapshotCovers(const WriteRanges* snapshot, std::uint64_t address, std::uin
 }
 
 bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
+    if (LockedSnapshotReads()) return SnapshotCovers(currentPendingWrites(), address, end);
     const auto snapshot = pendingWrites.load(std::memory_order_acquire);
     return SnapshotCovers(snapshot.get(), address, end);
 }

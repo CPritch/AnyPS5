@@ -202,6 +202,7 @@ private:
     std::thread resolver;
     alignas(64) std::atomic<int> resolveState{0};
     std::atomic<std::uint32_t> resolverWake{0};
+    std::atomic<std::uint32_t> resolverSleeping{0};
     std::atomic<bool> resolverClosing{false};
     void (*resolveBody)(void*) = nullptr;
     void (*resolveFinish)(void*, bool) = nullptr;
