@@ -588,9 +588,6 @@ private:
     // Whether the image is live (not released) and overlaps the fill: the test that gives ClassifyFill
     // its overlapping images, and that NoteKeysFill and ClearByKeysFill use to bound the key match.
     bool overlapsLive(std::uint64_t address, std::size_t bytes) const;
-    bool newlyPendingInsideAlias(std::uint64_t begin, std::uint64_t end);
-    std::uint64_t aliasGeneration = ~std::uint64_t{0};
-    std::vector<const StorageTexture*> aliases;
     // Whether a fill of [address, address + bytes) is a fill of this image's DCC keys, `overlapped`
     // saying whether any live image overlaps the fill (see Texture.cpp).
     bool keysFillMatches(std::uint64_t address, std::size_t bytes, bool overlapped) const;

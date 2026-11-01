@@ -217,7 +217,6 @@ void countStorageWriteBack(std::uint64_t bytes, bool direct, bool drawn = false)
 struct LiveImages {
     AgcDriver::Mutex mutex;
     std::vector<StorageTexture*> textures;
-    std::uint64_t generation = 0;
 };
 
 LiveImages& Live() {
@@ -1440,7 +1439,6 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         live.textures.push_back(texture.get());
-        ++live.generation;
     }
     if (profile) {
         auto& totals = Profile();
@@ -3969,20 +3967,6 @@ bool StorageTexture::overlaps(std::uint64_t address, std::size_t bytes) const {
     return address < descriptor.baseAddress + guestBytes && descriptor.baseAddress < address + bytes;
 }
 
-bool StorageTexture::newlyPendingInsideAlias(std::uint64_t begin, std::uint64_t end) {
-    if (end <= begin) return false;
-    auto& live = Live();
-    std::lock_guard lock(live.mutex);
-    if (aliasGeneration != live.generation) {
-        aliases.clear();
-        for (const auto* texture : live.textures) {
-            if (texture != this && texture->guestBytes != 0 && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) aliases.push_back(texture);
-        }
-        aliasGeneration = live.generation;
-    }
-    return std::any_of(aliases.begin(), aliases.end(), [&](const StorageTexture* alias) { return alias->overlapsLive(begin, static_cast<std::size_t>(end - begin)); });
-}
-
 bool StorageTexture::overlapsLive(std::uint64_t address, std::size_t bytes) const {
     return !released && guestBytes != 0 && overlaps(address, bytes);
 }
@@ -4096,13 +4080,8 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     }
     if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(&unsaved);
     bool newlyPending = false;
-    std::uint64_t newlyBegin = ~std::uint64_t{0}, newlyEnd = 0;
     for (std::uint32_t layer = first; layer < first + count; ++layer) {
         newlyPending = newlyPending || !layerPending[layer];
-        if (!layerPending[layer]) {
-            newlyBegin = std::min(newlyBegin, layerBegin(layer));
-            newlyEnd = std::max(newlyEnd, layerBegin(layer) + layerBytes(layer));
-        }
         if (!layerPending[layer] && !completionKept.empty()) {
             const auto end = layerBegin(layer) + layerBytes(layer);
             for (auto at = layerBegin(layer) & ~std::uint64_t{65535}; at < end; at += 65536) completionKept[static_cast<std::size_t>(at / 65536 - descriptor.baseAddress / 65536)] = 0;
@@ -4129,9 +4108,6 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         WriteBack();
         return;
     }
-    static const bool newlyPendingBumps = std::getenv("APS5_NO_NEWLY_PENDING_BUMP") == nullptr;
-    static const bool everyNewlyPending = std::getenv("APS5_NEWLY_PENDING_BUMP_ALL") != nullptr;
-    const bool newlyInsideAlias = newlyPending && newlyPendingBumps && (everyNewlyPending || newlyPendingInsideAlias(newlyBegin, newlyEnd));
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     if (!drawingTarget) {
@@ -4150,7 +4126,8 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     ++version;
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
-        if (wasLent || newlyInsideAlias) BumpPendingSerial();
+        static const bool newlyPendingBumps = std::getenv("APS5_NO_NEWLY_PENDING_BUMP") == nullptr;
+        if (wasLent || (newlyPending && newlyPendingBumps)) BumpPendingSerial();
         return;
     }
     dirty = true;
@@ -6846,7 +6823,6 @@ StorageTexture::~StorageTexture() {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         std::erase(live.textures, this);
-        ++live.generation;
     }
     // Cache eviction flushes first; anything still pending here is being torn down with the device.
     {

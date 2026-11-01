@@ -302,30 +302,6 @@ void LayersAndMipsCase(AgcDriver::VulkanDevice& device) {
     RequireCounts(0, 1, name + ": comparison samples after a second store");
 }
 
-void AliasLayerCase(AgcDriver::VulkanDevice& device) {
-    const std::string name = "alias layer";
-    const Shape layered{Format32Float, 256, 256, 4, 1, true};
-    const Shape single{Format32Float, 256, 256, 1, 1, false};
-    GuestBlock block;
-    auto* texels = block.Data();
-    const auto describe = [](const void* data, const Shape& shape) { return AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(data, shape))).guestBytes; };
-    const auto layerBytes = describe(texels, single);
-    Require(describe(texels, layered) == 4 * layerBytes && 4 * layerBytes <= BlockBytes, name + ": the layered image is not four single-layer images back to back in the guest block");
-    auto* inside = texels + layerBytes;
-    Store(device, texels, layered, StoreLayerMipCode, 0, 0, 1.0f / 8.0f);
-    Store(device, inside, single, StoreQuarterCode);
-    Settle(device, inside, layerBytes);
-    Require(AgcDriver::Graphics::StorageTexture::FindPending(reinterpret_cast<std::uintptr_t>(texels), layerBytes) != nullptr, name + ": the layered image's first layer is not pending");
-    Require(AgcDriver::Graphics::StorageTexture::FindPending(reinterpret_cast<std::uintptr_t>(inside), layerBytes) == nullptr, name + ": the single-layer image is still pending after it was stored");
-    auto serial = AgcDriver::Graphics::StorageTexture::PendingSerial();
-    Store(device, texels, layered, StoreLayerMipCode, 1, 0, 1.0f / 16.0f);
-    RequirePendingSerialMoved(serial, name + ": a newly pending layer inside the single-layer image");
-    serial = AgcDriver::Graphics::StorageTexture::PendingSerial();
-    Store(device, texels, layered, StoreLayerMipCode, 3, 0, 1.0f / 32.0f);
-    if (std::getenv("APS5_NEWLY_PENDING_BUMP_ALL") == nullptr)
-        Require(AgcDriver::Graphics::StorageTexture::PendingSerial() == serial, name + ": a newly pending layer that no other image overlaps moved the pending serial");
-}
-
 }
 
 int main() {
@@ -338,7 +314,6 @@ int main() {
         SingleLevelCase(*device, {Format32Float, 512, 512, 1, 1, false}, "R32F 512x512");
         SingleLevelCase(*device, {Format16Unorm, 1024, 512, 1, 1, false}, "R16 unorm 1024x512");
         LayersAndMipsCase(*device);
-        AliasLayerCase(*device);
         std::puts("depth compare copy tests passed");
         return 0;
     } catch (const std::exception& error) {
