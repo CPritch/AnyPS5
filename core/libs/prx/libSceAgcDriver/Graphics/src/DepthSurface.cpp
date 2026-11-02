@@ -3605,11 +3605,17 @@ void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t b
     thread_local std::size_t next = 0;
     const auto serial = surfacesSerial.load(std::memory_order_acquire);
     if (memo && std::any_of(clear.begin(), clear.end(), [&](const Retired& entry) { return entry.serial == serial && entry.device == device && entry.address == address && entry.bytes == bytes; })) return;
+    const auto retiring = [&](const auto& surface) { return surface->context.device == device && !surface->retired && surface->Overlaps(address, bytes); };
+    bool any = false;
     {
+        std::lock_guard lock(surfacesMutex());
+        any = std::any_of(surfaces().begin(), surfaces().end(), retiring);
+    }
+    if (any) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
         std::lock_guard lock(surfacesMutex());
         for (const auto& surface : surfaces()) {
-            if (surface->context.device != device || surface->retired || !surface->Overlaps(address, bytes)) continue;
+            if (!retiring(surface)) continue;
             const auto [stencilBegin, stencilEnd] = staleStencilRange(*surface);
             if (!(address <= stencilBegin && stencilEnd <= address + bytes)) storeStaleStencil(*surface);
             retire(*surface);
@@ -3619,10 +3625,15 @@ void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t b
 }
 
 void RetireCoveredDepthSurfaces(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::span<const WrittenStorageExtent> extents) {
+    const auto retiring = [&](const auto& surface) { return surface->context.device == device && !surface->retired && surface->CoveredBy(written, extents); };
+    {
+        std::lock_guard lock(surfacesMutex());
+        if (std::none_of(surfaces().begin(), surfaces().end(), retiring)) return;
+    }
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
-        if (surface->context.device != device || surface->retired || !surface->CoveredBy(written, extents)) continue;
+        if (!retiring(surface)) continue;
         if (!surface->PlaneCoveredBy(true, written, extents)) storeStaleStencil(*surface);
         retire(*surface);
     }
