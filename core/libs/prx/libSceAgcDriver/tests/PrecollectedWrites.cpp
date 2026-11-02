@@ -2,6 +2,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -138,13 +139,41 @@ void PreparersShareTheWalksOfOneEpoch() {
     Require(Walks() == walked + 1 && other.walks.size() == 1, "a preparation of the next epoch reused a walk of the last");
 }
 
+std::uint64_t CollectOnFollower(std::uint64_t token, std::uint64_t address, std::size_t bytes) {
+    std::uint64_t collected = 0;
+    std::thread follower([&] {
+        MarkProofThread();
+        BumpCollectEpoch();
+        FollowCollectToken(token);
+        collected = CollectWrites(address, bytes);
+    });
+    follower.join();
+    return collected;
+}
+
+void FollowersShareTheWalksOfOneToken() {
+    constexpr std::uint64_t Token = 21;
+    constexpr std::uint64_t Range = Base + 2 * Block;
+    const auto walked = Walks();
+    const auto first = CollectOnFollower(Token, Range, Page);
+    Require(first != 0 && Walks() == walked + 1, "the first follower of a token did not walk");
+    Require(CollectOnFollower(Token, Range + Page, Page) != 0 && Walks() == walked + 1, "a second follower of the same token walked a range the first had walked");
+    Write(Range + Page);
+    Require(CollectOnFollower(Token + 1, Range, Page) != 0 && Walks() == walked + 2, "a follower of the next token reused a walk of the last");
+    Require(!UnchangedSince(Range + Page, Page, first), "the next token's walk did not stamp a write made after the last token's walk");
+    const auto preparer = PreparedOn(Token + 2, Range, Block);
+    Require(CollectOnFollower(Token + 2, Range, Page) != 0 && Walks() == walked + 3, "a follower walked a range the preparer had walked under its token");
+}
+
 }
 
 int main() {
+    setenv("APS5_TOKEN_WALK_SHARE", "1", 1);
     try {
         WalksServeTheCommitOfTheirEpoch();
         WalksOfAnotherEpochAreIgnored();
         PreparersShareTheWalksOfOneEpoch();
+        FollowersShareTheWalksOfOneToken();
     } catch (const std::exception& error) {
         std::cerr << "precollected writes test failed: " << error.what() << "\n";
         return 1;

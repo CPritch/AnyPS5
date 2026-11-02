@@ -104,6 +104,7 @@ std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> precollectedHits{0};
+std::atomic<std::uint64_t> tokenShareHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
@@ -354,7 +355,7 @@ public:
         for (std::size_t i = 0; i < MemoryCounterCount; ++i) {
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
-        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, precollected hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(precollectedHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, precollected hits %llu, token-share hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(precollectedHits.load()), static_cast<unsigned long long>(tokenShareHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
@@ -1515,6 +1516,38 @@ PrecollectShare& precollectShare() {
     return *share;
 }
 
+thread_local bool tokenFollower = false;
+
+bool tokenWalkShare() {
+    static const bool shared = std::getenv("APS5_TOKEN_WALK_SHARE") != nullptr;
+    return shared;
+}
+
+bool sharedWalkCovers(std::uint64_t token, std::uint64_t first, std::uint64_t stop, std::uint64_t unwatched, std::uint64_t mapping) {
+    auto& share = precollectShare();
+    std::lock_guard lock(share.mutex);
+    for (const auto& [epoch, walks] : share.epochs) {
+        if (epoch != token) continue;
+        const auto after = walks.upper_bound(first);
+        if (after == walks.begin()) return false;
+        const auto& walk = std::prev(after)->second;
+        return walk.unwatched == unwatched && walk.mapping == mapping && walk.begin <= first && stop <= walk.end;
+    }
+    return false;
+}
+
+void shareWalk(std::uint64_t token, const PrecollectedWrites::Walk& walk) {
+    auto& share = precollectShare();
+    std::lock_guard lock(share.mutex);
+    auto slot = std::find_if(share.epochs.begin(), share.epochs.end(), [&](const auto& entry) { return entry.first == token; });
+    if (slot == share.epochs.end()) {
+        slot = share.epochs.begin() + static_cast<std::ptrdiff_t>(share.next++ % share.epochs.size());
+        slot->first = token;
+        slot->second.clear();
+    }
+    if (slot->second.size() < 4096) slot->second[walk.begin] = walk;
+}
+
 struct StampRuns {
     WriteTracker& tracker;
     StampKind kind;
@@ -1712,6 +1745,13 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
+    const auto token = useMemo && tokenFollower && tokenWalkShare() && !sharedCollectMemo() ? HostThreadSlot<std::uint64_t, CollectTokenSlot>::Get() : 0;
+    if (token != 0 && sharedWalkCovers(token, first, stop, unwatched, mapping)) {
+        tokenShareHits.fetch_add(1, std::memory_order_relaxed);
+        auto& memo = threadCollectMemo();
+        memo.entries[memo.next++ % memo.entries.size()] = {first, stop, epoch, unwatched, mapping};
+        return tracker.stable.load(std::memory_order_acquire);
+    }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
@@ -1749,6 +1789,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
+    if (token != 0) shareWalk(token, {first, stop, unwatchSerial.load(std::memory_order_relaxed), mapping, tracker.generation.load(std::memory_order_relaxed)});
     return tracker.generation;
 }
 
@@ -1949,6 +1990,7 @@ std::string TakeProofBreakText() {
 
 void MarkProofThread() {
     proofThread = true;
+    tokenFollower = true;
 }
 
 std::uint64_t CollectEpoch() {
@@ -2877,6 +2919,7 @@ std::string TakeResolverRecorderText() {
 void MarkResolverThread() {
     noteResolveHook(resolverThread, true);
     resolverThread = true;
+    tokenFollower = true;
 }
 
 bool OnResolverThread() {
@@ -2889,7 +2932,9 @@ void SetEarlyReadLog(std::vector<std::pair<std::uint64_t, std::uint64_t>>* log) 
 }
 
 void NoteEarlyRead(std::uint64_t address, std::size_t bytes) {
-    if (!resolveHooksIdle() && earlyReadLog != nullptr && bytes != 0) earlyReadLog->emplace_back(address, address + bytes);
+    if (resolveHooksIdle() || earlyReadLog == nullptr || bytes == 0) return;
+    const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
+    if (earlyReadLog->empty() || earlyReadLog->back() != range) earlyReadLog->push_back(range);
 }
 
 void NoteResolveMemo() {
@@ -2918,12 +2963,22 @@ void NoteResolveRecorder(const void* site, const char* method) {
     if (resolveHooksIdle() || (!resolveTraceActive && !earlyAbortArmed)) return;
     if (resolverThread && earlyAbortArmed && method != nullptr) {
         static constexpr std::array<std::string_view, 8> safe{"Active", "PendingWriteOverlaps", "PendingLabelIn", "wideLabelInLocked", "QueuedStoreOverlaps", "ReusableDrawSnapshot", "eraseDrawSnapshot", "KnownHighestIndex"};
-        if (std::find(safe.begin(), safe.end(), std::string_view(method)) == safe.end()) {
+        static const bool pointerMemo = std::getenv("APS5_NO_RESOLVER_RECORDER_MEMO") == nullptr;
+        thread_local std::array<const char*, 16> safeSeen{};
+        thread_local std::size_t safeCount = 0;
+        bool safeMethod = pointerMemo && std::find(safeSeen.begin(), safeSeen.begin() + safeCount, method) != safeSeen.begin() + safeCount;
+        if (!safeMethod && std::find(safe.begin(), safe.end(), std::string_view(method)) != safe.end()) {
+            safeMethod = true;
+            if (pointerMemo && safeCount < safeSeen.size()) safeSeen[safeCount++] = method;
+        }
+        if (!safeMethod) {
             if (std::uncaught_exceptions() == 0 && std::current_exception() == nullptr) {
                 std::lock_guard lock(resolverRecorderMutex);
                 ++resolverRecorderMethods[method];
             }
             ResolveBarrierAt(BarrierKind::ResolverRecorder, method);
+        } else if (pointerMemo && !resolveTraceActive) {
+            return;
         }
     }
     ++resolveTrace.recorderUses;

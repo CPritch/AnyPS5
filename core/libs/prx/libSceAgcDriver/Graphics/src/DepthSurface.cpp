@@ -2247,9 +2247,33 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
 FoundDepthView FindDepthSurfaceView(const Context& context, const DepthTarget& target) {
     static const bool multisampled = std::getenv("APS5_NO_DEFERRED_MSAA_DEPTH_VIEW") == nullptr;
     if (target.samples != 1u && !multisampled) return {};
+    struct ViewMemo {
+        VkDevice device = VK_NULL_HANDLE;
+        DepthTarget target{};
+        std::uint64_t serial = ~std::uint64_t{0};
+        std::shared_ptr<std::atomic<bool>> active;
+        VkImageView view = VK_NULL_HANDLE;
+        std::weak_ptr<void> owner;
+        bool owned = false;
+    };
+    static const bool memoEnabled = std::getenv("APS5_NO_TARGET_MEMO") == nullptr;
+    thread_local std::array<ViewMemo, 4> memos{};
+    thread_local std::size_t nextMemo = 0;
+    const auto serial = surfacesSerial.load(std::memory_order_acquire);
+    if (memoEnabled) {
+        for (const auto& entry : memos) {
+            if (entry.serial != serial || entry.device != context.device || entry.active == nullptr || !entry.active->load(std::memory_order_acquire) || !sameSurface(entry.target, target)) continue;
+            auto owner = entry.owner.lock();
+            if (entry.owned && owner == nullptr) break;
+            return {entry.view, std::move(owner)};
+        }
+    }
     std::lock_guard lock(surfacesMutex());
     for (const auto& candidate : surfaces()) {
-        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) return {candidate->view, candidate->owned};
+        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
+            if (memoEnabled) memos[nextMemo++ % memos.size()] = {context.device, target, serial, candidate->active, candidate->view, candidate->owned, candidate->owned != nullptr};
+            return {candidate->view, candidate->owned};
+        }
     }
     return {};
 }
@@ -2296,6 +2320,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         }
         surface = surfaces().back().get();
     }
+    if (surface->retired) surfacesSerial.fetch_add(1, std::memory_order_release);
     surface->retired = false;
     const auto owner = depthOwners().find({context.device, target.address});
     const bool inherits = owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;

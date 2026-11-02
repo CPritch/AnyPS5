@@ -91,6 +91,7 @@ struct GuestTextureResource {
     std::uint32_t allocatedMipCount = 0;
     std::uint32_t samples = 1;
     std::uint64_t fmaskCmaskAddress = 0;
+    bool operator==(const GuestTextureResource&) const = default;
 };
 
 float EffectiveMinLod(const GuestTextureResource& resource);

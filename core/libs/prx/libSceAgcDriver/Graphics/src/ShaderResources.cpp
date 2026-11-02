@@ -1144,6 +1144,7 @@ struct StorageTextureCache {
     std::unordered_map<StorageKey, std::list<CachedStorageTexture>::iterator, StorageKeyHash> index;
     std::unordered_map<const StorageTexture*, std::list<CachedStorageTexture>::iterator> byImage;
     std::atomic<std::uint64_t> bytes{0};
+    std::atomic<std::uint64_t> generation{0};
 };
 
 StorageTextureCache& StorageTextures() {
@@ -1187,6 +1188,7 @@ std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::li
     cache.index.erase(it->key);
     cache.byImage.erase(it->texture.get());
     cache.entries.erase(it);
+    cache.generation.fetch_add(1, std::memory_order_release);
     return texture;
 }
 
@@ -1335,6 +1337,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             cache.entries.push_front(std::move(entry));
             cache.index[key] = cache.entries.begin();
             cache.byImage[texture.get()] = cache.entries.begin();
+            cache.generation.fetch_add(1, std::memory_order_release);
             texture->SetCached(true);
             counters.storageCreated.fetch_add(1, std::memory_order_relaxed);
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageMade, start);
@@ -1482,6 +1485,7 @@ void ClearCachedTextures(VkDevice device) {
             storage.index.erase(it->key);
             storage.byImage.erase(it->texture.get());
             it = storage.entries.erase(it);
+            storage.generation.fetch_add(1, std::memory_order_release);
         }
     }
     for (const auto& image : cleared) {
@@ -1626,9 +1630,35 @@ bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddres
 
 namespace {
 
+struct RepeatMemo {
+    VkDevice device = VK_NULL_HANDLE;
+    const StorageTexture* stored = nullptr;
+    GuestTextureResource requested{};
+    std::uint64_t viewedAddress = 0;
+    std::uint64_t viewedBytes = 0;
+    std::uint64_t storage = 0;
+    std::uint64_t depth = 0;
+    std::uint64_t mapping = 0;
+};
+
 std::shared_ptr<StorageTexture> repeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored, bool refresh) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled || stored == nullptr) return nullptr;
+    static const bool memoEnabled = std::getenv("APS5_NO_TARGET_MEMO") == nullptr;
+    thread_local std::array<RepeatMemo, 8> memos{};
+    thread_local std::size_t nextMemo = 0;
+    const bool memo = memoEnabled && !refresh;
+    const auto storageGeneration = memo ? StorageTextures().generation.load(std::memory_order_acquire) : 0;
+    const auto depthGeneration = memo ? DepthSurfacesSerial() : 0;
+    const auto mapping = memo ? GuestAllocations::GuestAllocationsGeneration_nid_postfix() : 0;
+    if (memo) {
+        for (const auto& entry : memos) {
+            if (entry.stored != stored.get() || entry.device != context.device || entry.storage != storageGeneration || entry.depth != depthGeneration || entry.mapping != mapping || !(entry.requested == requested)) continue;
+            if (DepthPlanesStale()) static_cast<void>(FlushDepthPlanes(entry.viewedAddress, static_cast<std::size_t>(entry.viewedBytes), DepthPlaneScope::Overlapped));
+            TextureCounts().storageHits.fetch_add(1, std::memory_order_relaxed);
+            return stored;
+        }
+    }
     const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
     const auto viewedBytes = DescribeSurface(viewed).guestBytes;
@@ -1649,6 +1679,7 @@ std::shared_ptr<StorageTexture> repeatStorageSurface(const Context& context, con
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
     TextureCounts().storageHits.fetch_add(1, std::memory_order_relaxed);
     if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
+    if (memo && (resource.dccAddress == 0 || resource.dccAddress == it->texture->Descriptor().dccAddress)) memos[nextMemo++ % memos.size()] = {context.device, stored.get(), requested, viewed.baseAddress, viewedBytes, storageGeneration, depthGeneration, mapping};
     return it->texture;
 }
 
@@ -1666,8 +1697,10 @@ bool RefreshCachedStorage(const Context& context, const std::shared_ptr<StorageT
     auto& cache = StorageTextures();
     std::lock_guard lock(cache.mutex);
     const CacheHold held(storageCacheHeld);
-    if (findStorageByImage(cache, context.device, texture.get()) == cache.entries.end()) return false;
+    const auto it = findStorageByImage(cache, context.device, texture.get());
+    if (it == cache.entries.end()) return false;
     texture->Refresh();
+    cache.entries.splice(cache.entries.begin(), cache.entries, it);
     return true;
 }
 

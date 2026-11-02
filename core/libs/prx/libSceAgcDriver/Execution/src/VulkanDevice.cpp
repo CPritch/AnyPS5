@@ -2297,7 +2297,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
 }
 
 void VulkanDevice::startJournalReplay() {
-    if (!state->journalReplayPending.exchange(false, std::memory_order_acq_rel)) return;
+    if (!state->journalReplayPending.load(std::memory_order_relaxed) || !state->journalReplayPending.exchange(false, std::memory_order_acq_rel)) return;
     state->journalReplay = Graphics::StartPipelineJournalReplay(graphicsContext(), Graphics::PipelineJournalDeviceFingerprint(state->properties), {[this](const ShaderRecompiler::RecompileResult& shader, bool pushConstants) { return ReplayComputePipeline(shader, pushConstants); }});
 }
 
@@ -2519,7 +2519,8 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
     if (import == nullptr) return 3;
     // A unit shadow's results in the label's unit reach the import before the store lands over
@@ -4129,6 +4130,16 @@ Graphics::Context VulkanDevice::graphicsContext() const {
     return buildContext();
 }
 
+const Graphics::Context& VulkanDevice::contextRef(std::optional<Graphics::Context>& built) const {
+    if (const auto* cached = cachedContext()) return *cached;
+    return built.emplace(graphicsContext());
+}
+
+const Graphics::Context* VulkanDevice::cachedContext() const {
+    static const bool reference = std::getenv("APS5_NO_CONTEXT_CACHE") == nullptr && std::getenv("APS5_NO_CONTEXT_REF") == nullptr;
+    return reference && state->contextReady ? &state->context : nullptr;
+}
+
 Graphics::Context VulkanDevice::buildContext() const {
     auto context = Graphics::Context{
         state->device,
@@ -4260,7 +4271,8 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
 
 bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders) {
     PerformanceTimer timing("Vulkan.GraphicsPipelinePrebuild");
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     if (!context.graphicsPipelineLibrary || context.descriptorCache == nullptr) return false;
     Graphics::State state{};
     state.stages = stages;
@@ -4298,7 +4310,8 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
 
 void VulkanDevice::PrepareDrawAhead(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::uint64_t shape, Graphics::DrawAhead& ahead) const {
     require(state->contextReady, "prepare-ahead before the device's context");
-    Graphics::PrepareDrawAhead(graphicsContext(), graphics, draw, shaders, shape, ahead);
+    std::optional<Graphics::Context> contextCopy;
+    Graphics::PrepareDrawAhead(contextRef(contextCopy), graphics, draw, shaders, shape, ahead);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const DrawTraceContext* trace, std::uint64_t shape, Graphics::DrawAhead* ahead) {
@@ -4311,8 +4324,8 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (traceDraws) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
-    const auto context = graphicsContext();
-    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe, trace, shape, ahead);
+    if (const auto* cached = cachedContext()) Graphics::Draw(*cached, graphics, draw, shaders, snapshots, recipe, trace, shape, ahead);
+    else Graphics::Draw(graphicsContext(), graphics, draw, shaders, snapshots, recipe, trace, shape, ahead);
     if (traceDraws) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 
@@ -4324,38 +4337,46 @@ Graphics::DrawPacketPtr VulkanDevice::ResolveDraw(const Graphics::State& graphic
     }
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (traceDraws) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     return Graphics::ResolveDraw(context, graphics, draw, shaders, snapshots, recipe, trace, shape, ahead);
 }
 
 void VulkanDevice::ApplyDrawMemoKeeps(Graphics::DrawPacket& packet) {
-    Graphics::ApplyDrawMemoKeeps(graphicsContext(), packet);
+    std::optional<Graphics::Context> contextCopy;
+    Graphics::ApplyDrawMemoKeeps(contextRef(contextCopy), packet);
 }
 
 void VulkanDevice::DiscardDraw(Graphics::DrawPacket& packet) {
-    Graphics::DiscardDrawPacket(graphicsContext(), packet);
+    std::optional<Graphics::Context> contextCopy;
+    Graphics::DiscardDrawPacket(contextRef(contextCopy), packet);
 }
 
 Graphics::HostImportsProof VulkanDevice::ImportsIdentity() {
-    return Graphics::HostImportsIdentity(graphicsContext());
+    std::optional<Graphics::Context> contextCopy;
+    return Graphics::HostImportsIdentity(contextRef(contextCopy));
 }
 
 bool VulkanDevice::ImportsUnchanged(const Graphics::HostImportsProof& proof) {
-    return Graphics::HostImportsUnchanged(graphicsContext(), proof);
+    std::optional<Graphics::Context> contextCopy;
+    return Graphics::HostImportsUnchanged(contextRef(contextCopy), proof);
 }
 
 std::uint64_t VulkanDevice::RecorderOpenSerial() {
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     return context.recorder != nullptr ? context.recorder->OpenSerial() : 0;
 }
 
 void VulkanDevice::ApplyDeferredEffects(Graphics::Recorder::DeferredEffects& effects) {
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     if (context.recorder != nullptr) context.recorder->ApplyDeferred(effects);
 }
 
 VulkanDevice::EarlySerials VulkanDevice::TakeEarlySerials(std::vector<std::pair<std::uint64_t, std::uint64_t>>* queuedStores) {
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     EarlySerials serials;
     serials.imports = Graphics::HostImportsIdentity(context);
     if (context.recorder != nullptr) {
@@ -4367,7 +4388,8 @@ VulkanDevice::EarlySerials VulkanDevice::TakeEarlySerials(std::vector<std::pair<
 }
 
 VulkanDevice::EarlyChange VulkanDevice::CheckEarlySerials(const EarlySerials& serials, std::vector<std::pair<std::uint64_t, std::uint64_t>>& noted, bool& overrun) {
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     overrun = false;
     if (!Graphics::HostImportsUnchanged(context, serials.imports)) return EarlyChange::Imports;
     if (context.recorder == nullptr) return EarlyChange::None;
@@ -4378,7 +4400,8 @@ VulkanDevice::EarlyChange VulkanDevice::CheckEarlySerials(const EarlySerials& se
 }
 
 bool VulkanDevice::FindMultisampleTargets(const Graphics::State& graphics, std::vector<Graphics::FoundMultisampleTarget>& found) {
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     found.clear();
     for (std::size_t index = 0; index < graphics.colors.size(); ++index) {
         if (graphics.colors[index].samples <= 1) continue;
@@ -4395,22 +4418,26 @@ bool VulkanDevice::ResolverInputsClear() {
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> VulkanDevice::QueuedStoreRanges() {
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     return context.recorder != nullptr ? context.recorder->QueuedStoreRanges() : std::vector<std::pair<std::uint64_t, std::uint64_t>>{};
 }
 
 std::uint64_t VulkanDevice::RecorderNotedSerial() {
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     return context.recorder != nullptr ? context.recorder->NotedSerial() : 0;
 }
 
 bool VulkanDevice::RecorderNotedSince(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     return context.recorder == nullptr || context.recorder->NotedSince(since, ranges);
 }
 
 void VulkanDevice::EmitDraw(Graphics::DrawPacket& packet) {
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     Graphics::EmitDraw(context, packet);
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (traceDraws) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
@@ -4972,7 +4999,8 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
         counters.rebuildDevice.fetch_add(1, std::memory_order_relaxed);
         return RecipeOutcome::Rebuild;
     }
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     const auto outcome = Graphics::DrawWithRecipe(context, graphics, draw, shaders, snapshots, *recipe, trace);
     if (!outcome.recorded) {
         switch (outcome.miss) {
@@ -5069,7 +5097,8 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = std::chrono::steady_clock::now();
     const Graphics::CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     auto prepared = std::make_shared<PreparedDispatch>();
     prepared->dispatchThreads = dispatchThreads;
     // A cached build (the map locks itself) is revalidated under the mutex by the dispatch, which
@@ -5167,7 +5196,8 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
     // its memory has no import), else over the template's current list.
     if (!NoPresync() && CanWaitUnlocked()) {
         Presyncs().checked.fetch_add(1, std::memory_order_relaxed);
-        if (Graphics::HostImportsUnchanged(graphicsContext(), recipe->presyncProof)) {
+        std::optional<Graphics::Context> contextCopy;
+        if (Graphics::HostImportsUnchanged(contextRef(contextCopy), recipe->presyncProof)) {
             counters.presyncsFromRecipe.fetch_add(1, std::memory_order_relaxed);
             hit->presyncSerial = presync(recipe->presyncSurfaces);
         } else {
@@ -5637,7 +5667,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         throw std::runtime_error("Vulkan dispatch: compute push constant range exceeds device limit");
     }
     auto pushBytes = Graphics::AssemblePushConstants(shaders);
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     const auto pipelineKey = ComputePipelineKey::Of(shader, pushStages != 0);
     std::shared_ptr<ComputePipelineObjects> objects = prepared != nullptr ? prepared->objects : nullptr;
     if (objects == nullptr && !pipelineKey.identity.Empty()) {
@@ -5969,7 +6000,8 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     auto& counters = Recipes().kinds[hit->indirect ? 1 : 0];
     auto& d = Dispatches();
     const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
-    const auto context = graphicsContext();
+    std::optional<Graphics::Context> contextCopy;
+    const auto& context = contextRef(contextCopy);
     if (recipe.needsCompletion || recipe.holdsLease || !hit->resources->Reusable()) throw std::runtime_error("Vulkan dispatch: recipe over a non-reusable template");
     // Without the refresh the template holds the words it was keyed with: a data-only hit takes
     // the ordinary path, whose word-keyed lookup serves or builds the object for the live words.

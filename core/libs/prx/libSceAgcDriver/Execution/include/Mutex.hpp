@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 
 namespace AgcDriver {
 
@@ -55,7 +56,21 @@ private:
     static constexpr std::uint32_t Locked = 1;
     static constexpr std::uint32_t Contended = 2;
 
+    static std::uint32_t SpinLimit() noexcept {
+        static const std::uint32_t limit = [] {
+            const char* text = std::getenv("APS5_MUTEX_SPINS");
+            return text == nullptr ? 0u : static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
+        }();
+        return limit;
+    }
+
     [[gnu::noinline]] void lockContended() noexcept {
+        for (std::uint32_t spin = SpinLimit(); spin != 0; --spin) {
+            if (state.load(std::memory_order_relaxed) == Unlocked && tryAcquire()) return;
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        }
         while (state.exchange(Contended, std::memory_order_acquire) != Unlocked) WaitWhile(state, Contended);
     }
 

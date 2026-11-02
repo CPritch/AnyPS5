@@ -1177,7 +1177,9 @@ struct DrawTimer {
     bool counted = false;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
-    explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
+    explicit DrawTimer(bool profile) : profile(profile) {
+        if (profile) phaseStart = std::chrono::steady_clock::now();
+    }
     void phase(DrawPhase which) {
         GuestMemory::ResolveCheckpoint();
         if (!profile && !counted) return;
@@ -1704,12 +1706,41 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
-    std::vector<VertexFetch> fetches;
-    std::vector<std::size_t> fetchValid;
+    struct VertexScratch {
+        std::vector<VertexFetch> fetches;
+        std::vector<std::size_t> fetchValid;
+        std::vector<std::size_t> fetchOf;
+        std::vector<std::shared_ptr<Buffer>> zeroed;
+        std::vector<bool> isSolo;
+        std::vector<VertexFetch> plannedFetches;
+        std::vector<std::size_t> plannedOf;
+        std::vector<VkBuffer> rangeHandles;
+        std::vector<VkDeviceSize> rangeOffsets;
+        std::vector<VkBuffer> soloHandles;
+        bool busy = false;
+    };
+    static const bool useScratch = std::getenv("APS5_NO_VERTEX_SCRATCH") == nullptr;
+    thread_local VertexScratch threadScratch;
+    VertexScratch localScratch;
+    auto& scratch = useScratch && !threadScratch.busy ? threadScratch : localScratch;
+    struct ScratchHold {
+        VertexScratch& held;
+        explicit ScratchHold(VertexScratch& owner) : held(owner) { held.busy = true; }
+        ~ScratchHold() {
+            for (auto& buffer : held.zeroed) buffer.reset();
+            held.busy = false;
+        }
+    } scratchHold(scratch);
+    auto& fetches = scratch.fetches;
+    auto& fetchValid = scratch.fetchValid;
+    fetches.clear();
+    fetchValid.clear();
     fetches.reserve(attributes.size());
     fetchValid.reserve(attributes.size());
-    std::vector<std::size_t> fetchOf(attributes.size(), 0);
-    std::vector<std::shared_ptr<Buffer>> zeroed(attributes.size());
+    auto& fetchOf = scratch.fetchOf;
+    fetchOf.assign(attributes.size(), 0);
+    auto& zeroed = scratch.zeroed;
+    zeroed.assign(attributes.size(), nullptr);
     const auto& layout = inputs.VertexLayout();
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
@@ -1734,19 +1765,24 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
     const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    std::vector<bool> isSolo(fetches.size(), false);
+    auto& isSolo = scratch.isSolo;
+    isSolo.assign(fetches.size(), false);
     for (const auto f : soloFetches) isSolo[f] = true;
-    std::vector<VertexFetch> plannedFetches;
+    auto& plannedFetches = scratch.plannedFetches;
+    plannedFetches.clear();
     plannedFetches.reserve(fetches.size());
-    std::vector<std::size_t> plannedOf(fetches.size(), 0);
+    auto& plannedOf = scratch.plannedOf;
+    plannedOf.assign(fetches.size(), 0);
     for (std::size_t f = 0; f < fetches.size(); ++f) {
         if (isSolo[f]) continue;
         plannedOf[f] = plannedFetches.size();
         plannedFetches.push_back(fetches[f]);
     }
     const auto plan = PlanVertexCopies(plannedFetches);
-    std::vector<VkBuffer> rangeHandles;
-    std::vector<VkDeviceSize> rangeOffsets;
+    auto& rangeHandles = scratch.rangeHandles;
+    auto& rangeOffsets = scratch.rangeOffsets;
+    rangeHandles.clear();
+    rangeOffsets.clear();
     rangeHandles.reserve(plan.copies.size());
     rangeOffsets.reserve(plan.copies.size());
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
@@ -1766,7 +1802,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
-    std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    auto& soloHandles = scratch.soloHandles;
+    soloHandles.assign(fetches.size(), VK_NULL_HANDLE);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
@@ -1946,7 +1983,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    static const bool aheadKeyedSkip = std::getenv("APS5_NO_AHEAD_KEYED_SKIP") == nullptr;
+    const bool aheadKeyed = aheadKeyedSkip && ahead.Takes() && !ahead.ahead->contentKey.empty();
+    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && (aheadKeyed || (std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders)));
     if (resolved.cacheable) {
         if (ahead.Takes() && !ahead.ahead->contentKey.empty()) {
             resolved.contentKey = std::move(ahead.ahead->contentKey);
@@ -3075,6 +3114,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     const bool counted = timer.counted;
     timer = DrawTimer(profile);
     timer.counted = counted;
+    if (counted && !profile) timer.phaseStart = std::chrono::steady_clock::now();
     struct ResolveTraceScope {
         bool on;
         explicit ResolveTraceScope(bool traced) : on(traced) {
