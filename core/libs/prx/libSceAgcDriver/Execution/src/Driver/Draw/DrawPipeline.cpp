@@ -984,7 +984,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         ++wakes;
         wake.notify_one();
     }
-    static const bool stats = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    static const bool stats = std::getenv("APS5_COMMIT_STATS") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!profile && !stats) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
@@ -1047,7 +1047,6 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     char reads[96];
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains));
     reportedDecodeDrains = decodeDrainCount;
-    drainText += reads;
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     if (PrepareThreads() != 0) AgcDriver::ProfilePrint_nid_no_patch("%s with %u threads\n", Graphics::DrawAheadReport().c_str(), PrepareThreads());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
@@ -1313,7 +1312,8 @@ std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
 }
 
 bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0 || std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr) return false;
+    static const bool unordered = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr;
+    if (bytes == 0 || unordered) return false;
     const auto end = address + bytes;
     auto& pipeline = Queue0();
     std::lock_guard lock(pipeline.mutex);

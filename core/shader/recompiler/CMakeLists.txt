@@ -269,6 +269,7 @@ function(add_shader_recompiler target runtimeTarget)
             ReadWholeFile
             Recompile
             RecompileCacheKey::ContextHash
+            RecompileCacheKey::SealFeatureDigest
             RecompileResult
             PrepareShader
             GetPreparedCode
@@ -291,6 +292,7 @@ function(add_shader_recompiler target runtimeTarget)
             RuntimeAbi::HeapCapacity
             SampledTextureNumericClass
             SetDebugProbeActive
+            SrtEvaluatingBranch
             ShaderCacheDirectory
             ShaderDiskCache::Shutdown
             ShaderStage
@@ -393,6 +395,20 @@ function(add_shader_recompiler target runtimeTarget)
         if(MINGW)
             target_link_libraries(spirv_validator_exit_tests PRIVATE libc)
             set_tests_properties(spirv_validator_exit PROPERTIES ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endif()
+    if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET spirv_literal_float_tests)
+        add_test_executable(spirv_literal_float_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/SpirvLiteralFloat.cpp")
+        target_include_directories(spirv_literal_float_tests PRIVATE "${ANYPS5_SPIRV_HEADERS_SOURCE_DIR}/include")
+        target_link_libraries(spirv_literal_float_tests PRIVATE SPIRV-Tools-static)
+        set_target_properties(spirv_literal_float_tests PROPERTIES CXX_EXTENSIONS OFF)
+        configure_windows_unwind(spirv_literal_float_tests)
+        add_test(NAME spirv_literal_float COMMAND spirv_literal_float_tests)
+        set_tests_properties(spirv_literal_float PROPERTIES TIMEOUT 30)
+        if(MINGW)
+            target_link_libraries(spirv_literal_float_tests PRIVATE libc)
+            set_tests_properties(spirv_literal_float PROPERTIES ENVIRONMENT_MODIFICATION
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endif()
