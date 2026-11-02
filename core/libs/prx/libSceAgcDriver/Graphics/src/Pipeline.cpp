@@ -911,6 +911,12 @@ void BumpGraphicsStateEpoch() {
     graphicsStateEpoch.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Pipeline::CheckContinue(const State& state) const {
+    if (!depthBias || !state.depth) return;
+    static_cast<void>(HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant));
+    if (SplitsFaces()) static_cast<void>(HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant));
+}
+
 bool Pipeline::SecondaryCapable(const State& state) const {
     return dynamicRendering && !state.mergedCoverage && !state.truncatedCoverage;
 }

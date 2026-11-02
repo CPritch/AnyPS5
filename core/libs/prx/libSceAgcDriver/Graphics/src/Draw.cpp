@@ -2486,12 +2486,12 @@ std::array<std::byte, PipelinePushConstantBytes> plainPushBlock(const State& sta
 struct SecondaryDrawJob {
     const Context* context = nullptr;
     VkCommandBuffer commands = VK_NULL_HANDLE;
-    std::shared_ptr<Pipeline> pipeline;
+    const Pipeline* pipeline = nullptr;
     State state;
     Pm4::DrawParameters draw;
     DrawInputs inputs;
-    std::shared_ptr<ShaderResources> resources;
-    std::shared_ptr<ShaderResources::DrawBindings> bindings;
+    const ShaderResources* resources = nullptr;
+    const ShaderResources::DrawBindings* bindings = nullptr;
     std::array<std::byte, PipelinePushConstantBytes> push{};
     VkShaderStageFlags pushStages = 0;
 
@@ -2518,6 +2518,94 @@ struct SecondaryDrawJob {
         }
     }
 };
+
+thread_local bool secondaryRecorderThread = false;
+
+void pauseOnce() {
+#if defined(__x86_64__)
+    __builtin_ia32_pause();
+#endif
+}
+
+class SecondaryDrawRing {
+public:
+    static constexpr std::uint64_t Capacity = 256;
+
+    SecondaryDrawJob& Claim() {
+        std::call_once(started, [this] { thread = std::thread([this] { run(); }); });
+        const auto claimed = head.load(std::memory_order_relaxed);
+        for (auto seen = tail.load(std::memory_order_acquire); claimed - seen >= Capacity; seen = tail.load(std::memory_order_acquire)) tail.wait(seen, std::memory_order_acquire);
+        return slots[claimed % Capacity];
+    }
+
+    void Publish() {
+        head.fetch_add(1, std::memory_order_release);
+        if (sleeping.load(std::memory_order_acquire)) head.notify_one();
+    }
+
+    void Wait() {
+        const auto target = head.load(std::memory_order_relaxed);
+        const auto spinUntil = std::chrono::steady_clock::now() + std::chrono::microseconds(50);
+        for (auto seen = tail.load(std::memory_order_acquire); seen < target; seen = tail.load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() < spinUntil) {
+                pauseOnce();
+                continue;
+            }
+            tail.wait(seen, std::memory_order_acquire);
+        }
+        std::exception_ptr failed;
+        {
+            std::lock_guard lock(errorMutex);
+            failed = std::exchange(error, nullptr);
+        }
+        if (failed) std::rethrow_exception(failed);
+    }
+
+private:
+    void run() {
+        CpuTopology::PinHelperThread("draw recorder");
+        secondaryRecorderThread = true;
+        std::uint64_t next = 0;
+        for (;;) {
+            const auto spinUntil = std::chrono::steady_clock::now() + std::chrono::microseconds(50);
+            while (head.load(std::memory_order_acquire) == next && std::chrono::steady_clock::now() < spinUntil) pauseOnce();
+            if (head.load(std::memory_order_acquire) == next) {
+                sleeping.store(true, std::memory_order_seq_cst);
+                if (head.load(std::memory_order_seq_cst) == next) head.wait(next, std::memory_order_acquire);
+                sleeping.store(false, std::memory_order_relaxed);
+                continue;
+            }
+            auto& job = slots[next % Capacity];
+            try {
+                job.Record();
+            } catch (...) {
+                std::lock_guard lock(errorMutex);
+                if (!error) error = std::current_exception();
+            }
+            job.pipeline = nullptr;
+            job.resources = nullptr;
+            job.bindings = nullptr;
+            ++next;
+            Recorder::CountSecondaryJob();
+            tail.store(next, std::memory_order_release);
+            tail.notify_all();
+        }
+    }
+
+    std::array<SecondaryDrawJob, Capacity> slots{};
+    std::atomic<std::uint64_t> head{0};
+    std::atomic<std::uint64_t> tail{0};
+    std::atomic<bool> sleeping{false};
+    std::mutex errorMutex;
+    std::exception_ptr error;
+    std::once_flag started;
+    std::thread thread;
+};
+
+SecondaryDrawRing& secondaryDrawRing() {
+    static auto* ring = new SecondaryDrawRing();
+    return *ring;
+}
 
 void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false) {
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
@@ -2742,6 +2830,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool workerDraw = args == nullptr && record.stencilReplay.empty() && !state.stages.mesh && state.tessellationCapture == nullptr && inputs.restartTable.empty() && !usesFunctionLds;
     const bool secondaryDraw = record.pipeline->SecondaryCapable(state) && (Recorder::ParallelRecord() < 2 || workerDraw);
     const bool leavesSecondary = recorder->SecondaryPassOpen() && !secondaryDraw;
+    std::optional<std::array<std::byte, PipelinePushConstantBytes>> deferredPush;
+    VkShaderStageFlags deferredPushStages = record.pushStages;
+    if (Recorder::ParallelRecord() >= 2 && secondaryDraw) {
+        record.pipeline->CheckContinue(state);
+        deferredPush = plainPushBlock(state, shaders, resources, record.pushBytes, deferredPushStages);
+    }
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || PixelFunctionLdsSubgroup(shaders) != 0u || leavesSecondary, fenced, passAccess);
     part(3);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
@@ -2750,7 +2844,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     outcome.passBegun = !continued;
     outcome.passBreak = start.reason;
     auto commands = start.commands;
-    const bool secondaryPass = continued ? recorder->SecondaryPassOpen() : recorder->SecondaryPasses() && secondaryDraw;
+    const bool secondaryPass = continued ? recorder->SecondaryPassOpen() : recorder->SecondaryPassFor(passKey) && secondaryDraw;
     const bool deferred = secondaryPass && Recorder::ParallelRecord() >= 2;
     if (!continued) {
         recorder->PrepareSampleSlot();
@@ -2839,24 +2933,26 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
                 CaptureTrace::Log("draw-recorded token=%llu batch=%llu submission=%llu queue=%u offset=%zu target=%llx subdraw=%u", static_cast<unsigned long long>(trace->token), static_cast<unsigned long long>(recorder->OpenBatchSerial()), static_cast<unsigned long long>(trace->submission), trace->queue, trace->offset, static_cast<unsigned long long>(trace->target), subdraw++);
             }
         }
-        auto job = std::make_shared<SecondaryDrawJob>();
-        job->context = &recorder->RecordingContext();
-        job->commands = commands;
-        job->pipeline = record.pipeline;
-        job->state = state;
-        job->draw = draw;
-        job->inputs.vertexHandles = inputs.vertexHandles;
-        job->inputs.vertexOffsets = inputs.vertexOffsets;
-        job->inputs.indexHandle = inputs.indexHandle;
-        job->inputs.indexOffset = inputs.indexOffset;
-        job->inputs.indexCount = inputs.indexCount;
-        job->inputs.expandedIndexCount = inputs.expandedIndexCount;
-        job->inputs.meshGroups = inputs.meshGroups;
-        job->resources = record.resources;
-        job->bindings = drawBindings;
-        job->pushStages = record.pushStages;
-        job->push = plainPushBlock(state, shaders, resources, record.pushBytes, job->pushStages);
-        Recorder::EnqueueSecondaryRecording([job] { job->Record(); });
+        Require(deferredPush.has_value(), "a deferred draw's push block was not assembled before its pass");
+        auto& ring = secondaryDrawRing();
+        auto& job = ring.Claim();
+        job.context = &recorder->RecordingContext();
+        job.commands = commands;
+        job.pipeline = record.pipeline.get();
+        job.state = state;
+        job.draw = draw;
+        job.inputs.vertexHandles = inputs.vertexHandles;
+        job.inputs.vertexOffsets = inputs.vertexOffsets;
+        job.inputs.indexHandle = inputs.indexHandle;
+        job.inputs.indexOffset = inputs.indexOffset;
+        job.inputs.indexCount = inputs.indexCount;
+        job.inputs.expandedIndexCount = inputs.expandedIndexCount;
+        job.inputs.meshGroups = inputs.meshGroups;
+        job.resources = record.resources.get();
+        job.bindings = drawBindings.get();
+        job.pushStages = deferredPushStages;
+        job.push = *deferredPush;
+        ring.Publish();
     } else {
         if (drawBindings != nullptr) {
             const auto set = drawBindings->allocation.set;
@@ -2939,6 +3035,18 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         timer.phase(PhaseSync);
     }
 }
+
+}
+
+bool Recorder::OnSecondaryRecorder() {
+    return secondaryRecorderThread;
+}
+
+void Recorder::WaitSecondaryRecording() {
+    secondaryDrawRing().Wait();
+}
+
+namespace {
 
 // The state with the outputs the pixel shader lacks masked: Vulkan leaves attachments a pixel
 // shader has no output for undefined, so their writes are masked (shaders that only store to

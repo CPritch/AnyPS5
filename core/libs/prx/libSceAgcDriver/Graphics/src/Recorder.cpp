@@ -1232,104 +1232,7 @@ struct SecondaryCommandLease {
 std::atomic<std::uint64_t> secondaryPassesOpened{0};
 std::atomic<std::uint64_t> secondaryPassesEnded{0};
 std::atomic<std::uint64_t> secondaryJobsRecorded{0};
-thread_local bool secondaryRecorderThread = false;
 
-class SecondaryRecordWorker {
-public:
-    void Enqueue(std::function<void()> job) {
-        start();
-        {
-            std::lock_guard lock(mutex);
-            jobs.push_back(std::move(job));
-        }
-        queued.fetch_add(1, std::memory_order_release);
-        if (sleeping.load(std::memory_order_acquire)) {
-            std::lock_guard lock(mutex);
-            wake.notify_one();
-        }
-    }
-
-    void Wait() {
-        const auto target = queued.load(std::memory_order_acquire);
-        while (done.load(std::memory_order_acquire) < target) {
-#if defined(__x86_64__)
-            __builtin_ia32_pause();
-#endif
-        }
-        std::exception_ptr failed;
-        {
-            std::lock_guard lock(mutex);
-            failed = std::exchange(error, nullptr);
-        }
-        if (failed) std::rethrow_exception(failed);
-    }
-
-    ~SecondaryRecordWorker() {
-        if (!thread.joinable()) return;
-        {
-            std::lock_guard lock(mutex);
-            stop = true;
-        }
-        wake.notify_one();
-        thread.join();
-    }
-
-private:
-    void start() {
-        if (thread.joinable()) return;
-        thread = std::thread([this] { run(); });
-    }
-
-    void run() {
-        CpuTopology::PinHelperThread("draw recorder");
-        secondaryRecorderThread = true;
-        std::uint64_t taken = 0;
-        for (;;) {
-            const auto spinUntil = std::chrono::steady_clock::now() + std::chrono::microseconds(50);
-            while (queued.load(std::memory_order_acquire) == taken && std::chrono::steady_clock::now() < spinUntil) {
-#if defined(__x86_64__)
-                __builtin_ia32_pause();
-#endif
-            }
-            std::function<void()> job;
-            {
-                std::unique_lock lock(mutex);
-                if (jobs.empty()) {
-                    sleeping.store(true, std::memory_order_release);
-                    wake.wait(lock, [&] { return stop || !jobs.empty(); });
-                    sleeping.store(false, std::memory_order_release);
-                    if (stop && jobs.empty()) return;
-                }
-                job = std::move(jobs.front());
-                jobs.pop_front();
-            }
-            ++taken;
-            try {
-                job();
-            } catch (...) {
-                std::lock_guard lock(mutex);
-                if (!error) error = std::current_exception();
-            }
-            secondaryJobsRecorded.fetch_add(1, std::memory_order_relaxed);
-            done.fetch_add(1, std::memory_order_release);
-        }
-    }
-
-    std::mutex mutex;
-    std::condition_variable wake;
-    std::deque<std::function<void()>> jobs;
-    std::atomic<std::uint64_t> queued{0};
-    std::atomic<std::uint64_t> done{0};
-    std::atomic<bool> sleeping{false};
-    std::exception_ptr error;
-    bool stop = false;
-    std::thread thread;
-};
-
-SecondaryRecordWorker& secondaryRecordWorker() {
-    static SecondaryRecordWorker worker;
-    return worker;
-}
 
 }
 
@@ -1845,12 +1748,13 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;
-    if (!pass.open) {
+    if (!pass.open || pass.draws == 0) {
         pass.timing = timing;
         pass.afterPass = std::move(afterPass);
     }
     pass.open = true;
     pass.key = key;
+    ++pass.draws;
     pass.fenced = pass.fenced || fenced;
     open->passHazards.Add(access);
 }
@@ -1863,8 +1767,12 @@ void Recorder::SealPassWriteOnly() {
 void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     auto& pass = open->renderPass;
+    if (pass.draws != 0) {
+        if (passDraws.size() >= 8192) passDraws.clear();
+        passDraws[pass.key] = pass.draws;
+    }
     if (pass.secondary) {
-        if (ParallelRecord() >= 2) secondaryRecordWorker().Wait();
+        if (ParallelRecord() >= 2) WaitSecondaryRecording();
         Check(function(endCommandBuffer, "vkEndCommandBuffer")(pass.chunk), "vkEndCommandBuffer secondary pass");
         context.Function<PFN_vkCmdExecuteCommands>("vkCmdExecuteCommands")(open->commands, 1, &pass.chunk);
         EndRenderPass(context, open->commands);
@@ -2849,6 +2757,17 @@ bool Recorder::SecondaryPasses() const {
     return ParallelRecord() >= 1 && !drawTimestamps && context.graphicsPipelineLibrary && (context.inheritedQueries || !countingSamples);
 }
 
+bool Recorder::SecondaryPassFor(std::uint64_t key) const {
+    static const std::uint32_t minimum = [] {
+        const char* text = std::getenv("APS5_PARALLEL_RECORD_MIN_DRAWS");
+        return text == nullptr ? 8u : static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
+    }();
+    if (!SecondaryPasses()) return false;
+    if (minimum <= 1) return true;
+    const auto found = passDraws.find(key);
+    return found != passDraws.end() && found->second >= minimum;
+}
+
 bool Recorder::SecondaryPassOpen() const {
     return open != nullptr && open->renderPass.open && open->renderPass.secondary;
 }
@@ -2903,16 +2822,13 @@ VkCommandBuffer Recorder::OpenSecondaryPass(const PassInheritance& inheritance) 
     BumpGraphicsStateEpoch();
     open->renderPass.secondary = true;
     open->renderPass.chunk = chunk;
+    open->renderPass.open = true;
     secondaryPassesOpened.fetch_add(1, std::memory_order_relaxed);
     return chunk;
 }
 
-void Recorder::EnqueueSecondaryRecording(std::function<void()> job) {
-    secondaryRecordWorker().Enqueue(std::move(job));
-}
-
-bool Recorder::OnSecondaryRecorder() {
-    return secondaryRecorderThread;
+void Recorder::CountSecondaryJob() {
+    secondaryJobsRecorded.fetch_add(1, std::memory_order_relaxed);
 }
 
 VkCommandBuffer Recorder::PassCommands() {

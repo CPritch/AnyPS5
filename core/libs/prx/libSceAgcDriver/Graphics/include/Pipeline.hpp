@@ -53,6 +53,7 @@ public:
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
     void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const;
     bool SecondaryCapable(const State& state) const;
+    void CheckContinue(const State& state) const;
     void BeginSecondary(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, PassInheritance& inheritance) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
     // construction: the attachment formats alone decide).

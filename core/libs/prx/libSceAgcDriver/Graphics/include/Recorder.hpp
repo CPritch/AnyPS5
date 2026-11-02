@@ -262,13 +262,15 @@ public:
     void EndPassSamples();
     static int ParallelRecord();
     bool SecondaryPasses() const;
+    bool SecondaryPassFor(std::uint64_t key) const;
     bool SecondaryPassOpen() const;
     void BeginPassSamples();
     VkCommandBuffer OpenSecondaryPass(const PassInheritance& inheritance);
     VkCommandBuffer PassCommands();
     const Context& RecordingContext() const { return context; }
-    static void EnqueueSecondaryRecording(std::function<void()> job);
     static bool OnSecondaryRecorder();
+    static void WaitSecondaryRecording();
+    static void CountSecondaryJob();
     void RecordUncounted(const std::function<void(VkCommandBuffer)>& record);
     struct SampleDumpStatistics {
         std::uint64_t queued;
@@ -743,6 +745,7 @@ private:
             PassBreak closedBy = PassBreak::NewBatch;
             bool secondary = false;
             VkCommandBuffer chunk = VK_NULL_HANDLE;
+            std::uint32_t draws = 0;
         } renderPass;
         PassHazards passHazards;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
@@ -810,6 +813,7 @@ private:
     VkPipeline dumpPipeline = VK_NULL_HANDLE;
     std::shared_ptr<void> segmentPools;
     std::shared_ptr<SecondaryCommandPool> secondaryPool;
+    std::unordered_map<std::uint64_t, std::uint32_t> passDraws;
     int dispatchArgumentState = 0;
     VkPipelineLayout dispatchArgumentLayout = VK_NULL_HANDLE;
     VkPipeline dispatchArgumentPipeline = VK_NULL_HANDLE;
