@@ -874,14 +874,38 @@ struct HotHookSync {
 std::mutex hotHookSyncMutex;
 std::map<std::tuple<int, int, int, std::uint64_t, std::size_t, HotStack>, HotHookSync> hotHookSyncs;
 
-bool HotHookSyncCounted() {
+bool HotWaitStatsCounted() {
     static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
-    return counted && GuestMemory::CurrentHotThread() != GuestMemory::HotThread::None;
+    return counted;
+}
+
+bool LongWaitLogged() {
+    static const bool logged = std::getenv("APS5_LONG_WAIT_LOG") != nullptr;
+    return logged;
+}
+
+long long SteadyMicroseconds() {
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void LogLongWait(const char* kind, int detail, std::uint64_t address, std::size_t bytes, double ms, const HotStack& stack) {
+    constexpr std::array<const char*, 4> threads{"other", "worker", "finisher", "committer"};
+    const auto thread = static_cast<std::size_t>(GuestMemory::CurrentHotThread());
+    std::fprintf(stderr, "[long-wait] %lld %s %s %d 0x%llx+0x%zx %.2f ms via %s\n", SteadyMicroseconds(), thread < threads.size() ? threads[thread] : "?", kind, detail, static_cast<unsigned long long>(address), bytes, ms, HotStackText(stack).c_str());
+}
+
+bool HotHookSyncCounted() {
+    return (HotWaitStatsCounted() || LongWaitLogged()) && GuestMemory::CurrentHotThread() != GuestMemory::HotThread::None;
 }
 
 void NoteHotHookSync(int kind, std::uint64_t address, std::size_t bytes, std::chrono::steady_clock::time_point start) {
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (!HotWaitStatsCounted()) {
+        if (ms >= 1.0) LogLongWait("access", kind, address, bytes, ms, CaptureHotStack());
+        return;
+    }
     const auto stack = CaptureHotStack();
+    if (LongWaitLogged() && ms >= 1.0) LogLongWait("access", kind, address, bytes, ms, stack);
     std::lock_guard lock(hotHookSyncMutex);
     auto& entry = hotHookSyncs[{static_cast<int>(GuestMemory::CurrentHotThread()), kind, static_cast<int>(GuestMemory::CurrentReadSite()), address, bytes, stack}];
     ++entry.count;
@@ -1681,7 +1705,12 @@ void Recorder::AnnounceSyncSite(const void* site) {
 namespace {
 
 void NoteHotWait(int source, const void* site, double ms) {
+    if (!HotWaitStatsCounted()) {
+        if (ms >= 1.0) LogLongWait("gpu", source, reinterpret_cast<std::uintptr_t>(site), 0, ms, CaptureHotStack());
+        return;
+    }
     const auto stack = CaptureHotStack();
+    if (LongWaitLogged() && ms >= 1.0) LogLongWait("gpu", source, reinterpret_cast<std::uintptr_t>(site), 0, ms, stack);
     std::lock_guard lock(hotWaitSitesMutex);
     auto& entry = hotWaitSites[{static_cast<int>(GuestMemory::CurrentHotThread()), source, site, stack}];
     ++entry.first;

@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -72,6 +74,8 @@ void Driver::AttachWindow(const PresentationWindow& window) {
 
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, const DisplayBuffer* plane, bool opaque, void (*gpuReady)(void*), void* context) {
     if (PerformanceTrace::Configured()) PerformanceTrace::Present(window.width, window.height, device.Load().get());
+    static const bool logged = std::getenv("APS5_LONG_WAIT_LOG") != nullptr;
+    if (logged) std::fprintf(stderr, "[present] %lld\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
     PerformanceContext timingContext(window.timing.get());
     PerformanceTimer timing("Driver.Present");
     static thread_local bool pinned = false;

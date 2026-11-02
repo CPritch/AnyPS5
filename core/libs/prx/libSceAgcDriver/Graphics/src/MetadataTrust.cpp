@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MetadataTrust.hpp"
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8,6 +9,13 @@
 
 namespace AgcDriver::Graphics {
 namespace {
+
+void LogAudit(const MetadataTrust::Key& key, bool forced) {
+    static const bool logged = std::getenv("APS5_LONG_WAIT_LOG") != nullptr;
+    if (!logged) return;
+    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::fprintf(stderr, "[audit] %lld writer 0x%llx 0x%llx+0x%llx%s\n", static_cast<long long>(now), static_cast<unsigned long long>(key.writer), static_cast<unsigned long long>(key.begin), static_cast<unsigned long long>(key.bytes), forced ? " forced" : "");
+}
 
 std::uint32_t AuditFromEnvironment() {
     const char* value = std::getenv("APS5_TRUST_METADATA_AUDIT");
@@ -89,6 +97,7 @@ MetadataTrust::Use MetadataTrust::Consult(const Key& key, std::uint64_t note) {
         ++counts.forced;
         ++counts.audits;
         entry.answer = Use::Forced;
+        LogAudit(key, true);
         return entry.answer;
     }
     if (entry.uses + 1 < auditEvery) {
@@ -98,6 +107,7 @@ MetadataTrust::Use MetadataTrust::Consult(const Key& key, std::uint64_t note) {
     } else {
         ++counts.audits;
         entry.answer = Use::Audit;
+        LogAudit(key, false);
     }
     return entry.answer;
 }
