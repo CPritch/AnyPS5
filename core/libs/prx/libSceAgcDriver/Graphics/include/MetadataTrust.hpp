@@ -21,13 +21,15 @@ public:
         std::uint64_t bytes = 0;
         auto operator<=>(const Key&) const = default;
     };
-    enum class Use : std::uint8_t { Untrusted, Skip, Audit };
+    enum class Use : std::uint8_t { Untrusted, Skip, Audit, Forced };
     struct Counts {
         std::uint64_t skips = 0;
         std::uint64_t audits = 0;
         std::uint64_t confirmations = 0;
         std::uint64_t revocations = 0;
         std::uint64_t trusted = 0;
+        std::uint64_t deferred = 0;
+        std::uint64_t forced = 0;
     };
 
     explicit MetadataTrust(std::uint32_t auditEvery = DefaultAudit);
@@ -36,12 +38,14 @@ public:
     static bool Enabled();
     static std::uint32_t Level();
     static MetadataTrust& Process();
+    static bool LazyAudit();
     std::uint32_t AuditEvery() const { return auditEvery; }
     bool Trusted(const Key& key) const;
     bool Revoked(const Key& key) const;
     std::vector<std::uint64_t> Writers(std::span<const std::uint64_t> writers, std::uint64_t begin, std::uint64_t bytes, bool learning) const;
     Use Consult(const Key& key, std::uint64_t note);
     bool Check(const Key& key, bool predicted);
+    void DeferAudit(const Key& key);
     Counts Totals() const;
 
 private:
@@ -50,6 +54,8 @@ private:
         std::uint32_t uses = 0;
         bool trusted = false;
         bool revoked = false;
+        bool deferred = false;
+        std::uint32_t deferredUses = 0;
         std::uint64_t note = 0;
         Use answer = Use::Untrusted;
     };

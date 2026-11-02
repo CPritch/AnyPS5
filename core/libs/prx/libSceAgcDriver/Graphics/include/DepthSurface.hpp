@@ -86,8 +86,9 @@ struct PendingHtile {
     std::vector<std::uint32_t> words;
     std::uint32_t predicted = 0;
     std::vector<MetadataTrust::Key> checks;
+    std::vector<MetadataTrust::Key> deferred;
 };
-PendingHtile ResolvePendingHtile(std::span<const Recorder::PendingWrite> writes, std::uint64_t address, std::size_t bytes, MetadataTrust* trust, std::optional<std::uint32_t> known = std::nullopt);
+PendingHtile ResolvePendingHtile(std::span<const Recorder::PendingWrite> writes, std::uint64_t address, std::size_t bytes, MetadataTrust* trust, std::optional<std::uint32_t> known = std::nullopt, bool deferAudit = false);
 void CheckPendingHtile(MetadataTrust& trust, const PendingHtile& resolved, std::span<const std::uint32_t> words);
 void NoteKnownHtileWord(std::uint64_t address, std::size_t bytes, std::optional<std::uint32_t> word, std::uint64_t generation);
 std::optional<std::uint32_t> KnownHtileWord(std::uint64_t address, std::size_t bytes);

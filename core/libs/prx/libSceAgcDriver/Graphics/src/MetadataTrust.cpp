@@ -36,6 +36,11 @@ std::uint32_t MetadataTrust::Level() {
     return level;
 }
 
+bool MetadataTrust::LazyAudit() {
+    static const bool lazy = Enabled() && std::getenv("APS5_LAZY_METADATA_AUDIT") != nullptr;
+    return lazy;
+}
+
 MetadataTrust& MetadataTrust::Process() {
     static auto* trust = new MetadataTrust(AuditFromEnvironment());
     return *trust;
@@ -74,6 +79,18 @@ MetadataTrust::Use MetadataTrust::Consult(const Key& key, std::uint64_t note) {
     auto& entry = found->second;
     if (note != 0 && note == entry.note) return entry.answer;
     entry.note = note;
+    if (entry.deferred) {
+        if (++entry.deferredUses < auditEvery) {
+            ++counts.skips;
+            entry.answer = Use::Skip;
+            return entry.answer;
+        }
+        entry.deferred = false;
+        ++counts.forced;
+        ++counts.audits;
+        entry.answer = Use::Forced;
+        return entry.answer;
+    }
     if (entry.uses + 1 < auditEvery) {
         ++entry.uses;
         ++counts.skips;
@@ -91,6 +108,7 @@ bool MetadataTrust::Check(const Key& key, bool predicted) {
     auto& entry = entries[key];
     if (entry.revoked) return false;
     entry.uses = 0;
+    entry.deferred = false;
     if (predicted) {
         ++counts.confirmations;
         if (++entry.confirmations >= Confirmations && !entry.trusted) {
@@ -105,6 +123,16 @@ bool MetadataTrust::Check(const Key& key, bool predicted) {
     ++counts.revocations;
     std::fprintf(stderr, "[trust-meta] writer 0x%llx changed metadata 0x%llx+0x%llx: revoked\n", static_cast<unsigned long long>(key.writer), static_cast<unsigned long long>(key.begin), static_cast<unsigned long long>(key.bytes));
     return true;
+}
+
+void MetadataTrust::DeferAudit(const Key& key) {
+    std::lock_guard lock(mutex);
+    const auto found = entries.find(key);
+    if (found == entries.end() || !found->second.trusted || found->second.deferred) return;
+    found->second.deferred = true;
+    found->second.deferredUses = 0;
+    found->second.answer = Use::Skip;
+    ++counts.deferred;
 }
 
 MetadataTrust::Counts MetadataTrust::Totals() const {

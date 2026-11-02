@@ -281,7 +281,50 @@ void testWordFillKeys() {
 
 }
 
+void testDeferredHtileAudit() {
+    std::vector<std::uint32_t> words(0x2000 / 4u, 0u);
+    const auto address = reinterpret_cast<std::uint64_t>(words.data());
+    const auto bytes = words.size() * sizeof(std::uint32_t);
+    const auto end = address + bytes;
+    const MetadataTrust::Key key{Writer, address, bytes};
+    std::uint64_t note = 0;
+    const auto alone = [&] { return std::vector<Recorder::PendingWrite>{{address, end, ++note, -1, -1, Writer, false}}; };
+    MetadataTrust registry(4);
+    const auto resolve = [&] { return ResolvePendingHtile(alone(), address, bytes, &registry, Expanded, true); };
+    trust(registry, key);
+    const auto skipUntilAudit = [&] {
+        for (std::uint32_t use = 1; use < registry.AuditEvery(); ++use) {
+            const auto skipped = resolve();
+            Require(skipped.word == Expanded && skipped.deferred.empty() && skipped.checks.empty(), "the uses before the audit are skipped");
+        }
+    };
+    skipUntilAudit();
+    auto resolved = resolve();
+    Require(resolved.word == Expanded && resolved.checks.empty() && resolved.deferred.size() == 1 && resolved.deferred[0] == key && resolved.predicted == Expanded, "a deferred audit keeps the remembered word and names the writer to check once its batch completes");
+    Require(!ResolvePendingHtile(alone(), address, bytes, &registry, Expanded).word.has_value(), "without deferral the due audit must still read the HTILE");
+    registry.DeferAudit(key);
+    for (std::uint32_t use = 1; use < registry.AuditEvery(); ++use) {
+        resolved = resolve();
+        Require(resolved.word == Expanded && resolved.deferred.empty() && resolved.checks.empty(), "uses while the deferred check is outstanding are skipped, not audited again");
+    }
+    resolved = resolve();
+    Require(!resolved.word.has_value() && resolved.deferred.empty() && resolved.checks.size() == 1 && registry.Totals().forced == 1, "a deferred check that never comes forces an audit that reads the HTILE");
+    registry.Check(key, true);
+    skipUntilAudit();
+    Require(!resolve().deferred.empty(), "after a forced audit confirms, the next audit may be deferred again");
+    registry.DeferAudit(key);
+    registry.Check(key, true);
+    Require(registry.Trusted(key), "a deferred check that confirms keeps the writer trusted");
+    skipUntilAudit();
+    Require(!resolve().deferred.empty(), "the audit after a confirmed deferred check is deferred again");
+    registry.DeferAudit(key);
+    registry.Check(key, false);
+    Require(registry.Revoked(key) && !resolve().word.has_value(), "a deferred check that finds the HTILE changed revokes the writer");
+    Require(registry.Totals().deferred == 3, "each deferral is counted once");
+}
+
 void RunPendingMetadataTrustTests() {
+    testDeferredHtileAudit();
     testPendingHtile();
     testPendingKeys();
     testKnownHtile();
