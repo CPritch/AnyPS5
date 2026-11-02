@@ -1949,30 +1949,15 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     return true;
 }
 
-bool recordHtileAudit(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t predicted, std::vector<MetadataTrust::Key> keys) {
+bool recordHtileAudit(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t predicted, std::vector<MetadataTrust::Key> keys) {
     if (address % 4u != 0 || bytes % 4u != 0) return false;
-    const auto* import = HostImportFor(context, address, bytes);
-    if (import == nullptr) return false;
-    recorder.FlushKeyStoresOverlapping(address, bytes);
-    recorder.FlushStoresOverlapping(address, bytes);
-    auto copy = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    const auto commands = recorder.Commands();
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    CopyBuffer(context, commands, import->buffer, address - import->base, copy->Handle(), 0, bytes);
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-    recorder.Keep(copy, bytes);
-    auto& trust = MetadataTrust::Process();
-    for (const auto& key : keys) trust.DeferAudit(key);
-    return recorder.AfterRecordedWork([copy, predicted, keys = std::move(keys), &trust] {
-        copy->Invalidate();
-        const auto copied = copy->Bytes();
-        bool same = true;
-        for (std::size_t offset = 0; same && offset + 4u <= copied.size(); offset += 4u) {
+    return RecordDeferredAudit(recorder, address, bytes, std::move(keys), [predicted](std::span<const std::byte> copied) {
+        for (std::size_t offset = 0; offset + 4u <= copied.size(); offset += 4u) {
             std::uint32_t word = 0;
             std::memcpy(&word, copied.data() + offset, 4u);
-            same = word == predicted;
+            if (word != predicted) return false;
         }
-        for (const auto& key : keys) trust.Check(key, same);
+        return true;
     });
 }
 
@@ -2002,7 +1987,7 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
         }
         const auto known = remember ? KnownHtileWord(target.htileAddress, bytes) : std::nullopt;
         resolved = ResolvePendingHtile(recorder->PendingWritesOver(target.htileAddress, bytes), target.htileAddress, bytes, MetadataTrust::Enabled() ? &MetadataTrust::Process() : nullptr, known, MetadataTrust::LazyAudit());
-        if (!resolved.deferred.empty() && !recordHtileAudit(context, *recorder, target.htileAddress, bytes, resolved.predicted, resolved.deferred)) {
+        if (!resolved.deferred.empty() && !recordHtileAudit(*recorder, target.htileAddress, bytes, resolved.predicted, resolved.deferred)) {
             resolved.word.reset();
             resolved.checks = std::move(resolved.deferred);
         }

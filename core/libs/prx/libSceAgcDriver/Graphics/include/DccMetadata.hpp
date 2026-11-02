@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <vector>
@@ -125,7 +126,8 @@ struct DccKeyCheck {
     std::uint64_t generation = 0;
     std::vector<std::uint64_t> writers;
 };
-std::optional<DccKeys> TrustedPendingKeys(std::span<const Recorder::PendingWrite> writes, std::uint64_t begin, std::size_t count, MetadataTrust& trust);
+std::optional<DccKeys> TrustedPendingKeys(std::span<const Recorder::PendingWrite> writes, std::uint64_t begin, std::size_t count, MetadataTrust& trust, Recorder* deferTo = nullptr);
+bool RecordDeferredAudit(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::vector<MetadataTrust::Key> keys, std::function<bool(std::span<const std::byte>)> matches);
 std::optional<DccKeyCheck> PredictPendingKeys(std::span<const Recorder::PendingWrite> writes, std::uint64_t begin, std::size_t count, const MetadataTrust& trust);
 void CheckPendingKeys(MetadataTrust& trust, const DccKeyCheck& check);
 std::optional<DccKeyCheck> PrepareDccKeyCheck(std::uint64_t metaAddress, std::size_t count);

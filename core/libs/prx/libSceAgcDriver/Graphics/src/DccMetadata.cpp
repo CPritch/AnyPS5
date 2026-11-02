@@ -385,7 +385,7 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count)) return std::nullopt;
     const auto landed = KeysAfterPendingWrites(recorder, begin, count);
     if (landed.mixed) return DccKeys::Mixed;
-    if (landed.unknown && MetadataTrust::Enabled()) return TrustedPendingKeys(recorder.PendingWritesOver(begin, count), begin, count, MetadataTrust::Process());
+    if (landed.unknown && MetadataTrust::Enabled()) return TrustedPendingKeys(recorder.PendingWritesOver(begin, count), begin, count, MetadataTrust::Process(), MetadataTrust::LazyAudit() ? &recorder : nullptr);
     if (landed.unknown || landed.value < 0) return std::nullopt;
     return ByteKeys(static_cast<std::uint8_t>(landed.value));
 }
@@ -948,15 +948,55 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     return std::nullopt;
 }
 
-std::optional<DccKeys> TrustedPendingKeys(std::span<const Recorder::PendingWrite> writes, std::uint64_t begin, std::size_t count, MetadataTrust& trust) {
+bool RecordDeferredAudit(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::vector<MetadataTrust::Key> keys, std::function<bool(std::span<const std::byte>)> matches) {
+    if (bytes == 0 || keys.empty()) return false;
+    const auto& context = recorder.RecordingContext();
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) return false;
+    recorder.FlushKeyStoresOverlapping(address, bytes);
+    recorder.FlushStoresOverlapping(address, bytes);
+    auto copy = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, import->buffer, address - import->base, copy->Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Keep(copy, bytes);
+    auto& trust = MetadataTrust::Process();
+    const auto deferred = keys;
+    if (!recorder.AfterRecordedWork([copy, keys = std::move(keys), matches = std::move(matches), &trust] {
+        copy->Invalidate();
+        const bool same = matches(copy->Bytes());
+        for (const auto& key : keys) trust.Check(key, same);
+    })) return false;
+    for (const auto& key : deferred) trust.DeferAudit(key);
+    return true;
+}
+
+std::optional<DccKeys> TrustedPendingKeys(std::span<const Recorder::PendingWrite> writes, std::uint64_t begin, std::size_t count, MetadataTrust& trust, Recorder* deferTo) {
     const auto trusted = trust.Writers(PendingWriters(writes), begin, count, false);
     if (trusted.empty()) return std::nullopt;
     const auto landed = KeysAfterPendingWrites(std::vector<Recorder::PendingWrite>(writes.begin(), writes.end()), begin, count, trusted);
     if (landed.unknown || (!landed.mixed && landed.value < 0)) return std::nullopt;
     bool audit = false;
-    for (const auto& [writer, note] : landed.passed) audit = trust.Consult({writer, begin, count}, note) != MetadataTrust::Use::Skip || audit;
-    if (audit) return std::nullopt;
-    return landed.mixed ? DccKeys::Mixed : ByteKeys(static_cast<std::uint8_t>(landed.value));
+    bool forced = false;
+    for (const auto& [writer, note] : landed.passed) {
+        const auto use = trust.Consult({writer, begin, count}, note);
+        audit = use != MetadataTrust::Use::Skip || audit;
+        forced = use == MetadataTrust::Use::Forced || forced;
+    }
+    const auto predicted = landed.mixed ? DccKeys::Mixed : ByteKeys(static_cast<std::uint8_t>(landed.value));
+    if (!audit) return predicted;
+    if (deferTo == nullptr || forced) return std::nullopt;
+    std::vector<MetadataTrust::Key> keys;
+    for (const auto& [writer, note] : landed.passed) keys.push_back({writer, begin, count});
+    const int value = landed.mixed ? -1 : landed.value;
+    const auto matches = [value](std::span<const std::byte> copied) {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(copied.data());
+        const int found = copied.empty() ? -1 : AllKeysEqual(bytes + 1, copied.size() - 1, bytes[0]) ? bytes[0] : -1;
+        return found == value;
+    };
+    if (!RecordDeferredAudit(*deferTo, begin, count, std::move(keys), matches)) return std::nullopt;
+    return predicted;
 }
 
 std::optional<DccKeyCheck> PredictPendingKeys(std::span<const Recorder::PendingWrite> writes, std::uint64_t begin, std::size_t count, const MetadataTrust& trust) {
