@@ -59,7 +59,7 @@ private:
     static std::uint32_t SpinLimit() noexcept {
         static const std::uint32_t limit = [] {
             const char* text = std::getenv("APS5_MUTEX_SPINS");
-            return text == nullptr ? 0u : static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
+            return text == nullptr ? 160u : static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
         }();
         return limit;
     }

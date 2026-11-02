@@ -2421,7 +2421,7 @@ void VulkanDevice::WaitIdle() {
 namespace {
 
 bool OpportunisticReap() {
-    static const bool enabled = std::getenv("APS5_NO_OPPORTUNISTIC_REAP") == nullptr;
+    static const bool enabled = std::getenv("APS5_OPPORTUNISTIC_REAP") != nullptr;
     return enabled;
 }
 
@@ -2632,10 +2632,6 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     const Graphics::Recorder::GpuSiteTag siteTag(Graphics::Recorder::GpuSitesEnabled() ? "fill " + Graphics::Recorder::SiteHex(address) + "+" + std::to_string(bytes >> 10) + "K" : std::string{});
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
     auto& recorder = *state->recorder;
-    // Finished batches are retired first (one fence status check, as WriteLabelOnGpu does): their
-    // completion labels landed and their copied writers are delisted, so a batch the idle GPU already
-    // finished does not force a wait below. Before the import lookup: a completion may refresh the
-    // import table. Debug aid: APS5_NO_OPPORTUNISTIC_REAP=1 skips it.
     if (OpportunisticReap()) recorder.Reap();
     const auto context = graphicsContext();
     const Graphics::HostImport* import = Graphics::HostImportFor(context, address, bytes);

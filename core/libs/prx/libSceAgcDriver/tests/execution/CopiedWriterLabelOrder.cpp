@@ -240,10 +240,8 @@ int main() {
     try {
 #ifdef _WIN32
         _putenv_s("APS5_CPU_COPIES", "1");
-        _putenv_s("APS5_NO_OPPORTUNISTIC_REAP", "1");
 #else
         setenv("APS5_CPU_COPIES", "1", 1);
-        setenv("APS5_NO_OPPORTUNISTIC_REAP", "1", 1);
 #endif
         const GuestBlock copied;
         const GuestBlock direct;

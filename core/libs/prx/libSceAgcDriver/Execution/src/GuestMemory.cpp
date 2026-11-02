@@ -1519,7 +1519,7 @@ PrecollectShare& precollectShare() {
 thread_local bool tokenFollower = false;
 
 bool tokenWalkShare() {
-    static const bool shared = std::getenv("APS5_TOKEN_WALK_SHARE") != nullptr;
+    static const bool shared = std::getenv("APS5_NO_TOKEN_WALK_SHARE") == nullptr;
     return shared;
 }
 

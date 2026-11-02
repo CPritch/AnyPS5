@@ -65,7 +65,7 @@ bool Driver::labelTryEachPacket() {
 std::chrono::microseconds Driver::labelFlushDeadline() {
     static const std::chrono::microseconds value = [] {
         const char* text = std::getenv("APS5_LABEL_FLUSH_US");
-        return std::chrono::microseconds(text ? std::atoi(text) : (LabelBatchSubmit() ? 1000 : 250));
+        return std::chrono::microseconds(text ? std::atoi(text) : (LabelBatchSubmit() ? 2000 : 250));
     }();
     return value;
 }
@@ -89,11 +89,11 @@ bool Driver::reapEachPacket() {
 bool Driver::idleSubmitDue(std::uint64_t work) {
     static const std::uint64_t minimum = [] {
         const char* text = std::getenv("APS5_IDLE_SUBMIT");
-        return text ? std::strtoull(text, nullptr, 10) : 0ull;
+        return text ? std::strtoull(text, nullptr, 10) : 8ull;
     }();
     static const std::chrono::microseconds idle = [] {
         const char* text = std::getenv("APS5_IDLE_SUBMIT_US");
-        return std::chrono::microseconds(text ? std::atoi(text) : 0);
+        return std::chrono::microseconds(text ? std::atoi(text) : 300);
     }();
     if (minimum == 0 || work < minimum) return false;
     return idle.count() == 0 ? Graphics::Recorder::GpuCaughtUp() : Graphics::Recorder::GpuIdleFor() >= idle;
@@ -102,7 +102,7 @@ bool Driver::idleSubmitDue(std::uint64_t work) {
 std::uint64_t Driver::batchCap() {
     static const std::uint64_t value = [] {
         const char* text = std::getenv("APS5_BATCH_CAP");
-        return text ? std::strtoull(text, nullptr, 10) : 64ull;
+        return text ? std::strtoull(text, nullptr, 10) : 256ull;
     }();
     return value;
 }

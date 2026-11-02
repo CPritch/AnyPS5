@@ -55,7 +55,7 @@ void Driver::noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, cons
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded, DispatchUnbounded* reason) {
-    static const bool boundReadOnly = std::getenv("APS5_BOUND_READ_ONLY_ADDRESS_DISPATCHES") != nullptr;
+    static const bool boundReadOnly = std::getenv("APS5_NO_BOUND_READ_ONLY_ADDRESS_DISPATCHES") == nullptr;
     const bool addressBased = compiled.bdaAbiVersion != 0;
     const bool readOnly = addressBased && !compiled.bdaWrites && !Graphics::ShaderStoresThroughAddresses(compiled.spirv);
     const bool addressesBounded = !addressBased || (readOnly && boundReadOnly);

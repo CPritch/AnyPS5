@@ -34,7 +34,7 @@ namespace {
 std::atomic<std::uint64_t> graphicsStateEpoch{1};
 
 bool StateFilter() {
-    static const bool enabled = std::getenv("APS5_STATE_FILTER") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_STATE_FILTER") == nullptr;
     return enabled;
 }
 

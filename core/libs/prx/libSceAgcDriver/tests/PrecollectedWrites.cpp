@@ -168,7 +168,6 @@ void FollowersShareTheWalksOfOneToken() {
 }
 
 int main() {
-    setenv("APS5_TOKEN_WALK_SHARE", "1", 1);
     try {
         WalksServeTheCommitOfTheirEpoch();
         WalksOfAnotherEpochAreIgnored();

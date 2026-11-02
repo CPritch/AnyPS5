@@ -102,11 +102,6 @@ public:
     void PrepareForReplacement();
     void startJournalReplay();
     bool ImportGuestMemory(const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
-    // Sends recorded work to the GPU without waiting for it. With `reapFirst` it first retires batches
-    // that already finished, so the in-flight list stays short (APS5_NO_OPPORTUNISTIC_REAP=1 skips
-    // that). A reap runs completion actions, and a write-back can wait for a later batch under the
-    // mutex through the flush hook, so a thread submitting on another queue's behalf (a WAIT_REG_MEM
-    // poller, a compute worker's between-packet flush) passes false: it must only submit, never wait.
     void SubmitRecorded(bool reapFirst = true);
     void StoreIdleResults(bool reapFirst = true);
     // Unlocked drain: SubmitAndEpoch (under the mutex) returns the serial covering every recorded

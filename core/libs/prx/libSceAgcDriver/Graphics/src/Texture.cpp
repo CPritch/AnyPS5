@@ -2633,7 +2633,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
 }
 
 DccKeys StorageTexture::ProvedKeys() const {
-    static const bool fillProof = std::getenv("APS5_DCC_FILL_KEY_PROOF") != nullptr;
+    static const bool fillProof = std::getenv("APS5_NO_DCC_FILL_KEY_PROOF") == nullptr;
     std::optional<DccKeys> keys;
     std::uint64_t collected = 0;
     if (descriptor.dccAddress != 0 && uploadedKeys == DccKeys::Uncompressed) {

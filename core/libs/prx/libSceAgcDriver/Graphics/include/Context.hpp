@@ -333,7 +333,7 @@ struct Context {
     VkMemoryPropertyFlags UploadProperties() const {
         constexpr VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         constexpr VkMemoryPropertyFlags local = coherent | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-        static const bool requested = std::getenv("APS5_DEVICE_LOCAL_UPLOADS") != nullptr;
+        static const bool requested = std::getenv("APS5_NO_DEVICE_LOCAL_UPLOADS") == nullptr;
         if (!requested) return coherent;
         for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
             if ((memory.memoryTypes[i].propertyFlags & local) == local) return local;

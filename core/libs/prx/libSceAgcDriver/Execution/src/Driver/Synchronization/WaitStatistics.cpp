@@ -58,7 +58,7 @@ WaitLabels& waitLabels() {
 int Driver::waitEpochSkip() {
     static const int mode = [] {
         const char* text = std::getenv("APS5_WAIT_EPOCH_SKIP");
-        return text == nullptr ? 0 : std::atoi(text);
+        return text == nullptr ? 2 : std::atoi(text);
     }();
     return mode;
 }

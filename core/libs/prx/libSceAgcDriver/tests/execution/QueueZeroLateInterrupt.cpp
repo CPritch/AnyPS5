@@ -60,11 +60,6 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
 }
 
 int main() {
-#ifdef _WIN32
-    _putenv_s("APS5_NO_OPPORTUNISTIC_REAP", "1");
-#else
-    setenv("APS5_NO_OPPORTUNISTIC_REAP", "1", 1);
-#endif
     try {
         {
             const auto device = OpenVulkanTestDevice();

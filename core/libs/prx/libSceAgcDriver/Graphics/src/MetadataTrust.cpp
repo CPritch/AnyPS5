@@ -45,7 +45,7 @@ std::uint32_t MetadataTrust::Level() {
 }
 
 bool MetadataTrust::LazyAudit() {
-    static const bool lazy = Enabled() && std::getenv("APS5_LAZY_METADATA_AUDIT") != nullptr;
+    static const bool lazy = Enabled() && std::getenv("APS5_NO_LAZY_METADATA_AUDIT") == nullptr;
     return lazy;
 }
 
