@@ -95,6 +95,7 @@ struct ProofCounters {
     std::atomic<std::uint64_t> unstable{0};
     std::atomic<std::uint64_t> rangeProved{0};
     std::atomic<std::uint64_t> rangeScanned{0};
+    std::atomic<std::uint64_t> storeProofs{0};
 };
 
 ProofCounters& Proofs() {
@@ -786,7 +787,10 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
         LastKeyProofOutcome() = collected == 0 ? KeyProofOutcome::Unwatched : KeyProofOutcome::Memoized;
     }
     if (stable) LastKeyProofOutcome() = KeyProofOutcome::Stable;
-    proof = stable ? DccKeyProof{keys, collected} : DccKeyProof{};
+    static const bool storeProof = std::getenv("APS5_DCC_STORE_KEY_PROOF") != nullptr;
+    const bool storeAnswer = storeProof && !stable && memoized && collected != 0 && GuestMemory::GpuMutex().HeldByThisThread();
+    if (storeAnswer) counters.storeProofs.fetch_add(1, std::memory_order_relaxed);
+    proof = stable || storeAnswer ? DccKeyProof{keys, collected} : DccKeyProof{};
     counters.scanned.fetch_add(1, std::memory_order_relaxed);
     if (!stable) counters.unstable.fetch_add(1, std::memory_order_relaxed);
     return keys;
