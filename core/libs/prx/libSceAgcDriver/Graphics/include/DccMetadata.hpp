@@ -83,6 +83,8 @@ struct DccKeyProof {
 // their record), which makes the proof exactly as sound as UnchangedSince over the texels.
 // APS5_NO_KEY_FAST_PATH=1 scans on every call and stores nothing.
 DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, DccKeyProof& proof);
+enum class KeyProofOutcome : std::uint8_t { None, Proved, Stable, Unwatched, Memoized, PendingWriter, SnapshotPending, Fills, Count };
+KeyProofOutcome& LastKeyProofOutcome();
 bool KeyFastPath();
 bool SingleKeysReadable(const GuestTextureResource& resource);
 bool ReadSingleElement(const GuestTextureResource& resource, std::span<std::byte> element);

@@ -744,7 +744,13 @@ bool KeyFastPath() {
     return enabled;
 }
 
+KeyProofOutcome& LastKeyProofOutcome() {
+    thread_local KeyProofOutcome outcome = KeyProofOutcome::None;
+    return outcome;
+}
+
 DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, DccKeyProof& proof) {
+    LastKeyProofOutcome() = KeyProofOutcome::None;
     if (resource.dccAddress == 0) return DccKeys::Uncompressed;
     auto& counters = Proofs();
     if (!KeyFastPath()) {
@@ -757,6 +763,7 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
     const auto collected = count == 0 ? 0 : GuestMemory::CollectWrites(resource.dccAddress, count);
     if (proof.generation != 0 && collected != 0 && GuestMemory::UnchangedSince(resource.dccAddress, count, proof.generation)) {
         counters.proved.fetch_add(1, std::memory_order_relaxed);
+        LastKeyProofOutcome() = KeyProofOutcome::Proved;
         return proof.keys;
     }
     bool memoized = false;
@@ -772,8 +779,13 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
             }
         } else {
             stable = !Recorder::SnapshotWriteOverlaps(resource.dccAddress, count);
+            if (!stable) LastKeyProofOutcome() = KeyProofOutcome::SnapshotPending;
         }
+        if (!stable && LastKeyProofOutcome() == KeyProofOutcome::None) LastKeyProofOutcome() = KeyProofOutcome::PendingWriter;
+    } else {
+        LastKeyProofOutcome() = collected == 0 ? KeyProofOutcome::Unwatched : KeyProofOutcome::Memoized;
     }
+    if (stable) LastKeyProofOutcome() = KeyProofOutcome::Stable;
     proof = stable ? DccKeyProof{keys, collected} : DccKeyProof{};
     counters.scanned.fetch_add(1, std::memory_order_relaxed);
     if (!stable) counters.unstable.fetch_add(1, std::memory_order_relaxed);

@@ -2178,7 +2178,7 @@ thread_local std::uint8_t lastProofRefusal = 0;
 struct UnprovedImage {
     std::uint64_t count = 0, ns = 0, unchanged = 0;
     std::array<std::uint64_t, 9> provedFail{};
-    std::array<std::uint64_t, 6> proofRefusal{};
+    std::array<std::uint64_t, 16> proofRefusal{};
 };
 
 std::mutex unprovedMutex;
@@ -2241,7 +2241,7 @@ std::string StorageTexture::TakeCommitterRefreshText() {
         unprovedImages.clear();
     }
     std::sort(images.begin(), images.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
-    text += "; unproved image refreshes by image (count/ms, unchanged exits; refreshProved failed: 1 no proof, 2 generation, 3 keys, 4 lock, 5 unwatched, 6 dcc, 7 written, 8 other pending; proof refused: 1 aliased, 2 generation 0, 3 lock, 4 dcc, 5 other pending):";
+    text += "; unproved image refreshes by image (count/ms, unchanged exits; refreshProved failed: 1 no proof, 2 generation, 3 keys, 4 lock, 5 unwatched, 6 dcc, 7 written, 8 other pending; proof refused: 1 aliased, 2 generation 0, 3 lock, 4 dcc keys differ, 6-13 dcc key proof missing after: 6 no scan, 7 proved, 8 stable scan, 9 unwatched, 10 memoized keys, 11 pending writer, 12 pending snapshot, 13 pending fills, 5 other pending):";
     for (std::size_t i = 0; i < images.size() && i < 4; ++i) {
         const auto& [key, image] = images[i];
         char item[160];
@@ -2640,7 +2640,10 @@ DccKeys StorageTexture::ProvedKeys() const {
         if (fillProof && guestBytes >= 256 && GuestMemory::GpuMutex().HeldByThisThread()) collected = GuestMemory::CollectWrites(descriptor.dccAddress, static_cast<std::size_t>(guestBytes / 256));
         keys = WaitForKeyWriters(descriptor, guestBytes);
     }
-    if (keys.has_value()) keyProof = collected != 0 && *keys == DccKeys::Uncompressed ? DccKeyProof{*keys, collected} : DccKeyProof{};
+    if (keys.has_value()) {
+        keyProof = collected != 0 && *keys == DccKeys::Uncompressed ? DccKeyProof{*keys, collected} : DccKeyProof{};
+        LastKeyProofOutcome() = KeyProofOutcome::Fills;
+    }
     else keys = ProvedClearKeys(descriptor, guestBytes, keyProof);
     if (IsDccClear(filledKeys) && *keys != filledKeys && !anyLayerPending()) filledKeys = DccKeys::Uncompressed;
     return *keys;
@@ -2697,7 +2700,7 @@ void StorageTexture::takeRefreshProof(bool aliased) {
     lastProofRefusal = aliased ? 1 : generation == 0 ? 2 : !GuestMemory::GpuMutex().HeldByThisThread() ? 3 : 0;
     if (lastProofRefusal != 0) return;
     if (descriptor.dccAddress != 0 && (keyProof.generation == 0 || keyProof.keys != uploadedKeys)) {
-        lastProofRefusal = 4;
+        lastProofRefusal = keyProof.generation != 0 ? 4 : static_cast<std::uint8_t>(6 + static_cast<unsigned>(LastKeyProofOutcome()));
         return;
     }
     const auto serial = PendingSerial();
