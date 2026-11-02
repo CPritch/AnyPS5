@@ -10,6 +10,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -139,8 +140,14 @@ void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 void AdoptCollectEpoch(std::uint64_t epoch);
 std::uint64_t ProofSerial();
-enum class ProofBreak : std::uint8_t { Other = 0, Item, ForeignHold, Store, Write, WriteBack, Count };
+enum class ProofBreak : std::uint8_t { Other = 0, Item, ForeignHold, Store, Write, WriteBack, Import, ScopedLabel, Count };
 void BreakProofs(ProofBreak cause = ProofBreak::Other);
+bool ScopedLabelBreaks();
+void BreakProofsScoped(std::uint64_t begin, std::uint64_t end);
+std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> ScopedSince(std::uint64_t recorded);
+void SetScopedLabelRange(std::uint64_t begin, std::uint64_t end);
+void NoteScopedLabelCommit(bool scoped);
+bool TakeScopedLabelCommit();
 std::string TakeProofBreakText();
 void MarkProofThread();
 std::uint64_t CollectEpoch();

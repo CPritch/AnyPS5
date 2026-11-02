@@ -160,7 +160,7 @@ std::string QueueWaits::Text() {
                 if (count != 0) kinds += (kinds.empty() ? "" : ", ") + std::string(kind < kindNames.size() ? kindNames[kind] : "a draw without an early hook") + " " + std::to_string(count);
             }
             return kinds;
-        }() + "), offered once the committer's own resolve was done " + event(E::LateOffered) + ", offered across a seal " + event(E::AcrossSeal) + ", a draw without an early hook " + event(E::NextNoHook) + "; kept by the gate: recipe " + event(E::KeptRecipe) + ", tessellation " + event(E::KeptTessellation) + ", another epoch " + event(E::KeptEpoch) + ", reads the previous draw's writes " + event(E::KeptReadsWritten) + ", depth over colour " + event(E::KeptDepthColour) + ", predictor " + event(E::KeptPredictor) + ", the template being emitted " + event(E::KeptCurrentTemplate) + ", described ranges written " + event(E::KeptDescribed) + "; aborted at a barrier:";
+        }() + "), offered once the committer's own resolve was done " + event(E::LateOffered) + ", offered across a seal " + event(E::AcrossSeal) + ", offered across a label run " + event(E::AcrossLabels) + " (used " + event(E::UsedAcrossLabels) + ", redone for a label's bytes " + event(E::StaleScoped) + ", for its template " + event(E::StaleScopedTemplate) + ")" + ", a draw without an early hook " + event(E::NextNoHook) + "; kept by the gate: recipe " + event(E::KeptRecipe) + ", tessellation " + event(E::KeptTessellation) + ", another epoch " + event(E::KeptEpoch) + ", reads the previous draw's writes " + event(E::KeptReadsWritten) + ", depth over colour " + event(E::KeptDepthColour) + ", predictor " + event(E::KeptPredictor) + ", the template being emitted " + event(E::KeptCurrentTemplate) + ", described ranges written " + event(E::KeptDescribed) + "; aborted at a barrier:";
         for (std::size_t kind = 1; kind < earlyAborts.size(); ++kind) {
             const auto count = earlyAborts[kind].exchange(0, std::memory_order_relaxed);
             if (count != 0) text += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
@@ -516,6 +516,10 @@ void DrawPipeline::NoteEarly(EarlyEvent event) {
     earlyEvents[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
 }
 
+std::uint64_t DrawPipeline::EarlyEventCount(EarlyEvent event) {
+    return earlyEvents[static_cast<std::size_t>(event)].load(std::memory_order_relaxed);
+}
+
 void DrawPipeline::NoteCommitterPart(CommitterPart part, std::chrono::steady_clock::time_point since) {
     const auto index = static_cast<std::size_t>(part);
     committerPartNs[index].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count()), std::memory_order_relaxed);
@@ -708,10 +712,51 @@ bool DrawPipeline::SealsBreakProofs() {
     return breaks;
 }
 
+bool DrawPipeline::OfferAcrossLabels() {
+    static const bool across = std::getenv("APS5_OFFER_ACROSS_LABELS") != nullptr && GuestMemory::ScopedLabelBreaks();
+    return across;
+}
+
+namespace {
+
+constexpr std::size_t MaxOfferRun = 4;
+constexpr std::size_t MaxOfferLabels = 2;
+thread_local std::vector<DrawPipeline::Range> runWrites;
+
+}
+
+bool DrawPipeline::RunMember(const Item& item, std::size_t& labels) {
+    if (item.kind == ItemKind::Seal && !SealsBreakProofs()) return true;
+    if (!OfferAcrossLabels() || item.kind != ItemKind::Label || item.writes.empty() || labels >= MaxOfferLabels) return false;
+    ++labels;
+    return true;
+}
+
+const std::vector<DrawPipeline::Range>* DrawPipeline::OfferWrites(const std::deque<Item>& items, std::size_t next) {
+    if (next < 2 || !OfferAcrossLabels()) return &items.front().writes;
+    runWrites.assign(items.front().writes.begin(), items.front().writes.end());
+    for (std::size_t k = 1; k < next; ++k) runWrites.insert(runWrites.end(), items[k].writes.begin(), items[k].writes.end());
+    return &runWrites;
+}
+
+bool DrawPipeline::OnlyRunBehind(const std::deque<Item>& items) {
+    std::size_t labels = 0;
+    for (std::size_t k = 1; k < items.size(); ++k) {
+        if (k > MaxOfferRun || !RunMember(items[k], labels)) return false;
+    }
+    return true;
+}
+
 std::size_t DrawPipeline::EarlyIndex(const std::deque<Item>& items) {
     if (items.size() >= 2 && items[1].draw) return items[1].early ? 1 : 0;
-    if (items.size() >= 3 && items[1].kind == ItemKind::Seal && !SealsBreakProofs() && items[2].draw && items[2].early) return 2;
-    return 0;
+    if (!OfferAcrossLabels()) {
+        if (items.size() >= 3 && items[1].kind == ItemKind::Seal && !SealsBreakProofs() && items[2].draw && items[2].early) return 2;
+        return 0;
+    }
+    std::size_t k = 1;
+    std::size_t labels = 0;
+    while (k < items.size() && k <= MaxOfferRun && RunMember(items[k], labels)) ++k;
+    return k >= 2 && k < items.size() && items[k].draw && items[k].early ? k : 0;
 }
 
 void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentTemplate) {
@@ -720,8 +765,9 @@ void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentT
         std::lock_guard lock(pipeline.mutex);
         if (const auto next = EarlyIndex(pipeline.items); next != 0) {
             pendingEarly.hook = pipeline.items[next].early;
+            pendingEarly.writes = OfferWrites(pipeline.items, next);
             NoteEarly(EarlyEvent::LateOffered);
-            if (next == 2) NoteEarly(EarlyEvent::AcrossSeal);
+            if (next >= 2) NoteEarly(pendingEarly.writes == &runWrites && runWrites.size() > pipeline.items.front().writes.size() ? EarlyEvent::AcrossLabels : EarlyEvent::AcrossSeal);
         }
     }
     if (!pendingEarly.hook) {
@@ -1035,11 +1081,11 @@ void DrawPipeline::run() {
         if (ResolveSplit() == 0 || !isDraw || commit == nullptr || EarlyStopped()) return;
         if (const auto next = EarlyIndex(items); next != 0) {
             pendingEarly.hook = items[next].early;
-            pendingEarly.writes = &items.front().writes;
-            if (next == 2) NoteEarly(EarlyEvent::AcrossSeal);
+            pendingEarly.writes = OfferWrites(items, next);
+            if (next >= 2) NoteEarly(pendingEarly.writes == &runWrites && runWrites.size() > items.front().writes.size() ? EarlyEvent::AcrossLabels : EarlyEvent::AcrossSeal);
             return;
         }
-        const bool sealLast = items.size() == 2 && items[1].kind == ItemKind::Seal && !SealsBreakProofs();
+        const bool sealLast = OfferAcrossLabels() ? items.size() >= 2 && OnlyRunBehind(items) : items.size() == 2 && items[1].kind == ItemKind::Seal && !SealsBreakProofs();
         NoteEarly(items.size() < 2 || sealLast ? EarlyEvent::NextMissing : !items[1].draw ? EarlyEvent::NextNotDraw : EarlyEvent::NextNoHook);
         if (items.size() >= 2 && !items[1].draw && !sealLast) nextNotDrawKinds[static_cast<std::size_t>(items[1].kind)].fetch_add(1, std::memory_order_relaxed);
         if (items.size() >= 3 && items[1].kind == ItemKind::Seal) afterSealKinds[items[2].draw ? static_cast<std::size_t>(ItemKind::Count) : static_cast<std::size_t>(items[2].kind)].fetch_add(1, std::memory_order_relaxed);
@@ -1091,7 +1137,8 @@ void DrawPipeline::run() {
                 } clearEarly;
                 (*commit)();
             }
-            if (!isDraw && (kind != static_cast<std::size_t>(ItemKind::Seal) || SealsBreakProofs())) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Item);
+            const bool scopedLabel = kind == static_cast<std::size_t>(ItemKind::Label) && GuestMemory::TakeScopedLabelCommit();
+            if (!isDraw && !scopedLabel && (kind != static_cast<std::size_t>(ItemKind::Seal) || SealsBreakProofs())) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Item);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

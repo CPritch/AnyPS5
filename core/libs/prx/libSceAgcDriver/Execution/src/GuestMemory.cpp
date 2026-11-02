@@ -1977,8 +1977,73 @@ void BreakProofs(ProofBreak cause) {
     proofBreaks[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+
+struct ScopedBreak {
+    std::uint64_t serial = 0;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+};
+
+std::array<ScopedBreak, 64> scopedBreaks{};
+thread_local std::pair<std::uint64_t, std::uint64_t> scopedLabelRange{0, 0};
+thread_local bool scopedLabelCommit = false;
+
+struct BreakProofsAfter {
+    ProofBreak cause;
+    std::uint64_t scopedBegin = 0;
+    std::uint64_t scopedEnd = 0;
+
+    explicit BreakProofsAfter(ProofBreak reason) : cause(reason) {}
+    BreakProofsAfter(const BreakProofsAfter&) = delete;
+    BreakProofsAfter& operator=(const BreakProofsAfter&) = delete;
+
+    ~BreakProofsAfter() {
+        if (scopedEnd > scopedBegin) BreakProofsScoped(scopedBegin, scopedEnd);
+        else BreakProofs(cause);
+    }
+};
+
+}
+
+bool ScopedLabelBreaks() {
+    static const bool scoped = std::getenv("APS5_SCOPED_LABEL_BREAKS") != nullptr;
+    return scoped;
+}
+
+void BreakProofsScoped(std::uint64_t begin, std::uint64_t end) {
+    NoteResolveEffect(ResolveEffect::ProofBreak);
+    const auto serial = proofSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    scopedBreaks[serial % scopedBreaks.size()] = {serial, begin, end};
+    proofBreaks[static_cast<std::size_t>(ProofBreak::ScopedLabel)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> ScopedSince(std::uint64_t recorded) {
+    const auto current = proofSerial.load(std::memory_order_acquire);
+    if (current < recorded || current - recorded > scopedBreaks.size()) return std::nullopt;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (auto serial = recorded + 1; serial <= current; ++serial) {
+        const auto& entry = scopedBreaks[serial % scopedBreaks.size()];
+        if (entry.serial != serial) return std::nullopt;
+        ranges.emplace_back(entry.begin, entry.end);
+    }
+    return ranges;
+}
+
+void SetScopedLabelRange(std::uint64_t begin, std::uint64_t end) {
+    scopedLabelRange = {begin, end};
+}
+
+void NoteScopedLabelCommit(bool scoped) {
+    scopedLabelCommit = scoped;
+}
+
+bool TakeScopedLabelCommit() {
+    return std::exchange(scopedLabelCommit, false);
+}
+
 std::string TakeProofBreakText() {
-    constexpr std::array<const char*, static_cast<std::size_t>(ProofBreak::Count)> names{"other", "non-draw items", "other threads' lock holds", "driver stores", "driver writes", "write-backs"};
+    constexpr std::array<const char*, static_cast<std::size_t>(ProofBreak::Count)> names{"other", "non-draw items", "other threads' lock holds", "driver stores", "driver writes", "write-backs", "import retirements", "scoped labels"};
     std::string text;
     for (std::size_t i = 0; i < names.size(); ++i) {
         char item[64];
@@ -2236,7 +2301,7 @@ static GuestAllocations::Lease::Ranges pinStoreRanges(std::uint64_t address, std
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
     const auto pinned = pinStoreRanges(address, bytes);
-    BreakProofs(ProofBreak::Store);
+    const BreakProofsAfter breakAfter(ProofBreak::Store);
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -2287,7 +2352,11 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
-    BreakProofs(ProofBreak::Write);
+    BreakProofsAfter breakAfter(ProofBreak::Write);
+    if (bytes != 0 && scopedLabelRange.second > scopedLabelRange.first && address >= scopedLabelRange.first && address + bytes <= scopedLabelRange.second) {
+        breakAfter.scopedBegin = address;
+        breakAfter.scopedEnd = address + bytes;
+    }
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     tracker.initialize();

@@ -471,10 +471,21 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     recordDeferredLabels(localDevice.get(), queue);
     bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;
+    GuestMemory::NoteScopedLabelCommit(false);
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
         if (localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
+        const bool scopable = GuestMemory::ScopedLabelBreaks() && queue == 0 && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer && (GuestMemory::AliasSerial() == 0 || !GuestMemory::Aliased(address, bytes.size())) && !Graphics::AnyShadowedOverlaps(address, bytes.size());
+        if (scopable) GuestMemory::SetScopedLabelRange(address, address + bytes.size());
+        struct ClearScope {
+            bool on;
+            ~ClearScope() {
+                if (on) GuestMemory::SetScopedLabelRange(0, 0);
+            }
+        } clearScope{scopable};
         reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
+        if (scopable) GuestMemory::SetScopedLabelRange(0, 0);
+        GuestMemory::NoteScopedLabelCommit(scopable && reason == 0);
         if (reason != 0 && reason != 5 && reason != 6) {
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(address, bytes, 4);
