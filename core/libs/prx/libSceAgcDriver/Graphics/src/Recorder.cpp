@@ -1201,6 +1201,39 @@ std::atomic<std::int64_t> watchedCompletedAt{0};
 
 }
 
+struct SecondaryCommandPool {
+    VkDevice device = VK_NULL_HANDLE;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    PFN_vkDestroyCommandPool destroy = nullptr;
+    std::mutex mutex;
+    std::vector<VkCommandBuffer> free;
+
+    ~SecondaryCommandPool() {
+        if (pool != VK_NULL_HANDLE) destroy(device, pool, nullptr);
+    }
+};
+
+namespace {
+
+struct SecondaryCommandLease {
+    std::shared_ptr<SecondaryCommandPool> pool;
+    VkCommandBuffer buffer;
+
+    SecondaryCommandLease(std::shared_ptr<SecondaryCommandPool> owner, VkCommandBuffer leased) : pool(std::move(owner)), buffer(leased) {}
+    SecondaryCommandLease(const SecondaryCommandLease&) = delete;
+    SecondaryCommandLease& operator=(const SecondaryCommandLease&) = delete;
+
+    ~SecondaryCommandLease() {
+        std::lock_guard lock(pool->mutex);
+        pool->free.push_back(buffer);
+    }
+};
+
+std::atomic<std::uint64_t> secondaryPassesOpened{0};
+std::atomic<std::uint64_t> secondaryPassesEnded{0};
+
+}
+
 struct Recorder::ProgressWatcher {
     std::mutex mutex;
     std::condition_variable wake;
@@ -1299,6 +1332,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
 }
 
 Recorder::~Recorder() {
+    if (std::getenv("APS5_PARALLEL_RECORD_REPORT") != nullptr) std::fprintf(stderr, "[secondary] %llu render passes opened, %llu ended in secondary command buffers\n", static_cast<unsigned long long>(secondaryPassesOpened.load(std::memory_order_relaxed)), static_cast<unsigned long long>(secondaryPassesEnded.load(std::memory_order_relaxed)));
     std::lock_guard gpu(GuestMemory::GpuMutex());
     try {
         Sync();
@@ -1730,8 +1764,16 @@ void Recorder::SealPassWriteOnly() {
 void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     auto& pass = open->renderPass;
-    if (open->segmentActive) endSegment(*open);
-    EndRenderPass(context, open->commands);
+    if (pass.secondary) {
+        Check(function(endCommandBuffer, "vkEndCommandBuffer")(pass.chunk), "vkEndCommandBuffer secondary pass");
+        context.Function<PFN_vkCmdExecuteCommands>("vkCmdExecuteCommands")(open->commands, 1, &pass.chunk);
+        EndRenderPass(context, open->commands);
+        if (open->segmentActive) endSegment(*open);
+        secondaryPassesEnded.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        if (open->segmentActive) endSegment(*open);
+        EndRenderPass(context, open->commands);
+    }
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
     if (barrier) {
@@ -2219,6 +2261,7 @@ void reportBarriers() {
     }
     AgcDriver::ProfilePrint_nid_no_patch("\n");
     AgcDriver::ProfilePrint_nid_no_patch("[samples] occlusion dumps (cumulative): %llu queued (%llu inside an open pass), %llu recorded at once; %llu segments closed; %llu folds of queued dumps\n", static_cast<unsigned long long>(dumpsQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsQueuedInPass.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsAtOnce.load(std::memory_order_relaxed)), static_cast<unsigned long long>(segmentsClosed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpFolds.load(std::memory_order_relaxed)));
+    AgcDriver::ProfilePrint_nid_no_patch("[secondary] render passes recorded in secondary command buffers (cumulative): %llu opened, %llu ended\n", static_cast<unsigned long long>(secondaryPassesOpened.load(std::memory_order_relaxed)), static_cast<unsigned long long>(secondaryPassesEnded.load(std::memory_order_relaxed)));
 }
 
 }
@@ -2689,7 +2732,84 @@ void Recorder::PrepareSampleSlot() {
 
 void Recorder::EndPassSamples() {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
-    if (open != nullptr && open->segmentActive) endSegment(*open);
+    if (open != nullptr && open->renderPass.open && open->renderPass.secondary) endOpenRenderPass(PassBreak::Samples);
+    else if (open != nullptr && open->segmentActive) endSegment(*open);
+}
+
+int Recorder::ParallelRecord() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_PARALLEL_RECORD");
+        return text == nullptr ? 0 : std::atoi(text);
+    }();
+    return mode;
+}
+
+bool Recorder::SecondaryPasses() const {
+    static const bool drawTimestamps = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
+    return ParallelRecord() >= 1 && !drawTimestamps && context.graphicsPipelineLibrary && (context.inheritedQueries || !countingSamples);
+}
+
+bool Recorder::SecondaryPassOpen() const {
+    return open != nullptr && open->renderPass.open && open->renderPass.secondary;
+}
+
+void Recorder::BeginPassSamples() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    if (open != nullptr && countingSamples && segmentMode() && !open->segmentActive) beginSegment(*open);
+}
+
+VkCommandBuffer Recorder::OpenSecondaryPass(const PassInheritance& inheritance) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    Require(open != nullptr && !open->renderPass.secondary, "a secondary pass opens without a batch, or inside another");
+    if (secondaryPool == nullptr) {
+        auto pool = std::make_shared<SecondaryCommandPool>();
+        pool->device = context.device;
+        pool->destroy = context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool");
+        VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        info.queueFamilyIndex = context.queueFamily;
+        Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &info, nullptr, &pool->pool), "vkCreateCommandPool secondary passes");
+        secondaryPool = std::move(pool);
+    }
+    VkCommandBuffer chunk = VK_NULL_HANDLE;
+    {
+        std::lock_guard lock(secondaryPool->mutex);
+        if (!secondaryPool->free.empty()) {
+            chunk = secondaryPool->free.back();
+            secondaryPool->free.pop_back();
+        }
+    }
+    if (chunk == VK_NULL_HANDLE) {
+        VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocate.commandPool = secondaryPool->pool;
+        allocate.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+        allocate.commandBufferCount = 1;
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, &chunk), "vkAllocateCommandBuffers secondary pass");
+    }
+    open->kept.push_back(std::make_shared<SecondaryCommandLease>(secondaryPool, chunk));
+    VkCommandBufferInheritanceRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO_KHR};
+    rendering.colorAttachmentCount = static_cast<std::uint32_t>(inheritance.colors.size());
+    rendering.pColorAttachmentFormats = inheritance.colors.empty() ? nullptr : inheritance.colors.data();
+    rendering.depthAttachmentFormat = inheritance.depth;
+    rendering.stencilAttachmentFormat = inheritance.stencil;
+    rendering.rasterizationSamples = inheritance.samples;
+    VkCommandBufferInheritanceInfo inherited{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, &rendering};
+    inherited.occlusionQueryEnable = context.inheritedQueries ? VK_TRUE : VK_FALSE;
+    inherited.queryFlags = context.inheritedQueries && context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u;
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+    begin.pInheritanceInfo = &inherited;
+    Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(chunk, &begin), "vkBeginCommandBuffer secondary pass");
+    BumpGraphicsStateEpoch();
+    open->renderPass.secondary = true;
+    open->renderPass.chunk = chunk;
+    secondaryPassesOpened.fetch_add(1, std::memory_order_relaxed);
+    return chunk;
+}
+
+VkCommandBuffer Recorder::PassCommands() {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    return SecondaryPassOpen() ? open->renderPass.chunk : open->commands;
 }
 
 void Recorder::RecordUncounted(const std::function<void(VkCommandBuffer)>& record) {
@@ -2904,7 +3024,8 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
     if (segmentMode()) {
         ensureOpen();
         if (address != 0 && LabelRunsPerBatch() && pendingSamples.size() < SegmentFoldCapacity && open->queuedDumps < DumpFoldCapacity) {
-            if (open->segmentActive) endSegment(*open);
+            if (open->renderPass.open && open->renderPass.secondary) endOpenRenderPass(PassBreak::Samples);
+            else if (open->segmentActive) endSegment(*open);
             if (open->renderPass.open) dumpsQueuedInPass.fetch_add(1, std::memory_order_relaxed);
             if (open->run.queued.empty()) storeRuns.fetch_add(1, std::memory_order_relaxed);
             auto& queued = open->run.queued.emplace_back();

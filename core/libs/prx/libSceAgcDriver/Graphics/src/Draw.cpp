@@ -2686,14 +2686,16 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     part(2);
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    const bool leavesSecondary = recorder->SecondaryPassOpen() && !record.pipeline->SecondaryCapable(state);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || PixelFunctionLdsSubgroup(shaders) != 0u || leavesSecondary, fenced, passAccess);
     part(3);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     outcome.passBreak = start.reason;
-    const auto commands = start.commands;
+    auto commands = start.commands;
+    const bool secondaryPass = continued ? recorder->SecondaryPassOpen() : recorder->SecondaryPasses() && record.pipeline->SecondaryCapable(state);
     if (!continued) {
         recorder->PrepareSampleSlot();
         PerformanceTrace::Count(PerformanceTrace::RenderPassScope);
@@ -2722,6 +2724,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
+        if (secondaryPass) commands = recorder->PassCommands();
         record.pipeline->Continue(commands, state);
     } else {
         for (const auto& proxy : record.proxies) {
@@ -2759,7 +2762,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             for (auto& object : kept) recorder->Keep(std::move(object));
         }
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
-        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
+        if (secondaryPass) {
+            recorder->BeginPassSamples();
+            PassInheritance inheritance;
+            record.pipeline->BeginSecondary(commands, *record.framebuffer, state.renderExtent, state, inheritance);
+            commands = recorder->OpenSecondaryPass(inheritance);
+            record.pipeline->Continue(commands, state);
+        } else {
+            record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
+        }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {

@@ -627,6 +627,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         if (dynamicRendering) {
             depthFormat = state.depth ? HostDepthFormat(context, state.depth->format) : VK_FORMAT_UNDEFINED;
             colorSlots.assign(state.blends.size(), ~0u);
+            colorFormats = renderingColors;
             for (std::uint32_t index = 0; index < state.colors.size(); ++index) {
                 if (state.colors[index].partialWriteMask == 0u) colorSlots.at(state.colors[index].exportIndex) = index;
             }
@@ -910,35 +911,55 @@ void BumpGraphicsStateEpoch() {
     graphicsStateEpoch.fetch_add(1, std::memory_order_relaxed);
 }
 
+bool Pipeline::SecondaryCapable(const State& state) const {
+    return dynamicRendering && !state.mergedCoverage && !state.truncatedCoverage;
+}
+
+void Pipeline::BeginSecondary(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, PassInheritance& inheritance) const {
+    Require(SecondaryCapable(state), "a secondary-recorded pass needs dynamic rendering without mixed-sample coverage");
+    BumpGraphicsStateEpoch();
+    beginRendering(commands, framebuffer, extent, state, VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT_KHR);
+    const bool outputs = !state.rasterizerDiscard;
+    inheritance.colors = outputs ? colorFormats : std::vector<VkFormat>{};
+    inheritance.depth = outputs ? depthFormat : VK_FORMAT_UNDEFINED;
+    inheritance.stencil = outputs && depthFormat != VK_FORMAT_UNDEFINED && HasStencil(depthFormat) ? depthFormat : VK_FORMAT_UNDEFINED;
+    inheritance.samples = static_cast<VkSampleCountFlagBits>(state.samples);
+}
+
+void Pipeline::beginRendering(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, VkRenderingFlags flags) const {
+    const auto views = framebuffer.Views();
+    Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
+    std::vector<VkRenderingAttachmentInfoKHR> colors(colorSlots.size(), VkRenderingAttachmentInfoKHR{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR});
+    for (std::size_t slot = 0; slot < colorSlots.size(); ++slot) {
+        if (colorSlots[slot] == ~0u) continue;
+        colors[slot].imageView = views[colorSlots[slot]];
+        colors[slot].imageLayout = attachmentLayout;
+        colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    VkRenderingAttachmentInfoKHR depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+    if (depthFormat != VK_FORMAT_UNDEFINED) {
+        depth.imageView = views.back();
+        depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+    rendering.renderArea = {{0, 0}, extent};
+    rendering.layerCount = state.renderLayers;
+    const bool outputs = !state.rasterizerDiscard;
+    rendering.colorAttachmentCount = outputs ? static_cast<std::uint32_t>(colors.size()) : 0u;
+    rendering.pColorAttachments = outputs && !colors.empty() ? colors.data() : nullptr;
+    if (outputs && depthFormat != VK_FORMAT_UNDEFINED) rendering.pDepthAttachment = &depth;
+    if (outputs && depthFormat != VK_FORMAT_UNDEFINED && HasStencil(depthFormat)) rendering.pStencilAttachment = &depth;
+    rendering.flags = flags;
+    context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
+}
+
 void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
     BumpGraphicsStateEpoch();
     if (dynamicRendering) {
-        const auto views = framebuffer.Views();
-        Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
-        std::vector<VkRenderingAttachmentInfoKHR> colors(colorSlots.size(), VkRenderingAttachmentInfoKHR{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR});
-        for (std::size_t slot = 0; slot < colorSlots.size(); ++slot) {
-            if (colorSlots[slot] == ~0u) continue;
-            colors[slot].imageView = views[colorSlots[slot]];
-            colors[slot].imageLayout = attachmentLayout;
-            colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        }
-        VkRenderingAttachmentInfoKHR depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
-        if (depthFormat != VK_FORMAT_UNDEFINED) {
-            depth.imageView = views.back();
-            depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        }
-        VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
-        rendering.renderArea = {{0, 0}, extent};
-        rendering.layerCount = state.renderLayers;
-        const bool outputs = !state.rasterizerDiscard;
-        rendering.colorAttachmentCount = outputs ? static_cast<std::uint32_t>(colors.size()) : 0u;
-        rendering.pColorAttachments = outputs && !colors.empty() ? colors.data() : nullptr;
-        if (outputs && depthFormat != VK_FORMAT_UNDEFINED) rendering.pDepthAttachment = &depth;
-        if (outputs && depthFormat != VK_FORMAT_UNDEFINED && HasStencil(depthFormat)) rendering.pStencilAttachment = &depth;
-        context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
+        beginRendering(commands, framebuffer, extent, state, 0);
         Continue(commands, state);
         return;
     }

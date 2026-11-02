@@ -447,6 +447,7 @@ struct VulkanDevice::State {
     bool dualSrcBlend = false;
     bool logicOp = false;
     bool occlusionQueryPrecise = false;
+    bool inheritedQueries = false;
     VkDeviceSize hostImportAlignment = 0;
     bool drawInputsInPlace = true;
     bool dmaBufImport = false;
@@ -1825,6 +1826,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->dualSrcBlend = enabled.dualSrcBlend == VK_TRUE;
     enabled.occlusionQueryPrecise = available.occlusionQueryPrecise;
     state->occlusionQueryPrecise = enabled.occlusionQueryPrecise == VK_TRUE;
+    enabled.inheritedQueries = available.inheritedQueries;
+    state->inheritedQueries = enabled.inheritedQueries == VK_TRUE;
     // Recompiled storage-image access declares no format (the guest descriptor decides it).
     enabled.shaderStorageImageMultisample = available.shaderStorageImageMultisample;
     state->storageImageMultisample = enabled.shaderStorageImageMultisample == VK_TRUE;
@@ -4211,6 +4214,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.provokingVertexModePerPipeline = state->provokingVertexModePerPipeline;
     context.drawIndirectCount = state->drawIndirectCount;
     context.occlusionQueryPrecise = state->occlusionQueryPrecise;
+    context.inheritedQueries = state->inheritedQueries;
     context.emptyBuffer = state->emptyBuffer ? state->emptyBuffer->Handle() : VK_NULL_HANDLE;
     context.exactRobustLoads = state->exactRobustLoads;
     context.copiedWriters = state->copiedWriters.get();

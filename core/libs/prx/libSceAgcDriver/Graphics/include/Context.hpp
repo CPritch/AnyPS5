@@ -236,6 +236,7 @@ struct Context {
     bool multiDrawIndirect = false;
     bool drawIndirectCount = false;
     bool occlusionQueryPrecise = false;
+    bool inheritedQueries = false;
     bool depthBounds = false;
     bool depthBiasClamp = false;
     bool dualSrcBlend = false;
@@ -403,6 +404,13 @@ struct Context {
 inline VkShaderModule CreateShaderModule(const Context& context, const std::uint32_t* code, std::size_t bytes, const char* operation) {
     return CreateShaderModule(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule"), context.device, context.graphicsPipelineLibrary, code, bytes, operation);
 }
+
+struct PassInheritance {
+    std::vector<VkFormat> colors;
+    VkFormat depth = VK_FORMAT_UNDEFINED;
+    VkFormat stencil = VK_FORMAT_UNDEFINED;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+};
 
 inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
     if (context.graphicsPipelineLibrary) context.Resolved(&DeviceFunctions::cmdEndRendering, "vkCmdEndRenderingKHR")(commands);

@@ -52,6 +52,8 @@ public:
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<void>> owners, VkExtent2D extent, std::uint32_t layers = 1);
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
     void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const;
+    bool SecondaryCapable(const State& state) const;
+    void BeginSecondary(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, PassInheritance& inheritance) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
     // construction: the attachment formats alone decide).
     void Continue(VkCommandBuffer commands, const State& state) const;
@@ -69,6 +71,7 @@ public:
     void Abandon() noexcept;
 
 private:
+    void beginRendering(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, VkRenderingFlags flags) const;
     struct CachedFramebuffer {
         std::vector<VkImageView> views;
         std::vector<std::weak_ptr<void>> owners;
@@ -99,6 +102,7 @@ private:
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::vector<std::uint32_t> colorSlots;
+    std::vector<VkFormat> colorFormats;
     bool sampleLocationsEnabled = false;
     VkExtent2D sampleLocationGrid{1, 1};
     SampleOrder sampleOrder{};
