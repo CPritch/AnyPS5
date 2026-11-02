@@ -871,6 +871,7 @@ struct VulkanDevice::State {
             Graphics::DeviceLostOwner() = nullptr;
         }
         if (compileOnly && device != VK_NULL_HANDLE) {
+            Graphics::DeviceProcEpoch().fetch_add(1, std::memory_order_acq_rel);
             reinterpret_cast<PFN_vkDestroyDevice>(deviceProc(device, "vkDestroyDevice"))(device, nullptr);
             device = VK_NULL_HANDLE;
         }
@@ -960,6 +961,7 @@ struct VulkanDevice::State {
             if (markerMemory) reinterpret_cast<PFN_vkFreeMemory>(deviceProc(device, "vkFreeMemory"))(device, markerMemory, nullptr);
             if (swapchain) reinterpret_cast<PFN_vkDestroySwapchainKHR>(deviceProc(device, "vkDestroySwapchainKHR"))(device, swapchain, nullptr);
             const auto destroyPool = reinterpret_cast<PFN_vkDestroyCommandPool>(deviceProc(device, "vkDestroyCommandPool"));
+            Graphics::DeviceProcEpoch().fetch_add(1, std::memory_order_acq_rel);
             const auto destroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(deviceProc(device, "vkDestroyDevice"));
             if (pool != VK_NULL_HANDLE) {
                 destroyPool(device, pool, nullptr);

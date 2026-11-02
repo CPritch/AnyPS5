@@ -2321,8 +2321,21 @@ struct Kept {
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+    struct BatchKeeps {
+        const Recorder* recorder = nullptr;
+        std::uint64_t serial = 0;
+        const ShaderResources* resources = nullptr;
+        const ShaderResources* checked = nullptr;
+    };
+    static const bool dedupe = std::getenv("APS5_NO_KEEP_DEDUPE") == nullptr;
+    thread_local BatchKeeps batchKeeps;
+    const auto batch = dedupe ? recorder.OpenSerial() : 0;
+    if (dedupe && (batchKeeps.recorder != &recorder || batchKeeps.serial != batch)) batchKeeps = {&recorder, batch, nullptr, nullptr};
     auto kept = std::make_shared<Kept>();
-    kept->resources = resources;
+    if (!dedupe || batchKeeps.resources != resources.get()) {
+        kept->resources = resources;
+        batchKeeps.resources = resources.get();
+    }
     kept->pipeline = std::move(pipeline);
     kept->framebuffer = std::move(framebuffer);
     kept->indices = std::move(inputs.indices);
@@ -2357,7 +2370,10 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         writers->push_back(resources);
         GuestMemory::BreakProofs();
     } else if (completion) {
-        if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
+        if (resources->Reusable()) {
+            if (!dedupe || batchKeeps.checked != resources.get()) recorder.OnComplete([resources] { resources->CheckFaults(); });
+            batchKeeps.checked = resources.get();
+        }
         else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
     }
     std::vector<bool> storeNow(residents.size(), false);

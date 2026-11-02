@@ -150,6 +150,31 @@ inline std::uint64_t& DeviceProcLookups() {
     return count;
 }
 
+inline std::atomic<std::uint64_t>& DeviceProcEpoch() {
+    static std::atomic<std::uint64_t> epoch{1};
+    return epoch;
+}
+
+inline PFN_vkVoidFunction CachedDeviceProc(PFN_vkGetDeviceProcAddr deviceProc, VkDevice device, const char* name) {
+    struct Entry {
+        std::uint64_t epoch = 0;
+        PFN_vkGetDeviceProcAddr proc = nullptr;
+        VkDevice device = VK_NULL_HANDLE;
+        const char* name = nullptr;
+        PFN_vkVoidFunction function = nullptr;
+    };
+    static const bool cached = std::getenv("APS5_NO_PROC_CACHE") == nullptr;
+    thread_local std::array<Entry, 256> entries{};
+    auto& entry = entries[(reinterpret_cast<std::uintptr_t>(name) >> 3u) % entries.size()];
+    const auto epoch = DeviceProcEpoch().load(std::memory_order_acquire);
+    if (cached && entry.name == name && entry.device == device && entry.proc == deviceProc && entry.epoch == epoch) return entry.function;
+    ++DeviceProcLookups();
+    const auto function = deviceProc(device, name);
+    if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
+    if (cached) entry = {epoch, deviceProc, device, name, function};
+    return function;
+}
+
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
 struct Context {
@@ -287,10 +312,7 @@ struct Context {
     template<typename TFunction>
     TFunction Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
-        ++DeviceProcLookups();
-        const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
-        if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
-        return function;
+        return reinterpret_cast<TFunction>(CachedDeviceProc(deviceProc, device, name));
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.

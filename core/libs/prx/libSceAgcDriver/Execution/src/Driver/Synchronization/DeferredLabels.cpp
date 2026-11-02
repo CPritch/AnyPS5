@@ -91,7 +91,12 @@ bool Driver::idleSubmitDue(std::uint64_t work) {
         const char* text = std::getenv("APS5_IDLE_SUBMIT");
         return text ? std::strtoull(text, nullptr, 10) : 0ull;
     }();
-    return minimum != 0 && work >= minimum && Graphics::Recorder::GpuCaughtUp();
+    static const std::chrono::microseconds idle = [] {
+        const char* text = std::getenv("APS5_IDLE_SUBMIT_US");
+        return std::chrono::microseconds(text ? std::atoi(text) : 0);
+    }();
+    if (minimum == 0 || work < minimum) return false;
+    return idle.count() == 0 ? Graphics::Recorder::GpuCaughtUp() : Graphics::Recorder::GpuIdleFor() >= idle;
 }
 
 std::uint64_t Driver::batchCap() {

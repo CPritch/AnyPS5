@@ -1197,6 +1197,7 @@ namespace {
 
 std::atomic<std::uint64_t> watchedSubmitted{0};
 std::atomic<std::uint64_t> watchedCompleted{0};
+std::atomic<std::int64_t> watchedCompletedAt{0};
 
 }
 
@@ -1231,6 +1232,7 @@ struct Recorder::ProgressWatcher {
                 std::uint64_t value = target;
                 if (counterValue(device, timeline, &value) != VK_SUCCESS) value = target;
                 seen = std::max(target, value);
+                watchedCompletedAt.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
                 watchedCompleted.store(seen, std::memory_order_release);
                 KernelWakeSleepers_nid_no_patch();
             }
@@ -1403,6 +1405,11 @@ std::uint64_t Recorder::RecordedWorkSinceSubmit() {
 bool Recorder::GpuCaughtUp() {
     const auto submitted = watchedSubmitted.load(std::memory_order_acquire);
     return submitted != 0 && watchedCompleted.load(std::memory_order_acquire) >= submitted;
+}
+
+std::chrono::steady_clock::duration Recorder::GpuIdleFor() {
+    if (!GpuCaughtUp()) return std::chrono::steady_clock::duration::zero();
+    return std::chrono::steady_clock::now().time_since_epoch() - std::chrono::steady_clock::duration(watchedCompletedAt.load(std::memory_order_relaxed));
 }
 
 void Recorder::CountRecordedWork() {
