@@ -35,6 +35,7 @@
 #include <map>
 #ifdef __linux__
 #include <dlfcn.h>
+#include <link.h>
 #include <execinfo.h>
 #endif
 #include <mutex>
@@ -154,18 +155,46 @@ using HotStack = std::array<std::uint64_t, 8>;
 HotStack CaptureHotStack() {
     HotStack stack{};
 #ifdef __linux__
+    struct DriverModule {
+        std::uintptr_t base = 0;
+        std::uintptr_t self = 0;
+        std::array<std::pair<std::uintptr_t, std::uintptr_t>, 16> segments{};
+        std::size_t count = 0;
+        bool Contains(std::uintptr_t address) const {
+            return std::any_of(segments.begin(), segments.begin() + count, [&](const auto& segment) { return address >= segment.first && address < segment.second; });
+        }
+    };
+    static const DriverModule driver = [] {
+        DriverModule module{};
+        Dl_info self{};
+        if (dladdr(reinterpret_cast<const void*>(&CaptureHotStack), &self) == 0) return module;
+        module.base = reinterpret_cast<std::uintptr_t>(self.dli_fbase);
+        module.self = reinterpret_cast<std::uintptr_t>(&CaptureHotStack);
+        dl_iterate_phdr([](dl_phdr_info* info, std::size_t, void* data) {
+            auto& found = *static_cast<DriverModule*>(data);
+            DriverModule candidate{};
+            candidate.base = found.base;
+            candidate.self = found.self;
+            for (std::size_t i = 0; i < info->dlpi_phnum && candidate.count < candidate.segments.size(); ++i) {
+                const auto& header = info->dlpi_phdr[i];
+                if (header.p_type != PT_LOAD) continue;
+                const auto begin = static_cast<std::uintptr_t>(info->dlpi_addr + header.p_vaddr);
+                candidate.segments[candidate.count++] = {begin, begin + header.p_memsz};
+            }
+            if (!candidate.Contains(found.self)) return 0;
+            found = candidate;
+            return 1;
+        }, &module);
+        return module;
+    }();
+    if (driver.count == 0) return stack;
     void* raw[32];
     const int captured = backtrace(raw, static_cast<int>(std::size(raw)));
-    static const void* const driverBase = [] {
-        Dl_info self{};
-        return dladdr(reinterpret_cast<const void*>(&CaptureHotStack), &self) != 0 ? self.dli_fbase : nullptr;
-    }();
-    if (driverBase == nullptr) return stack;
     std::size_t used = 0;
     for (int i = 1; i < captured && used < stack.size(); ++i) {
-        Dl_info info{};
-        if (dladdr(raw[i], &info) == 0 || info.dli_fbase != driverBase) continue;
-        stack[used++] = reinterpret_cast<std::uintptr_t>(raw[i]) - reinterpret_cast<std::uintptr_t>(driverBase);
+        const auto address = reinterpret_cast<std::uintptr_t>(raw[i]);
+        if (!driver.Contains(address)) continue;
+        stack[used++] = address - driver.base;
     }
 #endif
     return stack;
