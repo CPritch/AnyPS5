@@ -266,6 +266,9 @@ public:
     void BeginPassSamples();
     VkCommandBuffer OpenSecondaryPass(const PassInheritance& inheritance);
     VkCommandBuffer PassCommands();
+    const Context& RecordingContext() const { return context; }
+    static void EnqueueSecondaryRecording(std::function<void()> job);
+    static bool OnSecondaryRecorder();
     void RecordUncounted(const std::function<void(VkCommandBuffer)>& record);
     struct SampleDumpStatistics {
         std::uint64_t queued;
