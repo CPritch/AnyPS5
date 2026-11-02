@@ -1597,9 +1597,29 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
             } checkTimer{timed, checking};
             using E = DrawPipeline::EarlyEvent;
             auto stale = E::Used;
-            if (early->device != localDevice.get()) stale = E::StaleDevice;
-            else if (early->proof != GuestMemory::ProofSerial()) stale = E::StaleProof;
-            else if (early->pending != Graphics::StorageTexture::PendingSerial()) stale = E::StalePending;
+            const auto rangesOverlap = [](const auto& first, const auto& second) {
+                return std::any_of(first.begin(), first.end(), [&](const auto& a) { return std::any_of(second.begin(), second.end(), [&](const auto& b) { return a.first < b.second && b.first < a.second; }); });
+            };
+            bool acrossLabels = false;
+            if (early->device != localDevice.get()) {
+                stale = E::StaleDevice;
+            } else if (early->proof != GuestMemory::ProofSerial()) {
+                stale = E::StaleProof;
+                if (DrawPipeline::OfferAcrossLabels()) {
+                    if (const auto scoped = GuestMemory::ScopedSince(early->proof)) {
+                        const auto itemReads = QueuedDrawReadRanges(drawParameters, stages);
+                        const auto* targetWrites = DrawPipeline::CommittingWrites();
+                        if (rangesOverlap(*scoped, itemReads) || rangesOverlap(*scoped, early->reads) || (targetWrites != nullptr && rangesOverlap(*scoped, *targetWrites)) || Graphics::DrawPacketReadsOverlap(*early->packet, *scoped)) stale = E::StaleScoped;
+                        else if (!Graphics::RevalidateDrawPacketTemplate(*early->packet, stages)) stale = E::StaleScopedTemplate;
+                        else {
+                            stale = E::Used;
+                            acrossLabels = true;
+                        }
+                    }
+                }
+            }
+            if (stale != E::Used) {
+            } else if (early->pending != Graphics::StorageTexture::PendingSerial()) stale = E::StalePending;
             else if (early->redo != Graphics::DrawRedoSerial()) stale = E::StaleRedo;
             else if (Graphics::DrawPacketTemplateGone(*early->packet)) stale = E::StaleTemplate;
             else {
@@ -1615,6 +1635,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
                 else if (change == VulkanDevice::EarlyChange::Noted && (overrun || overlaps(noted, early->reads) || Graphics::DrawPacketReadsOverlap(*early->packet, noted))) stale = E::StaleNoted;
             }
             DrawPipeline::NoteEarly(stale);
+            if (stale == E::Used && acrossLabels) DrawPipeline::NoteEarly(E::UsedAcrossLabels);
             if (stale == E::Used) {
                 packet = std::move(early->packet);
                 fromEarly = true;

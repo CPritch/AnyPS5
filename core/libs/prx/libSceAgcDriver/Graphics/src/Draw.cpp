@@ -4517,6 +4517,11 @@ const void* DrawPacketTemplate(const DrawPacket& packet) {
     return packet.prepared.resolved.resources.get();
 }
 
+bool RevalidateDrawPacketTemplate(const DrawPacket& packet, std::span<const CompiledShader> shaders) {
+    const auto& resources = packet.prepared.resolved.resources;
+    return resources == nullptr || resources->Revalidate(shaders);
+}
+
 bool DrawPacketTemplateGone(const DrawPacket& packet) {
     const auto& resolved = packet.prepared.resolved;
     return resolved.cacheable && resolved.resources != nullptr && !packet.prepared.deferredInsert.has_value() && !resolved.resources->InResourceCache();
