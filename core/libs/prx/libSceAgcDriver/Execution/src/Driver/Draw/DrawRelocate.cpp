@@ -403,6 +403,7 @@ void Driver::learnPendingRelocation(const DrawRelocationPending& pending) {
 }
 
 void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches) {
+    static const bool indexedMoves = std::getenv("APS5_NO_RELOCATE_INDEX") == nullptr;
     auto& counters = drawRelocationCounters;
     ++counters.lookups;
     const auto found = drawAliases.find(alias);
@@ -441,10 +442,14 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
         }
         std::uint64_t movedWords = 0;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> movedValues;
+        std::array<std::uint64_t, 64> movedDelta{};
+        std::array<std::uint32_t, 64> movedTo{};
         for (const auto& move : moves) {
             if (move.program != i || move.index >= 64) continue;
             movedWords |= std::uint64_t {1} << move.index;
             movedValues.emplace_back(move.index, move.to);
+            movedDelta[move.index] = AlignedWord(move.to) - AlignedWord(move.from);
+            movedTo[move.index] = move.to;
         }
         for (const auto& variant : donor->stages[i]) {
             if (variant == nullptr || variant->compiled == nullptr) continue;
@@ -467,17 +472,33 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->flatBinding = variant->flatBinding;
             copy->pushOffset = variant->pushOffset;
             copy->vertexInfo = variant->vertexInfo;
-            for (const auto& move : moves) {
-                if (move.program != i) continue;
-                const auto delta = AlignedWord(move.to) - AlignedWord(move.from);
+            if (indexedMoves) {
                 for (std::size_t run = 0; run < copy->runs.size() && run < copy->runBases.size(); ++run) {
-                    if (copy->runBases[run] != static_cast<std::int8_t>(move.index)) continue;
-                    copy->runs[run].first += delta;
-                    copy->runs[run].second += delta;
+                    const auto base = copy->runBases[run];
+                    if (base < 0 || base >= 64 || (movedWords >> base & 1u) == 0) continue;
+                    copy->runs[run].first += movedDelta[static_cast<std::size_t>(base)];
+                    copy->runs[run].second += movedDelta[static_cast<std::size_t>(base)];
                 }
                 const auto& forwarded = variant->compiled->shaderDataUserWords;
+                const auto patchesBefore = copy->shaderDataPatches.size();
                 for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
-                    if (forwarded[slot] == move.index) copy->shaderDataPatches.emplace_back(slot, move.to);
+                    const auto word = forwarded[slot];
+                    if (word < 64 && (movedWords >> word & 1u) != 0) copy->shaderDataPatches.emplace_back(slot, movedTo[word]);
+                }
+                std::stable_sort(copy->shaderDataPatches.begin() + static_cast<std::ptrdiff_t>(patchesBefore), copy->shaderDataPatches.end(), [&](const auto& left, const auto& right) { return forwarded[left.first] < forwarded[right.first]; });
+            } else {
+                for (const auto& move : moves) {
+                    if (move.program != i) continue;
+                    const auto delta = AlignedWord(move.to) - AlignedWord(move.from);
+                    for (std::size_t run = 0; run < copy->runs.size() && run < copy->runBases.size(); ++run) {
+                        if (copy->runBases[run] != static_cast<std::int8_t>(move.index)) continue;
+                        copy->runs[run].first += delta;
+                        copy->runs[run].second += delta;
+                    }
+                    const auto& forwarded = variant->compiled->shaderDataUserWords;
+                    for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
+                        if (forwarded[slot] == move.index) copy->shaderDataPatches.emplace_back(slot, move.to);
+                    }
                 }
             }
             if ((!variant->movableWords.empty() || !variant->rebases.empty()) && !RebaseMovedFields(*copy, *variant, movedWords, movedValues)) {

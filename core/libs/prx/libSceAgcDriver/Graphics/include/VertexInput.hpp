@@ -330,13 +330,23 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
     plan.offsets.assign(fetches.size(), 0);
     std::vector<std::size_t> order(fetches.size());
     for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    const auto before = [&](std::size_t a, std::size_t b) {
         const auto& x = fetches[a];
         const auto& y = fetches[b];
         if (x.stride != y.stride) return x.stride < y.stride;
         if (x.fetchIndex != y.fetchIndex) return x.fetchIndex < y.fetchIndex;
         return x.begin < y.begin;
-    });
+    };
+    if (order.size() <= 32) {
+        for (std::size_t k = 1; k < order.size(); ++k) {
+            const auto key = order[k];
+            auto at = k;
+            for (; at > 0 && before(key, order[at - 1]); --at) order[at] = order[at - 1];
+            order[at] = key;
+        }
+    } else {
+        std::stable_sort(order.begin(), order.end(), before);
+    }
     std::size_t lead = fetches.size();
     for (const auto i : order) {
         const auto& fetch = fetches[i];
