@@ -5159,6 +5159,50 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
     return RecipeOutcome::Recorded;
 }
 
+namespace {
+
+void logPresync(std::span<const Graphics::PresyncSurface> surfaces, bool texels, std::chrono::steady_clock::duration waited) {
+    static const bool logged = std::getenv("APS5_LONG_WAIT_LOG") != nullptr;
+    if (!logged) return;
+    struct Entry {
+        std::uint64_t count = 0;
+        double ms = 0;
+    };
+    static std::mutex mutex;
+    static std::map<std::tuple<std::uint64_t, std::uint64_t, bool>, Entry> bySurface;
+    static std::uint64_t waits = 0, texelWaits = 0;
+    static double waitedMs = 0;
+    static auto lastReport = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(waited).count();
+    std::lock_guard lock(mutex);
+    ++waits;
+    if (texels) ++texelWaits;
+    waitedMs += ms;
+    for (const auto& surface : surfaces) {
+        auto& entry = bySurface[{surface.address, surface.bytes, surface.dccKeys}];
+        ++entry.count;
+        entry.ms += ms;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::vector<std::pair<std::tuple<std::uint64_t, std::uint64_t, bool>, Entry>> top(bySurface.begin(), bySurface.end());
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+    std::string text;
+    for (std::size_t i = 0; i < top.size() && i < 6; ++i) {
+        const auto& [key, entry] = top[i];
+        char item[112];
+        std::snprintf(item, sizeof(item), " 0x%llx+0x%llx%s x%llu (%.1f ms)", static_cast<unsigned long long>(std::get<0>(key)), static_cast<unsigned long long>(std::get<1>(key)), std::get<2>(key) ? " keys" : "", static_cast<unsigned long long>(entry.count), entry.ms);
+        text += item;
+    }
+    std::fprintf(stderr, "[presync-log] %lld (10 s) %llu pre-syncs waited %.1f ms, %llu over texels; surfaces:%s\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count()), static_cast<unsigned long long>(waits), waitedMs, static_cast<unsigned long long>(texelWaits), text.c_str());
+    waits = texelWaits = 0;
+    waitedMs = 0;
+    bySurface.clear();
+}
+
+}
+
 std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> surfaces) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& counters = Presyncs();
@@ -5194,6 +5238,7 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
     if (serial != 0) {
         const auto waitStart = std::chrono::steady_clock::now();
         WaitRecorded(serial);
+        logPresync(surfaces, texelsPending, std::chrono::steady_clock::now() - waitStart);
         counters.presyncs.fetch_add(1, std::memory_order_relaxed);
         if (!texelsPending) counters.keyWaits.fetch_add(1, std::memory_order_relaxed);
         counters.waitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitStart).count()), std::memory_order_relaxed);
