@@ -4923,6 +4923,18 @@ bool ShaderResources::DescribedRangesOverlap(std::span<const std::pair<std::uint
     });
 }
 
+std::string ShaderResources::DescribeRangeOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {
+    for (const auto& range : describedRanges) {
+        for (const auto& other : ranges) {
+            if (range.address >= other.second || other.first >= range.address + range.bytes) continue;
+            char text[224];
+            std::snprintf(text, sizeof(text), "write 0x%llx+0x%llx inside %s 0x%llx+0x%llx (%ux%u format %u tile %d, dcc 0x%llx)", static_cast<unsigned long long>(other.first), static_cast<unsigned long long>(other.second - other.first), range.kind, static_cast<unsigned long long>(range.address), static_cast<unsigned long long>(range.bytes), range.width, range.height, range.format, range.tileMode, static_cast<unsigned long long>(range.dccAddress));
+            return text;
+        }
+    }
+    return {};
+}
+
 void ShaderResources::PrecollectSurfaces(GuestMemory::PrecollectedWrites& into) const {
     for (const auto& range : describedRanges) GuestMemory::Precollect(into, range.address, static_cast<std::size_t>(range.bytes));
 }

@@ -1485,7 +1485,12 @@ bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, 
         if (reason != R::Accepted && !proofOnly) return DrawPipeline::NoteEarly(E::KeptPredictor), false;
         if (proofOnly && result != nullptr && result->found != nullptr && result->found.get() == currentTemplate) return DrawPipeline::NoteEarly(E::KeptCurrentTemplate), false;
     }
-    if (result != nullptr && result->found != nullptr && (result->found->DescribedRangesOverlap(writes) || result->found->DescribedRangesOverlap(depth))) return DrawPipeline::NoteEarly(E::KeptDescribed), false;
+    if (result != nullptr && result->found != nullptr && (result->found->DescribedRangesOverlap(writes) || result->found->DescribedRangesOverlap(depth))) {
+        static const bool reported = std::getenv("APS5_COMMIT_STATS") != nullptr;
+        static std::atomic<int> reports{0};
+        if (reported && writes.size() > 0 && reports.fetch_add(1, std::memory_order_relaxed) % 997 == 0 && reports.load(std::memory_order_relaxed) < 997 * 24) std::fprintf(stderr, "[early-described] kept: %s; %zu write ranges offered\n", result->found->DescribeRangeOverlap(writes).c_str(), writes.size());
+        return DrawPipeline::NoteEarly(E::KeptDescribed), false;
+    }
     const auto split = DrawPipeline::ResolveSplit();
     if (split >= 2 && !localDevice->ResolverInputsClear()) {
         DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::DeclinedWriters);
