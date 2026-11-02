@@ -42,7 +42,7 @@ struct WaitOutcomes {
 };
 
 struct EpochBumps {
-    std::uint64_t submissions = 0, waits = 0, drains = 0, reaps = 0, packets = 0;
+    std::uint64_t submissions = 0, waits = 0, drains = 0, reaps = 0, packets = 0, ownSkips = 0, prereadSkips = 0;
 };
 
 void PollSleep();

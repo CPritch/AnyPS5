@@ -2633,9 +2633,14 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
 }
 
 DccKeys StorageTexture::ProvedKeys() const {
+    static const bool fillProof = std::getenv("APS5_DCC_FILL_KEY_PROOF") != nullptr;
     std::optional<DccKeys> keys;
-    if (descriptor.dccAddress != 0 && uploadedKeys == DccKeys::Uncompressed) keys = WaitForKeyWriters(descriptor, guestBytes);
-    if (keys.has_value()) keyProof = {};
+    std::uint64_t collected = 0;
+    if (descriptor.dccAddress != 0 && uploadedKeys == DccKeys::Uncompressed) {
+        if (fillProof && guestBytes >= 256 && GuestMemory::GpuMutex().HeldByThisThread()) collected = GuestMemory::CollectWrites(descriptor.dccAddress, static_cast<std::size_t>(guestBytes / 256));
+        keys = WaitForKeyWriters(descriptor, guestBytes);
+    }
+    if (keys.has_value()) keyProof = collected != 0 && *keys == DccKeys::Uncompressed ? DccKeyProof{*keys, collected} : DccKeyProof{};
     else keys = ProvedClearKeys(descriptor, guestBytes, keyProof);
     if (IsDccClear(filledKeys) && *keys != filledKeys && !anyLayerPending()) filledKeys = DccKeys::Uncompressed;
     return *keys;

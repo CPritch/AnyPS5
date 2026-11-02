@@ -312,7 +312,13 @@ void Driver::execute(const Submission& submission) {
                 continue;
             }
             if (!DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes) && Pm4::WaitSatisfiedUnchecked(packet)) {
-                bumpEpoch(&EpochBumps::waits);
+                std::uint32_t writer = submission.queue;
+                if (waitEpochSkip() >= 1 && storedSince(packet, awaited, awaitedBytes, submission.received, &writer) && writer == submission.queue) {
+                    ++epochBumps().ownSkips;
+                } else if (!waitOrdersNothingNew(packet, awaited, awaitedBytes)) {
+                    learnWaitLabel(awaited, awaitedBytes);
+                    bumpEpoch(&EpochBumps::waits);
+                }
                 ++waitOutcomes().atEntry;
                 gateOpened() = true;
                 recent.Record(cursor);

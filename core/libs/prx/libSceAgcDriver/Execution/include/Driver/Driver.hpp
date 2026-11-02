@@ -362,6 +362,9 @@ private:
     static Graphics::Recorder::LateStatistics& lateCountsSeen();
     static EpochBumps& epochBumps();
     static void bumpEpoch(std::uint64_t EpochBumps::*counter);
+    static int waitEpochSkip();
+    static bool waitOrdersNothingNew(std::span<const std::uint32_t> packet, std::uint64_t awaited, std::size_t bytes);
+    static void learnWaitLabel(std::uint64_t awaited, std::size_t bytes);
     static std::chrono::steady_clock::time_point& lastEpochBump();
     static std::deque<const std::uint32_t*>& releasedTails();
     void noteReleasedTails(const Submission& submission);

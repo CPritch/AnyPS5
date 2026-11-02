@@ -142,7 +142,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
-        if (storedByOwnLabel()) epochPoint.bump = false;
+        if (storedByOwnLabel() || waitOrdersNothingNew(packet, awaited, awaitedBytes)) epochPoint.bump = false;
+        else learnWaitLabel(awaited, awaitedBytes);
         return;
     }
     if (heldAtSubmit) return;
