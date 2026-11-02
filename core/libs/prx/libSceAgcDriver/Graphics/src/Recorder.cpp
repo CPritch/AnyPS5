@@ -1193,6 +1193,13 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 
 }
 
+namespace {
+
+std::atomic<std::uint64_t> watchedSubmitted{0};
+std::atomic<std::uint64_t> watchedCompleted{0};
+
+}
+
 struct Recorder::ProgressWatcher {
     std::mutex mutex;
     std::condition_variable wake;
@@ -1224,12 +1231,14 @@ struct Recorder::ProgressWatcher {
                 std::uint64_t value = target;
                 if (counterValue(device, timeline, &value) != VK_SUCCESS) value = target;
                 seen = std::max(target, value);
+                watchedCompleted.store(seen, std::memory_order_release);
                 KernelWakeSleepers_nid_no_patch();
             }
         });
     }
 
     void Submitted(std::uint64_t serial) {
+        watchedSubmitted.store(serial, std::memory_order_release);
         {
             std::lock_guard lock(mutex);
             submitted = serial;
@@ -1389,6 +1398,11 @@ std::uint64_t Recorder::PendingWriteBackCompletions() {
 
 std::uint64_t Recorder::RecordedWorkSinceSubmit() {
     return workSinceSubmit.load(std::memory_order_relaxed);
+}
+
+bool Recorder::GpuCaughtUp() {
+    const auto submitted = watchedSubmitted.load(std::memory_order_acquire);
+    return submitted != 0 && watchedCompleted.load(std::memory_order_acquire) >= submitted;
 }
 
 void Recorder::CountRecordedWork() {

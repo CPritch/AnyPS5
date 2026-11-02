@@ -86,6 +86,14 @@ bool Driver::reapEachPacket() {
     return each;
 }
 
+bool Driver::idleSubmitDue(std::uint64_t work) {
+    static const std::uint64_t minimum = [] {
+        const char* text = std::getenv("APS5_IDLE_SUBMIT");
+        return text ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return minimum != 0 && work >= minimum && Graphics::Recorder::GpuCaughtUp();
+}
+
 std::uint64_t Driver::batchCap() {
     static const std::uint64_t value = [] {
         const char* text = std::getenv("APS5_BATCH_CAP");

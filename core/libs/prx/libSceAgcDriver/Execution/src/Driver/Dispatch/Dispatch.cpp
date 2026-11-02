@@ -58,6 +58,13 @@ constexpr std::array<const char*, static_cast<std::size_t>(DispatchUnbounded::Co
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DispatchUnbounded::Count)> unboundedItems{};
 std::atomic<std::uint64_t> noRecipeItemCommits{0};
 std::atomic<std::uint64_t> itemRebuilds{0};
+enum class DrainSite : std::size_t { Resolving, Ahead, ItemsOff, Indirect, Labels, CopyKernel, Reads, NotPipelined, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> DrainSiteNames{"resolving", "resolved ahead", "items off", "indirect", "deferred labels", "copy kernel", "reads or a miss", "not pipelined"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainSite::Count)> drainSites{};
+
+void NoteDrainSite(DrainSite site) {
+    drainSites[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+}
 
 void NoteItemFallback(ItemFallback reason) {
     itemFallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -82,6 +89,13 @@ void ReportDispatchItems(bool profile) {
         drained += item;
     }
     std::fprintf(stderr, "[dispatch-item] %llu commit items, %llu of them cache misses and %llu without a recipe (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(missItemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(noRecipeItemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
+    std::string sites;
+    for (std::size_t i = 0; i < DrainSiteNames.size(); ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), "%s %s %llu", i == 0 ? "" : ",", DrainSiteNames[i], static_cast<unsigned long long>(drainSites[i].load(std::memory_order_relaxed)));
+        sites += item;
+    }
+    std::fprintf(stderr, "[dispatch-drains] queue 0 dispatches that drained the draw pipeline while it was busy, by why they were not commit items (cumulative):%s\n", sites.c_str());
 }
 
 bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
@@ -184,7 +198,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
-        if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (DrawPipeline::Active() && !pipelineCandidate) {
+            if (DrawPipeline::Queue0().Busy()) NoteDrainSite(resolving ? DrainSite::Resolving : fromAhead ? DrainSite::Ahead : !DispatchItemsEnabled() ? DrainSite::ItemsOff : indirectArguments != 0 ? DrainSite::Indirect : !deferredLabels().labels.empty() ? DrainSite::Labels : DrainSite::CopyKernel);
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
@@ -366,7 +383,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 readsClear = true;
             }
         }
-        if (!readsClear && !missItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!readsClear && !missItem && DrawPipeline::Queue0().Busy()) {
+            NoteDrainSite(DrainSite::Reads);
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
     }
     if (fromAhead) {
         compiledResult = std::move(ahead.compiledResult);
@@ -401,7 +421,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             NoteItemFallback(ItemFallback::NoRecipe);
             noRecipeItem = cached && keepVariant != nullptr && NoRecipeItemsEnabled();
         }
-        if (!pipelined && !noRecipeItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!pipelined && !noRecipeItem && DrawPipeline::Queue0().Busy()) {
+            NoteDrainSite(DrainSite::NotPipelined);
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
     }
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");

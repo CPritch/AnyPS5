@@ -375,6 +375,7 @@ private:
     static bool completionsPending();
     static bool reapEachPacket();
     static std::uint64_t batchCap();
+    static bool idleSubmitDue(std::uint64_t work);
     void recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue);
     bool recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queue);
     void recordQueuedLabelsBeforeRead(std::uint32_t queue);

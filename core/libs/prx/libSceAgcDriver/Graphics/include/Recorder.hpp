@@ -453,6 +453,7 @@ public:
     // dispatches and draws recorded since the last submit (the driver counts them: CountRecordedWork),
     // so a batch is submitted after a bounded amount of work (APS5_BATCH_CAP).
     static std::uint64_t RecordedWorkSinceSubmit();
+    static bool GpuCaughtUp();
     static void CountRecordedWork();
 
     // The recorder of the current device, for code that only has guest addresses (the flush hook)

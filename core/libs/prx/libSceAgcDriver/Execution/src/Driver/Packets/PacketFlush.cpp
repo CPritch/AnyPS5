@@ -44,7 +44,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         if (now - *pending >= labelFlushDeadline()) submit = pendingDue = true;
     }
     const auto work = Graphics::Recorder::RecordedWorkSinceSubmit();
-    const bool capped = !submit && !record && batchCap() != 0 && work >= batchCap();
+    const bool capped = !submit && !record && ((batchCap() != 0 && work >= batchCap()) || idleSubmitDue(work));
     const bool reap = !submit && !record && !capped && reapDue && (reapEachPacket() || now - lastReapTry >= ReapInterval);
     if (!submit && !record && !capped && !reap) {
         if (recordAtLock) ++recordTriesSkipped;
@@ -87,7 +87,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     if (localDevice == nullptr) return;
     if (submit || capped) {
 
-        if (!Graphics::Recorder::PendingLabelSince().has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
+        if (!Graphics::Recorder::PendingLabelSince().has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap()) && !idleSubmitDue(Graphics::Recorder::RecordedWorkSinceSubmit())) return;
         localDevice->SubmitRecorded(queue == 0);
         if (capped) ++capFlushes;
         else if (!labelPacket && packetFlush) ++packetFlushes;
