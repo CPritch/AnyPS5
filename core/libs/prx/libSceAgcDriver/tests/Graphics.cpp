@@ -6519,7 +6519,7 @@ void dispatchMoveTests() {
         refuses(both, 30, Refusal::Limit, "moved buffers past the byte budget together were served");
 
         auto written = relocated;
-        written.bindings[0].bufferWritten[1] = true;
+        written.bindings[0].bufferWritten.Mutable()[1] = true;
         refuses(written, 0, Refusal::Written, "a moved buffer the dispatch writes was served");
         refuses(moveTo(1, guestMovedSecond.data(), 20000), 0, Refusal::Written, "a moved buffer over the storage buffer range that no registered allocation holds was served");
         refuses(relocated, 16, Refusal::Limit, "a moved buffer over the byte budget was served");
@@ -11945,7 +11945,7 @@ void ResourceContentKeyTests(bool benchmark) {
         for (std::size_t i = 0; i < images.guestDescriptor.size(); ++i) images.guestDescriptor[i] = static_cast<std::uint32_t>(i * 1664525u + 1013904223u);
         for (auto* bits : {&images.imageWritten, &images.samplerDepthCompare, &images.imageDepthCompare, &images.imageAtomic, &images.samplerUnnormalized, &images.samplerIntegerBorder, &images.imageUnnormalized, &images.imageUnnormalizedBaseLevel, &images.bufferWritten}) {
             bits->resize(count);
-            for (std::size_t i = 0; i < bits->size(); ++i) (*bits)[i] = i % 3u == 0;
+            for (std::size_t i = 0; i < bits->size(); ++i) bits->Mutable()[i] = i % 3u == 0;
         }
         images.imageSamplers.resize(count, 7u);
         images.imageShapes.resize(count, ShaderRecompiler::DescriptorImageShape::Image2D);
@@ -11972,21 +11972,21 @@ void ResourceContentKeyTests(bool benchmark) {
             program.bindings[2].guestDescriptor[0] += 0x1000u;
             Require((ShaderResources::ContentKey(shader, dataWords, movable) != original) == !movable, "content key changed its movable-buffer policy");
             program.bindings[2].guestDescriptor[0] -= 0x1000u;
-            program.bindings[2].bufferWritten[0] = true;
+            program.bindings[2].bufferWritten.Mutable()[0] = true;
             Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the written-buffer mask");
-            program.bindings[2].bufferWritten[0] = false;
+            program.bindings[2].bufferWritten.Mutable()[0] = false;
             if (count != 0) {
                 for (auto* bits : {&program.bindings[0].imageWritten, &program.bindings[0].samplerDepthCompare, &program.bindings[0].imageDepthCompare, &program.bindings[0].imageAtomic, &program.bindings[0].samplerUnnormalized, &program.bindings[0].samplerIntegerBorder, &program.bindings[0].imageUnnormalized, &program.bindings[0].imageUnnormalizedBaseLevel}) {
-                    bits->back().flip();
+                    bits->Mutable().back().flip();
                     Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last packed flag");
-                    bits->back().flip();
+                    bits->Mutable().back().flip();
                 }
-                ++program.bindings[0].imageSamplers.back();
+                ++program.bindings[0].imageSamplers.Mutable().back();
                 Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last sampler association");
-                --program.bindings[0].imageSamplers.back();
-                program.bindings[0].imageShapes.back() = ShaderRecompiler::DescriptorImageShape::Image3D;
+                --program.bindings[0].imageSamplers.Mutable().back();
+                program.bindings[0].imageShapes.Mutable().back() = ShaderRecompiler::DescriptorImageShape::Image3D;
                 Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last image shape");
-                program.bindings[0].imageShapes.back() = ShaderRecompiler::DescriptorImageShape::Image2D;
+                program.bindings[0].imageShapes.Mutable().back() = ShaderRecompiler::DescriptorImageShape::Image2D;
             }
             Require(original.capacity() == original.size(), "content key reserved a different word count than it serialized");
             std::uint64_t hash = 14695981039346656037ull;

@@ -86,9 +86,9 @@ namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(CompiledShaderArtifact) == 288, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 216, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 552, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 656, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(ShaderInvocation) == 192, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(RecompileResult) == 528, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(DescriptorBinding) == 320, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
@@ -467,7 +467,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.imageDepthCompare);
     writer.Flags(binding.imageAtomic);
     writer.Flags(binding.imageAtomic64);
-    writer.List(binding.imageShapes, [](Writer& out, DescriptorImageShape shape) { out.Value(shape); });
+    writer.List(binding.imageShapes.Get(), [](Writer& out, DescriptorImageShape shape) { out.Value(shape); });
     writer.Flags(binding.bufferAtomic);
     writer.Flags(binding.bufferWritten);
     writer.Flags(binding.samplerUnnormalized);
@@ -475,9 +475,9 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.imageUnnormalizedBaseLevel);
     writer.Flags(binding.samplerIntegerBorder);
     writer.Flags(binding.samplerCoordinatesIgnored);
-    writer.Values(std::span<const std::uint32_t>(binding.imageSamplers));
+    writer.Values(std::span<const std::uint32_t>(binding.imageSamplers.Get()));
     writer.Flags(binding.bufferRead);
-    writer.Values(std::span<const std::uint32_t>(binding.bufferExtent));
+    writer.Values(std::span<const std::uint32_t>(binding.bufferExtent.Get()));
 }
 
 void decodeBinding(Reader& reader, DescriptorBinding& binding) {
@@ -491,22 +491,22 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     const bool hasShape = reader.Get<bool>();
     const auto shape = reader.Get<DescriptorImageShape>();
     binding.imageShape = hasShape ? std::optional(shape) : std::nullopt;
-    reader.Flags(binding.samplerDepthCompare);
-    reader.Flags(binding.imageWritten);
-    reader.Flags(binding.imageDepthCompare);
-    reader.Flags(binding.imageAtomic);
-    reader.Flags(binding.imageAtomic64);
-    reader.List(binding.imageShapes, 4, [](Reader& in, DescriptorImageShape& shape) { in.Value(shape); });
-    reader.Flags(binding.bufferAtomic);
-    reader.Flags(binding.bufferWritten);
-    reader.Flags(binding.samplerUnnormalized);
-    reader.Flags(binding.imageUnnormalized);
-    reader.Flags(binding.imageUnnormalizedBaseLevel);
-    reader.Flags(binding.samplerIntegerBorder);
-    reader.Flags(binding.samplerCoordinatesIgnored);
-    reader.Values(binding.imageSamplers);
-    reader.Flags(binding.bufferRead);
-    reader.Values(binding.bufferExtent);
+    reader.Flags(binding.samplerDepthCompare.Mutable());
+    reader.Flags(binding.imageWritten.Mutable());
+    reader.Flags(binding.imageDepthCompare.Mutable());
+    reader.Flags(binding.imageAtomic.Mutable());
+    reader.Flags(binding.imageAtomic64.Mutable());
+    reader.List(binding.imageShapes.Mutable(), 4, [](Reader& in, DescriptorImageShape& shape) { in.Value(shape); });
+    reader.Flags(binding.bufferAtomic.Mutable());
+    reader.Flags(binding.bufferWritten.Mutable());
+    reader.Flags(binding.samplerUnnormalized.Mutable());
+    reader.Flags(binding.imageUnnormalized.Mutable());
+    reader.Flags(binding.imageUnnormalizedBaseLevel.Mutable());
+    reader.Flags(binding.samplerIntegerBorder.Mutable());
+    reader.Flags(binding.samplerCoordinatesIgnored.Mutable());
+    reader.Values(binding.imageSamplers.Mutable());
+    reader.Flags(binding.bufferRead.Mutable());
+    reader.Values(binding.bufferExtent.Mutable());
 }
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
@@ -660,17 +660,17 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
     });
     writer.Value(invocation.userDataRegisterReads);
     writer.Value(invocation.poisonedSrtReads);
-    writer.List(invocation.imageTablePoison, [](Writer& out, const ImageTableEntryPoison& poison) {
+    writer.List(invocation.imageTablePoison.Get(), [](Writer& out, const ImageTableEntryPoison& poison) {
         for (const auto word : poison.words) out.Value(word);
         out.Value(poison.dwordCount);
         out.Value(poison.resource);
         out.Value(poison.reason);
     });
-    writer.List(invocation.imageTableRanges, [](Writer& out, const std::pair<std::uint64_t, std::uint64_t>& range) {
+    writer.List(invocation.imageTableRanges.Get(), [](Writer& out, const std::pair<std::uint64_t, std::uint64_t>& range) {
         out.Value(range.first);
         out.Value(range.second);
     });
-    writer.List(invocation.imageTableReadRanges, [](Writer& out, const auto& ranges) {
+    writer.List(invocation.imageTableReadRanges.Get(), [](Writer& out, const auto& ranges) {
         out.List(ranges, [](Writer& rangeWriter, const auto& range) {
             rangeWriter.Value(range.first);
             rangeWriter.Value(range.second);
@@ -701,17 +701,17 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     });
     reader.Value(invocation.userDataRegisterReads);
     reader.Value(invocation.poisonedSrtReads);
-    reader.List(invocation.imageTablePoison, 44, [](Reader& in, ImageTableEntryPoison& poison) {
+    reader.List(invocation.imageTablePoison.Mutable(), 44, [](Reader& in, ImageTableEntryPoison& poison) {
         for (auto& word : poison.words) in.Value(word);
         in.Value(poison.dwordCount);
         in.Value(poison.resource);
         in.Value(poison.reason);
     });
-    reader.List(invocation.imageTableRanges, 16, [](Reader& in, std::pair<std::uint64_t, std::uint64_t>& range) {
+    reader.List(invocation.imageTableRanges.Mutable(), 16, [](Reader& in, std::pair<std::uint64_t, std::uint64_t>& range) {
         in.Value(range.first);
         in.Value(range.second);
     });
-    reader.List(invocation.imageTableReadRanges, 8, [](Reader& in, auto& ranges) {
+    reader.List(invocation.imageTableReadRanges.Mutable(), 8, [](Reader& in, auto& ranges) {
         in.List(ranges, 16, [](Reader& rangeReader, auto& range) {
             rangeReader.Value(range.first);
             rangeReader.Value(range.second);
