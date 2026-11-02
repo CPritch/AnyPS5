@@ -1232,6 +1232,31 @@ struct SecondaryCommandLease {
 std::atomic<std::uint64_t> secondaryPassesOpened{0};
 std::atomic<std::uint64_t> secondaryPassesEnded{0};
 std::atomic<std::uint64_t> secondaryJobsRecorded{0};
+std::atomic<std::uint64_t> secondaryIntervalPasses{0};
+std::atomic<std::uint64_t> secondaryIntervalShort{0};
+std::atomic<std::uint64_t> secondaryIntervalJobs{0};
+std::atomic<std::uint64_t> secondaryIntervalWaits{0};
+std::atomic<std::uint64_t> secondaryIntervalWaitNs{0};
+
+bool secondaryCounted() {
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    return counted;
+}
+
+void reportSecondary() {
+    if (!secondaryCounted() || Recorder::ParallelRecord() == 0) return;
+    static auto lastReport = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    const auto passes = take(secondaryIntervalPasses);
+    const auto shortPasses = take(secondaryIntervalShort);
+    const auto jobs = take(secondaryIntervalJobs);
+    const auto waits = take(secondaryIntervalWaits);
+    const auto waitedMs = static_cast<double>(take(secondaryIntervalWaitNs)) / 1e6;
+    AgcDriver::ProfilePrint_nid_no_patch("[secondary] (10 s) %llu passes recorded in secondary command buffers, %llu kept inline by APS5_PARALLEL_RECORD_MIN_DRAWS; %llu draws recorded on the recorder thread; pass ends waited for it %llu times, %.1f ms\n", passes, shortPasses, jobs, waits, waitedMs);
+}
 
 
 }
@@ -1772,7 +1797,16 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
         passDraws[pass.key] = pass.draws;
     }
     if (pass.secondary) {
-        if (ParallelRecord() >= 2) WaitSecondaryRecording();
+        if (ParallelRecord() >= 2) {
+            if (secondaryCounted()) {
+                const auto waitStart = std::chrono::steady_clock::now();
+                WaitSecondaryRecording();
+                secondaryIntervalWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()), std::memory_order_relaxed);
+                secondaryIntervalWaits.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                WaitSecondaryRecording();
+            }
+        }
         Check(function(endCommandBuffer, "vkEndCommandBuffer")(pass.chunk), "vkEndCommandBuffer secondary pass");
         context.Function<PFN_vkCmdExecuteCommands>("vkCmdExecuteCommands")(open->commands, 1, &pass.chunk);
         EndRenderPass(context, open->commands);
@@ -2765,7 +2799,9 @@ bool Recorder::SecondaryPassFor(std::uint64_t key) const {
     if (!SecondaryPasses()) return false;
     if (minimum <= 1) return true;
     const auto found = passDraws.find(key);
-    return found != passDraws.end() && found->second >= minimum;
+    const bool longEnough = found != passDraws.end() && found->second >= minimum;
+    if (!longEnough) secondaryIntervalShort.fetch_add(1, std::memory_order_relaxed);
+    return longEnough;
 }
 
 bool Recorder::SecondaryPassOpen() const {
@@ -2824,11 +2860,13 @@ VkCommandBuffer Recorder::OpenSecondaryPass(const PassInheritance& inheritance) 
     open->renderPass.chunk = chunk;
     open->renderPass.open = true;
     secondaryPassesOpened.fetch_add(1, std::memory_order_relaxed);
+    secondaryIntervalPasses.fetch_add(1, std::memory_order_relaxed);
     return chunk;
 }
 
 void Recorder::CountSecondaryJob() {
     secondaryJobsRecorded.fetch_add(1, std::memory_order_relaxed);
+    secondaryIntervalJobs.fetch_add(1, std::memory_order_relaxed);
 }
 
 VkCommandBuffer Recorder::PassCommands() {
@@ -4385,6 +4423,7 @@ void Recorder::Submit() {
     }
     EndGpuTiming(open->batchTiming);
     if (!GpuTimingEnabled()) reportBarriers();
+    reportSecondary();
     if (FlipReadCheck()) {
         // A CPU write into a noted read after this collect (and so possibly before the GPU read
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
