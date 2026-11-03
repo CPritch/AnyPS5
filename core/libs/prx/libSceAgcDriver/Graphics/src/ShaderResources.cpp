@@ -4074,19 +4074,22 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     lastProofReuse = ProofReuse::Off;
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
-        provedEpoch = 0;
+        provedEpoch.store(0, std::memory_order_relaxed);
         return false;
     }
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
-        if (epoch == 0 || provedEpoch == 0) lastProofReuse = ProofReuse::NeverProved;
-        else if (provedEpoch != epoch) lastProofReuse = ProofReuse::Epoch;
-        else if (provedProof != proof) lastProofReuse = ProofReuse::Proof;
-        else if (provedPending != pending) lastProofReuse = ProofReuse::Pending;
+        const auto epochProved = provedEpoch.load(std::memory_order_relaxed);
+        const auto proofProved = provedProof.load(std::memory_order_relaxed);
+        const auto pendingProved = provedPending.load(std::memory_order_relaxed);
+        if (epoch == 0 || epochProved == 0) lastProofReuse = ProofReuse::NeverProved;
+        else if (epochProved != epoch) lastProofReuse = ProofReuse::Epoch;
+        else if (proofProved != proof) lastProofReuse = ProofReuse::Proof;
+        else if (pendingProved != pending) lastProofReuse = ProofReuse::Pending;
         else lastProofReuse = ProofReuse::Reused;
-        if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
+        if (epoch != 0 && epochProved == epoch && proofProved == proof && pendingProved == pending) {
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;
             if (verify && ++reuses % 64u == 0u) {
@@ -4103,11 +4106,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const bool ok = revalidateFull(shaders, report);
         noteEpochProof(false, false, false);
         if (ok) {
-            provedEpoch = epoch;
-            provedProof = proof;
-            provedPending = pending;
+            provedEpoch.store(epoch, std::memory_order_relaxed);
+            provedProof.store(proof, std::memory_order_relaxed);
+            provedPending.store(pending, std::memory_order_relaxed);
         } else {
-            provedEpoch = 0;
+            provedEpoch.store(0, std::memory_order_relaxed);
         }
         return ok;
     }
@@ -5353,7 +5356,7 @@ void ShaderResources::PrecollectSurfaces() const {
 
 bool ShaderResources::EpochProofCurrent() const {
     const auto epoch = GuestMemory::CollectEpoch();
-    return epoch != 0 && provedEpoch == epoch && provedProof == GuestMemory::ProofSerial() && provedPending == StorageTexture::PendingSerial();
+    return epoch != 0 && provedEpoch.load(std::memory_order_relaxed) == epoch && provedProof.load(std::memory_order_relaxed) == GuestMemory::ProofSerial() && provedPending.load(std::memory_order_relaxed) == StorageTexture::PendingSerial();
 }
 
 bool ShaderResources::DescribedRangesOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {

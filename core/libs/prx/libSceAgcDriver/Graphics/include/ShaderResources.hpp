@@ -702,9 +702,9 @@ private:
     // no image other than the object's own sources has results pending over its surfaces and
     // regions, so those checks are skipped (see fastRevalidate).
     std::uint64_t pendingSerialSeen = 0;
-    std::uint64_t provedEpoch = 0;
-    std::uint64_t provedProof = 0;
-    std::uint64_t provedPending = 0;
+    std::atomic<std::uint64_t> provedEpoch{0};
+    std::atomic<std::uint64_t> provedProof{0};
+    std::atomic<std::uint64_t> provedPending{0};
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
