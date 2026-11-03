@@ -1915,6 +1915,46 @@ std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
     return *list;
 }
 
+struct DepthFootprint {
+    VkDevice device = VK_NULL_HANDLE;
+    const DepthSurface* surface = nullptr;
+    std::uint64_t depthBegin = 0;
+    std::uint64_t depthEnd = 0;
+    std::uint64_t stencilBegin = 0;
+    std::uint64_t stencilEnd = 0;
+};
+
+std::mutex& footprintsMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<DepthFootprint>& footprints() {
+    static auto* list = new std::vector<DepthFootprint>();
+    return *list;
+}
+
+void addFootprint(const DepthSurface& surface) {
+    const auto stencil = surface.target.stencilAddress;
+    std::lock_guard lock(footprintsMutex());
+    footprints().push_back({surface.context.device, &surface, surface.target.address, surface.target.address + surface.depthPlaneBytes, stencil, stencil == 0 ? 0 : stencil + surface.stencilPlaneBytes});
+}
+
+void removeFootprint(const DepthSurface& surface) {
+    std::lock_guard lock(footprintsMutex());
+    std::erase_if(footprints(), [&](const DepthFootprint& footprint) { return footprint.surface == &surface; });
+}
+
+bool footprintOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
+    const auto end = address + bytes;
+    std::lock_guard lock(footprintsMutex());
+    return std::any_of(footprints().begin(), footprints().end(), [&](const DepthFootprint& footprint) {
+        if (footprint.device != device) return false;
+        if (address < footprint.depthEnd && footprint.depthBegin < end) return true;
+        return footprint.stencilBegin != 0 && address < footprint.stencilEnd && footprint.stencilBegin < end;
+    });
+}
+
 struct PlaneOwner {
     DepthSurface* surface = nullptr;
     std::uint64_t serial = 0;
@@ -2450,6 +2490,7 @@ void storeStaleStencil(DepthSurface& surface) {
 
 void retire(DepthSurface& surface) {
     if (!surface.retired) GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::DepthRetire, __builtin_return_address(0));
+    if (!surface.retired) removeFootprint(surface);
     surface.retired = true;
     for (auto* owners : {&depthOwners(), &stencilOwners()}) {
         std::erase_if(*owners, [&](const auto& entry) { return entry.second.surface == &surface; });
@@ -2701,6 +2742,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         surfaces().push_back(std::make_unique<DepthSurface>(context, target, std::move(sampling)));
         ++mirrorEpoch;
         auto& fresh = *surfaces().back();
+        addFootprint(fresh);
         if (target.samples != 1u && fresh.sampleable && fresh.sampling.refusal.empty()) {
             std::unique_lock guardLock(depthGuardMutex());
             for (const auto& range : fresh.sampling.initial) depthGuards().push_back({context.device, range.address, range.bytes, fresh.active, {{range.address, range.bytes, 0u}}, fresh.hostWritten});
@@ -2710,7 +2752,10 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         }
         surface = surfaces().back().get();
     }
-    if (surface->retired) surfacesSerial.fetch_add(1, std::memory_order_release);
+    if (surface->retired) {
+        surfacesSerial.fetch_add(1, std::memory_order_release);
+        addFootprint(*surface);
+    }
     surface->retired = false;
     const auto owner = depthOwners().find({context.device, target.address});
     const bool inherits = owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;
@@ -3125,6 +3170,10 @@ void ClearDepthSurfaces(VkDevice device) {
     surfacesSerial.fetch_add(1, std::memory_order_release);
     std::erase_if(depthOwners(), [&](const auto& entry) { return entry.first.first == device; });
     std::erase_if(stencilOwners(), [&](const auto& entry) { return entry.first.first == device; });
+    {
+        std::lock_guard footprintLock(footprintsMutex());
+        std::erase_if(footprints(), [&](const DepthFootprint& footprint) { return footprint.device == device; });
+    }
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
     std::erase_if(planeCopies(), [&](const auto& entry) { return std::get<0>(entry.first) == device; });
     std::erase_if(layeredStorages(), [&](const auto& entry) { return std::get<0>(entry.first) == device; });
@@ -3607,10 +3656,15 @@ void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t b
     const auto serial = surfacesSerial.load(std::memory_order_acquire);
     if (memo && std::any_of(clear.begin(), clear.end(), [&](const Retired& entry) { return entry.serial == serial && entry.device == device && entry.address == address && entry.bytes == bytes; })) return;
     const auto retiring = [&](const auto& surface) { return surface->context.device == device && !surface->retired && surface->Overlaps(address, bytes); };
+    static const bool footprinted = std::getenv("APS5_NO_DEPTH_FOOTPRINTS") == nullptr;
+    static const bool verifyFootprints = std::getenv("APS5_VERIFY_DEPTH_FOOTPRINTS") != nullptr;
     bool any = false;
-    {
+    if (footprinted) any = footprintOverlaps(device, address, bytes);
+    if (!footprinted || verifyFootprints) {
         std::lock_guard lock(surfacesMutex());
-        any = std::any_of(surfaces().begin(), surfaces().end(), retiring);
+        const bool scanned = std::any_of(surfaces().begin(), surfaces().end(), retiring);
+        Require(!footprinted || scanned == any, "the depth surface footprints disagree with the surfaces");
+        any = scanned;
     }
     if (any) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
