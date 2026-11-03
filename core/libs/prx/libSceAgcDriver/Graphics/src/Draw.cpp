@@ -2541,7 +2541,9 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         }
         else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
     }
-    std::vector<bool> storeNow(residents.size(), false);
+    thread_local std::vector<std::uint8_t>* storeNowSlot = nullptr;
+    auto& storeNow = ShaderRecompiler::ThreadOwned(storeNowSlot);
+    storeNow.assign(residents.size(), 0);
     for (std::size_t index = 0; index < residents.size(); ++index) {
         if (residents[index] == nullptr) continue;
         if (residents[index]->Descriptor().tileMode == TextureTileMode::kLinear) storeNow[index] = !residents[index]->MarkDrawn(index < slices.size() ? slices[index].first : 0u, index < slices.size() ? slices[index].second : 0u, scissor) || !residents[index]->Cached();
@@ -2950,8 +2952,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
     const auto passImages = resources.StorageImages();
-    std::vector<std::pair<VkImage, bool>> passAttachments;
-    passAttachments.reserve(record.targets.size());
+    thread_local std::vector<std::pair<VkImage, bool>>* passAttachmentsSlot = nullptr;
+    auto& passAttachments = ShaderRecompiler::ThreadOwned(passAttachmentsSlot);
+    passAttachments.clear();
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
