@@ -807,6 +807,7 @@ void releasedTests(Context context) {
     ClearCachedTextures(context.device);
     auto& cache = SharedResourceCache();
     cache.Clear();
+    cache.SetReleasedScanInterval(std::chrono::steady_clock::duration::zero());
     try {
         Block block(context);
         auto pinned = ImageResources(context, block, 0, 1, true);
@@ -832,11 +833,30 @@ void releasedTests(Context context) {
         Require(cache.Find({3}) == nullptr, "a descriptor set holding a released texture entered the resource cache");
         Require(cache.Size() == 0 && displaced.size() == 1 && displaced.front() == live, "the live entry whose texture was released stayed in the resource cache");
         displaced.clear();
+        live.reset();
+        stale.reset();
+        cache.SetReleasedScanInterval(std::chrono::hours(1));
+        auto first = ImageResources(context, block, 3, 1, true);
+        cache.Insert({4}, first, &displaced);
+        Require(cache.Find({4}) == first, "the resource cache rejected a descriptor set whose texture is cached");
+        const std::weak_ptr<ShaderResources> firstSet = first;
+        first.reset();
+        ClearCachedTextures(context.device);
+        auto second = ImageResources(context, block, 4, 1, true);
+        cache.Insert({5}, second, &displaced);
+        Require(cache.Size() == 2 && displaced.empty() && !firstSet.expired(), "a released texture's entry was dropped inside the scan interval");
+        cache.SetReleasedScanInterval(std::chrono::steady_clock::duration::zero());
+        auto third = ImageResources(context, block, 5, 1, true);
+        cache.Insert({6}, third, &displaced);
+        Require(cache.Find({4}) == nullptr && displaced.size() >= 1 && std::find(displaced.begin(), displaced.end(), firstSet.lock()) != displaced.end(), "the deferred scan did not drop the entry holding a released texture");
+        displaced.clear();
     } catch (...) {
         cache.Clear();
+        cache.SetReleasedScanInterval(ResourceCache::DefaultReleasedScanInterval());
         throw;
     }
     cache.Clear();
+    cache.SetReleasedScanInterval(ResourceCache::DefaultReleasedScanInterval());
     ClearCachedTextures(context.device);
     std::puts("resource cache released texture tests passed");
 }

@@ -769,6 +769,8 @@ public:
     std::size_t Size() const;
     std::size_t Capacity() const;
     void SetBase(std::size_t entries, std::size_t shrinkWindow);
+    void SetReleasedScanInterval(std::chrono::steady_clock::duration interval);
+    static std::chrono::steady_clock::duration DefaultReleasedScanInterval();
     std::uint64_t TableElements() const;
     static std::uint64_t TableElementBudget();
     static constexpr std::size_t InitialEntries = 1024;
@@ -824,6 +826,8 @@ private:
     std::size_t baseShrinkWindow = InitialShrinkWindow;
     std::size_t shrinkWindow = InitialShrinkWindow;
     bool shrankLast = false;
+    std::chrono::steady_clock::duration releasedScanInterval = DefaultReleasedScanInterval();
+    std::chrono::steady_clock::time_point releasedScanAt{};
 };
 
 // The process-wide cache the device and the draw path share (keys name the device; a device clears

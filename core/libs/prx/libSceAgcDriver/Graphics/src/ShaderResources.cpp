@@ -244,8 +244,22 @@ std::atomic<bool>& TexturesReleased() {
     return released;
 }
 
-void noteReleased(const std::shared_ptr<Texture>& texture) {
+struct ReleasedScanCounts {
+    std::atomic<std::uint64_t> sinceScan{0}, evictedHeld{0}, notAdmitted{0}, scans{0}, visited{0}, dropped{0}, deferred{0}, scanNs{0};
+};
+
+ReleasedScanCounts& ReleasedScans() {
+    static ReleasedScanCounts counts;
+    return counts;
+}
+
+enum class ReleaseSite { EvictedHeld, NotAdmitted };
+
+void noteReleased(const std::shared_ptr<Texture>& texture, ReleaseSite site) {
     texture->MarkReleased();
+    auto& counts = ReleasedScans();
+    counts.sinceScan.fetch_add(1, std::memory_order_relaxed);
+    (site == ReleaseSite::EvictedHeld ? counts.evictedHeld : counts.notAdmitted).fetch_add(1, std::memory_order_relaxed);
     TexturesReleased().store(true, std::memory_order_release);
 }
 
@@ -280,7 +294,7 @@ void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
             }
         }
     }
-    if (it->texture.use_count() > 1) noteReleased(it->texture);
+    if (it->texture.use_count() > 1) noteReleased(it->texture, ReleaseSite::EvictedHeld);
     cache.index.erase(it->key);
     cache.entries.erase(it);
     ++cache.erasures;
@@ -1196,7 +1210,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
     if (!admitTexture(cache, key, entry.accounted, budget)) {
-        noteReleased(texture);
+        noteReleased(texture, ReleaseSite::NotAdmitted);
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budget);
         reportTextureCounters();
@@ -4567,17 +4581,54 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
 }
 
 void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    constexpr std::uint64_t ReleasedScanBacklog = 64;
+    if (!TexturesReleased().load(std::memory_order_acquire)) return;
+    auto& counts = ReleasedScans();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - releasedScanAt < releasedScanInterval && counts.sinceScan.load(std::memory_order_relaxed) < ReleasedScanBacklog) {
+        counts.deferred.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (!TexturesReleased().exchange(false, std::memory_order_acq_rel)) return;
+    counts.sinceScan.store(0, std::memory_order_relaxed);
+    releasedScanAt = now;
+    std::uint64_t visited = 0, dropped = 0;
     for (auto it = entries.begin(); it != entries.end();) {
+        ++visited;
         if (!it->second->HoldsReleasedTexture()) {
             ++it;
             continue;
         }
+        ++dropped;
         forget(it->second);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
     }
+    counts.scans.fetch_add(1, std::memory_order_relaxed);
+    counts.visited.fetch_add(visited, std::memory_order_relaxed);
+    counts.dropped.fetch_add(dropped, std::memory_order_relaxed);
+    counts.scanNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - now).count()), std::memory_order_relaxed);
+}
+
+std::chrono::steady_clock::duration ResourceCache::DefaultReleasedScanInterval() {
+    static const bool unlimited = std::getenv("APS5_NO_RELEASED_SCAN_LIMIT") != nullptr;
+    return unlimited ? std::chrono::steady_clock::duration::zero() : std::chrono::milliseconds(100);
+}
+
+void ResourceCache::SetReleasedScanInterval(std::chrono::steady_clock::duration interval) {
+    std::lock_guard lock(mutex);
+    releasedScanInterval = interval;
+    releasedScanAt = std::chrono::steady_clock::now();
+}
+
+std::string TakeReleasedScanText() {
+    auto& counts = ReleasedScans();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto evictedHeld = take(counts.evictedHeld), notAdmitted = take(counts.notAdmitted), scans = take(counts.scans), visited = take(counts.visited), dropped = take(counts.dropped), deferred = take(counts.deferred);
+    char text[256];
+    std::snprintf(text, sizeof(text), "; sampled textures released: evicted while held %llu, not admitted %llu; resource-cache scans for them %llu (%llu entries visited, %llu dropped, %.1f ms), deferred %llu", evictedHeld, notAdmitted, scans, visited, dropped, static_cast<double>(counts.scanNs.exchange(0, std::memory_order_relaxed)) / 1e6, deferred);
+    return text;
 }
 
 bool ResourceCache::Touch(const Key& key) {
