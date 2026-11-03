@@ -234,7 +234,22 @@ void countStorageWriteBack(std::uint64_t bytes, bool direct, bool drawn = false)
 struct LiveImages {
     MapImportGate::LeafMutex<AgcDriver::Mutex> mutex;
     std::vector<StorageTexture*> textures;
+    struct Span {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::uint64_t keys = 0;
+    };
+    std::vector<Span> spans;
 };
+
+bool LiveSpans() {
+    static const bool enabled = std::getenv("APS5_NO_LIVE_SPANS") == nullptr;
+    return enabled;
+}
+
+bool SpanOverlaps(const LiveImages::Span& span, std::uint64_t address, std::size_t bytes) {
+    return address < span.end && span.begin < address + bytes;
+}
 
 std::atomic<void (*)()> publishHookForTest{nullptr};
 
@@ -1530,6 +1545,7 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         live.textures.push_back(texture.get());
+        live.spans.push_back({texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes, texture->descriptor.dccAddress});
     }
     if (profile) {
         auto& totals = Profile();
@@ -5114,11 +5130,13 @@ bool StorageTexture::UnwatchHookLocksGpu(std::span<const std::pair<std::uint64_t
     if (AnyPendingOverlaps(ranges)) return true;
     auto& live = Live();
     std::lock_guard lock(live.mutex);
+    const bool spans = LiveSpans();
     for (const auto& range : ranges) {
         if (range.second <= range.first) continue;
         const auto bytes = static_cast<std::size_t>(range.second - range.first);
-        for (const auto* texture : live.textures) {
-            if (texture->hashedAtUnwatch(range.first, bytes)) return true;
+        for (std::size_t index = 0; index < live.textures.size(); ++index) {
+            if (spans && !SpanOverlaps(live.spans[index], range.first, bytes)) continue;
+            if (live.textures[index]->hashedAtUnwatch(range.first, bytes)) return true;
         }
     }
     return false;
@@ -5141,7 +5159,10 @@ void StorageTexture::SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes)
     {
         auto& images = Live();
         std::lock_guard lock(images.mutex);
-        for (auto* texture : images.textures) {
+        const bool spans = LiveSpans();
+        for (std::size_t index = 0; index < images.textures.size(); ++index) {
+            if (spans && !SpanOverlaps(images.spans[index], address, bytes)) continue;
+            auto* texture = images.textures[index];
             if (!texture->hashedAtUnwatch(address, bytes)) continue;
             if (auto alive = texture->weak_from_this().lock()) live.push_back(std::move(alive));
         }
@@ -5733,11 +5754,13 @@ bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t,
 bool StorageTexture::AnyLiveOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     auto& live = Live();
     std::lock_guard lock(live.mutex);
+    const bool spans = LiveSpans();
     for (const auto& range : ranges) {
         if (range.second <= range.first) continue;
         const auto bytes = static_cast<std::size_t>(range.second - range.first);
-        for (const auto* texture : live.textures) {
-            if (texture->overlapsLive(range.first, bytes)) return true;
+        for (std::size_t index = 0; index < live.textures.size(); ++index) {
+            if (spans && !SpanOverlaps(live.spans[index], range.first, bytes)) continue;
+            if (live.textures[index]->overlapsLive(range.first, bytes)) return true;
         }
     }
     return false;
@@ -5990,9 +6013,11 @@ StorageTexture::FillCoverage StorageTexture::ClassifyFill(std::uint64_t address,
     FillCoverage coverage;
     auto& live = Live();
     std::lock_guard lock(live.mutex);
+    const bool spans = LiveSpans();
     std::vector<StorageTexture*> overlapping;
-    for (auto* texture : live.textures) {
-        if (texture->overlapsLive(address, bytes)) overlapping.push_back(texture);
+    for (std::size_t index = 0; index < live.textures.size(); ++index) {
+        if (spans && !SpanOverlaps(live.spans[index], address, bytes)) continue;
+        if (live.textures[index]->overlapsLive(address, bytes)) overlapping.push_back(live.textures[index]);
     }
     const auto end = address + bytes;
     StorageTexture* covered = nullptr;
@@ -6033,7 +6058,13 @@ StorageTexture::FillCoverage StorageTexture::ClassifyFill(std::uint64_t address,
                 if (texture->descriptor.baseAddress >= address && texture->descriptor.baseAddress + texture->guestBytes <= end) ++coverage.inside;
             }
         }
-    } else if (std::any_of(live.textures.begin(), live.textures.end(), [&](const StorageTexture* texture) { return texture->keysFillMatches(address, bytes, !overlapping.empty()); })) {
+    } else if ([&] {
+                   for (std::size_t index = 0; index < live.textures.size(); ++index) {
+                       if (spans && live.spans[index].keys != address) continue;
+                       if (live.textures[index]->keysFillMatches(address, bytes, !overlapping.empty())) return true;
+                   }
+                   return false;
+               }()) {
         coverage.cover = FillCover::Keys;
     } else if (overlapping.size() > 1) {
         coverage.cover = FillCover::Several;
@@ -6078,9 +6109,18 @@ std::size_t StorageTexture::NoteKeysFill(std::uint64_t address, std::size_t byte
     static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
     auto& live = Live();
     std::lock_guard lock(live.mutex);
-    const bool overlapped = std::any_of(live.textures.begin(), live.textures.end(), [&](const StorageTexture* texture) { return texture->overlapsLive(address, bytes); });
+    const bool spans = LiveSpans();
+    const bool overlapped = [&] {
+        for (std::size_t index = 0; index < live.textures.size(); ++index) {
+            if (spans && !SpanOverlaps(live.spans[index], address, bytes)) continue;
+            if (live.textures[index]->overlapsLive(address, bytes)) return true;
+        }
+        return false;
+    }();
     std::size_t covered = 0;
-    for (auto* texture : live.textures) {
+    for (std::size_t index = 0; index < live.textures.size(); ++index) {
+        if (spans && live.spans[index].keys != address) continue;
+        auto* texture = live.textures[index];
         if (!texture->keysFillMatches(address, bytes, overlapped)) continue;
         texture->filledKeys = keys;
         ++covered;
@@ -6107,8 +6147,17 @@ std::size_t StorageTexture::ClearByKeysFill(std::uint64_t address, std::size_t b
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
-        const bool overlapped = std::any_of(live.textures.begin(), live.textures.end(), [&](const StorageTexture* texture) { return texture->overlapsLive(address, bytes); });
-        for (auto* texture : live.textures) {
+        const bool spans = LiveSpans();
+        const bool overlapped = [&] {
+            for (std::size_t index = 0; index < live.textures.size(); ++index) {
+                if (spans && !SpanOverlaps(live.spans[index], address, bytes)) continue;
+                if (live.textures[index]->overlapsLive(address, bytes)) return true;
+            }
+            return false;
+        }();
+        for (std::size_t index = 0; index < live.textures.size(); ++index) {
+            if (spans && live.spans[index].keys != address) continue;
+            auto* texture = live.textures[index];
             if (!texture->keysFillMatches(address, bytes, overlapped)) continue;
             if (auto shared = texture->weak_from_this().lock()) covered.push_back(std::move(shared));
         }
@@ -6263,7 +6312,10 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
-        for (auto* texture : live.textures) {
+        const bool spans = LiveSpans();
+        for (std::size_t index = 0; index < live.textures.size(); ++index) {
+            if (spans && !SpanOverlaps(live.spans[index], begin, bytes)) continue;
+            auto* texture = live.textures[index];
             if (texture == this || texture->released || !texture->overlaps(begin, bytes)) continue;
             texture->forgetSavedOver(begin, bytes);
             if (texture->descriptor.dccAddress != 0) aliasedKeys = true;
@@ -6356,8 +6408,10 @@ void StorageTexture::WriteBack() {
 std::shared_ptr<StorageTexture> StorageTexture::FindLive(std::uint64_t address, std::uint64_t bytes) {
     auto& live = Live();
     std::lock_guard lock(live.mutex);
-    for (auto it = live.textures.rbegin(); it != live.textures.rend(); ++it) {
-        auto* texture = *it;
+    const bool spans = LiveSpans();
+    for (auto index = live.textures.size(); index-- > 0;) {
+        if (spans && (live.spans[index].begin != address || live.spans[index].end - live.spans[index].begin != bytes)) continue;
+        auto* texture = live.textures[index];
         if (texture->released || !texture->Cached() || texture->descriptor.baseAddress != address || texture->guestBytes != bytes) continue;
         return texture->weak_from_this().lock();
     }
@@ -6400,7 +6454,10 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
-        for (auto* texture : live.textures) {
+        const bool spans = LiveSpans();
+        for (std::size_t index = 0; index < live.textures.size(); ++index) {
+            if (spans && !SpanOverlaps(live.spans[index], descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
+            auto* texture = live.textures[index];
             if (texture != this && !texture->released && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) texture->forgetSavedOver(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
         }
     }
@@ -7414,7 +7471,10 @@ StorageTexture::~StorageTexture() {
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
-        std::erase(live.textures, this);
+        if (const auto found = std::find(live.textures.begin(), live.textures.end(), this); found != live.textures.end()) {
+            live.spans.erase(live.spans.begin() + (found - live.textures.begin()));
+            live.textures.erase(found);
+        }
     }
     // Cache eviction flushes first; anything still pending here is being torn down with the device.
     {
