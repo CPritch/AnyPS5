@@ -71,6 +71,7 @@
 #include <charconv>
 #include <condition_variable>
 #include <future>
+#include <filesystem>
 #include <fstream>
 #include <cctype>
 #include <cstdio>
@@ -3546,6 +3547,16 @@ struct FrameDumps {
     int every = 1;
     int dumped = 0;
     std::uint64_t presents = 0;
+    const char* stopFile = std::getenv("APS5_DUMP_FRAMES_STOP_FILE");
+    bool Due() {
+        if (dumped >= limit || ++presents % static_cast<std::uint64_t>(every) != 0) return false;
+        std::error_code error;
+        if (stopFile != nullptr && std::filesystem::exists(stopFile, error)) {
+            limit = dumped;
+            return false;
+        }
+        return true;
+    }
 };
 
 FrameDumps& Dumps() {
@@ -3583,7 +3594,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
         const auto pixels = passthrough ? ReadDisplayBufferTexels(buffer) : ReadDisplayBuffer(buffer);
         bool dumpFrame = false;
         std::optional<int> cpuDump;
-        if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+        if (frameDumpOutput.Enabled_nid_no_patch() && dumps.Due()) {
             if (passthrough || dumps.cpu) {
                 cpuDump = dumps.dumped++;
             } else {
@@ -3634,7 +3645,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
     const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
     bool dumpFrame = false;
     std::optional<int> cpuDump;
-    if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+    if (frameDumpOutput.Enabled_nid_no_patch() && dumps.Due()) {
         if (dumps.cpu || (passthrough && resident == nullptr)) {
             cpuDump = dumps.dumped++;
         } else {
