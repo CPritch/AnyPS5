@@ -2194,7 +2194,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             }
             lap(split.movedNs);
             if (moved.has_value()) {
-                if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                if (trimKey && !(ahead.Takes() && ahead.ahead->aliasesChecked && ahead.ahead->aliasIndexBytes == indexBytes)) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
@@ -4983,6 +4983,16 @@ void PrepareDrawAhead(const Context& context, const State& state, const Pm4::Dra
             movedPlanNs.fetch_add(NanosecondsBetween(planStart, std::chrono::steady_clock::now()), std::memory_order_relaxed);
             ahead.movedPlanned = true;
             CountDrawAhead(DrawAheadEvent::MovedPlanned);
+        }
+        static const bool aliasesAhead = std::getenv("APS5_NO_AHEAD_ALIAS_CHECK") == nullptr;
+        if (trimKey && aliasesAhead) {
+            const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+            try {
+                CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                ahead.aliasesChecked = true;
+                ahead.aliasIndexBytes = indexBytes;
+            } catch (const std::exception&) {
+            }
         }
     }
     static const bool precollect = std::getenv("APS5_NO_PREPARE_AHEAD_PRECOLLECT") == nullptr;

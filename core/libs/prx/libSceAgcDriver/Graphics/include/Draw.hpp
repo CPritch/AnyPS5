@@ -46,6 +46,8 @@ struct DrawAhead {
     std::uint64_t pendingAtLookup = 0;
     bool movedPlanned = false;
     std::optional<ShaderResources::MovedPlan> movedPlan;
+    bool aliasesChecked = false;
+    std::uint64_t aliasIndexBytes = 0;
     GuestMemory::PrecollectedWrites walks;
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
