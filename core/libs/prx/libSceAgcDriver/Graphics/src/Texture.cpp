@@ -135,6 +135,7 @@ std::atomic<std::uint64_t> queuedReadHeld{0};
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
 std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
+std::array<std::atomic<std::uint64_t>, 4> labelReadbackCounts{};
 std::atomic<std::uint64_t> untrackedCompares{0};
 std::atomic<std::uint64_t> storeSerials{0};
 std::atomic<std::uint64_t> orderedFlushes{0}, orderedWaits{0};
@@ -2322,6 +2323,7 @@ std::string StorageTexture::TakeCommitterRefreshText() {
         writerWaits.clear();
     }
     std::sort(waits.begin(), waits.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    text += "; readback stores before a label: memo skips " + std::to_string(labelReadbackCounts[0].exchange(0, std::memory_order_relaxed)) + ", scans " + std::to_string(labelReadbackCounts[1].exchange(0, std::memory_order_relaxed)) + " flushing " + std::to_string(labelReadbackCounts[2].exchange(0, std::memory_order_relaxed)) + " ranges, " + std::to_string(labelReadbackCounts[3].exchange(0, std::memory_order_relaxed)) + " stored";
     text += "; committer image stores waiting for other writers by reason (count/ms; pending writes over the range: stores, shader writers [top programs], other, in the open batch):";
     for (std::size_t i = 0; i < waits.size() && i < 4; ++i) {
         const auto& [reason, wait] = waits[i];
@@ -5453,6 +5455,7 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
 }
 
 void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
     static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
     if (disabled) return;
     static const bool memo = std::getenv("APS5_NO_LABEL_STORE_MEMO") == nullptr;
@@ -5463,7 +5466,10 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     {
         std::lock_guard lock(pending.mutex);
-        if (memo && pendingAdds == cleanAt) return;
+        if (memo && pendingAdds == cleanAt) {
+            if (counted) labelReadbackCounts[0].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         seenAt = pendingAdds;
 #if defined(__APPLE__)
         const bool trap = LabelTrapsEnabled();
@@ -5488,7 +5494,13 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
             ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
         }
     }
-    for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
+    std::size_t stored = 0;
+    for (const auto& [address, bytes] : ranges) stored += FlushPending(address, bytes, nullptr, reason) ? 1u : 0u;
+    if (counted) {
+        labelReadbackCounts[1].fetch_add(1, std::memory_order_relaxed);
+        labelReadbackCounts[2].fetch_add(ranges.size(), std::memory_order_relaxed);
+        labelReadbackCounts[3].fetch_add(stored, std::memory_order_relaxed);
+    }
     if (!memo) return;
     std::lock_guard lock(pending.mutex);
     if (std::none_of(pending.textures.begin(), pending.textures.end(), qualifies)) cleanAt = seenAt;

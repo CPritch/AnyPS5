@@ -4508,6 +4508,14 @@ std::string TakeDrawSplitText() {
         result += builds;
         constexpr std::array<const char*, 7> kindNames{"a miss", "not recordable", "cache off", "a pipeline variant of 0", "a BDA page table", "a fault buffer", "other"};
         constexpr std::array<const char*, static_cast<std::size_t>(ShaderResources::BuildPhase::Count)> phaseNames{"bindings", "precollect", "upload", "descriptors", "stage A", "images", "bda", "stage B"};
+        {
+            static AddressSpaceStats seen{};
+            const auto now = AddressSpaceCounters();
+            char spaces[192];
+            std::snprintf(spaces, sizeof(spaces), "; address spaces (10 s): hits %llu, rebuilt for the allocation generation %llu, the imports epoch %llu, a waiter drop %llu, first %llu", static_cast<unsigned long long>(now.hits - seen.hits), static_cast<unsigned long long>(now.rebuiltGeneration - seen.rebuiltGeneration), static_cast<unsigned long long>(now.rebuiltEpoch - seen.rebuiltEpoch), static_cast<unsigned long long>(now.rebuiltWaiterDrop - seen.rebuiltWaiterDrop), static_cast<unsigned long long>(now.rebuiltFirst - seen.rebuiltFirst));
+            result += spaces;
+            seen = now;
+        }
         result += "; template builds by why (builds, us each [phases, us each]):";
         for (std::size_t kind = 0; kind < kindNames.size(); ++kind) {
             const auto count = take(split.buildKinds[kind]);
