@@ -20,6 +20,8 @@ class Texture;
 class StorageTexture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten = true, bool stencilTested = false);
+std::uint64_t DepthViewMemoHits();
+std::uint64_t DepthViewMemoMisses();
 struct FoundDepthView {
     VkImageView view = VK_NULL_HANDLE;
     std::shared_ptr<void> owner;

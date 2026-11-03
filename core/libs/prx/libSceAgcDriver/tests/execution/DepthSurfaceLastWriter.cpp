@@ -230,6 +230,36 @@ void Run(const Context& context) {
     Require(Refused(context, watchedMips), "a driver store past the depth plane retired the depth surface");
     AgcDriver::GuestMemory::MarkWritten(watched + 0x100, 4);
     Require(Sample(context, watchedMips) == nullptr, "depth, then a driver store, then a view with two levels: the view was not left to guest memory");
+
+    auto* fresh = static_cast<volatile std::uint8_t*>(AllocateWatched(2 * Block));
+    const auto plane = reinterpret_cast<std::uint64_t>(fresh);
+    AgcDriver::GuestMemory::CollectWrites(plane, 2 * Block);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    DepthSurfaceView(context, Depth(plane));
+    const auto hits = DepthViewMemoHits();
+    const auto misses = DepthViewMemoMisses();
+    DepthSurfaceView(context, Depth(plane));
+    const bool memo = std::getenv("APS5_NO_DEPTH_VIEW_MEMO") == nullptr;
+    Require(DepthViewMemoHits() == hits + (memo ? 1u : 0u), "the same depth target twice in one collect epoch did not take the memo");
+    fresh[24] = 0x3c;
+    AgcDriver::GuestMemory::CollectWritesUncached(plane, static_cast<std::size_t>(depthBytes));
+    DepthSurfaceView(context, Depth(plane));
+    Require(DepthViewMemoHits() == hits + (memo ? 1u : 0u) && DepthViewMemoMisses() == misses + (memo ? 1u : 0u), "a CPU write another walk stamped in the same collect epoch took the memo");
+    DepthSurfaceView(context, Depth(plane));
+    Require(DepthViewMemoHits() == hits + (memo ? 2u : 0u), "the depth target after a full call did not take the memo");
+    AgcDriver::GuestMemory::MarkWritten(plane + 0x200, 4);
+    DepthSurfaceView(context, Depth(plane));
+    Require(DepthViewMemoHits() == hits + (memo ? 2u : 0u), "a driver store over the depth plane took the memo");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    DepthSurfaceView(context, Depth(plane));
+    Require(DepthViewMemoHits() == hits + (memo ? 2u : 0u), "a new collect epoch took the memo");
+    DepthSurfaceView(context, Depth(plane), false);
+    Require(DepthViewMemoHits() == hits + (memo ? 2u : 0u), "a call that does not write depth took the memo of one that does");
+    DepthSurfaceView(context, Depth(plane), false);
+    Require(DepthViewMemoHits() == hits + (memo ? 3u : 0u), "the same read-only depth target twice did not take the memo");
+    RetireDepthSurfaces(context.device, plane + 0x100, 0x1000);
+    DepthSurfaceView(context, Depth(plane), false);
+    Require(DepthViewMemoHits() == hits + (memo ? 3u : 0u), "a retired depth surface took the memo");
 }
 
 }
