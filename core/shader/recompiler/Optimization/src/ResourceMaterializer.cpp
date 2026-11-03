@@ -2710,7 +2710,10 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
                 TableSnapshotter(plan, runtime, walker, activeSources, nextSnapshot.tables).Run();
                 const auto afterTables = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
                 const auto afterImageGeneration = runtime.imageViewGeneration != nullptr ? runtime.imageViewGeneration(runtime.userContext) : 0u;
-                if ((runtime.descriptorScope != nullptr && (afterTables != afterSnapshot || (plan.uniformFill.fill.kind != UniformFillKind::None && afterSnapshot != beforeSnapshot))) || afterImageGeneration != beforeImageGeneration) {
+                const bool identities = std::any_of(nextSnapshot.tables.tables.begin(), nextSnapshot.tables.tables.end(), [](const auto& table) {
+                    return std::any_of(table.resourceViews.begin(), table.resourceViews.end(), [](const auto& view) { return !view.identities.empty(); });
+                });
+                if ((runtime.descriptorScope != nullptr && (afterTables != afterSnapshot || (plan.uniformFill.fill.kind != UniformFillKind::None && afterSnapshot != beforeSnapshot))) || (identities && afterImageGeneration != beforeImageGeneration)) {
                     continue;
                 }
                 for (const auto& table : nextSnapshot.tables.tables) {
