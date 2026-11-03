@@ -4831,7 +4831,7 @@ DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSe
     {
         std::lock_guard lock(mutex);
         if (const auto found = recycled.find({layout, variableCount.value_or(0u)}); found != recycled.end() && !found->second.empty()) {
-            const auto allocation = found->second.back();
+            auto allocation = std::move(found->second.back());
             found->second.pop_back();
             CountBinding(CountRecycled);
             return allocation;
