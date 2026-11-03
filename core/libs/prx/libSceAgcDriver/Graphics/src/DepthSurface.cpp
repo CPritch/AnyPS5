@@ -759,14 +759,21 @@ public:
     }
 
     bool PlanesUnwrittenSince(std::uint64_t mirrorBytes, std::uint64_t stencilMirrorBytes) const {
-        if (depthMemory == 0 || GuestMemory::WrittenSince(target.address, static_cast<std::size_t>(depthBytes()), depthMemory)) return false;
-        if (target.stencilAddress != 0 && (stencilMemory == 0 || GuestMemory::WrittenSince(target.stencilAddress, static_cast<std::size_t>(stencilBytes()), stencilMemory))) return false;
+        if (depthMemory == 0 || (target.stencilAddress != 0 && stencilMemory == 0)) return false;
+        auto depthGeneration = depthMemory;
         if (mirrorBytes != 0) {
             if (unitGeneration.empty()) return false;
             const auto oldest = *std::min_element(unitGeneration.begin(), unitGeneration.end());
-            if (oldest == 0 || GuestMemory::WrittenSince(target.address, static_cast<std::size_t>(mirrorBytes), oldest)) return false;
+            if (oldest == 0) return false;
+            depthGeneration = std::min(depthGeneration, oldest);
         }
-        return stencilMirrorBytes == 0 || (stencilGeneration != 0 && !GuestMemory::WrittenSince(target.stencilAddress, static_cast<std::size_t>(stencilMirrorBytes), stencilGeneration));
+        auto stencilSince = stencilMemory;
+        if (stencilMirrorBytes != 0) {
+            if (stencilGeneration == 0) return false;
+            stencilSince = std::min(stencilSince, stencilGeneration);
+        }
+        const std::array<GuestMemory::UnchangedQuery, 2> planes{{{target.address, static_cast<std::size_t>(std::max(depthBytes(), mirrorBytes)), depthGeneration}, {target.stencilAddress, static_cast<std::size_t>(std::max(stencilBytes(), stencilMirrorBytes)), stencilSince}}};
+        return !GuestMemory::WrittenSinceAny(std::span(planes).first(target.stencilAddress != 0 ? 2u : 1u));
     }
 
     bool OverwrittenOnGpu() const {

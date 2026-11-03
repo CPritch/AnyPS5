@@ -2725,6 +2725,21 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
     return false;
 }
 
+bool WrittenSinceAny(std::span<const UnchangedQuery> queries) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return false;
+    for (const auto& query : queries) {
+        if (query.generation == 0 || query.bytes == 0 || !tracker.covers(query.address, query.bytes)) continue;
+        const auto last = tracker.blockOf(query.address + query.bytes - 1);
+        for (auto block = tracker.blockOf(query.address); block <= last; ++block) {
+            if (tracker.stampOf(block) > query.generation) return true;
+        }
+    }
+    return false;
+}
+
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu) {
     std::fill(changed.begin(), changed.end(), BlockWritten);
     std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
