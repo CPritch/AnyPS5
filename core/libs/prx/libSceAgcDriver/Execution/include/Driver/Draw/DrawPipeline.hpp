@@ -104,6 +104,10 @@ public:
     static void NoteCommitterPart(CommitterPart part, std::chrono::steady_clock::time_point since);
     enum class OwnCause : std::uint8_t { NoneQueued, BehindSeal, BehindSealThenLabel, BehindLabel, BehindFill, BehindOther, NextNoHook, DeclinedPredictor, DeclinedDescribed, DeclinedReadsWritten, DeclinedOther, Revoked, AbortedImageRefresh, AbortedOther, Failed, Dropped, StaleSubmit, StaleProof, StaleOther, Unknown, Count };
     static OwnCause TakenOwnCause();
+    static bool CarryHold();
+    static bool HoldCarried();
+    static void ReleaseCarriedHold() noexcept;
+    static void SetCarryRelease(void (*release)());
     static void NoteOwnResolve(OwnCause cause, std::uint64_t resolveNs, std::uint64_t emitNs);
     static std::uint64_t FollowedEpoch();
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
@@ -215,6 +219,7 @@ private:
     void (*resolveBody)(void*) = nullptr;
     void (*resolveFinish)(void*, bool) = nullptr;
     void* resolveContext = nullptr;
+    const void* resolveTarget = nullptr;
     std::chrono::steady_clock::time_point resolvePosted;
     alignas(64) std::uint64_t resolveLineEnd = 0;
 };

@@ -41,6 +41,8 @@ struct PendingEarly {
     DrawPipeline::Early hook;
     const std::vector<DrawPipeline::Range>* writes = nullptr;
     bool late = false;
+    const void* target = nullptr;
+    std::size_t next = 0;
 };
 thread_local PendingEarly pendingEarly;
 thread_local DrawPipeline* committingPipeline = nullptr;
@@ -56,6 +58,15 @@ alignas(64) std::atomic<std::uint64_t> resolveStartNs{0};
 std::atomic<std::uint64_t> resolveBusyNs{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::EarlyEvent::Count)> earlyEvents{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> earlyAborts{};
+thread_local const void* offerTarget = nullptr;
+thread_local std::size_t offerNext = 0;
+thread_local std::size_t postedNext = 0;
+thread_local bool carriedHold = false;
+thread_local const void* carriedTarget = nullptr;
+thread_local const void* takenItem = nullptr;
+thread_local const void* heldReadsFrom = nullptr;
+void (*carryRelease)() = nullptr;
+std::atomic<std::uint64_t> carriedHolds{0}, carriesReleasedEarly{0}, heldReadsTargetMissing{0};
 thread_local DrawPipeline::OwnCause takenOwnCause = DrawPipeline::OwnCause::Unknown;
 thread_local DrawPipeline::OwnCause nextOwnCause = DrawPipeline::OwnCause::Unknown;
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::OwnCause::Count)> ownCauseCount{}, ownCauseResolveNs{}, ownCauseEmitNs{};
@@ -199,6 +210,7 @@ std::string QueueWaits::Text() {
             const auto started = posted - std::min(posted, resolvesRevoked.load(std::memory_order_relaxed));
             const auto waited = resolvesWaited.exchange(0, std::memory_order_relaxed);
             const auto per = [](std::uint64_t ns, std::uint64_t count) { return count == 0 ? std::string("0") : std::to_string(ns / count); };
+            text += " holds carried to the next draw " + take(carriedHolds) + " (released before another item " + take(carriesReleasedEarly) + ", held reads whose target was gone " + take(heldReadsTargetMissing) + "),";
             text += " resolver jobs posted " + std::to_string(posted) + ", revoked unstarted " + take(resolvesRevoked) + ", done before the join " + take(resolvesDoneBeforeJoin) + ", waited for " + std::to_string(waited) + " (" + per(resolveWaitNs.exchange(0, std::memory_order_relaxed), waited) + " ns each), start latency " + per(resolveStartNs.exchange(0, std::memory_order_relaxed), started) + " ns, resolving " + per(resolveBusyNs.exchange(0, std::memory_order_relaxed), started) + " ns a job; recorder methods off the resolver's list:" + GuestMemory::TakeResolverRecorderText() + ";";
         }
         const auto [unwinding, handler, completion] = GuestMemory::TakeEarlyBarriersPassed();
@@ -548,6 +560,37 @@ DrawPipeline::OwnCause DrawPipeline::TakenOwnCause() {
     return takenOwnCause;
 }
 
+bool DrawPipeline::CarryHold() {
+    static const bool enabled = std::getenv("APS5_NO_CARRY_RESOLVE_HOLD") == nullptr;
+    const auto next = std::exchange(postedNext, 0);
+    if (!enabled || next != 1 || committingPipeline == nullptr || carriedHold || std::uncaught_exceptions() != 0) return false;
+    auto& pipeline = Queue0();
+    if (pipeline.resolveState.load(std::memory_order_acquire) == ResolveIdle || pipeline.resolveTarget == nullptr) return false;
+    GuestMemory::GpuMutex().lock();
+    carriedHold = true;
+    carriedTarget = pipeline.resolveTarget;
+    carriedHolds.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool DrawPipeline::HoldCarried() {
+    return carriedHold;
+}
+
+void DrawPipeline::ReleaseCarriedHold() noexcept {
+    if (!carriedHold) return;
+    carriedHold = false;
+    carriedTarget = nullptr;
+    try {
+        GuestMemory::GpuMutex().unlock();
+    } catch (...) {
+    }
+}
+
+void DrawPipeline::SetCarryRelease(void (*release)()) {
+    carryRelease = release;
+}
+
 void DrawPipeline::NoteOwnResolve(OwnCause cause, std::uint64_t resolveNs, std::uint64_t emitNs) {
     const auto index = static_cast<std::size_t>(cause);
     ownCauseCount[index].fetch_add(1, std::memory_order_relaxed);
@@ -581,6 +624,8 @@ void DrawPipeline::PostResolve(void (*body)(void*), void (*finish)(void*, bool),
     pipeline.resolveBody = body;
     pipeline.resolveFinish = finish;
     pipeline.resolveContext = context;
+    pipeline.resolveTarget = std::exchange(offerTarget, nullptr);
+    postedNext = std::exchange(offerNext, 0);
     static const bool timed = std::getenv("APS5_COMMIT_STATS") != nullptr;
     if (timed) pipeline.resolvePosted = std::chrono::steady_clock::now();
     resolvesPosted.fetch_add(1, std::memory_order_relaxed);
@@ -600,6 +645,7 @@ void DrawPipeline::WaitResolve() {
 
 void DrawPipeline::joinResolve(bool revoke) {
     auto& pipeline = Queue0();
+    postedNext = 0;
     if (pipeline.resolveState.load(std::memory_order_acquire) == ResolveIdle) return;
     bool ran = true;
     int expected = ResolvePosted;
@@ -719,10 +765,12 @@ void DrawPipeline::resolveAhead() {
         static const bool timed = std::getenv("APS5_COMMIT_STATS") != nullptr;
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (timed) resolveStartNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - resolvePosted).count()), std::memory_order_relaxed);
+        heldReadsFrom = resolveTarget;
         try {
             resolveBody(resolveContext);
         } catch (...) {
         }
+        heldReadsFrom = nullptr;
         if (timed) resolveBusyNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
         resolveState.store(ResolveDone, std::memory_order_release);
     }
@@ -795,6 +843,8 @@ void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentT
         if (const auto next = EarlyIndex(pipeline.items); next != 0) {
             pendingEarly.hook = pipeline.items[next].early;
             pendingEarly.writes = OfferWrites(pipeline.items, next);
+            pendingEarly.target = &pipeline.items[next];
+            pendingEarly.next = next;
             NoteEarly(EarlyEvent::LateOffered);
             nextOwnCause = OwnCause::Unknown;
             if (next >= 2) NoteEarly(pendingEarly.writes == &runWrites && runWrites.size() > pipeline.items.front().writes.size() ? EarlyEvent::AcrossLabels : EarlyEvent::AcrossSeal);
@@ -806,6 +856,8 @@ void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentT
     }
     auto hook = std::move(pendingEarly.hook);
     const auto* writes = pendingEarly.writes;
+    offerTarget = pendingEarly.target;
+    offerNext = pendingEarly.next;
     pendingEarly = {};
     try {
         (hook(EarlyOffer{writes, depth, currentTemplate}) ? earlyResolved : earlyDeclined).fetch_add(1, std::memory_order_relaxed);
@@ -1086,6 +1138,16 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 
+namespace {
+void releaseCarriedForRun() {
+    struct Drop {
+        ~Drop() { DrawPipeline::ReleaseCarriedHold(); }
+    } drop;
+    if (carryRelease != nullptr) carryRelease();
+    else DrawPipeline::JoinResolve();
+}
+}
+
 void DrawPipeline::run() {
     committingPipeline = this;
     PinCommitterThread("draw committer");
@@ -1103,6 +1165,7 @@ void DrawPipeline::run() {
     std::size_t kind = 0;
     bool taken = false;
     const auto take = [&] {
+        takenItem = &items.front();
         commit = stopped ? nullptr : &items.front().commit;
         committingWrites = &items.front().writes;
         isDraw = items.front().draw;
@@ -1115,6 +1178,8 @@ void DrawPipeline::run() {
         if (const auto next = EarlyIndex(items); next != 0) {
             pendingEarly.hook = items[next].early;
             pendingEarly.writes = OfferWrites(items, next);
+            pendingEarly.target = &items[next];
+            pendingEarly.next = next;
             if (next >= 2) NoteEarly(pendingEarly.writes == &runWrites && runWrites.size() > items.front().writes.size() ? EarlyEvent::AcrossLabels : EarlyEvent::AcrossSeal);
             return;
         }
@@ -1162,6 +1227,10 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
+            if (carriedHold && (commit == nullptr || takenItem != carriedTarget)) {
+                carriesReleasedEarly.fetch_add(1, std::memory_order_relaxed);
+                releaseCarriedForRun();
+            }
             if (commit != nullptr) {
                 struct ClearEarly {
                     ~ClearEarly() {
@@ -1185,6 +1254,12 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         } catch (...) {
             fatal = std::current_exception();
+        }
+        if (carriedHold && fatal != nullptr) {
+            try {
+                releaseCarriedForRun();
+            } catch (...) {
+            }
         }
         const auto committed = clock();
         const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(committed - start).count());
@@ -1221,6 +1296,12 @@ void DrawPipeline::run() {
         }
         idleStart = clock();
         if (counted) QueueWaits::Note(QueueWaits::Site::CommitterRetire, committed, idleStart);
+    }
+    if (carriedHold) {
+        try {
+            releaseCarriedForRun();
+        } catch (...) {
+        }
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -1357,7 +1438,19 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     auto& pipeline = Queue0();
     std::lock_guard lock(pipeline.mutex);
     heldReadQueries.fetch_add(1, std::memory_order_relaxed);
-    for (auto it = pipeline.items.begin() + (skipCommittingReads && !pipeline.items.empty() ? 1 : 0); it != pipeline.items.end(); ++it) {
+    auto from = pipeline.items.begin();
+    if (skipCommittingReads && !pipeline.items.empty()) {
+        if (heldReadsFrom != nullptr) {
+            while (from != pipeline.items.end() && &*from != heldReadsFrom) ++from;
+            if (from == pipeline.items.end()) {
+                heldReadsTargetMissing.fetch_add(1, std::memory_order_relaxed);
+                from = pipeline.items.begin() + 1;
+            }
+        } else {
+            ++from;
+        }
+    }
+    for (auto it = from; it != pipeline.items.end(); ++it) {
         for (const auto& [begin, limit] : it->reads) {
             if (address >= limit || begin >= end) continue;
             heldReadHits.fetch_add(1, std::memory_order_relaxed);

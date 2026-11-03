@@ -1440,6 +1440,13 @@ bool DrawSplitTimed() {
     return timed;
 }
 
+thread_local Graphics::DrawPacketPtr carriedPacket;
+
+void releaseCarriedJob() {
+    DrawPipeline::JoinResolve();
+    carriedPacket.reset();
+}
+
 DrawPipeline::OwnCause OwnResolveCause(const EarlyDraw* early, DrawPipeline::EarlyEvent stale) {
     using C = DrawPipeline::OwnCause;
     using E = DrawPipeline::EarlyEvent;
@@ -1632,6 +1639,17 @@ bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, 
 
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, std::uint64_t shape, DrawAheadSlot* ahead, EarlyDraw* early) {
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
+    static const bool carryRegistered = (DrawPipeline::SetCarryRelease(&releaseCarriedJob), true);
+    static_cast<void>(carryRegistered);
+    if (DrawPipeline::HoldCarried()) {
+        struct Drop {
+            ~Drop() { DrawPipeline::ReleaseCarriedHold(); }
+        } drop;
+        const auto joining = DrawSplitTimed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        releaseCarriedJob();
+        if (DrawSplitTimed()) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Join, joining);
+        submitDueAfterCommit(localDevice.get());
+    }
     auto* prepared = ahead != nullptr && (early == nullptr || !early->claimed) ? ahead->Claim() : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -1640,7 +1658,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;
         ~SubmitDue() noexcept(false) {
-            if (std::uncaught_exceptions() == 0) driver.submitDueAfterCommit(device.get());
+            if (std::uncaught_exceptions() == 0 && !DrawPipeline::HoldCarried()) driver.submitDueAfterCommit(device.get());
         }
     } submitDue{*this, localDevice};
     recordLabelsForPacket(localDevice.get(), queue);
@@ -1754,12 +1772,17 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         if (fromEarly) localDevice->ApplyDrawMemoKeeps(*packet);
         struct JoinGuard {
             bool timed;
+            Graphics::DrawPacketPtr& packet;
             ~JoinGuard() noexcept(false) {
+                if (DrawPipeline::CarryHold()) {
+                    carriedPacket = std::move(packet);
+                    return;
+                }
                 const auto joining = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 DrawPipeline::JoinResolve();
                 if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Join, joining);
             }
-        } joinGuard{timed};
+        } joinGuard{timed, packet};
         if (DrawPipeline::ResolveSplit() != 0) {
             const auto offering = clock();
             const auto depth = DrawDepthRanges(graphics);
