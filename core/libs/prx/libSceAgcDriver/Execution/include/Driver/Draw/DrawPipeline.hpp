@@ -100,7 +100,7 @@ public:
     static void StopEarly();
     static void NoteEarlyAbort(std::uint8_t kind);
     static void NoteEarlyResolveNs(std::uint64_t ns);
-    enum class CommitterPart : std::uint8_t { Check, ResolveWhole, Offer, EmitEarly, EmitWhole, Join, Count };
+    enum class CommitterPart : std::uint8_t { Check, ResolveWhole, Offer, EmitEarly, EmitWhole, Join, Prologue, MemoKeeps, Count };
     static void NoteCommitterPart(CommitterPart part, std::chrono::steady_clock::time_point since);
     enum class OwnCause : std::uint8_t { NoneQueued, BehindSeal, BehindSealThenLabel, BehindLabel, BehindFill, BehindOther, NextNoHook, DeclinedPredictor, DeclinedDescribed, DeclinedReadsWritten, DeclinedOther, Revoked, AbortedImageRefresh, AbortedOther, Failed, Dropped, StaleSubmit, StaleProof, StaleOther, Unknown, Count };
     static OwnCause TakenOwnCause();
@@ -109,6 +109,8 @@ public:
     static constexpr std::size_t LabelPartCount = 6;
     static bool LabelPartsCounted();
     static void NoteLabelParts(const std::array<std::uint64_t, LabelPartCount>& parts);
+    static constexpr std::size_t LabelStorePartCount = 7;
+    static void NoteLabelStoreParts(const std::array<std::uint64_t, LabelStorePartCount>& parts, int reason);
     static void NoteJobClass(std::size_t jobClass, std::uint64_t jobNs, std::uint64_t waitNs);
     static bool CarryHold();
     static bool HoldCarried();
@@ -251,6 +253,7 @@ public:
     LabelLookup PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value);
     bool PendingOverlapsAny(std::span<const Range> ranges);
     bool PendingKey(std::uint64_t key, std::uint64_t shape);
+    bool WaitPendingKey(std::uint64_t key, std::uint64_t shape);
     static bool LookupDrainsEvery();
     enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, Enqueue, Count };
     static void NoteDrain(DrainSite site, bool drained);

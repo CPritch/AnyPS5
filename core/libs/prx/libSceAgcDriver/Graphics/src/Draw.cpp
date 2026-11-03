@@ -2032,6 +2032,7 @@ struct DrawSplitCounts {
     std::array<std::atomic<std::uint64_t>, 2> builds{}, buildNs{};
     std::array<std::atomic<std::uint64_t>, 7> buildKinds{}, buildKindNs{};
     std::array<std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::BuildPhase::Count)>, 7> buildPhaseNs{};
+    std::array<std::array<std::atomic<std::uint64_t>, 2>, 7> buildAddressNs{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> mispredictedKind{};
 };
 
@@ -2239,6 +2240,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             split.buildKindNs[reason].fetch_add(buildNs, std::memory_order_relaxed);
             const auto& phases = resolved.resources->PhaseMs();
             for (std::size_t phase = 0; phase < phases.size(); ++phase) split.buildPhaseNs[reason][phase].fetch_add(static_cast<std::uint64_t>(phases[phase] * 1e6f), std::memory_order_relaxed);
+            const auto address = resolved.resources->AddressPhaseMs();
+            for (std::size_t phase = 0; phase < address.size(); ++phase) split.buildAddressNs[reason][phase].fetch_add(static_cast<std::uint64_t>(address[phase] * 1e6f), std::memory_order_relaxed);
         }
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
@@ -4519,6 +4522,8 @@ std::string TakeDrawSplitText() {
                 std::snprintf(item, sizeof(item), "%s%s %.1f", phase == 0 ? "" : ", ", phaseNames[phase], static_cast<double>(phaseNs[phase]) / 1e3 / static_cast<double>(count));
                 result += item;
             }
+            std::snprintf(item, sizeof(item), ", address lease %.1f, address snapshots %.1f", static_cast<double>(take(split.buildAddressNs[kind][0])) / 1e3 / static_cast<double>(count), static_cast<double>(take(split.buildAddressNs[kind][1])) / 1e3 / static_cast<double>(count));
+            result += item;
             result += "],";
         }
     }

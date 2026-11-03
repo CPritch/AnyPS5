@@ -192,7 +192,7 @@ std::string QueueWaits::Text() {
             if (count != 0) text += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
         }
         text += " committer draw parts (count, ns each):";
-        constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitterPart::Count)> partNames{"early-packet checks", "resolves of its own", "offers", "emits of early packets", "emits of its own packets", "joins"};
+        constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitterPart::Count)> partNames{"early-packet checks", "resolves of its own", "offers", "emits of early packets", "emits of its own packets", "joins", "prologues (claim, lock, labels, draw writers)", "memo keeps"};
         for (std::size_t part = 0; part < partNames.size(); ++part) {
             const auto count = committerPartCount[part].exchange(0, std::memory_order_relaxed);
             const auto ns = committerPartNs[part].exchange(0, std::memory_order_relaxed);
@@ -335,6 +335,34 @@ bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
     const bool every = LookupDrainsEvery();
     std::lock_guard lock(mutex);
     return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return (every || held.inserts) && (held.key == key || (shape != 0 && held.shape == shape)); });
+}
+
+bool DrawFinisher::WaitPendingKey(std::uint64_t key, std::uint64_t shape) {
+    if (!Busy() || !finisherProducer || OnFinisherThread()) return false;
+    const bool every = LookupDrainsEvery();
+    std::unique_lock lock(mutex);
+    std::uint64_t target = 0;
+    std::size_t after = 0;
+    for (std::size_t i = pending.size(); i-- > 0;) {
+        const auto& held = pending[i];
+        if (!(every || held.inserts) || (held.key != key && (shape == 0 || held.shape != shape))) continue;
+        target = ranJobs + i + 1;
+        after = pending.size() - i - 1;
+        break;
+    }
+    if (target == 0) return false;
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher wait under the GPU lock");
+    PerformanceTimer timing("DrawFinisher.WaitKey");
+    const auto start = std::chrono::steady_clock::now();
+    lock.unlock();
+    SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) <= after; });
+    lock.lock();
+    ++idleWaiters;
+    idle.wait(lock, [&] { return ranJobs >= target || failure != nullptr; });
+    --idleWaiters;
+    QueueWaits::Note(QueueWaits::Site::FinisherLookup, start);
+    if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
+    return true;
 }
 
 namespace {
@@ -628,6 +656,15 @@ std::string TakeStaleSubmitText() {
 namespace {
 std::array<std::atomic<std::uint64_t>, DrawPipeline::LabelPartCount> labelPartNs{};
 std::atomic<std::uint64_t> labelPartCommits{0};
+std::array<std::atomic<std::uint64_t>, DrawPipeline::LabelStorePartCount> labelStorePartNs{};
+std::array<std::atomic<std::uint64_t>, 8> labelStoreReasons{};
+std::atomic<std::uint64_t> labelStores{0};
+}
+
+void DrawPipeline::NoteLabelStoreParts(const std::array<std::uint64_t, LabelStorePartCount>& parts, int reason) {
+    labelStores.fetch_add(1, std::memory_order_relaxed);
+    labelStoreReasons[static_cast<std::size_t>(std::clamp(reason, 0, 7))].fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t part = 0; part < parts.size(); ++part) labelStorePartNs[part].fetch_add(parts[part], std::memory_order_relaxed);
 }
 
 bool DrawPipeline::LabelPartsCounted() {
@@ -1216,6 +1253,12 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         const auto labels = labelPartCommits.exchange(0, std::memory_order_relaxed);
         drainText += "; label commits " + std::to_string(labels) + ", parts (ns each):";
         for (std::size_t part = 0; part < names.size(); ++part) drainText += std::string(" ") + names[part] + " " + std::to_string(labels == 0 ? 0 : labelPartNs[part].exchange(0, std::memory_order_relaxed) / labels) + (part + 1 == names.size() ? "" : ",");
+        constexpr std::array<const char*, LabelStorePartCount> storeNames{"pending image stores", "reap", "idle check and import lookup", "unit shadows", "copied-writer and completion checks", "recorded store", "note and stamp"};
+        const auto stores = labelStores.exchange(0, std::memory_order_relaxed);
+        drainText += "; label GPU stores " + std::to_string(stores) + " (by reason 0-7:";
+        for (auto& reason : labelStoreReasons) drainText += " " + std::to_string(reason.exchange(0, std::memory_order_relaxed));
+        drainText += "), parts (ns each):";
+        for (std::size_t part = 0; part < storeNames.size(); ++part) drainText += std::string(" ") + storeNames[part] + " " + std::to_string(stores == 0 ? 0 : labelStorePartNs[part].exchange(0, std::memory_order_relaxed) / stores) + (part + 1 == storeNames.size() ? "" : ",");
     }
     char targetedText[160];
     std::snprintf(targetedText, sizeof(targetedText), "; targeted waits %llu (%.1f ms), %.1f items left queued behind each", static_cast<unsigned long long>(targetedWaits), static_cast<double>(targetedWaitNs) / 1e6, targetedWaits == 0 ? 0.0 : static_cast<double>(targetedBehind) / static_cast<double>(targetedWaits));

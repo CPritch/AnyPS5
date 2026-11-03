@@ -510,8 +510,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
                 }
             }
-            const bool drain = !DrawFinisher::Overlap() || (!cached && DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0));
-            if (drain) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherLookup);
+            static const bool targeted = std::getenv("APS5_NO_TARGETED_LOOKUP_WAIT") == nullptr;
+            bool drain = false;
+            if (DrawFinisher::Overlap() && targeted) {
+                drain = !cached && DrawFinisher::Get().WaitPendingKey(drawKey, shapeMatters ? shapeKey : 0);
+            } else {
+                drain = !DrawFinisher::Overlap() || (!cached && DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0));
+                if (drain) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherLookup);
+            }
             if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain);
         }
         std::unique_lock cacheLock(drawCacheMutex);
@@ -1663,6 +1669,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         static const bool idleAfterEmit = std::getenv("APS5_NO_IDLE_SUBMIT_AFTER_EMIT") == nullptr;
         idleOwed = submitDueAfterCommit(localDevice.get(), idleAfterEmit && early != nullptr && early->packet != nullptr);
     }
+    const auto prologue = DrawSplitTimed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto* prepared = ahead != nullptr && (early == nullptr || !early->claimed) ? ahead->Claim() : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -1676,6 +1683,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     } submitDue{*this, localDevice};
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(stages, queue);
+    if (DrawSplitTimed()) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Prologue, prologue);
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
@@ -1785,7 +1793,11 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
                 ownResolveNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - resolving).count());
             }
         }
-        if (fromEarly) localDevice->ApplyDrawMemoKeeps(*packet);
+        if (fromEarly) {
+            const auto keeping = clock();
+            localDevice->ApplyDrawMemoKeeps(*packet);
+            if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::MemoKeeps, keeping);
+        }
         struct JoinGuard {
             bool timed;
             Graphics::DrawPacketPtr& packet;

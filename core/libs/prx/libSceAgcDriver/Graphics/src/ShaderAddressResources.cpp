@@ -143,10 +143,13 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
     if (usesBda) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+        const auto leaseStart = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         guestMemory.AcquireRegistered();
-        const auto snapshotsStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto snapshotsStart = profile || counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         for (const auto& snapshot : snapshots) guestMemory.AddSnapshot(snapshot);
         if (profile) GuestBufferMemory::CountAddressBuild(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - snapshotsStart).count());
+        if (counted) addressPhaseMs = {static_cast<float>(std::chrono::duration<double, std::milli>(snapshotsStart - leaseStart).count()), static_cast<float>(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - snapshotsStart).count())};
     }
 }
 

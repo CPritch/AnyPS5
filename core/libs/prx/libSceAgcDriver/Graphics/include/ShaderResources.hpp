@@ -378,6 +378,7 @@ public:
     };
     const BuildTiming& Timing() const { return timing; }
     const std::array<float, static_cast<std::size_t>(BuildPhase::Count)>& PhaseMs() const { return phaseMs; }
+    std::array<float, 2> AddressPhaseMs() const { return addressPhaseMs; }
     // The image surfaces (address, bytes) whose stage-B lookup reads guest memory on the CPU and so
     // would wait, under the device lock, for recorded work writing them: a surface without a host
     // import, or a sampled one that stays a CPU snapshot (block compressed, or the storage-view path
@@ -704,6 +705,7 @@ private:
     std::vector<DataPatch> dataPatches;
     BuildTiming timing;
     std::array<float, static_cast<std::size_t>(BuildPhase::Count)> phaseMs{};
+    std::array<float, 2> addressPhaseMs{};
     // Build state carried from stage A to stage B: the bindings in plan order, the image bindings
     // still to look up (index into `bindings`; the DescriptorBinding lives in the compiled shader),
     // the descriptor counts the set was sized for, and the compute stage of a deferred build.
