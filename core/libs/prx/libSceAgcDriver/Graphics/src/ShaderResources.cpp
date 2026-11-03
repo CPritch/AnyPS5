@@ -2947,7 +2947,10 @@ void ShaderResources::noteReusable() {
 GuestBufferMemory::SpaceReuse ShaderResources::ReacquireSpace() {
     if (spaceGuard != MultisampleTargetRangeGeneration()) return GuestBufferMemory::SpaceReuse::Stale;
     const auto taken = guestMemory.ReacquireSpace();
-    if (taken == GuestBufferMemory::SpaceReuse::Taken && VerifyBdaTemplateReuse()) Require(SameRanges(guestMemory.AddressRanges(), verifyRanges), "a reused address-based template's BDA table differs from the one its space and regions give now (APS5_VERIFY_BDA_TEMPLATE_REUSE)");
+    if (taken == GuestBufferMemory::SpaceReuse::Taken && VerifyBdaTemplateReuse() && !SameRanges(guestMemory.AddressRanges(), verifyRanges)) {
+        guestMemory.ReleaseSpace();
+        Require(false, "a reused address-based template's BDA table differs from the one its space and regions give now (APS5_VERIFY_BDA_TEMPLATE_REUSE)");
+    }
     return taken;
 }
 

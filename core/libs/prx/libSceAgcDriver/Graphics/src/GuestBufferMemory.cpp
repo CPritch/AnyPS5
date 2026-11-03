@@ -6973,13 +6973,17 @@ GuestBufferMemory::SpaceReuse GuestBufferMemory::ReacquireSpace() {
     compareBlocks(blocks);
     for (const auto& [run, collected] : checked) held->verified[run].store(collected, std::memory_order_relaxed);
     for (const auto& [slot, collected] : writableChecked) held->writableVerified[slot].store(collected, std::memory_order_relaxed);
+    space = std::move(held);
+    completeSpaceWrites();
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
-        if (importsStale(context, state) || state.epoch != held->importsEpoch) return stale();
+        if (importsStale(context, state) || state.epoch != space->importsEpoch) {
+            space.reset();
+            return stale();
+        }
     }
-    if (mirrorsEnabled() && held->mirrored) ++Mirrors().builds;
-    space = std::move(held);
+    if (mirrorsEnabled() && space->mirrored) ++Mirrors().builds;
     spaces.reuseTaken.fetch_add(1, std::memory_order_relaxed);
     return SpaceReuse::Taken;
 }

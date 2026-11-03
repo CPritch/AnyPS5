@@ -416,6 +416,38 @@ void idleUnmap(Fixture& fixture) {
     Require(!HostImportCovers(fixture.context, allocation.Address(), allocation.bytes), "an unmapped range still has a live host import");
 }
 
+void releasedSpaceDoesNotPin(Fixture& fixture) {
+    Allocation allocation(fixture);
+    const auto imported = fixture.Import(allocation.Address(), allocation.bytes);
+    GuestBufferMemory build(fixture.context);
+    {
+        std::lock_guard gpu(GpuMutex());
+        build.AcquireRegistered();
+        build.UploadPrepare(true);
+        build.UploadFinish(true);
+    }
+    Require(build.SpaceReusable(), "an address-based upload served whole by the published space is not reusable");
+    build.ReleaseSpace();
+    Require(!build.HoldsLease(), "an address space released between uses still pins its allocations");
+    {
+        std::lock_guard gpu(GpuMutex());
+        Require(build.ReacquireSpace() == GuestBufferMemory::SpaceReuse::Taken, "the current address space was not re-taken");
+        Require(build.ReacquireSpace() == GuestBufferMemory::SpaceReuse::Busy, "an address space in use was re-taken twice");
+    }
+    Require(build.HoldsLease(), "a re-taken address space does not hold its lease");
+    build.ReleaseSpace();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Unmap(allocation.data, allocation.bytes, [&](const void*, std::size_t, const void*, bool) {
+            requireFreed(imported);
+            allocation.Release();
+        });
+        allocation.registered = false;
+    }
+    std::lock_guard gpu(GpuMutex());
+    Require(build.ReacquireSpace() == GuestBufferMemory::SpaceReuse::Stale, "an address space whose allocation was unmapped was re-taken");
+}
+
 void pendingRead(Fixture& fixture, bool submitted, bool locked) {
     Allocation allocation(fixture);
     const auto imported = fixture.Import(allocation.Address(), allocation.bytes);
@@ -786,6 +818,7 @@ int RunHostImportLifetimeTests(const Context& context) {
     Fixture fixture(context);
     descriptorFirstImport(fixture);
     idleUnmap(fixture);
+    releasedSpaceDoesNotPin(fixture);
     pendingRead(fixture, false, false);
     pendingRead(fixture, true, false);
     pendingRead(fixture, false, true);

@@ -1151,7 +1151,8 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         if (auto words = memo.load(std::memory_order_acquire); words != nullptr) {
             key.insert(key.end(), words->begin(), words->end());
         } else {
-            ShaderResources::AppendContentKey(shader, true, MovableBuffers(), key);
+            const bool addressTable = std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
+            ShaderResources::AppendContentKey(shader, true, MovableBuffers() && !addressTable, key);
             memo.store(std::make_shared<const std::vector<std::uint32_t>>(key.begin() + static_cast<std::ptrdiff_t>(sizeAt + 1u), key.end()), std::memory_order_release);
         }
         key[sizeAt] = static_cast<std::uint32_t>(key.size() - sizeAt - 1u);
