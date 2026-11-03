@@ -6363,6 +6363,20 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             stamped = true;
         }
         VkDeviceSize offset = 0;
+        if (deferCopies) {
+            const auto pending = std::find_if(pendingNotes.begin(), pendingNotes.end(), [&](const PendingNote& note) { return note.address == begin && note.bytes == bytes && note.stamp == stamp; });
+            if (pending != pendingNotes.end()) {
+                const auto owner = std::find_if(result->owners.begin(), result->owners.end(), [&](const auto& held) { return held.get() == pending->buffer; });
+                if (owner != result->owners.end()) {
+                    CountBinding(CountSnapshots);
+                    CountBinding(CountReused);
+                    selected.push_back(index);
+                    keep({begin, pending->buffer, pending->offset, bytes}, *owner);
+                    totalSnapshotBytes += bytes;
+                    continue;
+                }
+            }
+        }
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
         CountBinding(CountSnapshots);
         if (buffer != nullptr) CountBinding(CountReused);
