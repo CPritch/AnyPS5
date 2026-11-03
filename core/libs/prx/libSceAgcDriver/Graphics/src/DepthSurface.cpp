@@ -1194,6 +1194,8 @@ public:
 
     const Context context;
     const DepthTarget target;
+    const std::uint64_t depthPlaneBytes = DepthSliceBytes(target.extent, target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u);
+    const std::uint64_t stencilPlaneBytes = DepthSliceBytes(target.extent, 1u);
     const VkFormat hostFormat;
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
@@ -1406,12 +1408,11 @@ private:
     }
 
     std::uint64_t depthBytes() const {
-        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
-        return DepthSliceBytes(target.extent, d16 ? 2u : 4u);
+        return depthPlaneBytes;
     }
 
     std::uint64_t stencilBytes() const {
-        return DepthSliceBytes(target.extent, 1u);
+        return stencilPlaneBytes;
     }
     PlaneStorage mirrorPlane;
     PlaneStorage stencilMirror;
