@@ -2718,12 +2718,7 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
-    const auto first = tracker.blockOf(address);
-    const auto last = tracker.blockOf(address + bytes - 1);
-    for (auto block = first; block <= last; ++block) {
-        if (tracker.stampOf(block) > generation) return true;
-    }
-    return false;
+    return !tracker.unchanged(tracker.blockOf(address), tracker.blockOf(address + bytes - 1), generation);
 }
 
 bool WrittenSinceAny(std::span<const UnchangedQuery> queries) {
@@ -2733,10 +2728,7 @@ bool WrittenSinceAny(std::span<const UnchangedQuery> queries) {
     if (!tracker.watched) return false;
     for (const auto& query : queries) {
         if (query.generation == 0 || query.bytes == 0 || !tracker.covers(query.address, query.bytes)) continue;
-        const auto last = tracker.blockOf(query.address + query.bytes - 1);
-        for (auto block = tracker.blockOf(query.address); block <= last; ++block) {
-            if (tracker.stampOf(block) > query.generation) return true;
-        }
+        if (!tracker.unchanged(tracker.blockOf(query.address), tracker.blockOf(query.address + query.bytes - 1), query.generation)) return true;
     }
     return false;
 }
@@ -3174,6 +3166,10 @@ void GpuMutexType::unlock() {
     const bool outermost = --depth == 0;
     if (outermost) {
         owner.store(nullptr, std::memory_order_relaxed);
+        if (GpuHoldersCounted()) {
+            gpuHolderName.store(0, std::memory_order_relaxed);
+            gpuHolderSite.store(nullptr, std::memory_order_relaxed);
+        }
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
         mutex.unlock();
