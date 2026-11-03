@@ -159,6 +159,8 @@ int main() {
         Require(split.shared == 0xfc3f8ull, "every other thread keeps the fourth performant core's first sibling and the efficient cores");
         const auto whole = CpuTopology::PlacementFor(zen5, cores, true, true);
         Require(whole.resolver == 0x2008ull && whole.shared == 0xfe3f8ull, "a whole-core resolver shares its core with every other thread");
+        const auto own = CpuTopology::PlacementFor(zen5, cores, true, false, true);
+        Require(own.resolver == 0x2008ull && own.shared == 0xfc3f0ull, "an own-core resolver takes the whole fourth performant core from every other thread");
         const auto single = CpuTopology::PlacementFor(zen5, {0x401ull, 0x802ull, 0x1004ull, 0x8ull}, true);
         Require(single.resolver == 0x8ull && (single.shared & 0x8ull) != 0, "a resolver core without a second sibling stays shared");
         const auto pins = CpuTopology::ParseNamedPins("RenderThread:2008,bad,:4,Other:0,Main Thread:30");
