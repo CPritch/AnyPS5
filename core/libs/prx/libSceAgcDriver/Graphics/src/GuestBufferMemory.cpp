@@ -185,9 +185,6 @@ struct AddressSpaceCache {
     std::atomic<std::uint64_t> waiterDrops{0};
     std::atomic<std::uint64_t> writableSkipped{0};
     std::atomic<std::uint64_t> writableCompared{0};
-    std::atomic<std::uint64_t> reuseTaken{0};
-    std::atomic<std::uint64_t> reuseBusy{0};
-    std::atomic<std::uint64_t> reuseStale{0};
 };
 
 AddressSpaceCache& Spaces() {
@@ -3876,7 +3873,7 @@ LeaseStats LeaseCounters() {
 AddressSpaceStats AddressSpaceCounters() {
     const auto& cache = Spaces();
     const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
-    return {addressSpaceCacheEnabled(), load(cache.hits), load(cache.rebuiltFirst), load(cache.rebuiltGeneration), load(cache.rebuiltEpoch), load(cache.rebuiltDevice), load(cache.rebuiltWaiterDrop), load(cache.unpublished), load(cache.dissolvedOverlap), load(cache.dissolvedImports), load(cache.waiterDrops), load(cache.writableSkipped), load(cache.writableCompared), load(cache.reuseTaken), load(cache.reuseBusy), load(cache.reuseStale)};
+    return {addressSpaceCacheEnabled(), load(cache.hits), load(cache.rebuiltFirst), load(cache.rebuiltGeneration), load(cache.rebuiltEpoch), load(cache.rebuiltDevice), load(cache.rebuiltWaiterDrop), load(cache.unpublished), load(cache.dissolvedOverlap), load(cache.dissolvedImports), load(cache.waiterDrops), load(cache.writableSkipped), load(cache.writableCompared)};
 }
 
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit) {
@@ -4668,87 +4665,6 @@ void GuestBufferMemory::RecordEvicted(std::uint64_t address) {
     if (!WasEvicted(address)) evictedRanges.push_back(address);
 }
 
-namespace {
-
-bool cachedSpaceServes(const Context& context, const std::shared_ptr<const GuestBufferMemory::AddressSpace>& current, std::uint64_t generation, std::uint64_t& floor, bool counted) {
-    auto& spaces = Spaces();
-    auto& state = Imports();
-    std::lock_guard lock(state.mutex);
-    bool hit = false;
-    const auto keeps = [&](ImageMirror* mirror) { return heapMirrorWatched(*mirror) || !importsNow(context, state, current->lease, mirror->base); };
-    if (current == nullptr) {
-        if (counted) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
-    } else if (current->device != context.device) {
-        if (counted) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
-    } else if (current->generation != generation) {
-        if (counted) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
-    } else if (current->importsEpoch != state.epoch) {
-        if (counted) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        hit = std::all_of(current->heapMirrors.begin(), current->heapMirrors.end(), keeps) && std::all_of(current->sparseMirrors.begin(), current->sparseMirrors.end(), keeps);
-    }
-    floor = state.useCounter + 1;
-    if (hit) {
-        const auto stamp = ++state.useCounter;
-        static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
-        auto& spaceUse = state.spaceUses[current->serial];
-        if (!stampOnce || spaceUse == 0) {
-            for (const auto& region : current->base) {
-                if (region.direct == nullptr) continue;
-                region.direct->lastUse = stamp;
-                if (stampOnce) region.direct->spaceSerial = current->serial;
-            }
-        }
-        spaceUse = stamp;
-        if (state.spaceUses.size() > 64) {
-            const auto oldest = std::min_element(state.spaceUses.begin(), state.spaceUses.end(), [](const auto& left, const auto& right) { return left.second < right.second; });
-            for (auto& [base, entry] : state.imports) {
-                if (entry.spaceSerial != oldest->first) continue;
-                entry.lastUse = std::max(entry.lastUse, oldest->second);
-                entry.spaceSerial = 0;
-            }
-            state.spaceUses.erase(oldest);
-        }
-    }
-    return hit;
-}
-
-bool refreshSpaceSparseMirrors(std::shared_ptr<const GuestBufferMemory::AddressSpace> current, std::vector<RefreshBlock>& blocks) {
-    for (auto* mirror : current->sparseMirrors) {
-        if (refreshSparseMirror(*mirror, blocks)) continue;
-        blocks.clear();
-        Spaces().current.compare_exchange_strong(current, std::shared_ptr<const GuestBufferMemory::AddressSpace>{});
-        return false;
-    }
-    return true;
-}
-
-void appendSpaceWritableMirrors(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks, std::vector<std::pair<std::size_t, std::uint64_t>>& checked) {
-    auto& spaces = Spaces();
-    const bool stamps = writableMirrorStamps();
-    for (std::size_t slot = 0; slot < space.writableMirrors.size(); ++slot) {
-        const auto& region = space.base[space.writableMirrors[slot]];
-        if (!prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) continue;
-        if (stamps) {
-            const auto bytes = static_cast<std::size_t>(region.end - region.begin);
-            const auto collected = GuestMemory::CollectWrites(region.begin, bytes);
-            const auto since = space.writableVerified[slot].load(std::memory_order_relaxed);
-            if (since != 0 && GuestMemory::UnchangedSince(region.begin, bytes, since)) {
-                if (verifyWritableMirrorStamps() && region.mirror->resident == nullptr && !region.mirror->shadow.empty()) {
-                    Require(std::memcmp(region.mirror->shadow.data() + (region.begin - region.mirror->base), reinterpret_cast<const void*>(region.begin), bytes) == 0, "a writable mirror skipped by its write stamps differs from guest memory (APS5_VERIFY_WRITABLE_MIRROR_STAMPS)");
-                }
-                spaces.writableSkipped.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            checked.emplace_back(slot, collected);
-        }
-        spaces.writableCompared.fetch_add(1, std::memory_order_relaxed);
-        appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
-    }
-}
-
-}
-
 void GuestBufferMemory::AcquireRegistered() {
     struct BuildingScope {
         explicit BuildingScope(GuestBufferMemory* self) { buildingBufferMemory = self; }
@@ -4784,8 +4700,49 @@ void GuestBufferMemory::AcquireRegistered() {
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (addressSpaceCacheEnabled()) {
         auto current = spaces.current.load();
-        bool hit = cachedSpaceServes(context, current, generation, importFloor, true);
-        if (hit && !refreshSpaceSparseMirrors(current, blocks)) hit = false;
+        bool hit = false;
+        {
+            auto& state = Imports();
+            std::lock_guard lock(state.mutex);
+            const auto keeps = [&](ImageMirror* mirror) { return heapMirrorWatched(*mirror) || !importsNow(context, state, current->lease, mirror->base); };
+            if (current == nullptr) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
+            else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
+            else if (current->generation != generation) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
+            else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
+            else hit = std::all_of(current->heapMirrors.begin(), current->heapMirrors.end(), keeps) && std::all_of(current->sparseMirrors.begin(), current->sparseMirrors.end(), keeps);
+            importFloor = state.useCounter + 1;
+            if (hit) {
+                const auto stamp = ++state.useCounter;
+                static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
+                auto& spaceUse = state.spaceUses[current->serial];
+                if (!stampOnce || spaceUse == 0) {
+                    for (const auto& region : current->base) {
+                        if (region.direct == nullptr) continue;
+                        region.direct->lastUse = stamp;
+                        if (stampOnce) region.direct->spaceSerial = current->serial;
+                    }
+                }
+                spaceUse = stamp;
+                if (state.spaceUses.size() > 64) {
+                    const auto oldest = std::min_element(state.spaceUses.begin(), state.spaceUses.end(), [](const auto& left, const auto& right) { return left.second < right.second; });
+                    for (auto& [base, entry] : state.imports) {
+                        if (entry.spaceSerial != oldest->first) continue;
+                        entry.lastUse = std::max(entry.lastUse, oldest->second);
+                        entry.spaceSerial = 0;
+                    }
+                    state.spaceUses.erase(oldest);
+                }
+            }
+        }
+        if (hit) {
+            for (auto* mirror : current->sparseMirrors) {
+                if (refreshSparseMirror(*mirror, blocks)) continue;
+                hit = false;
+                blocks.clear();
+                spaces.current.compare_exchange_strong(current, std::shared_ptr<const AddressSpace>{});
+                break;
+            }
+        }
         if (hit) {
             spaces.hits.fetch_add(1, std::memory_order_relaxed);
             space = std::move(current);
@@ -4799,7 +4756,26 @@ void GuestBufferMemory::AcquireRegistered() {
             // before any of them is dereferenced.
             served = true;
             mirrored = space->mirrored;
-            appendSpaceWritableMirrors(*space, blocks, writableChecked);
+            const bool stamps = writableMirrorStamps();
+            for (std::size_t slot = 0; slot < space->writableMirrors.size(); ++slot) {
+                const auto& region = space->base[space->writableMirrors[slot]];
+                if (!prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) continue;
+                if (stamps) {
+                    const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+                    const auto collected = GuestMemory::CollectWrites(region.begin, bytes);
+                    const auto since = space->writableVerified[slot].load(std::memory_order_relaxed);
+                    if (since != 0 && GuestMemory::UnchangedSince(region.begin, bytes, since)) {
+                        if (verifyWritableMirrorStamps() && region.mirror->resident == nullptr && !region.mirror->shadow.empty()) {
+                            Require(std::memcmp(region.mirror->shadow.data() + (region.begin - region.mirror->base), reinterpret_cast<const void*>(region.begin), bytes) == 0, "a writable mirror skipped by its write stamps differs from guest memory (APS5_VERIFY_WRITABLE_MIRROR_STAMPS)");
+                        }
+                        spaces.writableSkipped.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    writableChecked.emplace_back(slot, collected);
+                }
+                spaces.writableCompared.fetch_add(1, std::memory_order_relaxed);
+                appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
+            }
             lap(timing.mirrorsUs, at);
         }
     }
@@ -6930,68 +6906,10 @@ void GuestBufferMemory::WriteBack() {
     releaseHeapReferences();
 }
 
-bool GuestBufferMemory::SpaceReusable() const {
-    return space != nullptr && lease.empty() && space->copied.empty() && Spaces().current.load() == space;
-}
-
-void GuestBufferMemory::ReleaseSpace() {
-    if (space == nullptr) return;
-    reusableSpace = space;
-    space.reset();
-}
-
-GuestBufferMemory::SpaceReuse GuestBufferMemory::ReacquireSpace() {
-    auto& spaces = Spaces();
-    if (space != nullptr) {
-        spaces.reuseBusy.fetch_add(1, std::memory_order_relaxed);
-        return SpaceReuse::Busy;
-    }
-    const auto stale = [&] {
-        spaces.reuseStale.fetch_add(1, std::memory_order_relaxed);
-        return SpaceReuse::Stale;
-    };
-    auto held = reusableSpace.lock();
-    if (held == nullptr || spaces.current.load() != held) return stale();
-    struct BuildingScope {
-        explicit BuildingScope(GuestBufferMemory* self) { buildingBufferMemory = self; }
-        ~BuildingScope() {
-            buildingBufferMemory = nullptr;
-            buildingBlocks = nullptr;
-        }
-    };
-    const BuildingScope buildingScope(this);
-    ensurePinWaiter();
-    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    std::uint64_t floor = 0;
-    if (!cachedSpaceServes(context, held, generation, floor, false)) return stale();
-    std::vector<RefreshBlock> blocks;
-    buildingBlocks = &blocks;
-    if (!refreshSpaceSparseMirrors(held, blocks)) return stale();
-    std::vector<std::pair<std::size_t, std::uint64_t>> writableChecked;
-    appendSpaceWritableMirrors(*held, blocks, writableChecked);
-    const auto checked = refreshHeapRuns(*held, blocks);
-    compareBlocks(blocks);
-    for (const auto& [run, collected] : checked) held->verified[run].store(collected, std::memory_order_relaxed);
-    for (const auto& [slot, collected] : writableChecked) held->writableVerified[slot].store(collected, std::memory_order_relaxed);
-    space = std::move(held);
-    completeSpaceWrites();
-    if (context.hostImportAlignment != 0) {
-        auto& state = Imports();
-        std::lock_guard lock(state.mutex);
-        if (importsStale(context, state) || state.epoch != space->importsEpoch) {
-            space.reset();
-            return stale();
-        }
-    }
-    if (mirrorsEnabled() && space->mirrored) ++Mirrors().builds;
-    spaces.reuseTaken.fetch_add(1, std::memory_order_relaxed);
-    return SpaceReuse::Taken;
-}
-
-std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions(bool outsideSpace) const {
+std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions() const {
     if (!uploaded || committed) return std::nullopt;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (space != nullptr && !outsideSpace) {
+    if (space != nullptr) {
         for (const auto& region : space->base) {
             if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return std::nullopt;
             result.emplace_back(region.begin, region.end);

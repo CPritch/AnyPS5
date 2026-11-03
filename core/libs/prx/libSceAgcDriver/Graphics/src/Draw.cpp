@@ -1151,8 +1151,7 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         if (auto words = memo.load(std::memory_order_acquire); words != nullptr) {
             key.insert(key.end(), words->begin(), words->end());
         } else {
-            const bool addressTable = std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
-            ShaderResources::AppendContentKey(shader, true, MovableBuffers() && !addressTable, key);
+            ShaderResources::AppendContentKey(shader, true, MovableBuffers(), key);
             memo.store(std::make_shared<const std::vector<std::uint32_t>>(key.begin() + static_cast<std::ptrdiff_t>(sizeAt + 1u), key.end()), std::memory_order_release);
         }
         key[sizeAt] = static_cast<std::uint32_t>(key.size() - sizeAt - 1u);
@@ -2109,31 +2108,8 @@ void CountStaleView(StaleViewSite site, bool live, std::uint64_t address, std::s
 namespace {
 
 
-struct SpaceUse {
-    SpaceUse() = default;
-    SpaceUse(std::shared_ptr<ShaderResources> resources, std::uint64_t use) : resources(std::move(resources)), use(use) {}
-    SpaceUse(const SpaceUse&) = delete;
-    SpaceUse& operator=(const SpaceUse&) = delete;
-    SpaceUse(SpaceUse&& other) noexcept : resources(std::move(other.resources)), use(other.use) {}
-    SpaceUse& operator=(SpaceUse&& other) noexcept {
-        if (this != &other) {
-            end();
-            resources = std::move(other.resources);
-            use = other.use;
-        }
-        return *this;
-    }
-    ~SpaceUse() { end(); }
-    void end() {
-        if (resources != nullptr) std::exchange(resources, nullptr)->EndSpaceUse(use);
-    }
-    std::shared_ptr<ShaderResources> resources;
-    std::uint64_t use = 0;
-};
-
 struct ResolvedResources {
     std::shared_ptr<ShaderResources> resources;
-    SpaceUse spaceUse;
     std::vector<ShaderResources::MovedBuffer> moved;
     ResourceCache::Key contentKey;
     bool cacheable = false;
@@ -2156,7 +2132,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     static const bool aheadKeyedSkip = std::getenv("APS5_NO_AHEAD_KEYED_SKIP") == nullptr;
     const bool aheadKeyed = aheadKeyedSkip && ahead.Takes() && !ahead.ahead->contentKey.empty();
-    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && (aheadKeyed || (std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders, !GuestMemory::OnResolverThread())));
+    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && (aheadKeyed || (std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders)));
     if (resolved.cacheable) {
         if (ahead.Takes() && !ahead.ahead->contentKey.empty()) {
             resolved.contentKey = std::move(ahead.ahead->contentKey);
@@ -2221,16 +2197,6 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 }
             }
             lap(split.movedNs);
-            if (moved.has_value() && cached->ReusesSpace()) {
-                GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverPath);
-                const auto reuse = cached->ReacquireSpace();
-                if (reuse == GuestBufferMemory::SpaceReuse::Taken) {
-                    resolved.spaceUse = SpaceUse(cached, cached->BeginSpaceUse());
-                } else {
-                    if (reuse == GuestBufferMemory::SpaceReuse::Stale) SharedResourceCache().Remove(resolved.contentKey);
-                    moved.reset();
-                }
-            }
             if (moved.has_value()) {
                 if (trimKey && !(ahead.Takes() && ahead.ahead->aliasesChecked && ahead.ahead->aliasIndexBytes == indexBytes)) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
@@ -2260,7 +2226,6 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         const bool buildCounted = timer.counted && DrawSplitCounted();
         const auto building = buildCounted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
-        if (resolved.resources->ReusesSpace()) resolved.spaceUse = SpaceUse(resolved.resources, resolved.resources->BeginSpaceUse());
         if (buildCounted) {
             auto& split = DrawSplit();
             const std::size_t kind = resolved.cacheable ? 0u : 1u;
@@ -2518,7 +2483,6 @@ struct Kept {
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;
     std::vector<std::shared_ptr<StorageTexture>> targets;
     std::unique_ptr<DeviceBuffer> scratch;
-    std::shared_ptr<const void> space;
 };
 
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
@@ -2546,10 +2510,6 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     kept->vertexBuffers = std::move(inputs.vertexBuffers);
     kept->scratch = std::move(scratch);
     kept->targets = std::move(targets);
-    if (resources != nullptr && resources->ReusesSpace()) {
-        kept->space = resources->SpaceHold();
-        Require(kept->space != nullptr, "a reused address-based template was kept without its address space");
-    }
     const auto& residents = kept->targets;
     resources->KeepStorageImageBytes(recorder);
     for (const auto& target : residents) {
@@ -3970,7 +3930,6 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     if (!lean && !resolved.moved.empty()) {
         GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverPath);
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
-        resolved.spaceUse = resolved.resources->ReusesSpace() ? SpaceUse(resolved.resources, resolved.resources->BeginSpaceUse()) : SpaceUse{};
         resolved.moved.clear();
     }
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
@@ -4139,7 +4098,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->ReusesSpace() && resolved.moved.empty() && !multisampled && !pipeline->ReordersSamples()) {
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && resolved.moved.empty() && !multisampled && !pipeline->ReordersSamples()) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -4552,8 +4511,8 @@ std::string TakeDrawSplitText() {
         {
             static AddressSpaceStats seen{};
             const auto now = AddressSpaceCounters();
-            char spaces[320];
-            std::snprintf(spaces, sizeof(spaces), "; address spaces (10 s): hits %llu, rebuilt for the allocation generation %llu, the imports epoch %llu, a waiter drop %llu, first %llu; writable mirrors skipped by stamps %llu, compared %llu; address-based templates reused %llu, busy %llu, stale %llu", static_cast<unsigned long long>(now.hits - seen.hits), static_cast<unsigned long long>(now.rebuiltGeneration - seen.rebuiltGeneration), static_cast<unsigned long long>(now.rebuiltEpoch - seen.rebuiltEpoch), static_cast<unsigned long long>(now.rebuiltWaiterDrop - seen.rebuiltWaiterDrop), static_cast<unsigned long long>(now.rebuiltFirst - seen.rebuiltFirst), static_cast<unsigned long long>(now.writableSkipped - seen.writableSkipped), static_cast<unsigned long long>(now.writableCompared - seen.writableCompared), static_cast<unsigned long long>(now.reuseTaken - seen.reuseTaken), static_cast<unsigned long long>(now.reuseBusy - seen.reuseBusy), static_cast<unsigned long long>(now.reuseStale - seen.reuseStale));
+            char spaces[256];
+            std::snprintf(spaces, sizeof(spaces), "; address spaces (10 s): hits %llu, rebuilt for the allocation generation %llu, the imports epoch %llu, a waiter drop %llu, first %llu; writable mirrors skipped by stamps %llu, compared %llu", static_cast<unsigned long long>(now.hits - seen.hits), static_cast<unsigned long long>(now.rebuiltGeneration - seen.rebuiltGeneration), static_cast<unsigned long long>(now.rebuiltEpoch - seen.rebuiltEpoch), static_cast<unsigned long long>(now.rebuiltWaiterDrop - seen.rebuiltWaiterDrop), static_cast<unsigned long long>(now.rebuiltFirst - seen.rebuiltFirst), static_cast<unsigned long long>(now.writableSkipped - seen.writableSkipped), static_cast<unsigned long long>(now.writableCompared - seen.writableCompared));
             result += spaces;
             seen = now;
         }
