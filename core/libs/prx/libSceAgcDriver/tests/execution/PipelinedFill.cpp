@@ -25,7 +25,7 @@ alignas(256) constexpr auto Code = PatternFillKernel;
 alignas(256) std::array<std::uint32_t, 4> Pattern{};
 alignas(256) std::array<std::uint32_t, 4> Control{};
 alignas(256) std::array<std::uint32_t, 260> Output{};
-alignas(256) std::array<std::uint32_t, 64> Labels{};
+alignas(256) std::array<std::uint32_t, 256> Labels{};
 alignas(256) std::array<std::uint32_t, 4> ScratchPattern{0x0f0f0f0fu, 0, 0, 0};
 alignas(256) std::array<std::uint32_t, 4> ScratchControl{256, 0, 0, 0};
 alignas(256) std::array<std::uint32_t, 260> Scratch{};

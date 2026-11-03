@@ -413,7 +413,7 @@ namespace {
 std::size_t FinisherDepth() {
     static const std::size_t depth = [] {
         const char* text = std::getenv("APS5_FINISHER_DEPTH");
-        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 16ull;
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
         return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 2ull, 256ull));
     }();
     return depth;
@@ -578,9 +578,9 @@ std::size_t DrawPipeline::Depth() {
     static const std::size_t depth = [] {
         const char* text = std::getenv("APS5_PIPELINED_DRAWS");
         if (std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr || std::getenv("APS5_DRAW_DRAIN") != nullptr || std::getenv("APS5_DRAIN_ALL") != nullptr || std::getenv("APS5_NO_WORDWISE_CAPTURE") != nullptr) return std::size_t{0};
-        if (text == nullptr) return std::size_t{32};
+        if (text == nullptr) return std::size_t{128};
         const auto value = std::strtoull(text, nullptr, 10);
-        return value == 0 ? std::size_t{0} : value == 1 ? std::size_t{32} : static_cast<std::size_t>(std::min<unsigned long long>(value, 256));
+        return value == 0 ? std::size_t{0} : value == 1 ? std::size_t{128} : static_cast<std::size_t>(std::min<unsigned long long>(value, 256));
     }();
     return depth;
 }
