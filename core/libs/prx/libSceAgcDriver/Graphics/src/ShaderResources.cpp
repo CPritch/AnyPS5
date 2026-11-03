@@ -6255,9 +6255,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     bool stamped = false;
     static const bool lockedStamp = std::getenv("APS5_LOCKED_SNAPSHOT_STAMP") != nullptr;
     const auto snapshotStamp = [] { return lockedStamp ? GuestMemory::TrackerGeneration() : GuestMemory::PublishedTrackerGeneration(); };
-    const auto keep = [&](DrawBindings::Snapshot snapshot) {
+    const auto keep = [&](DrawBindings::Snapshot snapshot, const std::shared_ptr<Buffer>& owner) {
         if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
-        result->snapshots.push_back(std::move(snapshot));
+        Require(owner.get() == snapshot.buffer, "a draw snapshot is not owned by its bindings");
+        if (std::find(result->owners.begin(), result->owners.end(), owner) == result->owners.end()) result->owners.push_back(owner);
+        result->snapshots.push_back(snapshot);
     };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
@@ -6269,7 +6271,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (patch.allocation == index && patch.byte < override->size) slice.bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            keep({0, std::move(slice.buffer), slice.offset, override->size});
+            keep({0, slice.buffer, slice.offset, override->size}, recorder.DrawUploadOwner(slice.buffer));
             continue;
         }
         std::uint64_t address = item.address;
@@ -6302,12 +6304,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (!same) differing.fetch_add(1);
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
+        Buffer* raw = buffer.get();
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
-                buffer = std::move(slice.buffer);
+                raw = slice.buffer;
                 offset = slice.offset;
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
@@ -6317,12 +6320,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                     recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
                 }
+                raw = buffer.get();
             }
             if (snapshotStamp() != stamp[0]) stamped = false;
-            else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer, offset);
+            else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, uploaded ? recorder.DrawUploadOwner(raw) : buffer, offset);
         }
         selected.push_back(index);
-        keep({begin, std::move(buffer), offset, bytes});
+        keep({begin, raw, offset, bytes}, buffer != nullptr ? buffer : recorder.DrawUploadOwner(raw));
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
@@ -6386,7 +6390,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer, snapshot.buffer->Bytes().size());
     return result;
 }
 

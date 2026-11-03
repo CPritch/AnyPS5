@@ -3690,7 +3690,12 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
         offset = 0;
     }
     drawUploadUsed = offset + bytes;
-    return {drawUpload, offset, drawUpload->Bytes().data() + offset};
+    return {drawUpload.get(), offset, drawUpload->Bytes().data() + offset};
+}
+
+const std::shared_ptr<Buffer>& Recorder::DrawUploadOwner(const Buffer* buffer) const {
+    static const std::shared_ptr<Buffer> none;
+    return buffer == drawUpload.get() ? drawUpload : none;
 }
 
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {

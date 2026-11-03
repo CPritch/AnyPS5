@@ -4939,7 +4939,8 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         const auto snapshot = [&](std::byte expected) {
             const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
-            const auto buffer = bindings->snapshots[0].buffer;
+            Require(bindings->owners.size() == 1 && bindings->owners[0].get() == bindings->snapshots[0].buffer, "a draw snapshot above the upload limit is not owned by its bindings");
+            const auto buffer = bindings->owners[0];
             const auto contents = buffer->Bytes();
             Require(contents.size() == elementBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; }), "a draw snapshot does not hold the guest bytes of its draw");
             return buffer;
@@ -4960,7 +4961,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         Require(snapshot(std::byte{0x33}) == afterStore, "a driver store of the same bytes made the draw input copy again");
         reinterpret_cast<std::uint8_t*>(element)[elementBytes - 1] = 0x34;
         const auto tail = resources.PrepareDrawBindings(snapshotRecorder);
-        Require(tail != nullptr && tail->snapshots.size() == 1 && tail->snapshots[0].buffer != afterStore && tail->snapshots[0].buffer->Bytes()[elementBytes - 1] == std::byte{0x34}, "a draw snapshot outlived a store that changed its last byte");
+        Require(tail != nullptr && tail->snapshots.size() == 1 && tail->snapshots[0].buffer != afterStore.get() && tail->snapshots[0].buffer->Bytes()[elementBytes - 1] == std::byte{0x34}, "a draw snapshot outlived a store that changed its last byte");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
         {
             GuestAllocations::Mutation mutation;
@@ -5034,7 +5035,8 @@ void drawSnapshotPatchTests(const Device& device) {
         const auto snapshot = [&] {
             auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
-            auto buffer = bindings->snapshots[0].buffer;
+            Require(bindings->owners.size() == 1 && bindings->owners[0].get() == bindings->snapshots[0].buffer, "a draw snapshot above the upload limit is not owned by its bindings");
+            auto buffer = bindings->owners[0];
             const auto contents = buffer->Bytes();
             Require(contents.size() == elementBytes && std::memcmp(contents.data(), reinterpret_cast<const void*>(element), elementBytes) == 0, "a draw snapshot does not hold the guest bytes of its draw");
             return buffer;
@@ -5137,7 +5139,8 @@ void drawSnapshotEpochTests(const Device& device) {
         const auto snapshot = [&] {
             auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
-            auto buffer = bindings->snapshots[0].buffer;
+            Require(bindings->owners.size() == 1 && bindings->owners[0].get() == bindings->snapshots[0].buffer, "a draw snapshot above the upload limit is not owned by its bindings");
+            auto buffer = bindings->owners[0];
             const auto contents = buffer->Bytes();
             Require(contents.size() == elementBytes && std::memcmp(contents.data(), reinterpret_cast<const void*>(element), elementBytes) == 0, "a draw snapshot does not hold the guest bytes of its draw");
             return buffer;
