@@ -248,6 +248,9 @@ struct AddressSpaceStats {
     std::uint64_t dissolvedOverlap = 0;
     std::uint64_t dissolvedImports = 0;
     std::uint64_t waiterDrops = 0;
+    // Writable mirrors on a cached space's hit: skipped as unchanged by their write stamps, compared.
+    std::uint64_t writableSkipped = 0;
+    std::uint64_t writableCompared = 0;
 };
 AddressSpaceStats AddressSpaceCounters();
 

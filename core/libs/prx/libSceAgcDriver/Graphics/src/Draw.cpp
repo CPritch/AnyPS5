@@ -4511,8 +4511,8 @@ std::string TakeDrawSplitText() {
         {
             static AddressSpaceStats seen{};
             const auto now = AddressSpaceCounters();
-            char spaces[192];
-            std::snprintf(spaces, sizeof(spaces), "; address spaces (10 s): hits %llu, rebuilt for the allocation generation %llu, the imports epoch %llu, a waiter drop %llu, first %llu", static_cast<unsigned long long>(now.hits - seen.hits), static_cast<unsigned long long>(now.rebuiltGeneration - seen.rebuiltGeneration), static_cast<unsigned long long>(now.rebuiltEpoch - seen.rebuiltEpoch), static_cast<unsigned long long>(now.rebuiltWaiterDrop - seen.rebuiltWaiterDrop), static_cast<unsigned long long>(now.rebuiltFirst - seen.rebuiltFirst));
+            char spaces[256];
+            std::snprintf(spaces, sizeof(spaces), "; address spaces (10 s): hits %llu, rebuilt for the allocation generation %llu, the imports epoch %llu, a waiter drop %llu, first %llu; writable mirrors skipped by stamps %llu, compared %llu", static_cast<unsigned long long>(now.hits - seen.hits), static_cast<unsigned long long>(now.rebuiltGeneration - seen.rebuiltGeneration), static_cast<unsigned long long>(now.rebuiltEpoch - seen.rebuiltEpoch), static_cast<unsigned long long>(now.rebuiltWaiterDrop - seen.rebuiltWaiterDrop), static_cast<unsigned long long>(now.rebuiltFirst - seen.rebuiltFirst), static_cast<unsigned long long>(now.writableSkipped - seen.writableSkipped), static_cast<unsigned long long>(now.writableCompared - seen.writableCompared));
             result += spaces;
             seen = now;
         }
