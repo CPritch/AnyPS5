@@ -104,6 +104,12 @@ public:
     static void NoteCommitterPart(CommitterPart part, std::chrono::steady_clock::time_point since);
     enum class OwnCause : std::uint8_t { NoneQueued, BehindSeal, BehindSealThenLabel, BehindLabel, BehindFill, BehindOther, NextNoHook, DeclinedPredictor, DeclinedDescribed, DeclinedReadsWritten, DeclinedOther, Revoked, AbortedImageRefresh, AbortedOther, Failed, Dropped, StaleSubmit, StaleProof, StaleOther, Unknown, Count };
     static OwnCause TakenOwnCause();
+    static std::uint64_t LastJoinWaitNs();
+    static void NoteStaleSubmit();
+    static constexpr std::size_t LabelPartCount = 6;
+    static bool LabelPartsCounted();
+    static void NoteLabelParts(const std::array<std::uint64_t, LabelPartCount>& parts);
+    static void NoteJobClass(std::size_t jobClass, std::uint64_t jobNs, std::uint64_t waitNs);
     static bool CarryHold();
     static bool HoldCarried();
     static void ReleaseCarriedHold() noexcept;
@@ -198,6 +204,8 @@ private:
     std::array<std::uint64_t, 257> drainOpcodeNs{};
     std::array<std::uint64_t, static_cast<std::size_t>(ItemKind::Count)> kindCommits{};
     std::array<std::uint64_t, static_cast<std::size_t>(ItemKind::Count)> kindCommitNs{};
+    std::array<std::uint64_t, 5> drawRuns{}, drawRunDraws{};
+    std::uint64_t drawRun = 0;
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();

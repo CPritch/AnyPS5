@@ -511,16 +511,32 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
 }
 
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt) {
+    struct LabelLaps {
+        bool on = DrawPipeline::LabelPartsCounted();
+        std::chrono::steady_clock::time_point mark = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        std::array<std::uint64_t, DrawPipeline::LabelPartCount> parts{};
+        void lap(std::size_t part) {
+            if (!on) return;
+            const auto now = std::chrono::steady_clock::now();
+            parts[part] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count());
+            mark = now;
+        }
+        ~LabelLaps() {
+            if (on) DrawPipeline::NoteLabelParts(parts);
+        }
+    } laps;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), queue);
+    laps.lap(0);
     bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;
     GuestMemory::NoteScopedLabelCommit(false);
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
         if (localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
+        laps.lap(1);
         const bool scopable = GuestMemory::ScopedLabelBreaks() && queue == 0 && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer && (GuestMemory::AliasSerial() == 0 || !GuestMemory::Aliased(address, bytes.size())) && !Graphics::AnyShadowedOverlaps(address, bytes.size());
         if (scopable) GuestMemory::SetScopedLabelRange(address, address + bytes.size());
         struct ClearScope {
@@ -536,6 +552,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(address, bytes, 4);
         }
+        laps.lap(2);
         noteLabelStore(address, bytes, stamp, queue);
         Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
         countLabelOutcome(reason);
@@ -543,6 +560,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     } else {
         ++noOpLabels;
     }
+    laps.lap(3);
     if (endOfPipeInterrupt) {
         bool deferred = false;
         if (bytes.empty() && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("interrupt") != 0) workOpen = true;
@@ -552,7 +570,9 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         }
         if (!deferred) deliverGuestEopInterrupt(queue);
     }
+    laps.lap(4);
     submitDueAfterCommit(localDevice.get());
+    laps.lap(5);
 }
 
 void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
@@ -560,8 +580,11 @@ void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     const auto pending = Graphics::Recorder::PendingLabelSince();
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
     const auto work = Graphics::Recorder::RecordedWorkSinceSubmit();
-    const bool capped = (batchCap() != 0 && work >= batchCap()) || idleSubmitDue(work);
-    if (due || capped) localDevice->SubmitRecorded(true);
+    const bool cap = batchCap() != 0 && work >= batchCap();
+    const bool idle = !cap && idleSubmitDue(work);
+    if (!due && !cap && !idle) return;
+    Graphics::Recorder::TagSubmitCause(due ? Graphics::Recorder::SubmitCause::LabelDeadline : cap ? Graphics::Recorder::SubmitCause::BatchCap : Graphics::Recorder::SubmitCause::Idle);
+    localDevice->SubmitRecorded(true);
 }
 
 }

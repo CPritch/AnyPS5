@@ -53,6 +53,7 @@
 #ifndef __APPLE__
 #include <link.h>
 #endif
+#include <dlfcn.h>
 #include <pthread.h>
 #include <sstream>
 #include <sys/ioctl.h>
@@ -2946,6 +2947,78 @@ void NoteHotLockWait(std::size_t site, std::chrono::steady_clock::time_point sta
     hotLockWaits[thread][site].fetch_add(1, std::memory_order_relaxed);
     hotLockWaitNs[thread][site].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()), std::memory_order_relaxed);
 }
+
+std::atomic<const void*> gpuHolderSite{nullptr};
+std::atomic<std::uint32_t> gpuHolderName{0};
+std::mutex holderNamesMutex;
+std::vector<std::string> holderNames{"unknown"};
+std::mutex holderWaitsMutex;
+std::map<std::pair<std::uint32_t, const void*>, std::pair<std::uint64_t, std::uint64_t>> committerHolderWaits;
+
+bool GpuHoldersCounted() {
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    return counted;
+}
+
+std::uint32_t ThreadNameIndex() {
+    thread_local std::uint32_t index = 0;
+    if (index != 0) return index;
+    char name[32] = "unnamed";
+#ifdef __linux__
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+#endif
+    std::lock_guard lock(holderNamesMutex);
+    const auto found = std::find(holderNames.begin() + 1, holderNames.end(), name);
+    if (found != holderNames.end()) {
+        index = static_cast<std::uint32_t>(found - holderNames.begin());
+    } else {
+        holderNames.emplace_back(name);
+        index = static_cast<std::uint32_t>(holderNames.size() - 1);
+    }
+    return index;
+}
+
+void NoteGpuHolder(const void* site) {
+    gpuHolderSite.store(site, std::memory_order_relaxed);
+    gpuHolderName.store(ThreadNameIndex(), std::memory_order_relaxed);
+}
+
+void NoteCommitterHolderWait(std::uint32_t name, const void* site, std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end) {
+    const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+    std::lock_guard lock(holderWaitsMutex);
+    auto& entry = committerHolderWaits[{name, site}];
+    ++entry.first;
+    entry.second += ns;
+}
+
+std::string TakeCommitterHolderText() {
+    std::vector<std::pair<std::pair<std::uint32_t, const void*>, std::pair<std::uint64_t, std::uint64_t>>> waits;
+    {
+        std::lock_guard lock(holderWaitsMutex);
+        waits.assign(committerHolderWaits.begin(), committerHolderWaits.end());
+        committerHolderWaits.clear();
+    }
+    if (waits.empty()) return {};
+    std::sort(waits.begin(), waits.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    std::vector<std::string> names;
+    {
+        std::lock_guard lock(holderNamesMutex);
+        names = holderNames;
+    }
+    std::string text = "; committer GPU-lock waits by holder (thread at site: waits, ms):";
+    for (std::size_t i = 0; i < waits.size() && i < 10; ++i) {
+        const auto& [key, value] = waits[i];
+        unsigned long long offset = reinterpret_cast<std::uintptr_t>(key.second);
+#ifdef __linux__
+        Dl_info info{};
+        if (key.second != nullptr && dladdr(key.second, &info) != 0 && info.dli_fbase != nullptr) offset = reinterpret_cast<std::uintptr_t>(key.second) - reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+#endif
+        char item[128];
+        std::snprintf(item, sizeof(item), "%s %s at +0x%llx: %llu, %.1f", i == 0 ? "" : ",", key.first < names.size() ? names[key.first].c_str() : "unknown", offset, static_cast<unsigned long long>(value.first), static_cast<double>(value.second) / 1e6);
+        text += item;
+    }
+    return text;
+}
 }
 
 void CountGpuLockWaits(HotThread thread) {
@@ -2975,7 +3048,7 @@ std::string TakeHotLockWaitText() {
         if (!any) text += " none";
         text += thread + 1 < HotThreadCount ? ";" : "";
     }
-    return text;
+    return text + TakeCommitterHolderText();
 }
 
 void GpuMutexType::enter() {
@@ -3068,6 +3141,7 @@ bool GpuMutexType::try_lock() {
     if (!GpuLockProfiled()) {
         if (!tryEnter()) return false;
         acquired();
+        if (depth == 1 && GpuHoldersCounted()) NoteGpuHolder(__builtin_return_address(0));
         return true;
     }
     // The tag is consumed whether or not the try succeeds (a failed try must not name the next
@@ -3295,14 +3369,18 @@ void GpuMutexType::lock() {
         } else {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!tryEnter()) {
+                const auto holderName = gpuHolderName.load(std::memory_order_relaxed);
+                const auto holderSite = gpuHolderSite.load(std::memory_order_relaxed);
                 const auto start = std::chrono::steady_clock::now();
                 LockSpinning(mutex, HandoffSpinWindow());
                 const auto end = std::chrono::steady_clock::now();
                 if (trace != nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, end);
                 if (hotThread != HotThread::None) NoteHotLockWait(site, start, end);
+                if (hotThread == HotThread::Committer && GpuHoldersCounted()) NoteCommitterHolderWait(holderName, holderSite, start, end);
             }
         }
         acquired();
+        if (depth == 1 && GpuHoldersCounted()) NoteGpuHolder(__builtin_return_address(0));
         return;
     }
     auto& stats = LockStats();

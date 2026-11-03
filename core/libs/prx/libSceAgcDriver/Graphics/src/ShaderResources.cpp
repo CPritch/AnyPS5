@@ -2055,12 +2055,16 @@ BufferWriteCounters& BufferWrites() {
 }
 
 double ShaderResources::phase(BuildPhase which) {
-    if (!BuildProfiled()) return 0.0;
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    const bool profiled = BuildProfiled();
+    if (!profiled && !counted) return 0.0;
     const auto now = std::chrono::steady_clock::now();
     const auto ms = std::chrono::duration<double, std::milli>(now - phaseStart).count();
+    phaseMs[static_cast<std::size_t>(which)] += static_cast<float>(ms);
+    phaseStart = now;
+    if (!profiled) return 0.0;
     addBuildPhase(which, ms);
     if (ms > 50) AgcDriver::ProfilePrint_nid_no_patch("[resources] %s took %.0f ms (%zu textures, %zu storage images, %zu buffers, bda %d)\n", BuildPhaseNames[static_cast<std::size_t>(which)], ms, textures.size(), storageTextures.size(), allocations.size(), usesBda ? 1 : 0);
-    phaseStart = now;
     return ms;
 }
 
@@ -2565,6 +2569,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             if (!shared) writeOnlyRanges.emplace_back(begin, end);
         }
         timing.descriptorsMs = phase(BuildPhase::Descriptors);
+        phaseMs[static_cast<std::size_t>(BuildPhase::StageA)] = static_cast<float>(std::chrono::duration<double, std::milli>(phaseStart - stageStart).count());
         if (BuildProfiled()) {
             timing.prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stageStart).count();
             addBuildPhase(BuildPhase::StageA, timing.prepareMs);
@@ -2825,6 +2830,7 @@ void ShaderResources::buildComplete() {
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         noteReusable();
         completed = true;
+        phaseMs[static_cast<std::size_t>(BuildPhase::StageB)] = static_cast<float>(std::chrono::duration<double, std::milli>(phaseStart - stageStart).count());
         if (BuildProfiled()) {
             timing.completeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stageStart).count();
             addBuildPhase(BuildPhase::StageB, timing.completeMs);
@@ -3403,6 +3409,26 @@ std::size_t ShaderResources::LookupLogCapacity() {
     return lookupLog().capacity();
 }
 
+namespace {
+enum ProofPart : std::size_t { PartPendingWrites, PartDepthChecks, PartDepthPlanes, PartCollects, PartKeys, PartElements, PartPendingScan, PartUnchanged, PartFastTail, PartOwnRefresh, PartFullWalk, PartRegions, PartImports, PartRest, ProofPartCount };
+
+struct ProofLapClock {
+    bool on = false;
+    std::chrono::steady_clock::time_point mark{};
+    std::array<std::uint64_t, ProofPartCount> parts{};
+};
+
+thread_local ProofLapClock proofLapClock;
+
+void proofLap(ProofPart part) {
+    auto& clock = proofLapClock;
+    if (!clock.on) return;
+    const auto now = std::chrono::steady_clock::now();
+    clock.parts[part] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - clock.mark).count());
+    clock.mark = now;
+}
+}
+
 // Proves every texture and storage image still current without repeating its lookup: exactly the
 // "unchanged" branches of cachedTexture and StorageTexture::Refresh, evaluated from write stamps,
 // the pending-results registry and the DCC keys. Per element: collect first (stamps come only from
@@ -3452,21 +3478,25 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         owners.push_back(owner);
     };
     for (std::size_t i = 0; i < textures.size(); ++i) {
+        proofLap(PartElements);
         auto& surface = validatedTextures[i];
         if (!surface.valid) return fail(FastFail::NoRecord);
         if (surface.depth) {
             if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth);
+            proofLap(PartDepthChecks);
             continue;
         }
         if (textures[i]->Released()) return fail(FastFail::Replaced);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
+        proofLap(PartDepthPlanes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) {
             countCollectRefusal(false, address, bytes);
             return fail(FastFail::Collect);
         }
+        proofLap(PartCollects);
         const auto* source = surface.source;
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
@@ -3502,6 +3532,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             if (!unchanged) query(address, address + bytes, nullptr, nullptr, {i, false, false});
             if (surface.resource.dccAddress != 0) countKeysProven(false);
         }
+        proofLap(PartKeys);
         if (source != nullptr) {
             if (!source->Cached()) return fail(FastFail::Evicted);
             queries.push_back({address, bytes, source->GenerationFor(address, bytes)});
@@ -3510,6 +3541,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             queries.push_back({address, bytes, surface.generation});
         }
     }
+    proofLap(PartElements);
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys);
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
@@ -3518,14 +3550,17 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
+        proofLap(PartElements);
         if (DepthSurfaceOverlaps(context.device, address, bytes)) {
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
         }
+        proofLap(PartDepthChecks);
         if (GuestMemory::CollectWrites(address, bytes) == 0) {
             countCollectRefusal(true, address, bytes);
             return fail(FastFail::Collect);
         }
+        proofLap(PartCollects);
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
@@ -3533,11 +3568,13 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             if (!keyProofs || image->ProvedKeys() != image->UploadedKeys()) return fail(FastFail::StorageKeys);
             countKeysProven(true);
         }
+        proofLap(PartKeys);
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
         if (!image->Cached()) return fail(FastFail::Evicted);
         queries.push_back({address, bytes, image->GenerationFor(address, bytes)});
         images.push_back(image);
     }
+    proofLap(PartElements);
     if (!pending.empty()) {
         if (!StorageTexture::ScanPending(pending)) return fail(FastFail::ClearedView);
         // A foreign image over a view under uncompressed keys is no failure while FindPending
@@ -3578,7 +3615,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
+    proofLap(PartPendingScan);
     if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
+    proofLap(PartUnchanged);
     if (const auto aliasSerial = GuestMemory::AliasSerial(); aliasSerial != 0) {
         for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
             auto& surface = validatedTextures[i];
@@ -3901,6 +3940,82 @@ struct CommitterProofTimer {
         split.totalNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
     }
 };
+
+constexpr std::size_t ProofClassCount = 6;
+
+struct ProofLapTotals {
+    std::array<std::atomic<std::uint64_t>, ProofClassCount> proofs{}, totalNs{}, sampled{};
+    std::array<std::array<std::atomic<std::uint64_t>, ProofPartCount>, ProofClassCount> parts{};
+};
+
+std::array<ProofLapTotals, 2>& ProofLaps() {
+    static std::array<ProofLapTotals, 2> totals;
+    return totals;
+}
+
+std::uint64_t NanosecondsSince(std::chrono::steady_clock::time_point since, std::chrono::steady_clock::time_point now) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - since).count());
+}
+
+struct ProofLapScope {
+    int side = -1;
+    bool sampled = false;
+    std::chrono::steady_clock::time_point start{};
+    ProofLapScope() {
+        static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+        if (!counted || proofLapClock.on) return;
+        side = GuestMemory::OnResolverThread() ? 1 : GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer ? 0 : -1;
+        if (side < 0) return;
+        thread_local std::uint32_t calls = 0;
+        start = std::chrono::steady_clock::now();
+        sampled = (++calls & 3u) == 0u;
+        if (!sampled) return;
+        proofLapClock.on = true;
+        proofLapClock.mark = start;
+        proofLapClock.parts.fill(0);
+    }
+    ProofLapScope(const ProofLapScope&) = delete;
+    ProofLapScope& operator=(const ProofLapScope&) = delete;
+    ~ProofLapScope() {
+        if (side < 0) return;
+        const auto now = std::chrono::steady_clock::now();
+        auto& totals = ProofLaps()[static_cast<std::size_t>(side)];
+        const auto proofClass = std::min(static_cast<std::size_t>(lastProofReuse), ProofClassCount - 1);
+        totals.proofs[proofClass].fetch_add(1, std::memory_order_relaxed);
+        totals.totalNs[proofClass].fetch_add(NanosecondsSince(start, now), std::memory_order_relaxed);
+        if (!sampled) return;
+        auto& clock = proofLapClock;
+        clock.parts[PartRest] += NanosecondsSince(clock.mark, now);
+        clock.on = false;
+        totals.sampled[proofClass].fetch_add(1, std::memory_order_relaxed);
+        for (std::size_t part = 0; part < ProofPartCount; ++part) totals.parts[proofClass][part].fetch_add(clock.parts[part], std::memory_order_relaxed);
+    }
+};
+
+std::string TakeProofLapText() {
+    constexpr std::array<const char*, ProofClassCount> classes{"reused, verified", "never proved", "new epoch", "proofs broken", "pending images changed", "unclassed"};
+    constexpr std::array<const char*, ProofPartCount> parts{"pending writes", "depth checks", "depth planes", "collects", "keys", "elements", "pending scan", "unchanged", "fast tail", "own refresh", "full walk", "regions", "imports", "rest"};
+    constexpr std::array<const char*, 2> sides{"committer", "resolver"};
+    std::string text = "; template re-proofs by thread and why (proofs, us each; parts of 1 in 4, ns each):";
+    for (std::size_t side = 0; side < sides.size(); ++side) {
+        auto& totals = ProofLaps()[side];
+        text += std::string(" ") + sides[side] + ":";
+        for (std::size_t proofClass = 0; proofClass < ProofClassCount; ++proofClass) {
+            const auto proofs = totals.proofs[proofClass].exchange(0, std::memory_order_relaxed);
+            const auto totalNs = totals.totalNs[proofClass].exchange(0, std::memory_order_relaxed);
+            const auto sampled = totals.sampled[proofClass].exchange(0, std::memory_order_relaxed);
+            std::array<std::uint64_t, ProofPartCount> partNs{};
+            for (std::size_t part = 0; part < ProofPartCount; ++part) partNs[part] = totals.parts[proofClass][part].exchange(0, std::memory_order_relaxed);
+            if (proofs == 0) continue;
+            char item[96];
+            std::snprintf(item, sizeof(item), " %s %llu %.2f [", classes[proofClass], static_cast<unsigned long long>(proofs), static_cast<double>(totalNs) / 1e3 / static_cast<double>(proofs));
+            text += item;
+            for (std::size_t part = 0; part < ProofPartCount; ++part) text += std::string(part == 0 ? "" : ", ") + parts[part] + " " + std::to_string(sampled == 0 ? 0 : partNs[part] / sampled);
+            text += "],";
+        }
+    }
+    return text;
+}
 }
 
 std::string ShaderResources::TakeCommitterProofText() {
@@ -3909,11 +4024,15 @@ std::string ShaderResources::TakeCommitterProofText() {
     const auto proofs = take(split.proofs), total = take(split.totalNs), pending = take(split.pendingNs), fast = take(split.fastNs), walks = take(split.fullWalks), walkNs = take(split.fullWalkNs), passed = take(split.fastPassed);
     char text[256];
     std::snprintf(text, sizeof(text), "; committer full template proofs %llu, %.1f ms: pending-write checks %.1f ms, stamp proof %.1f ms (%llu passed), full walks %llu %.1f ms, rest %.1f ms", static_cast<unsigned long long>(proofs), static_cast<double>(total) / 1e6, static_cast<double>(pending) / 1e6, static_cast<double>(fast) / 1e6, static_cast<unsigned long long>(passed), static_cast<unsigned long long>(walks), static_cast<double>(walkNs) / 1e6, static_cast<double>(total - std::min(total, pending + fast + walkNs)) / 1e6);
-    return std::string(text) + ", proofs reused holding an out-of-date per-use copy " + std::to_string(staleCopyReuses.exchange(0, std::memory_order_relaxed)) + "; address-based uses noting their leased heaps as read: read-only " + std::to_string(addressBasedUses[0].exchange(0, std::memory_order_relaxed)) + ", writing through addresses " + std::to_string(addressBasedUses[1].exchange(0, std::memory_order_relaxed));
+    return std::string(text) + ", proofs reused holding an out-of-date per-use copy " + std::to_string(staleCopyReuses.exchange(0, std::memory_order_relaxed)) + "; address-based uses noting their leased heaps as read: read-only " + std::to_string(addressBasedUses[0].exchange(0, std::memory_order_relaxed)) + ", writing through addresses " + std::to_string(addressBasedUses[1].exchange(0, std::memory_order_relaxed)) + TakeProofLapText();
 }
 
 ShaderResources::ProofReuse ShaderResources::LastProofReuse() {
     return lastProofReuse;
+}
+
+void ShaderResources::ResetLastProofReuse() {
+    lastProofReuse = ProofReuse::Off;
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
@@ -3966,6 +4085,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CommitterProofTimer committerTimer;
+    const ProofLapScope proofLaps;
     for (const auto& region : directRegions) {
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
         CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
@@ -3980,6 +4100,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
     committerTimer.lap(CommitterProofs().pendingNs);
+    proofLap(PartPendingWrites);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
@@ -4088,6 +4209,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // pending over the refreshed surfaces, see fastRevalidate); a fallback, or a second failure,
     // takes the full walk as before.
     bool ownRefreshed = false;
+    proofLap(PartFastTail);
     if (!fast && !overlapping.empty()) {
         auto fallback = OwnRefreshFallback::Count;
         if (!OwnImageRefreshEnabled()) fallback = OwnRefreshFallback::Disabled;
@@ -4101,6 +4223,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             else fallback = OwnRefreshFallback::Rerun;
         }
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
+        proofLap(PartOwnRefresh);
     }
     if (fast && TemplateAuditDue(lastFullWalk)) {
         fast = false;
@@ -4113,7 +4236,9 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (!fast) {
         countFullWalk(reason);
         const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        proofLap(PartFastTail);
         const bool walked = fullWalk();
+        proofLap(PartFullWalk);
         countFullWalkTime(reason, walkStart);
         if (committerTimer.counted) CommitterProofs().fullWalks.fetch_add(1, std::memory_order_relaxed);
         committerTimer.lap(CommitterProofs().fullWalkNs);
@@ -4189,12 +4314,14 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                 else StorageTexture::FlushPendingAroundStaged(region.begin, static_cast<std::size_t>(region.end - region.begin), staged, "imported buffer region");
             }
         }
+        proofLap(PartRegions);
         if (importsReconcilable ? HostImportsReconciledUnchanged(context, importsProof) : HostImportsUnchanged(context, importsProof)) {
             if (profile) Revalidations().importSkips.fetch_add(1, std::memory_order_relaxed);
         } else {
             if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
             importsProof = HostImportsIdentity(context);
         }
+        proofLap(PartImports);
     } else {
         for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
         const auto staged = guestMemory.ShadowStagedRanges();

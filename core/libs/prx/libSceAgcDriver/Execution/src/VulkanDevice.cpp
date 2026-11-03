@@ -2540,6 +2540,7 @@ void VulkanDevice::StoreIdleResults(bool reapFirst, const std::function<bool()>&
 
 void VulkanDevice::SubmitRecorded(bool reapFirst) {
     if (!state->recorder) return;
+    Graphics::Recorder::TagSubmitSite(__builtin_return_address(0));
     // Finished batches are retired first (a non-blocking fence status check on the front of the
     // in-flight list), so PendingWriteOverlaps/HasCompletions scans stay short and a label recorded
     // after a completing batch already finished can go to the GPU instead of behind a completion.

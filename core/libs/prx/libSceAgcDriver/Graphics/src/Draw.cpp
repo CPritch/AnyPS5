@@ -2030,6 +2030,8 @@ struct DrawSplitCounts {
     std::array<std::array<std::atomic<std::uint64_t>, 2>, static_cast<std::size_t>(PredictReason::Count)> reasonPurity{};
     std::atomic<std::uint64_t> predictedPairs{0};
     std::array<std::atomic<std::uint64_t>, 2> builds{}, buildNs{};
+    std::array<std::atomic<std::uint64_t>, 7> buildKinds{}, buildKindNs{};
+    std::array<std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::BuildPhase::Count)>, 7> buildPhaseNs{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> mispredictedKind{};
 };
 
@@ -2226,8 +2228,17 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         if (buildCounted) {
             auto& split = DrawSplit();
             const std::size_t kind = resolved.cacheable ? 0u : 1u;
+            const auto buildNs = NanosecondsBetween(building, std::chrono::steady_clock::now());
             split.builds[kind].fetch_add(1, std::memory_order_relaxed);
-            split.buildNs[kind].fetch_add(NanosecondsBetween(building, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+            split.buildNs[kind].fetch_add(buildNs, std::memory_order_relaxed);
+            const auto hasRole = [&](ShaderRecompiler::DescriptorRole role) {
+                return std::any_of(shaders.begin(), shaders.end(), [role](const CompiledShader& shader) { return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [role](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == role; }); });
+            };
+            const std::size_t reason = resolved.cacheable ? 0u : !recordable ? 1u : noDrawResourceCache || noTextureCache ? 2u : !std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) ? 3u : hasRole(ShaderRecompiler::DescriptorRole::BdaPagetable) ? 4u : hasRole(ShaderRecompiler::DescriptorRole::FaultBuffer) ? 5u : 6u;
+            split.buildKinds[reason].fetch_add(1, std::memory_order_relaxed);
+            split.buildKindNs[reason].fetch_add(buildNs, std::memory_order_relaxed);
+            const auto& phases = resolved.resources->PhaseMs();
+            for (std::size_t phase = 0; phase < phases.size(); ++phase) split.buildPhaseNs[reason][phase].fetch_add(static_cast<std::uint64_t>(phases[phase] * 1e6f), std::memory_order_relaxed);
         }
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
@@ -4489,6 +4500,24 @@ std::string TakeDrawSplitText() {
         char builds[160];
         std::snprintf(builds, sizeof(builds), "; template builds: for misses %llu (%.1f us each), for uncacheable draws %llu (%.1f us each)", missBuilds, missBuilds == 0 ? 0.0 : static_cast<double>(missNs) / 1e3 / static_cast<double>(missBuilds), uncacheableBuilds, uncacheableBuilds == 0 ? 0.0 : static_cast<double>(uncacheableNs) / 1e3 / static_cast<double>(uncacheableBuilds));
         result += builds;
+        constexpr std::array<const char*, 7> kindNames{"a miss", "not recordable", "cache off", "a pipeline variant of 0", "a BDA page table", "a fault buffer", "other"};
+        constexpr std::array<const char*, static_cast<std::size_t>(ShaderResources::BuildPhase::Count)> phaseNames{"bindings", "precollect", "upload", "descriptors", "stage A", "images", "bda", "stage B"};
+        result += "; template builds by why (builds, us each [phases, us each]):";
+        for (std::size_t kind = 0; kind < kindNames.size(); ++kind) {
+            const auto count = take(split.buildKinds[kind]);
+            const auto ns = take(split.buildKindNs[kind]);
+            std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::BuildPhase::Count)> phaseNs{};
+            for (std::size_t phase = 0; phase < phaseNs.size(); ++phase) phaseNs[phase] = take(split.buildPhaseNs[kind][phase]);
+            if (count == 0) continue;
+            char item[96];
+            std::snprintf(item, sizeof(item), " %s %llu %.1f [", kindNames[kind], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e3 / static_cast<double>(count));
+            result += item;
+            for (std::size_t phase = 0; phase < phaseNs.size(); ++phase) {
+                std::snprintf(item, sizeof(item), "%s%s %.1f", phase == 0 ? "" : ", ", phaseNames[phase], static_cast<double>(phaseNs[phase]) / 1e3 / static_cast<double>(count));
+                result += item;
+            }
+            result += "],";
+        }
     }
     char depthViews[384];
     const auto viewed = deferredDepthViews.load(std::memory_order_relaxed);

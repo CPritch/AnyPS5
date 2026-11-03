@@ -54,6 +54,10 @@ namespace AgcDriver::Graphics {
 namespace {
 
 Recorder* activeRecorder = nullptr;
+thread_local Recorder::SubmitCause submitCauseTag = Recorder::SubmitCause::Other;
+thread_local const void* submitSiteTag = nullptr;
+std::atomic<const void*> lastSubmitSite{nullptr};
+std::atomic<std::uint8_t> lastSubmitCause{0};
 
 bool DrawProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4644,8 +4648,22 @@ void Recorder::HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value) {
     submitHoldValue = value;
 }
 
+void Recorder::TagSubmitCause(SubmitCause cause) {
+    submitCauseTag = cause;
+}
+
+void Recorder::TagSubmitSite(const void* site) {
+    submitSiteTag = site;
+}
+
+std::pair<const void*, Recorder::SubmitCause> Recorder::LastSubmitCause() {
+    return {lastSubmitSite.load(std::memory_order_relaxed), static_cast<SubmitCause>(lastSubmitCause.load(std::memory_order_relaxed))};
+}
+
 void Recorder::Submit() {
     PerformanceTimer frameTiming("Recorder.Submit");
+    const auto cause = std::exchange(submitCauseTag, SubmitCause::Other);
+    const auto* taggedSite = std::exchange(submitSiteTag, nullptr);
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
     // count behind, and the callers that act on it would otherwise take the mutex for nothing at
@@ -4653,6 +4671,11 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     dropStaleHoldKept();
     if (open == nullptr) return;
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    if (counted) {
+        lastSubmitSite.store(taggedSite != nullptr ? taggedSite : __builtin_return_address(0), std::memory_order_relaxed);
+        lastSubmitCause.store(static_cast<std::uint8_t>(cause), std::memory_order_relaxed);
+    }
     GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Submit);
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");

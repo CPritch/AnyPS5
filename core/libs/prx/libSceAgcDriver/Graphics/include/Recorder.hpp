@@ -256,6 +256,10 @@ public:
     std::optional<PendingWriteInfo> DescribePendingWrite(std::uint64_t address, std::size_t bytes) const;
     // Ends and submits the open batch without waiting.
     void Submit();
+    enum class SubmitCause : std::uint8_t { Other, LabelDeadline, BatchCap, Idle, Count };
+    static void TagSubmitCause(SubmitCause cause);
+    static void TagSubmitSite(const void* site);
+    static std::pair<const void*, SubmitCause> LastSubmitCause();
     void HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value);
     // Submits the open batch and returns the serial of the newest submitted batch (0 when nothing was
     // ever submitted); WaitSerial(serial) then covers all recorded work.

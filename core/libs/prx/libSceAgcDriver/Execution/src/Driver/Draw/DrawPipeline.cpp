@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <cstdio>
@@ -24,6 +25,7 @@
 #include <execinfo.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <dlfcn.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -34,7 +36,9 @@
 namespace AgcDriver::DriverDetail {
 
 namespace {
+std::string TakeStaleSubmitText();
 thread_local std::uint64_t followedEpoch = 0;
+std::atomic<std::uint64_t> committerEpochChanges{0};
 std::atomic<std::uint64_t> earlyResolved{0}, earlyDeclined{0}, earlyFailed{0};
 std::atomic<bool> earlyStopped{false};
 struct PendingEarly {
@@ -58,6 +62,9 @@ alignas(64) std::atomic<std::uint64_t> resolveStartNs{0};
 std::atomic<std::uint64_t> resolveBusyNs{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::EarlyEvent::Count)> earlyEvents{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> earlyAborts{};
+thread_local std::uint64_t lastJoinWaitNs = 0;
+constexpr std::size_t JobClassCount = 7;
+std::array<std::atomic<std::uint64_t>, JobClassCount> jobClassCount{}, jobClassNs{}, jobClassWaited{}, jobClassWaitNs{};
 thread_local const void* offerTarget = nullptr;
 thread_local std::size_t offerNext = 0;
 thread_local std::size_t postedNext = 0;
@@ -165,7 +172,7 @@ std::string QueueWaits::Text() {
         const auto take = [](std::atomic<std::uint64_t>& value) { return std::to_string(value.exchange(0, std::memory_order_relaxed)); };
         const auto event = [&](DrawPipeline::EarlyEvent kind) { return take(earlyEvents[static_cast<std::size_t>(kind)]); };
         using E = DrawPipeline::EarlyEvent;
-        text += "; early resolves (APS5_RESOLVE_SPLIT" + std::string(DrawPipeline::EarlyStopped() ? ", stopped by verify" : "") + "): resolved " + take(earlyResolved) + ", declined " + take(earlyDeclined) + ", failed " + take(earlyFailed) + ", never offered " + event(E::Unoffered) + "; packets used " + event(E::Used) + ", redone for proof " + event(E::StaleProof) + ", pending " + event(E::StalePending) + ", imports " + event(E::StaleImports) + ", device " + event(E::StaleDevice) + ", submit " + event(E::StaleSubmit) + ", redo " + event(E::StaleRedo) + ", a later note over its reads " + event(E::StaleNoted) + ", template left the cache " + event(E::StaleTemplate) + "; dropped after resolve for reads overlapping the previous draw's writes " + event(E::OverlapAfter) + ", failed on the resolver " + event(E::ResolverFailed) + "; declined for the resolver's copied writers " + event(E::DeclinedWriters) + "; multisampled draws whose targets were found before resolve " + event(E::MultisampleFound) + ", not found " + event(E::MultisampleMissed) + "; verified same " + event(E::VerifyMatched) + ", different " + event(E::VerifyDiffered) + "; draws not offered, by the next item: none queued " + event(E::NextMissing) + ", not a draw " + event(E::NextNotDraw) + " (" + [&] {
+        text += "; early resolves (APS5_RESOLVE_SPLIT" + std::string(DrawPipeline::EarlyStopped() ? ", stopped by verify" : "") + "): resolved " + take(earlyResolved) + ", declined " + take(earlyDeclined) + ", failed " + take(earlyFailed) + ", never offered " + event(E::Unoffered) + "; packets used " + event(E::Used) + ", redone for proof " + event(E::StaleProof) + ", pending " + event(E::StalePending) + ", imports " + event(E::StaleImports) + ", device " + event(E::StaleDevice) + ", submit " + event(E::StaleSubmit) + TakeStaleSubmitText() + ", redo " + event(E::StaleRedo) + ", a later note over its reads " + event(E::StaleNoted) + ", template left the cache " + event(E::StaleTemplate) + "; dropped after resolve for reads overlapping the previous draw's writes " + event(E::OverlapAfter) + ", failed on the resolver " + event(E::ResolverFailed) + "; declined for the resolver's copied writers " + event(E::DeclinedWriters) + "; multisampled draws whose targets were found before resolve " + event(E::MultisampleFound) + ", not found " + event(E::MultisampleMissed) + "; verified same " + event(E::VerifyMatched) + ", different " + event(E::VerifyDiffered) + "; draws not offered, by the next item: none queued " + event(E::NextMissing) + ", not a draw " + event(E::NextNotDraw) + " (" + [&] {
             std::string kinds;
             for (std::size_t kind = 0; kind < kindNames.size(); ++kind) {
                 const auto count = nextNotDrawKinds[kind].exchange(0, std::memory_order_relaxed);
@@ -210,6 +217,20 @@ std::string QueueWaits::Text() {
             const auto started = posted - std::min(posted, resolvesRevoked.load(std::memory_order_relaxed));
             const auto waited = resolvesWaited.exchange(0, std::memory_order_relaxed);
             const auto per = [](std::uint64_t ns, std::uint64_t count) { return count == 0 ? std::string("0") : std::to_string(ns / count); };
+            {
+                constexpr std::array<const char*, JobClassCount> classNames{"template reused", "never proved", "new epoch", "proofs broken", "pending images changed", "no template", "aborted"};
+                text += " resolver jobs by their template proof (jobs, us each, joins waited, us each):";
+                for (std::size_t index = 0; index < classNames.size(); ++index) {
+                    const auto jobs = jobClassCount[index].exchange(0, std::memory_order_relaxed);
+                    const auto jobNs = jobClassNs[index].exchange(0, std::memory_order_relaxed);
+                    const auto waits = jobClassWaited[index].exchange(0, std::memory_order_relaxed);
+                    const auto waitNs = jobClassWaitNs[index].exchange(0, std::memory_order_relaxed);
+                    if (jobs == 0) continue;
+                    char item[160];
+                    std::snprintf(item, sizeof(item), " %s %llu %.2f %llu %.2f,", classNames[index], static_cast<unsigned long long>(jobs), static_cast<double>(jobNs) / 1e3 / static_cast<double>(jobs), static_cast<unsigned long long>(waits), waits == 0 ? 0.0 : static_cast<double>(waitNs) / 1e3 / static_cast<double>(waits));
+                    text += item;
+                }
+            }
             text += " holds carried to the next draw " + take(carriedHolds) + " (released before another item " + take(carriesReleasedEarly) + ", held reads whose target was gone " + take(heldReadsTargetMissing) + "),";
             text += " resolver jobs posted " + std::to_string(posted) + ", revoked unstarted " + take(resolvesRevoked) + ", done before the join " + take(resolvesDoneBeforeJoin) + ", waited for " + std::to_string(waited) + " (" + per(resolveWaitNs.exchange(0, std::memory_order_relaxed), waited) + " ns each), start latency " + per(resolveStartNs.exchange(0, std::memory_order_relaxed), started) + " ns, resolving " + per(resolveBusyNs.exchange(0, std::memory_order_relaxed), started) + " ns a job; recorder methods off the resolver's list:" + GuestMemory::TakeResolverRecorderText() + ";";
         }
@@ -560,6 +581,69 @@ DrawPipeline::OwnCause DrawPipeline::TakenOwnCause() {
     return takenOwnCause;
 }
 
+std::uint64_t DrawPipeline::LastJoinWaitNs() {
+    return lastJoinWaitNs;
+}
+
+namespace {
+std::mutex staleSubmitMutex;
+std::map<std::pair<const void*, Graphics::Recorder::SubmitCause>, std::uint64_t> staleSubmits;
+
+std::string TakeStaleSubmitText() {
+    std::vector<std::pair<std::pair<const void*, Graphics::Recorder::SubmitCause>, std::uint64_t>> entries;
+    {
+        std::lock_guard lock(staleSubmitMutex);
+        entries.assign(staleSubmits.begin(), staleSubmits.end());
+        staleSubmits.clear();
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    constexpr std::array<const char*, static_cast<std::size_t>(Graphics::Recorder::SubmitCause::Count)> causes{"other", "label deadline", "batch cap", "idle"};
+    std::string text = " (by the submit:";
+    for (std::size_t i = 0; i < entries.size() && i < 8; ++i) {
+        const auto& [key, count] = entries[i];
+        unsigned long long offset = reinterpret_cast<std::uintptr_t>(key.first);
+#ifdef __linux__
+        Dl_info info{};
+        if (key.first != nullptr && dladdr(key.first, &info) != 0 && info.dli_fbase != nullptr) offset = reinterpret_cast<std::uintptr_t>(key.first) - reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+#endif
+        char item[96];
+        std::snprintf(item, sizeof(item), "%s %s at +0x%llx %llu", i == 0 ? "" : ",", causes[static_cast<std::size_t>(key.second)], offset, static_cast<unsigned long long>(count));
+        text += item;
+    }
+    return text + ")";
+}
+}
+
+namespace {
+std::array<std::atomic<std::uint64_t>, DrawPipeline::LabelPartCount> labelPartNs{};
+std::atomic<std::uint64_t> labelPartCommits{0};
+}
+
+bool DrawPipeline::LabelPartsCounted() {
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    return counted;
+}
+
+void DrawPipeline::NoteLabelParts(const std::array<std::uint64_t, LabelPartCount>& parts) {
+    labelPartCommits.fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t part = 0; part < parts.size(); ++part) labelPartNs[part].fetch_add(parts[part], std::memory_order_relaxed);
+}
+
+void DrawPipeline::NoteStaleSubmit() {
+    const auto cause = Graphics::Recorder::LastSubmitCause();
+    std::lock_guard lock(staleSubmitMutex);
+    ++staleSubmits[cause];
+}
+
+void DrawPipeline::NoteJobClass(std::size_t jobClass, std::uint64_t jobNs, std::uint64_t waitNs) {
+    const auto index = std::min(jobClass, JobClassCount - 1);
+    jobClassCount[index].fetch_add(1, std::memory_order_relaxed);
+    jobClassNs[index].fetch_add(jobNs, std::memory_order_relaxed);
+    if (waitNs == 0) return;
+    jobClassWaited[index].fetch_add(1, std::memory_order_relaxed);
+    jobClassWaitNs[index].fetch_add(waitNs, std::memory_order_relaxed);
+}
+
 bool DrawPipeline::CarryHold() {
     static const bool enabled = std::getenv("APS5_NO_CARRY_RESOLVE_HOLD") == nullptr;
     const auto next = std::exchange(postedNext, 0);
@@ -646,6 +730,7 @@ void DrawPipeline::WaitResolve() {
 void DrawPipeline::joinResolve(bool revoke) {
     auto& pipeline = Queue0();
     postedNext = 0;
+    lastJoinWaitNs = 0;
     if (pipeline.resolveState.load(std::memory_order_acquire) == ResolveIdle) return;
     bool ran = true;
     int expected = ResolvePosted;
@@ -660,7 +745,8 @@ void DrawPipeline::joinResolve(bool revoke) {
             const auto start = std::chrono::steady_clock::now();
             while (pipeline.resolveState.load(std::memory_order_acquire) != ResolveDone) SpinPause();
             resolvesWaited.fetch_add(1, std::memory_order_relaxed);
-            resolveWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+            lastJoinWaitNs = elapsedNs(start);
+            resolveWaitNs.fetch_add(lastJoinWaitNs, std::memory_order_relaxed);
         }
         pipeline.resolveState.store(ResolveIdle, std::memory_order_relaxed);
     }
@@ -877,6 +963,7 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
     if (followed == token) return;
     followed = token;
     static const bool shared = std::getenv("APS5_NO_SHARED_COMMIT_EPOCH") == nullptr;
+    if (GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer) committerEpochChanges.fetch_add(1, std::memory_order_relaxed);
     if (shared && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer) {
         static AgcDriver::Mutex mutex;
         static std::array<std::pair<std::uint64_t, std::uint64_t>, 32> epochs{};
@@ -1110,6 +1197,15 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     kindGpuWaitNs = {};
     kindCommits = {};
     kindCommitNs = {};
+    drainText += "; draw runs between other items by length (runs/draws): 1 " + std::to_string(drawRuns[0]) + "/" + std::to_string(drawRunDraws[0]) + ", 2-4 " + std::to_string(drawRuns[1]) + "/" + std::to_string(drawRunDraws[1]) + ", 5-16 " + std::to_string(drawRuns[2]) + "/" + std::to_string(drawRunDraws[2]) + ", 17-64 " + std::to_string(drawRuns[3]) + "/" + std::to_string(drawRunDraws[3]) + ", 65 or more " + std::to_string(drawRuns[4]) + "/" + std::to_string(drawRunDraws[4]) + "; committer collect-epoch changes " + std::to_string(committerEpochChanges.exchange(0, std::memory_order_relaxed));
+    drawRuns = {};
+    drawRunDraws = {};
+    {
+        constexpr std::array<const char*, LabelPartCount> names{"lock and deferred labels", "linear stores", "GPU store", "notes", "interrupt", "submit due"};
+        const auto labels = labelPartCommits.exchange(0, std::memory_order_relaxed);
+        drainText += "; label commits " + std::to_string(labels) + ", parts (ns each):";
+        for (std::size_t part = 0; part < names.size(); ++part) drainText += std::string(" ") + names[part] + " " + std::to_string(labels == 0 ? 0 : labelPartNs[part].exchange(0, std::memory_order_relaxed) / labels) + (part + 1 == names.size() ? "" : ",");
+    }
     char targetedText[160];
     std::snprintf(targetedText, sizeof(targetedText), "; targeted waits %llu (%.1f ms), %.1f items left queued behind each", static_cast<unsigned long long>(targetedWaits), static_cast<double>(targetedWaitNs) / 1e6, targetedWaits == 0 ? 0.0 : static_cast<double>(targetedBehind) / static_cast<double>(targetedWaits));
     drainText += targetedText;
@@ -1278,6 +1374,14 @@ void DrawPipeline::run() {
             commitNs += spent;
             ++kindCommits[kind];
             kindCommitNs[kind] += spent;
+            if (kind == static_cast<std::size_t>(ItemKind::Draw)) {
+                ++drawRun;
+            } else if (drawRun != 0) {
+                const std::size_t bucket = drawRun == 1 ? 0 : drawRun <= 4 ? 1 : drawRun <= 16 ? 2 : drawRun <= 64 ? 3 : 4;
+                ++drawRuns[bucket];
+                drawRunDraws[bucket] += drawRun;
+                drawRun = 0;
+            }
             kindGpuWaitNs[kind] += gpuWaitedNs;
             if (failed) ++commitErrors;
             if (fatal != nullptr && failure == nullptr) failure = fatal;

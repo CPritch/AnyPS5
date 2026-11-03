@@ -253,6 +253,8 @@ struct EarlyDraw {
     std::vector<Graphics::FoundMultisampleTarget> multisample;
     std::uint8_t abort = 0;
     bool failed = false;
+    std::uint8_t proofClass = 0;
+    std::uint64_t jobNs = 0;
     bool revoked = false;
     bool dropped = false;
     DrawPipeline::EarlyEvent declined = DrawPipeline::EarlyEvent::Count;
@@ -1488,6 +1490,9 @@ void resolveEarlyJob(void* context) {
     GuestMemory::SetEarlyReadLog(&early.reads);
     DrawPipeline::SkipCommittingReads(true);
     GuestMemory::ArmEarlyResolve();
+    const bool timed = DrawSplitTimed();
+    const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (timed) Graphics::ShaderResources::ResetLastProofReuse();
     try {
         early.packet = early.resolver->ResolveDraw(*early.graphics, *early.draw, early.stages, early.snapshots, early.recipeOut, early.trace, early.shape, early.prepared);
     } catch (const GuestMemory::EarlyResolveAbort& abort) {
@@ -1497,6 +1502,10 @@ void resolveEarlyJob(void* context) {
         early.packet.reset();
         early.failed = true;
     }
+    if (timed) {
+        early.proofClass = early.abort != 0 || early.failed ? 6u : static_cast<std::uint8_t>(Graphics::ShaderResources::LastProofReuse());
+        early.jobNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+    }
 }
 
 void finishEarlyJob(void* context, bool ran) {
@@ -1504,6 +1513,7 @@ void finishEarlyJob(void* context, bool ran) {
     early.handoff.snapshot.reset();
     if (!early.abandoned.Empty()) early.resolver->ApplyDeferredEffects(early.abandoned);
     Graphics::BuryPackets(early.graveyard);
+    if (ran && DrawSplitTimed()) DrawPipeline::NoteJobClass(early.proofClass, early.jobNs, DrawPipeline::LastJoinWaitNs());
     if (!ran) {
         early.claimed = false;
         early.revoked = true;
@@ -1721,7 +1731,10 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
                     return std::any_of(first.begin(), first.end(), [&](const auto& a) { return std::any_of(second.begin(), second.end(), [&](const auto& b) { return a.first < b.second && b.first < a.second; }); });
                 };
                 if (change == VulkanDevice::EarlyChange::Imports) stale = E::StaleImports;
-                else if (change == VulkanDevice::EarlyChange::Open) stale = E::StaleSubmit;
+                else if (change == VulkanDevice::EarlyChange::Open) {
+                    stale = E::StaleSubmit;
+                    if (DrawSplitTimed()) DrawPipeline::NoteStaleSubmit();
+                }
                 else if (change == VulkanDevice::EarlyChange::Noted && (overrun || overlaps(noted, early->reads) || Graphics::DrawPacketReadsOverlap(*early->packet, noted))) stale = E::StaleNoted;
             }
             DrawPipeline::NoteEarly(stale);
