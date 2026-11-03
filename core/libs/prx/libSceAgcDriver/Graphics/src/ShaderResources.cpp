@@ -2688,7 +2688,10 @@ void ShaderResources::buildComplete() {
         requireGuestBuffers();
         guestMemory.UploadFinish(usesBda, htileClear);
         timing.uploadMs += phase(BuildPhase::Upload);
-        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
+        if (usesBda) {
+            spaceGuard = MultisampleTargetRangeGeneration();
+            bda = std::make_unique<BdaResources>(context, guestMemory);
+        }
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         if (bda) bda->SetSrtGuards(std::move(srtGuardFaults));
         finishImageTables();
@@ -2884,18 +2887,34 @@ bool LoopGuardEnabled() {
     return enabled;
 }
 
+bool BdaTemplateReuse() {
+    static const bool enabled = std::getenv("APS5_NO_BDA_TEMPLATE_REUSE") == nullptr;
+    return enabled;
+}
+
+bool VerifyBdaTemplateReuse() {
+    static const bool enabled = std::getenv("APS5_VERIFY_BDA_TEMPLATE_REUSE") != nullptr;
+    return enabled;
+}
+
+bool SameRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& left, const std::vector<ShaderRecompiler::BdaAbi::Range>& right) {
+    return left.size() == right.size() && (left.empty() || std::memcmp(left.data(), right.data(), left.size() * sizeof(left.front())) == 0);
+}
+
 }
 
 void ShaderResources::noteReusable() {
     // Taken whether or not the object turns out reusable: the lookups' records are this build's.
     captureValidation();
     reusable = false;
+    reusesSpace = false;
     importsReconcilable = false;
     directRegions.clear();
-    if (htileClear.has_value() || guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
+    const bool spaceReuse = drawBuild && usesBda && bdaReadOnly && bda != nullptr && BdaTemplateReuse() && guestMemory.SpaceReusable();
+    if (htileClear.has_value() || guestMemory.HasCopiedWrites() || (HoldsLease() && !spaceReuse) || (usesBda && !spaceReuse) || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
     if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
-    const auto regions = guestMemory.DirectRegions();
+    const auto regions = guestMemory.DirectRegions(spaceReuse);
     if (!regions.has_value()) return;
     bool mirrored = false;
     for (const auto& [begin, end] : *regions) {
@@ -2921,16 +2940,26 @@ void ShaderResources::noteReusable() {
     }
     importsReconcilable = !mirrored && !bounded;
     reusable = true;
+    reusesSpace = spaceReuse;
+    if (spaceReuse && VerifyBdaTemplateReuse()) verifyRanges = guestMemory.AddressRanges();
+}
+
+GuestBufferMemory::SpaceReuse ShaderResources::ReacquireSpace() {
+    if (spaceGuard != MultisampleTargetRangeGeneration()) return GuestBufferMemory::SpaceReuse::Stale;
+    const auto taken = guestMemory.ReacquireSpace();
+    if (taken == GuestBufferMemory::SpaceReuse::Taken && VerifyBdaTemplateReuse()) Require(SameRanges(guestMemory.AddressRanges(), verifyRanges), "a reused address-based template's BDA table differs from the one its space and regions give now (APS5_VERIFY_BDA_TEMPLATE_REUSE)");
+    return taken;
 }
 
 std::uint64_t ShaderResources::DepthGuardRefusals() {
     return depthGuardRefusals.load(std::memory_order_relaxed);
 }
 
-bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
+bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders, bool committerDraw) {
     const bool loopGuard = LoopGuardEnabled();
-    return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {
-        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
+    const bool tables = !(committerDraw && BdaTemplateReuse());
+    return std::any_of(shaders.begin(), shaders.end(), [loopGuard, tables](const CompiledShader& shader) {
+        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard, tables](const ShaderRecompiler::DescriptorBinding& binding) { return (tables && binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
     });
 }
 

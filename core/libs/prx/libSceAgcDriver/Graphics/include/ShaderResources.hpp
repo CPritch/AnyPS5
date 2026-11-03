@@ -307,9 +307,16 @@ public:
     bool EpochProofCurrent() const;
     bool InResourceCache() const { return inResourceCache.load(std::memory_order_acquire); }
     bool Reusable() const { return reusable; }
+    bool ReusesSpace() const { return reusesSpace; }
+    GuestBufferMemory::SpaceReuse ReacquireSpace();
+    std::uint64_t BeginSpaceUse() { return ++spaceUse; }
+    void EndSpaceUse(std::uint64_t use) {
+        if (use == spaceUse) guestMemory.ReleaseSpace();
+    }
+    std::shared_ptr<const void> SpaceHold() const { return guestMemory.SpaceHold(); }
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
-    static bool NeverReusable(std::span<const CompiledShader> shaders);
+    static bool NeverReusable(std::span<const CompiledShader> shaders, bool committerDraw = false);
     static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     static std::size_t LookupLogCapacity();
@@ -683,6 +690,10 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    bool reusesSpace = false;
+    std::uint64_t spaceUse = 0;
+    std::uint64_t spaceGuard = 0;
+    std::vector<ShaderRecompiler::BdaAbi::Range> verifyRanges;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     std::vector<ShaderRecompiler::RegisteredImageView> registeredImageViews;
