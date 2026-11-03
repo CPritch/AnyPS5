@@ -21,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <shared_mutex>
@@ -34,6 +35,7 @@
 #include <set>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -2705,14 +2707,50 @@ FoundDepthView FindDepthSurfaceView(const Context& context, const DepthTarget& t
     return {};
 }
 
+namespace {
+
+constexpr std::size_t DepthViewLapCount = 7;
+std::array<std::atomic<std::uint64_t>, DepthViewLapCount> depthViewLapNs{};
+std::atomic<std::uint64_t> depthViewCalls{0};
+
+struct DepthViewLaps {
+    bool timed = [] {
+        static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+        return counted;
+    }();
+    std::chrono::steady_clock::time_point mark = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    DepthViewLaps() {
+        if (timed) depthViewCalls.fetch_add(1, std::memory_order_relaxed);
+    }
+    void Lap(std::size_t part) {
+        if (!timed) return;
+        const auto now = std::chrono::steady_clock::now();
+        depthViewLapNs[part].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count()), std::memory_order_relaxed);
+        mark = now;
+    }
+};
+
+}
+
+std::string TakeDepthViewLapText() {
+    constexpr std::array<const char*, DepthViewLapCount> names{"claims and HTILE store-back", "pending HTILE clear", "find or create", "owners and planes", "syncs from memory", "clears and memory notes", "stale planes"};
+    const auto calls = depthViewCalls.exchange(0, std::memory_order_relaxed);
+    std::string text = "; depth view parts (" + std::to_string(calls) + " calls, ns each):";
+    for (std::size_t part = 0; part < names.size(); ++part) text += std::string(" ") + names[part] + " " + std::to_string(calls == 0 ? 0 : depthViewLapNs[part].exchange(0, std::memory_order_relaxed) / calls) + (part + 1 == names.size() ? "" : ",");
+    return text;
+}
+
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested) {
+    DepthViewLaps laps;
     const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
     ClaimMultisampleTargetMemory(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u));
     if (target.stencilAddress != 0u) ClaimMultisampleTargetMemory(target.stencilAddress, planeBytes(1u));
     if (target.htileAddress != 0u) ClaimMultisampleTargetMemory(target.htileAddress, HtileMetadataBytes(target.extent));
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
+    laps.Lap(0);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);
+    laps.Lap(1);
     std::unique_lock lock(surfacesMutex());
     const bool cleared = takeClearedHtile(target);
     DepthSurface* surface = nullptr;
@@ -2752,6 +2790,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         }
         surface = surfaces().back().get();
     }
+    laps.Lap(2);
     if (surface->retired) {
         surfacesSerial.fetch_add(1, std::memory_order_release);
         addFootprint(*surface);
@@ -2769,13 +2808,16 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
+    laps.Lap(3);
     if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
     if (surface->StencilMirrorable()) surface->SyncStencilFromMemory(stencilResource(target));
+    laps.Lap(4);
     surface->ApplyFastClear();
     if (stencilTested && surface->samplingActive) surface->RequireStencilProven();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
     surface->NoteMemory();
+    laps.Lap(5);
     if (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) {
         surface->scannedEpoch = mirrorEpoch;
         const auto plane = stalePlaneRange(*surface);
@@ -2799,6 +2841,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         noteStalePlane(begin, end);
     }
     drawnDepth = surface;
+    laps.Lap(6);
     return surface->view;
 }
 

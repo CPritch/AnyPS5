@@ -56,6 +56,14 @@ alignas(64) std::atomic<std::uint64_t> resolveStartNs{0};
 std::atomic<std::uint64_t> resolveBusyNs{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::EarlyEvent::Count)> earlyEvents{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> earlyAborts{};
+thread_local DrawPipeline::OwnCause takenOwnCause = DrawPipeline::OwnCause::Unknown;
+thread_local DrawPipeline::OwnCause nextOwnCause = DrawPipeline::OwnCause::Unknown;
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::OwnCause::Count)> ownCauseCount{}, ownCauseResolveNs{}, ownCauseEmitNs{};
+
+bool OwnCausesCounted() {
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    return counted;
+}
 }
 
 namespace {
@@ -171,6 +179,16 @@ std::string QueueWaits::Text() {
             const auto count = committerPartCount[part].exchange(0, std::memory_order_relaxed);
             const auto ns = committerPartNs[part].exchange(0, std::memory_order_relaxed);
             text += std::string(" ") + partNames[part] + " " + std::to_string(count) + " " + std::to_string(count == 0 ? 0 : ns / count) + ",";
+        }
+        if (OwnCausesCounted()) {
+            constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::OwnCause::Count)> causeNames{"none queued", "behind a seal", "behind a seal then a label", "behind a label", "behind a fill", "behind another item", "next without an early hook", "declined by the predictor", "declined for described ranges written", "declined for reads the previous draw writes", "declined otherwise", "revoked unstarted", "aborted at an image refresh", "aborted at another barrier", "failed on the resolver", "dropped after the resolve", "stale after a submit", "stale after a proof break", "stale otherwise", "unknown"};
+            text += " committer's own resolves by cause (count, resolve ns, emit ns each):";
+            for (std::size_t cause = 0; cause < causeNames.size(); ++cause) {
+                const auto count = ownCauseCount[cause].exchange(0, std::memory_order_relaxed);
+                const auto resolveNs = ownCauseResolveNs[cause].exchange(0, std::memory_order_relaxed);
+                const auto emitNs = ownCauseEmitNs[cause].exchange(0, std::memory_order_relaxed);
+                if (count != 0) text += std::string(" ") + causeNames[cause] + " " + std::to_string(count) + " " + std::to_string(resolveNs / count) + " " + std::to_string(emitNs / count) + ",";
+            }
         }
         if (DrawPipeline::ResolveSplit() == 1) {
             const auto count = earlyResolveCount.exchange(0, std::memory_order_relaxed);
@@ -526,6 +544,17 @@ void DrawPipeline::NoteCommitterPart(CommitterPart part, std::chrono::steady_clo
     committerPartCount[index].fetch_add(1, std::memory_order_relaxed);
 }
 
+DrawPipeline::OwnCause DrawPipeline::TakenOwnCause() {
+    return takenOwnCause;
+}
+
+void DrawPipeline::NoteOwnResolve(OwnCause cause, std::uint64_t resolveNs, std::uint64_t emitNs) {
+    const auto index = static_cast<std::size_t>(cause);
+    ownCauseCount[index].fetch_add(1, std::memory_order_relaxed);
+    ownCauseResolveNs[index].fetch_add(resolveNs, std::memory_order_relaxed);
+    ownCauseEmitNs[index].fetch_add(emitNs, std::memory_order_relaxed);
+}
+
 void DrawPipeline::NoteEarlyResolveNs(std::uint64_t ns) {
     earlyResolveNs.fetch_add(ns, std::memory_order_relaxed);
     earlyResolveCount.fetch_add(1, std::memory_order_relaxed);
@@ -767,6 +796,7 @@ void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentT
             pendingEarly.hook = pipeline.items[next].early;
             pendingEarly.writes = OfferWrites(pipeline.items, next);
             NoteEarly(EarlyEvent::LateOffered);
+            nextOwnCause = OwnCause::Unknown;
             if (next >= 2) NoteEarly(pendingEarly.writes == &runWrites && runWrites.size() > pipeline.items.front().writes.size() ? EarlyEvent::AcrossLabels : EarlyEvent::AcrossSeal);
         }
     }
@@ -1078,6 +1108,10 @@ void DrawPipeline::run() {
         isDraw = items.front().draw;
         kind = static_cast<std::size_t>(items.front().kind);
         if (ResolveSplit() == 0 || !isDraw || commit == nullptr || EarlyStopped()) return;
+        if (OwnCausesCounted()) {
+            takenOwnCause = nextOwnCause;
+            nextOwnCause = OwnCause::Unknown;
+        }
         if (const auto next = EarlyIndex(items); next != 0) {
             pendingEarly.hook = items[next].early;
             pendingEarly.writes = OfferWrites(items, next);
@@ -1086,6 +1120,11 @@ void DrawPipeline::run() {
         }
         const bool sealLast = OfferAcrossLabels() ? items.size() >= 2 && OnlyRunBehind(items) : items.size() == 2 && items[1].kind == ItemKind::Seal && !SealsBreakProofs();
         NoteEarly(items.size() < 2 || sealLast ? EarlyEvent::NextMissing : !items[1].draw ? EarlyEvent::NextNotDraw : EarlyEvent::NextNoHook);
+        if (OwnCausesCounted()) {
+            using C = OwnCause;
+            const auto behind = [&](ItemKind next) { return next == ItemKind::Seal ? (items.size() >= 3 && items[2].kind == ItemKind::Label ? C::BehindSealThenLabel : C::BehindSeal) : next == ItemKind::Label ? C::BehindLabel : next == ItemKind::Fill ? C::BehindFill : C::BehindOther; };
+            nextOwnCause = items.size() < 2 || sealLast ? C::NoneQueued : items[1].draw ? C::NextNoHook : behind(items[1].kind);
+        }
         if (items.size() >= 2 && !items[1].draw && !sealLast) nextNotDrawKinds[static_cast<std::size_t>(items[1].kind)].fetch_add(1, std::memory_order_relaxed);
         if (items.size() >= 3 && items[1].kind == ItemKind::Seal) afterSealKinds[items[2].draw ? static_cast<std::size_t>(ItemKind::Count) : static_cast<std::size_t>(items[2].kind)].fetch_add(1, std::memory_order_relaxed);
         static const bool late = std::getenv("APS5_NO_LATE_EARLY_OFFER") == nullptr;

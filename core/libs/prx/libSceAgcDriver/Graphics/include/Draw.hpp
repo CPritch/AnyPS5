@@ -67,6 +67,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 std::string TakeDrawSplitText();
 std::string TakeDrawBindingsText();
 std::string TakeReleasedScanText();
+std::string TakeDepthViewLapText();
 struct DrawPacket;
 struct DrawPacketDeleter {
     void operator()(DrawPacket* packet) const;

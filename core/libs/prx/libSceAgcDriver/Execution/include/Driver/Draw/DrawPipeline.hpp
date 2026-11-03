@@ -102,6 +102,9 @@ public:
     static void NoteEarlyResolveNs(std::uint64_t ns);
     enum class CommitterPart : std::uint8_t { Check, ResolveWhole, Offer, EmitEarly, EmitWhole, Join, Count };
     static void NoteCommitterPart(CommitterPart part, std::chrono::steady_clock::time_point since);
+    enum class OwnCause : std::uint8_t { NoneQueued, BehindSeal, BehindSealThenLabel, BehindLabel, BehindFill, BehindOther, NextNoHook, DeclinedPredictor, DeclinedDescribed, DeclinedReadsWritten, DeclinedOther, Revoked, AbortedImageRefresh, AbortedOther, Failed, Dropped, StaleSubmit, StaleProof, StaleOther, Unknown, Count };
+    static OwnCause TakenOwnCause();
+    static void NoteOwnResolve(OwnCause cause, std::uint64_t resolveNs, std::uint64_t emitNs);
     static std::uint64_t FollowedEpoch();
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void WaitWritten(std::uint64_t address, std::size_t bytes, DrainReason reason, std::uint32_t opcode = 0x100);

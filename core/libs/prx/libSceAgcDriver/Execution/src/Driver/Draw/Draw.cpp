@@ -253,6 +253,9 @@ struct EarlyDraw {
     std::vector<Graphics::FoundMultisampleTarget> multisample;
     std::uint8_t abort = 0;
     bool failed = false;
+    bool revoked = false;
+    bool dropped = false;
+    DrawPipeline::EarlyEvent declined = DrawPipeline::EarlyEvent::Count;
 };
 
 namespace {
@@ -1436,6 +1439,30 @@ bool DrawSplitTimed() {
     static const bool timed = std::getenv("APS5_COMMIT_STATS") != nullptr;
     return timed;
 }
+
+DrawPipeline::OwnCause OwnResolveCause(const EarlyDraw* early, DrawPipeline::EarlyEvent stale) {
+    using C = DrawPipeline::OwnCause;
+    using E = DrawPipeline::EarlyEvent;
+    if (early == nullptr) return C::Unknown;
+    if (stale == E::StaleSubmit) return C::StaleSubmit;
+    if (stale == E::StaleProof || stale == E::StaleScoped || stale == E::StaleScopedTemplate) return C::StaleProof;
+    if (stale != E::Used) return C::StaleOther;
+    if (early->claimed) {
+        if (early->abort == static_cast<std::uint8_t>(GuestMemory::BarrierKind::ResolverRefresh)) return C::AbortedImageRefresh;
+        if (early->abort != 0) return C::AbortedOther;
+        if (early->failed) return C::Failed;
+        if (early->dropped) return C::Dropped;
+        return C::Unknown;
+    }
+    if (early->revoked) return C::Revoked;
+    switch (early->declined) {
+        case E::Count: return DrawPipeline::TakenOwnCause();
+        case E::KeptPredictor: return C::DeclinedPredictor;
+        case E::KeptDescribed: return C::DeclinedDescribed;
+        case E::KeptReadsWritten: return C::DeclinedReadsWritten;
+        default: return C::DeclinedOther;
+    }
+}
 }
 
 void resolveEarlyJob(void* context) {
@@ -1472,6 +1499,7 @@ void finishEarlyJob(void* context, bool ran) {
     Graphics::BuryPackets(early.graveyard);
     if (!ran) {
         early.claimed = false;
+        early.revoked = true;
         return;
     }
     if (early.abort != 0 || early.failed || early.packet == nullptr) {
@@ -1485,6 +1513,7 @@ void finishEarlyJob(void* context, bool ran) {
         early.resolver->DiscardDraw(*early.packet);
         early.packet.reset();
         early.built.reset();
+        early.dropped = true;
         DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::OverlapAfter);
     }
 }
@@ -1495,14 +1524,19 @@ bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, 
     static_cast<void>(probe);
     using E = DrawPipeline::EarlyEvent;
     if (early.packet != nullptr || early.claimed) return false;
-    if (recipe != nullptr) return DrawPipeline::NoteEarly(E::KeptRecipe), false;
-    if (graphics.stages.tessellationGeometry) return DrawPipeline::NoteEarly(E::KeptTessellation), false;
-    if (DrawPipeline::FollowedEpoch() != epoch) return DrawPipeline::NoteEarly(E::KeptEpoch), false;
+    const auto keep = [&early](E event) {
+        early.declined = event;
+        DrawPipeline::NoteEarly(event);
+        return false;
+    };
+    if (recipe != nullptr) return keep(E::KeptRecipe);
+    if (graphics.stages.tessellationGeometry) return keep(E::KeptTessellation);
+    if (DrawPipeline::FollowedEpoch() != epoch) return keep(E::KeptEpoch);
     const auto overlaps = [](std::span<const std::pair<std::uint64_t, std::uint64_t>> first, std::span<const std::pair<std::uint64_t, std::uint64_t>> second) {
         return std::any_of(first.begin(), first.end(), [&](const auto& a) { return std::any_of(second.begin(), second.end(), [&](const auto& b) { return a.first < b.second && b.first < a.second; }); });
     };
-    if (overlaps(writes, itemReads) || overlaps(depth, itemReads)) return DrawPipeline::NoteEarly(E::KeptReadsWritten), false;
-    if (!depth.empty() && overlaps(depth, DrawColorRanges(graphics))) return DrawPipeline::NoteEarly(E::KeptDepthColour), false;
+    if (overlaps(writes, itemReads) || overlaps(depth, itemReads)) return keep(E::KeptReadsWritten);
+    if (!depth.empty() && overlaps(depth, DrawColorRanges(graphics))) return keep(E::KeptDepthColour);
     const auto* result = ahead != nullptr && ahead->phase.load(std::memory_order_acquire) == DrawAheadSlot::Ready ? &ahead->result : nullptr;
     const bool multisampled = std::any_of(graphics.colors.begin(), graphics.colors.end(), [](const Graphics::ColorTarget& color) { return color.samples > 1; }) || (graphics.depth && graphics.depth->samples > 1);
     early.multisample.clear();
@@ -1513,19 +1547,18 @@ bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, 
         const auto reason = Graphics::PredictPureReason(graphics, drawParameters, stages, result, multisampleFound);
         static const bool offerUnhinted = std::getenv("APS5_RESOLVE_OFFER_UNHINTED") != nullptr;
         const bool proofOnly = reason == R::ProofNotCurrent || reason == R::NoSlot || (offerUnhinted && (reason == R::NotLooked || reason == R::NoHint));
-        if (reason != R::Accepted && !proofOnly) return DrawPipeline::NoteEarly(E::KeptPredictor), false;
-        if (proofOnly && result != nullptr && result->found != nullptr && result->found.get() == currentTemplate) return DrawPipeline::NoteEarly(E::KeptCurrentTemplate), false;
+        if (reason != R::Accepted && !proofOnly) return keep(E::KeptPredictor);
+        if (proofOnly && result != nullptr && result->found != nullptr && result->found.get() == currentTemplate) return keep(E::KeptCurrentTemplate);
     }
     if (result != nullptr && result->found != nullptr && (result->found->DescribedRangesOverlap(writes) || result->found->DescribedRangesOverlap(depth))) {
         static const bool reported = std::getenv("APS5_COMMIT_STATS") != nullptr;
         static std::atomic<int> reports{0};
         if (reported && writes.size() > 0 && reports.fetch_add(1, std::memory_order_relaxed) % 997 == 0 && reports.load(std::memory_order_relaxed) < 997 * 24) std::fprintf(stderr, "[early-described] kept: %s; %zu write ranges offered\n", result->found->DescribeRangeOverlap(writes).c_str(), writes.size());
-        return DrawPipeline::NoteEarly(E::KeptDescribed), false;
+        return keep(E::KeptDescribed);
     }
     const auto split = DrawPipeline::ResolveSplit();
     if (split >= 2 && !localDevice->ResolverInputsClear()) {
-        DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::DeclinedWriters);
-        return false;
+        return keep(E::DeclinedWriters);
     }
     auto* prepared = ahead != nullptr ? ahead->Claim() : nullptr;
     early.claimed = true;
@@ -1582,6 +1615,7 @@ bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, 
             early.packet.reset();
             early.built.reset();
             DrawPipeline::NoteEarlyAbort(abort.kind);
+            early.abort = abort.kind;
             return false;
         }
     }
@@ -1589,6 +1623,7 @@ bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, 
         localDevice->DiscardDraw(*early.packet);
         early.packet.reset();
         early.built.reset();
+        early.dropped = true;
         DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::OverlapAfter);
         return false;
     }
@@ -1621,6 +1656,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         Graphics::DrawPacketPtr packet;
         bool fromEarly = false;
         const bool timed = DrawSplitTimed();
+        auto staleCause = DrawPipeline::EarlyEvent::Used;
         const auto clock = [timed] { return timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
         if (early != nullptr && early->packet != nullptr) {
             const auto checking = clock();
@@ -1671,6 +1707,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
                 else if (change == VulkanDevice::EarlyChange::Noted && (overrun || overlaps(noted, early->reads) || Graphics::DrawPacketReadsOverlap(*early->packet, noted))) stale = E::StaleNoted;
             }
             DrawPipeline::NoteEarly(stale);
+            staleCause = stale;
             if (stale == E::Used && acrossLabels) DrawPipeline::NoteEarly(E::UsedAcrossLabels);
             if (stale == E::Used) {
                 packet = std::move(early->packet);
@@ -1705,10 +1742,14 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
                 early->built.reset();
             }
         }
+        std::uint64_t ownResolveNs = 0;
         if (packet == nullptr) {
             const auto resolving = clock();
             packet = localDevice->ResolveDraw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, prepared);
-            if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::ResolveWhole, resolving);
+            if (timed) {
+                DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::ResolveWhole, resolving);
+                ownResolveNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - resolving).count());
+            }
         }
         if (fromEarly) localDevice->ApplyDrawMemoKeeps(*packet);
         struct JoinGuard {
@@ -1727,7 +1768,10 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         }
         const auto emitting = clock();
         localDevice->EmitDraw(*packet);
-        if (timed) DrawPipeline::NoteCommitterPart(fromEarly ? DrawPipeline::CommitterPart::EmitEarly : DrawPipeline::CommitterPart::EmitWhole, emitting);
+        if (timed) {
+            DrawPipeline::NoteCommitterPart(fromEarly ? DrawPipeline::CommitterPart::EmitEarly : DrawPipeline::CommitterPart::EmitWhole, emitting);
+            if (!fromEarly && ownResolveNs != 0) DrawPipeline::NoteOwnResolve(OwnResolveCause(early, staleCause), ownResolveNs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - emitting).count()));
+        }
         if (fromEarly) built = std::move(early->built);
     }
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));

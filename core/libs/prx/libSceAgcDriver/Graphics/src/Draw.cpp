@@ -2029,6 +2029,7 @@ struct DrawSplitCounts {
     std::array<std::atomic<std::uint64_t>, 4> prediction{};
     std::array<std::array<std::atomic<std::uint64_t>, 2>, static_cast<std::size_t>(PredictReason::Count)> reasonPurity{};
     std::atomic<std::uint64_t> predictedPairs{0};
+    std::array<std::atomic<std::uint64_t>, 2> builds{}, buildNs{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::BarrierKind::Count)> mispredictedKind{};
 };
 
@@ -2219,7 +2220,15 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
         GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverPath);
+        const bool buildCounted = timer.counted && DrawSplitCounted();
+        const auto building = buildCounted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        if (buildCounted) {
+            auto& split = DrawSplit();
+            const std::size_t kind = resolved.cacheable ? 0u : 1u;
+            split.builds[kind].fetch_add(1, std::memory_order_relaxed);
+            split.buildNs[kind].fetch_add(NanosecondsBetween(building, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+        }
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
@@ -4474,10 +4483,18 @@ std::string TakeDrawSplitText() {
     char failed[48];
     std::snprintf(failed, sizeof(failed), ", failed %llu", take(split.proofFailed));
     result += failed;
+    {
+        const auto missBuilds = take(split.builds[0]), uncacheableBuilds = take(split.builds[1]);
+        const auto missNs = take(split.buildNs[0]), uncacheableNs = take(split.buildNs[1]);
+        char builds[160];
+        std::snprintf(builds, sizeof(builds), "; template builds: for misses %llu (%.1f us each), for uncacheable draws %llu (%.1f us each)", missBuilds, missBuilds == 0 ? 0.0 : static_cast<double>(missNs) / 1e3 / static_cast<double>(missBuilds), uncacheableBuilds, uncacheableBuilds == 0 ? 0.0 : static_cast<double>(uncacheableNs) / 1e3 / static_cast<double>(uncacheableBuilds));
+        result += builds;
+    }
     char depthViews[384];
     const auto viewed = deferredDepthViews.load(std::memory_order_relaxed);
     std::snprintf(depthViews, sizeof(depthViews), "; depth views found in resolve and noted after it %llu (multisampled %llu, %.0f ns each at emit), of them a different surface by then %llu; color targets refreshed after resolve %llu, draws redone whole %llu", static_cast<unsigned long long>(deferredDepthViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredMultisampledDepthViews.exchange(0, std::memory_order_relaxed)), viewed == 0 ? 0.0 : static_cast<double>(deferredDepthViewNs.exchange(0, std::memory_order_relaxed)) / static_cast<double>(viewed), static_cast<unsigned long long>(deferredDepthViewsChanged.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(deferredColorRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(redoneWhole.exchange(0, std::memory_order_relaxed)));
     result += depthViews;
+    result += TakeDepthViewLapText();
     {
         const auto acquired = deferredMultisampleTargets.exchange(0, std::memory_order_relaxed);
         const auto ns = deferredMultisampleNs.exchange(0, std::memory_order_relaxed);
