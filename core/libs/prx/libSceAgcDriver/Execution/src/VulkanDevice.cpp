@@ -5195,7 +5195,8 @@ void logPresync(std::span<const Graphics::PresyncSurface> surfaces, bool texels,
         std::snprintf(item, sizeof(item), " 0x%llx+0x%llx%s x%llu (%.1f ms)", static_cast<unsigned long long>(std::get<0>(key)), static_cast<unsigned long long>(std::get<1>(key)), std::get<2>(key) ? " keys" : "", static_cast<unsigned long long>(entry.count), entry.ms);
         text += item;
     }
-    std::fprintf(stderr, "[presync-log] %lld (10 s) %llu pre-syncs waited %.1f ms, %llu over texels; surfaces:%s\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count()), static_cast<unsigned long long>(waits), waitedMs, static_cast<unsigned long long>(texelWaits), text.c_str());
+    const auto trust = Graphics::MetadataTrust::Enabled() ? Graphics::MetadataTrust::Process().Totals() : Graphics::MetadataTrust::Counts{};
+    std::fprintf(stderr, "[presync-log] %lld (10 s) %llu pre-syncs waited %.1f ms, %llu over texels; surfaces:%s; metadata trust (cumulative): %llu keys trusted, %llu confirmations, %llu revocations, %llu skips, %llu audits\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count()), static_cast<unsigned long long>(waits), waitedMs, static_cast<unsigned long long>(texelWaits), text.c_str(), static_cast<unsigned long long>(trust.trusted), static_cast<unsigned long long>(trust.confirmations), static_cast<unsigned long long>(trust.revocations), static_cast<unsigned long long>(trust.skips), static_cast<unsigned long long>(trust.audits));
     waits = texelWaits = 0;
     waitedMs = 0;
     bySurface.clear();
