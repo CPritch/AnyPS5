@@ -99,6 +99,11 @@ std::vector<DepthGuard>& depthGuards() {
     return ranges;
 }
 
+std::atomic<std::uint64_t>& depthGuardGeneration() {
+    static std::atomic<std::uint64_t> generation{1};
+    return generation;
+}
+
 std::atomic<bool>& anyDepthGuard() {
     static std::atomic<bool> any{false};
     return any;
@@ -2592,6 +2597,10 @@ std::uint64_t MultisampledDepthBytes_nid_no_patch(VkExtent2D extent, std::uint32
     return width * height * bytesPerTexel * samples;
 }
 
+std::uint64_t DepthGuardGeneration() {
+    return depthGuardGeneration().load(std::memory_order_acquire);
+}
+
 void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t bytes, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) {
     if (bytes == 0u || !anyDepthGuard().load(std::memory_order_acquire)) return;
     Require(address <= std::numeric_limits<std::uint64_t>::max() - bytes, "native depth read range overflows");
@@ -3083,6 +3092,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         if (target.samples != 1u && fresh.sampleable && fresh.sampling.refusal.empty()) {
             std::unique_lock guardLock(depthGuardMutex());
             for (const auto& range : fresh.sampling.initial) depthGuards().push_back({context.device, range.address, range.bytes, fresh.active, {{range.address, range.bytes, 0u}}, fresh.hostWritten});
+            depthGuardGeneration().fetch_add(1, std::memory_order_release);
             anyDepthGuard().store(true, std::memory_order_release);
             InstallResidentImageReadGuard_nid_no_patch();
             fresh.samplingActive = true;

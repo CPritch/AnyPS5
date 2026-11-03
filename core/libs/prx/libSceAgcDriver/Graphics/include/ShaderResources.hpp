@@ -683,6 +683,8 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    mutable std::atomic<std::uint64_t> guardsCheckedDepth{~std::uint64_t{0}};
+    mutable std::atomic<std::uint64_t> guardsCheckedColor{~std::uint64_t{0}};
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     std::vector<ShaderRecompiler::RegisteredImageView> registeredImageViews;

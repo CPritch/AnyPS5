@@ -6691,6 +6691,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
 }
 
 void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
+    static const bool memo = std::getenv("APS5_NO_GUARD_CHECK_MEMO") == nullptr;
+    const bool remembered = memo && moved.empty();
+    const auto depthGeneration = remembered ? DepthGuardGeneration() : 0;
+    const auto colorGeneration = remembered ? MultisampleGuardGeneration() : 0;
+    if (remembered && guardsCheckedDepth.load(std::memory_order_acquire) == depthGeneration && guardsCheckedColor.load(std::memory_order_acquire) == colorGeneration) return;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         if (!item.guest) continue;
@@ -6699,6 +6704,10 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
         const auto bytes = override != moved.end() ? override->size : item.size;
         RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
         RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
+    }
+    if (remembered) {
+        guardsCheckedColor.store(colorGeneration, std::memory_order_relaxed);
+        guardsCheckedDepth.store(depthGeneration, std::memory_order_release);
     }
 }
 
