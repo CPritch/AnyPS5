@@ -186,7 +186,7 @@ std::string QueueWaits::Text() {
                 if (count != 0) kinds += (kinds.empty() ? "" : ", ") + std::string(kind < kindNames.size() ? kindNames[kind] : "a draw without an early hook") + " " + std::to_string(count);
             }
             return kinds;
-        }() + "), offered once the committer's own resolve was done " + event(E::LateOffered) + ", offered across a seal " + event(E::AcrossSeal) + ", offered across a label run " + event(E::AcrossLabels) + " (used " + event(E::UsedAcrossLabels) + ", redone for a label's bytes " + event(E::StaleScoped) + ", for its template " + event(E::StaleScopedTemplate) + ")" + ", a draw without an early hook " + event(E::NextNoHook) + "; kept by the gate: recipe " + event(E::KeptRecipe) + ", tessellation " + event(E::KeptTessellation) + ", another epoch " + event(E::KeptEpoch) + ", reads the previous draw's writes " + event(E::KeptReadsWritten) + ", depth over colour " + event(E::KeptDepthColour) + ", predictor " + event(E::KeptPredictor) + ", the template being emitted " + event(E::KeptCurrentTemplate) + ", described ranges written " + event(E::KeptDescribed) + "; aborted at a barrier:";
+        }() + "), offered once the committer's own resolve was done " + event(E::LateOffered) + ", offered across a seal " + event(E::AcrossSeal) + ", offered across a label run " + event(E::AcrossLabels) + " (used " + event(E::UsedAcrossLabels) + ", redone for a label's bytes " + event(E::StaleScoped) + ", for its template " + event(E::StaleScopedTemplate) + ")" + ", a draw without an early hook " + event(E::NextNoHook) + "; kept by the gate: recipe " + event(E::KeptRecipe) + ", tessellation " + event(E::KeptTessellation) + ", another epoch " + event(E::KeptEpoch) + ", reads the previous draw's writes " + event(E::KeptReadsWritten) + ", depth over colour " + event(E::KeptDepthColour) + ", predictor " + event(E::KeptPredictor) + ", the template being emitted " + event(E::KeptCurrentTemplate) + ", described ranges written " + event(E::KeptDescribed) + "; idle submits moved after the emit " + event(E::IdleSubmitAfterEmit) + "; aborted at a barrier:";
         for (std::size_t kind = 1; kind < earlyAborts.size(); ++kind) {
             const auto count = earlyAborts[kind].exchange(0, std::memory_order_relaxed);
             if (count != 0) text += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
@@ -381,13 +381,24 @@ bool DrawFinisher::OnFinisherThread() {
     return finisherThread;
 }
 
+namespace {
+std::size_t FinisherDepth() {
+    static const std::size_t depth = [] {
+        const char* text = std::getenv("APS5_FINISHER_DEPTH");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 16ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 2ull, 256ull));
+    }();
+    return depth;
+}
+}
+
 void DrawFinisher::Enqueue(Job job) {
     Enqueue(std::move(job), Pending{});
 }
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
     finisherProducer = true;
-    constexpr std::size_t depth = 16;
+    const std::size_t depth = FinisherDepth();
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
     reclaim.clear();
@@ -462,7 +473,7 @@ void DrawFinisher::run() {
             pending.pop_front();
             ++ranJobs;
             outstanding.fetch_sub(1, std::memory_order_release);
-            constexpr std::size_t depth = 16;
+            const std::size_t depth = FinisherDepth();
             if (idleWaiters != 0) idle.notify_all();
             if (roomWaiters != 0 && jobs.size() <= depth - std::min(RoomBatch(depth) / 2 + 1, depth)) room.notify_all();
         }

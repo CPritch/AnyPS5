@@ -1652,6 +1652,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     static const bool carryRegistered = (DrawPipeline::SetCarryRelease(&releaseCarriedJob), true);
     static_cast<void>(carryRegistered);
+    bool idleOwed = false;
     if (DrawPipeline::HoldCarried()) {
         struct Drop {
             ~Drop() { DrawPipeline::ReleaseCarriedHold(); }
@@ -1659,7 +1660,8 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         const auto joining = DrawSplitTimed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         releaseCarriedJob();
         if (DrawSplitTimed()) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Join, joining);
-        submitDueAfterCommit(localDevice.get());
+        static const bool idleAfterEmit = std::getenv("APS5_NO_IDLE_SUBMIT_AFTER_EMIT") == nullptr;
+        idleOwed = submitDueAfterCommit(localDevice.get(), idleAfterEmit && early != nullptr && early->packet != nullptr);
     }
     auto* prepared = ahead != nullptr && (early == nullptr || !early->claimed) ? ahead->Claim() : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -1797,17 +1799,24 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
                 if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Join, joining);
             }
         } joinGuard{timed, packet};
-        if (DrawPipeline::ResolveSplit() != 0) {
+        const auto offer = [&] {
+            if (DrawPipeline::ResolveSplit() == 0) return;
             const auto offering = clock();
             const auto depth = DrawDepthRanges(graphics);
             DrawPipeline::OfferEarly(depth, Graphics::DrawPacketTemplate(*packet));
             if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Offer, offering);
-        }
+        };
+        if (!idleOwed) offer();
         const auto emitting = clock();
         localDevice->EmitDraw(*packet);
         if (timed) {
             DrawPipeline::NoteCommitterPart(fromEarly ? DrawPipeline::CommitterPart::EmitEarly : DrawPipeline::CommitterPart::EmitWhole, emitting);
             if (!fromEarly && ownResolveNs != 0) DrawPipeline::NoteOwnResolve(OwnResolveCause(early, staleCause), ownResolveNs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - emitting).count()));
+        }
+        if (idleOwed) {
+            DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::IdleSubmitAfterEmit);
+            submitDueAfterCommit(localDevice.get());
+            offer();
         }
         if (fromEarly) built = std::move(early->built);
     }

@@ -575,16 +575,18 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     laps.lap(5);
 }
 
-void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
-    if (localDevice == nullptr) return;
+bool Driver::submitDueAfterCommit(VulkanDevice* localDevice, bool deferIdle) {
+    if (localDevice == nullptr) return false;
     const auto pending = Graphics::Recorder::PendingLabelSince();
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
     const auto work = Graphics::Recorder::RecordedWorkSinceSubmit();
     const bool cap = batchCap() != 0 && work >= batchCap();
     const bool idle = !cap && idleSubmitDue(work);
-    if (!due && !cap && !idle) return;
+    if (!due && !cap && !idle) return false;
+    if (deferIdle && !due && !cap) return true;
     Graphics::Recorder::TagSubmitCause(due ? Graphics::Recorder::SubmitCause::LabelDeadline : cap ? Graphics::Recorder::SubmitCause::BatchCap : Graphics::Recorder::SubmitCause::Idle);
     localDevice->SubmitRecorded(true);
+    return false;
 }
 
 }

@@ -312,7 +312,7 @@ private:
     bool enqueueSampleDumpPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue);
     void commitDmaStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes);
     void commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt);
-    void submitDueAfterCommit(VulkanDevice* localDevice);
+    bool submitDueAfterCommit(VulkanDevice* localDevice, bool deferIdle = false);
     std::optional<WrittenBuffer> newestWriterLocked(std::uint64_t begin, std::uint64_t end) const;
     std::optional<WrittenBuffer> newestWriter(std::uint64_t begin, std::uint64_t end);
     std::string describeWriters(std::uint64_t begin, std::uint64_t end);
