@@ -2368,7 +2368,8 @@ std::string StorageTexture::TakeCommitterRefreshText() {
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
-    GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverRefresh);
+    static const bool provedFirst = std::getenv("APS5_NO_RESOLVER_PROVED_REFRESH") == nullptr;
+    if (!provedFirst) GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverRefresh);
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
@@ -2417,6 +2418,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         epochRefreshes.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
+    if (provedFirst) GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverRefresh);
     const auto proofBefore = GuestMemory::ProofSerial();
     const auto pendingBefore = PendingSerial();
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
