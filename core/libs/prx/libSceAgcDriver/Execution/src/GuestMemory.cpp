@@ -3106,7 +3106,7 @@ void BeginResolveLockTrace() {
 }
 
 const char* BarrierKindName(BarrierKind kind) {
-    constexpr std::array<const char*, static_cast<std::size_t>(BarrierKind::Count)> names{"none", "GPU lock", "lock-held check", "commands", "submit", "batch reap", "proof break", "import made or retired", "template inserted", "storage image created", "recorder write", "pending images changed", "depth surface retired", "storage image evicted", "forced", "recorder method off the resolver's list", "path the resolver does not take", "image refresh on the resolver"};
+    constexpr std::array<const char*, static_cast<std::size_t>(BarrierKind::Count)> names{"none", "GPU lock", "lock-held check", "commands", "submit", "batch reap", "proof break", "import made or retired", "template inserted", "storage image created", "recorder write", "pending images changed", "depth surface retired", "storage image evicted", "forced", "recorder method off the resolver's list", "path the resolver does not take", "image refresh on the resolver", "template eviction on the resolver"};
     const auto index = static_cast<std::size_t>(kind);
     return index < names.size() ? names[index] : "?";
 }

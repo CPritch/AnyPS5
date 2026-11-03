@@ -2204,6 +2204,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 countCache(&DrawProfile::cacheMisses);
                 if (counted) split.unmoved.fetch_add(1, std::memory_order_relaxed);
             } else {
+                GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::TemplateEvict);
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
                 if (counted) split.invalidated.fetch_add(1, std::memory_order_relaxed);
