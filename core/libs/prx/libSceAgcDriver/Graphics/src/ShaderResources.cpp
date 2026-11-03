@@ -6296,6 +6296,38 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     bool stamped = false;
     static const bool lockedStamp = std::getenv("APS5_LOCKED_SNAPSHOT_STAMP") != nullptr;
     const auto snapshotStamp = [] { return lockedStamp ? GuestMemory::TrackerGeneration() : GuestMemory::PublishedTrackerGeneration(); };
+    struct PendingCopy {
+        std::byte* destination;
+        const std::byte* source;
+        std::size_t bytes;
+        std::size_t patched;
+    };
+    struct PendingNote {
+        std::uint64_t address;
+        std::size_t bytes;
+        VkDeviceSize offset;
+        Buffer* buffer;
+        std::array<std::uint64_t, 3> stamp;
+    };
+    static const bool deferCopies = std::getenv("APS5_NO_DEFERRED_UPLOAD_COPIES") == nullptr;
+    constexpr std::size_t Unpatched = std::numeric_limits<std::size_t>::max();
+    thread_local std::vector<PendingCopy>* copiesSlot = nullptr;
+    auto& pendingCopies = ShaderRecompiler::ThreadOwned(copiesSlot);
+    pendingCopies.clear();
+    thread_local std::vector<PendingNote>* notesSlot = nullptr;
+    auto& pendingNotes = ShaderRecompiler::ThreadOwned(notesSlot);
+    pendingNotes.clear();
+    const auto copy = [&](const PendingCopy& pending) {
+        std::memcpy(pending.destination, pending.source, pending.bytes);
+        if (pending.patched == Unpatched) return;
+        for (const auto& patch : dataPatches) {
+            if (patch.allocation == pending.patched && patch.byte < pending.bytes) pending.destination[patch.byte] = static_cast<std::byte>(patch.adjustment);
+        }
+    };
+    const auto upload = [&](const PendingCopy& pending) {
+        if (deferCopies) pendingCopies.push_back(pending);
+        else copy(pending);
+    };
     const auto keep = [&](DrawBindings::Snapshot snapshot, const std::shared_ptr<Buffer>& owner) {
         if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
         Require(owner.get() == snapshot.buffer, "a draw snapshot is not owned by its bindings");
@@ -6307,10 +6339,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
             auto slice = recorder.DrawUpload(override->size);
-            std::memcpy(slice.bytes, override->words.data(), override->size);
-            for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < override->size) slice.bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
-            }
+            upload({slice.bytes, reinterpret_cast<const std::byte*>(override->words.data()), override->size, index});
             selected.push_back(index);
             keep({0, slice.buffer, slice.offset, override->size}, recorder.DrawUploadOwner(slice.buffer));
             continue;
@@ -6352,7 +6381,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
-                std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
+                upload({slice.bytes, reinterpret_cast<const std::byte*>(begin), bytes, Unpatched});
                 CountBinding(CountUploaded);
                 CountBinding(CountUploadedBytes, bytes);
                 raw = slice.buffer;
@@ -6369,12 +6398,22 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 raw = buffer.get();
             }
             if (snapshotStamp() != stamp[0]) stamped = false;
+            else if (uploaded && deferCopies && stamp[1] != 0) pendingNotes.push_back({begin, bytes, offset, raw, stamp});
             else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, uploaded ? recorder.DrawUploadOwner(raw) : buffer, offset);
         }
         selected.push_back(index);
         keep({begin, raw, offset, bytes}, buffer != nullptr ? buffer : recorder.DrawUploadOwner(raw));
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+    }
+    for (const auto& pending : pendingCopies) copy(pending);
+    if (!pendingNotes.empty()) {
+        const auto generation = snapshotStamp();
+        for (const auto& note : pendingNotes) {
+            if (note.stamp[0] != generation) continue;
+            const auto owner = std::find_if(result->owners.begin(), result->owners.end(), [&](const auto& held) { return held.get() == note.buffer; });
+            if (owner != result->owners.end()) recorder.NoteUnwrittenDrawSnapshot(note.address, note.bytes, note.stamp, *owner, note.offset);
+        }
     }
     part(PartSnapshots);
     if (selected.empty()) {
