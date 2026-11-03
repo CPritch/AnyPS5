@@ -4760,7 +4760,7 @@ std::uint32_t CompareDrawPackets(const DrawPacket& first, const DrawPacket& seco
     mark(DrawPacketField::Inputs, a.inputs.nothing == b.inputs.nothing && a.inputs.indexBytes == b.inputs.indexBytes && a.inputs.indexCount == b.inputs.indexCount && a.inputs.maxIndex == b.inputs.maxIndex && a.inputs.inPlaceReads == b.inputs.inPlaceReads && a.inputs.vertexOffsets == b.inputs.vertexOffsets && a.inputs.vertexHandles.size() == b.inputs.vertexHandles.size() && (a.inputs.indices == nullptr) == (b.inputs.indices == nullptr) && a.inputs.expandedIndexCount == b.inputs.expandedIndexCount && a.deferredReads == b.deferredReads);
     mark(DrawPacketField::Moved, a.resolved.moved.size() == b.resolved.moved.size());
     mark(DrawPacketField::Depth, a.depthFound.view == b.depthFound.view);
-    mark(DrawPacketField::Refreshes, a.colorRefreshes == b.colorRefreshes);
+    mark(DrawPacketField::Refreshes, a.colorRefreshes == b.colorRefreshes || std::includes(b.colorRefreshes.begin(), b.colorRefreshes.end(), a.colorRefreshes.begin(), a.colorRefreshes.end()));
     mark(DrawPacketField::Flags, first.ready == second.ready && a.completion == b.completion && a.multisampled == b.multisampled && a.lean == b.lean && a.stencilReferences == b.stencilReferences);
     return differs;
 }
