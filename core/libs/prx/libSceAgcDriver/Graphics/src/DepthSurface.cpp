@@ -2742,12 +2742,14 @@ FoundDepthView FindDepthSurfaceView(const Context& context, const DepthTarget& t
 
 namespace {
 
-constexpr std::size_t DepthViewLapCount = 9;
+constexpr std::size_t DepthViewLapCount = 10;
 std::array<std::atomic<std::uint64_t>, DepthViewLapCount> depthViewLapNs{};
 std::atomic<std::uint64_t> depthViewCalls{0};
 
 enum DepthViewMemoOutcome : std::size_t { MemoHit, MissTarget, MissFlags, MissHtile, MissSurface, MissState, MissEpoch, MissStale, MissWritten, VerifiedSame, VerifiedSynced, HitAfterSwitch, MemoOutcomeCount };
 std::array<std::atomic<std::uint64_t>, MemoOutcomeCount> depthViewMemoCounts{};
+enum DepthViewStoreOutcome : std::size_t { StoreKept, StoreCleared, StoreNoEpoch, StoreSurfaceState, StoreEpochMoved, StoreMemoryUnnoted, StoreMirrorUngenerated, StoreStencilUngenerated, StoreEvictedValid, StoreOutcomeCount };
+std::array<std::atomic<std::uint64_t>, StoreOutcomeCount> depthViewStoreCounts{};
 
 bool DepthViewMemoEnabled() {
     static const bool enabled = std::getenv("APS5_NO_DEPTH_VIEW_MEMO") == nullptr;
@@ -2810,6 +2812,7 @@ DepthViewMemo& depthViewMemoSlot(const Context& context, const DepthTarget& targ
     }
     auto& memo = depthViewMemos[depthViewMemoNext];
     depthViewMemoNext = (depthViewMemoNext + 1) % DepthViewMemoSlots;
+    depthViewStoreCounts[StoreEvictedValid].fetch_add(1, std::memory_order_relaxed);
     return memo;
 }
 
@@ -2853,14 +2856,19 @@ DepthViewMemoOutcome depthViewMemoMiss(const Context& context, const DepthTarget
 void storeDepthViewMemo(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, DepthSurface& surface, bool clearedHere, const DepthViewEpoch& epoch) {
     auto& memo = depthViewMemoSlot(context, target);
     memo.valid = false;
-    if (!DepthViewMemoEnabled() || clearedHere || epoch.epoch == 0 || surface.samplingActive || surface.pendingClear != 0 || surface.depthFill.has_value() || surface.stencilFill.has_value()) return;
+    if (!DepthViewMemoEnabled()) return;
+    const auto count = [](DepthViewStoreOutcome outcome) { depthViewStoreCounts[outcome].fetch_add(1, std::memory_order_relaxed); };
+    if (clearedHere) return count(StoreCleared);
+    if (epoch.epoch == 0) return count(StoreNoEpoch);
+    if (surface.samplingActive || surface.pendingClear != 0 || surface.depthFill.has_value() || surface.stencilFill.has_value()) return count(StoreSurfaceState);
     const DepthViewEpoch now;
-    if (now.epoch != epoch.epoch || now.unwatched != epoch.unwatched || now.mapping != epoch.mapping) return;
-    if (!surface.MemoryNoted()) return;
+    if (now.epoch != epoch.epoch || now.unwatched != epoch.unwatched || now.mapping != epoch.mapping) return count(StoreEpochMoved);
+    if (!surface.MemoryNoted()) return count(StoreMemoryUnnoted);
     const bool mirrored = mirrorable(target);
-    if (mirrored && (surface.unitGeneration.empty() || *std::min_element(surface.unitGeneration.begin(), surface.unitGeneration.end()) == 0)) return;
+    if (mirrored && (surface.unitGeneration.empty() || *std::min_element(surface.unitGeneration.begin(), surface.unitGeneration.end()) == 0)) return count(StoreMirrorUngenerated);
     const bool stencilMirrored = surface.StencilMirrorable();
-    if (stencilMirrored && surface.stencilGeneration == 0) return;
+    if (stencilMirrored && surface.stencilGeneration == 0) return count(StoreStencilUngenerated);
+    count(StoreKept);
     memo = {context.device, target, depthWritten, stencilTested, &surface, surfacesSerial.load(std::memory_order_acquire), mirrorEpoch, depthContentWrites(), clearedHtileWrites.load(std::memory_order_acquire), stalePlaneWrites.load(std::memory_order_acquire), epoch.epoch, epoch.unwatched, epoch.mapping, mirrored ? DescribeSurface(mirrorResource(target)).guestBytes : 0, stencilMirrored ? DescribeSurface(stencilResource(target)).guestBytes : 0, true};
 }
 
@@ -2932,13 +2940,16 @@ std::uint64_t DepthViewMemoMisses() {
 }
 
 std::string TakeDepthViewLapText() {
-    constexpr std::array<const char*, DepthViewLapCount> names{"HTILE store-back", "pending HTILE clear", "find or create", "owners and planes", "syncs from memory", "clears and memory notes", "stale planes", "memo check", "multisample claims"};
+    constexpr std::array<const char*, DepthViewLapCount> names{"HTILE store-back", "pending HTILE clear", "find or create", "owners and planes", "syncs from memory", "clears and memory notes", "stale planes", "memo check", "multisample claims", "locks before the memo"};
     const auto calls = depthViewCalls.exchange(0, std::memory_order_relaxed);
     std::string text = "; depth view parts (" + std::to_string(calls) + " calls, ns each):";
     for (std::size_t part = 0; part < names.size(); ++part) text += std::string(" ") + names[part] + " " + std::to_string(calls == 0 ? 0 : depthViewLapNs[part].exchange(0, std::memory_order_relaxed) / calls) + (part + 1 == names.size() ? "" : ",");
     constexpr std::array<const char*, MemoOutcomeCount> outcomes{"hits", "missed: another target", "the same target with other flags", "HTILE cleared", "the surface", "its state", "the collect epoch", "stale planes", "planes written", "verified same", "verified with a sync of its own walk", "hits after another target"};
     text += "; depth view memo:";
     for (std::size_t outcome = 0; outcome < outcomes.size(); ++outcome) text += std::string(" ") + outcomes[outcome] + " " + std::to_string(depthViewMemoCounts[outcome].exchange(0, std::memory_order_relaxed)) + (outcome + 1 == outcomes.size() ? "" : ",");
+    constexpr std::array<const char*, StoreOutcomeCount> stores{"stored", "not stored: cleared here", "no collect epoch", "the surface's clear, fill or sampling state", "the epoch moved", "memory not noted", "mirror ungenerated", "stencil ungenerated", "valid entries evicted"};
+    text += "; depth view memo stores:";
+    for (std::size_t outcome = 0; outcome < stores.size(); ++outcome) text += std::string(" ") + stores[outcome] + " " + std::to_string(depthViewStoreCounts[outcome].exchange(0, std::memory_order_relaxed)) + (outcome + 1 == stores.size() ? "" : ",");
     return text;
 }
 
@@ -2956,6 +2967,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     std::optional<DepthViewSnapshot> verifying;
     if (DepthViewMemoEnabled()) {
         std::lock_guard memoLock(surfacesMutex());
+        laps.Lap(9);
         DepthViewMemo* memo = nullptr;
         const auto outcome = depthViewMemoMiss(context, target, depthWritten, stencilTested, htileCleared, epochAtStart, memo);
         depthViewMemoCounts[outcome].fetch_add(1, std::memory_order_relaxed);

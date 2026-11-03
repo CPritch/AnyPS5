@@ -3410,7 +3410,7 @@ std::size_t ShaderResources::LookupLogCapacity() {
 }
 
 namespace {
-enum ProofPart : std::size_t { PartPendingWrites, PartDepthChecks, PartDepthPlanes, PartCollects, PartKeys, PartElements, PartPendingScan, PartUnchanged, PartFastTail, PartOwnRefresh, PartFullWalk, PartRegions, PartImports, PartRest, ProofPartCount };
+enum ProofPart : std::size_t { PartPendingWrites, PartDepthChecks, PartDepthPlanes, PartCollects, PartKeys, PartElements, PartPendingScan, PartUnchanged, PartFastTail, PartOwnRefresh, PartFullWalk, PartRegions, PartImports, PartRest, PartTrackerWaits, ProofPartCount };
 
 struct ProofLapClock {
     bool on = false;
@@ -3960,6 +3960,7 @@ std::uint64_t NanosecondsSince(std::chrono::steady_clock::time_point since, std:
 struct ProofLapScope {
     int side = -1;
     bool sampled = false;
+    std::uint64_t trackerWaitNs = 0;
     std::chrono::steady_clock::time_point start{};
     ProofLapScope() {
         static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
@@ -3973,6 +3974,7 @@ struct ProofLapScope {
         proofLapClock.on = true;
         proofLapClock.mark = start;
         proofLapClock.parts.fill(0);
+        trackerWaitNs = GuestMemory::ThreadTrackerWaitNs();
     }
     ProofLapScope(const ProofLapScope&) = delete;
     ProofLapScope& operator=(const ProofLapScope&) = delete;
@@ -3986,6 +3988,7 @@ struct ProofLapScope {
         if (!sampled) return;
         auto& clock = proofLapClock;
         clock.parts[PartRest] += NanosecondsSince(clock.mark, now);
+        clock.parts[PartTrackerWaits] = GuestMemory::ThreadTrackerWaitNs() - trackerWaitNs;
         clock.on = false;
         totals.sampled[proofClass].fetch_add(1, std::memory_order_relaxed);
         for (std::size_t part = 0; part < ProofPartCount; ++part) totals.parts[proofClass][part].fetch_add(clock.parts[part], std::memory_order_relaxed);
@@ -3994,7 +3997,7 @@ struct ProofLapScope {
 
 std::string TakeProofLapText() {
     constexpr std::array<const char*, ProofClassCount> classes{"reused, verified", "never proved", "new epoch", "proofs broken", "pending images changed", "unclassed"};
-    constexpr std::array<const char*, ProofPartCount> parts{"pending writes", "depth checks", "depth planes", "collects", "keys", "elements", "pending scan", "unchanged", "fast tail", "own refresh", "full walk", "regions", "imports", "rest"};
+    constexpr std::array<const char*, ProofPartCount> parts{"pending writes", "depth checks", "depth planes", "collects", "keys", "elements", "pending scan", "unchanged", "fast tail", "own refresh", "full walk", "regions", "imports", "rest", "of them tracker-lock waits"};
     constexpr std::array<const char*, 2> sides{"committer", "resolver"};
     std::string text = "; template re-proofs by thread and why (proofs, us each; parts of 1 in 4, ns each):";
     for (std::size_t side = 0; side < sides.size(); ++side) {
@@ -4086,16 +4089,20 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CommitterProofTimer committerTimer;
     const ProofLapScope proofLaps;
+    static const bool gatedOnce = std::getenv("APS5_NO_PENDING_WRITE_GATE") == nullptr;
+    const bool cpuWrites = !gatedOnce || AnyPendingCpuWrites(context);
     for (const auto& region : directRegions) {
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
-        CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+        if (cpuWrites) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     }
     for (const auto& range : describedRanges) {
         if (!range.imageTable) RequireNoMultisampleColorTarget(range.address, static_cast<std::size_t>(range.bytes), "a cached image access");
+        if (!cpuWrites) continue;
         CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
         if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
     }
     for (const auto& image : storageTextures) {
+        if (!cpuWrites) break;
         CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
@@ -5310,6 +5317,15 @@ void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t alloc
 
 void ShaderResources::PrecollectSurfaces() const {
     for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
+}
+
+void ShaderResources::NoteResolverRefreshAbort(std::uint64_t epochSerial) const {
+    refreshAbortEpoch.store(epochSerial, std::memory_order_relaxed);
+}
+
+bool ShaderResources::ResolverRefreshPredicted(std::uint64_t epochSerial) const {
+    const auto aborted = refreshAbortEpoch.load(std::memory_order_relaxed);
+    return aborted != 0 && epochSerial >= aborted && epochSerial - aborted <= 8 && provedEpoch != GuestMemory::CollectEpoch();
 }
 
 bool ShaderResources::EpochProofCurrent() const {

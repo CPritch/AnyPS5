@@ -163,6 +163,7 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
+std::uint64_t ThreadTrackerWaitNs();
 std::uint64_t PublishedTrackerGeneration();
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);

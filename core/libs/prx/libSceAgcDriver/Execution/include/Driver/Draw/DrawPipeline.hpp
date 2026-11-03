@@ -88,7 +88,7 @@ public:
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {});
     static unsigned ResolveSplit();
-    enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, DeclinedWriters, MultisampleFound, MultisampleMissed, VerifyMatched, VerifyDiffered, Unoffered, KeptRecipe, KeptTessellation, KeptEpoch, KeptReadsWritten, KeptDepthColour, KeptPredictor, KeptCurrentTemplate, KeptDescribed, NextMissing, NextNotDraw, NextNoHook, LateOffered, AcrossSeal, AcrossLabels, UsedAcrossLabels, StaleScoped, StaleScopedTemplate, Count };
+    enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, DeclinedWriters, MultisampleFound, MultisampleMissed, VerifyMatched, VerifyDiffered, Unoffered, KeptRecipe, KeptTessellation, KeptEpoch, KeptReadsWritten, KeptDepthColour, KeptPredictor, KeptCurrentTemplate, KeptDescribed, KeptRefreshPredicted, NextMissing, NextNotDraw, NextNoHook, LateOffered, AcrossSeal, AcrossLabels, UsedAcrossLabels, StaleScoped, StaleScopedTemplate, Count };
     static void NoteEarly(EarlyEvent event);
     static std::uint64_t EarlyEventCount(EarlyEvent event);
     static bool OfferAcrossLabels();
@@ -116,6 +116,7 @@ public:
     static void SetCarryRelease(void (*release)());
     static void NoteOwnResolve(OwnCause cause, std::uint64_t resolveNs, std::uint64_t emitNs);
     static std::uint64_t FollowedEpoch();
+    static std::uint64_t CommitterEpochSerial();
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void WaitWritten(std::uint64_t address, std::size_t bytes, DrainReason reason, std::uint32_t opcode = 0x100);
     void WaitWrittenAny(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode = 0x100);

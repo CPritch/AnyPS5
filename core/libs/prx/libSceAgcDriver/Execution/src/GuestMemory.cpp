@@ -122,6 +122,7 @@ std::atomic<std::uint64_t> collectDirty{0};
 std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
+thread_local std::uint64_t threadTrackerWaitNs = 0;
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 std::atomic<std::uint64_t> aliasWalks{0};
 std::atomic<std::uint64_t> aliasWalkBytes{0};
@@ -1494,6 +1495,14 @@ class TrackerLock {
 public:
     explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+        if (!profile && counted) {
+            if (lock.try_lock()) return;
+            const auto start = std::chrono::steady_clock::now();
+            lock.lock();
+            threadTrackerWaitNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            return;
+        }
         if (!profile) {
             lock.lock();
             return;
@@ -2613,6 +2622,10 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 
 std::uint64_t PublishedTrackerGeneration() {
     return Tracker().stable.load(std::memory_order_acquire);
+}
+
+std::uint64_t ThreadTrackerWaitNs() {
+    return threadTrackerWaitNs;
 }
 
 std::uint64_t TrackerGeneration() {

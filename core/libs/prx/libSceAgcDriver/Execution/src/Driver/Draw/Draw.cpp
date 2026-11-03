@@ -255,6 +255,8 @@ struct EarlyDraw {
     bool failed = false;
     std::uint8_t proofClass = 0;
     std::uint64_t jobNs = 0;
+    std::shared_ptr<Graphics::ShaderResources> hinted;
+    std::uint64_t epochSerial = 0;
     bool revoked = false;
     bool dropped = false;
     DrawPipeline::EarlyEvent declined = DrawPipeline::EarlyEvent::Count;
@@ -1514,6 +1516,8 @@ void finishEarlyJob(void* context, bool ran) {
     if (!early.abandoned.Empty()) early.resolver->ApplyDeferredEffects(early.abandoned);
     Graphics::BuryPackets(early.graveyard);
     if (ran && DrawSplitTimed()) DrawPipeline::NoteJobClass(early.proofClass, early.jobNs, DrawPipeline::LastJoinWaitNs());
+    if (ran && early.hinted != nullptr && early.abort == static_cast<std::uint8_t>(GuestMemory::BarrierKind::ResolverRefresh)) early.hinted->NoteResolverRefreshAbort(early.epochSerial);
+    early.hinted.reset();
     if (!ran) {
         early.claimed = false;
         early.revoked = true;
@@ -1567,6 +1571,8 @@ bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, 
         if (reason != R::Accepted && !proofOnly) return keep(E::KeptPredictor);
         if (proofOnly && result != nullptr && result->found != nullptr && result->found.get() == currentTemplate) return keep(E::KeptCurrentTemplate);
     }
+    static const bool refreshPredicted = std::getenv("APS5_NO_REFRESH_ABORT_PREDICT") == nullptr;
+    if (refreshPredicted && result != nullptr && result->found != nullptr && result->found->ResolverRefreshPredicted(DrawPipeline::CommitterEpochSerial())) return keep(E::KeptRefreshPredicted);
     if (result != nullptr && result->found != nullptr && (result->found->DescribedRangesOverlap(writes) || result->found->DescribedRangesOverlap(depth))) {
         static const bool reported = std::getenv("APS5_COMMIT_STATS") != nullptr;
         static std::atomic<int> reports{0};
@@ -1607,6 +1613,8 @@ bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, 
         early.handoff.abandoned = &early.abandoned;
         early.handoff.graveyard = &early.graveyard;
         early.handoff.multisampleTargets = multisampleFound ? &early.multisample : nullptr;
+        if (refreshPredicted && result != nullptr) early.hinted = result->found;
+        early.epochSerial = DrawPipeline::CommitterEpochSerial();
         DrawPipeline::PostResolve(&resolveEarlyJob, &finishEarlyJob, &early);
         if (split == 3) DrawPipeline::WaitResolve();
         return true;
