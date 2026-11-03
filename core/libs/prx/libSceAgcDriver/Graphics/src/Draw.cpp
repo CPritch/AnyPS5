@@ -4485,6 +4485,7 @@ std::string TakeDrawSplitText() {
         constexpr std::array<const char*, 6> partNames{"before the bindings", "bindings", "pass access", "pass start", "commands", "keep"};
         result += "; recorded draws " + std::to_string(recorded) + ", ns each:";
         for (std::size_t index = 0; index < partNames.size(); ++index) result += std::string(" ") + partNames[index] + " " + std::to_string(recorded == 0 ? 0 : recordDrawParts[index].exchange(0, std::memory_order_relaxed) / recorded) + ",";
+        result += TakeDrawBindingsText();
         result += "; multisampled colour targets found before resolve and acquired at emit " + std::to_string(acquired) + " (" + std::to_string(acquired == 0 ? 0 : ns / acquired) + " ns each), of them a different target by then " + std::to_string(deferredMultisampleChanged.exchange(0, std::memory_order_relaxed));
     }
     char gaps[256];

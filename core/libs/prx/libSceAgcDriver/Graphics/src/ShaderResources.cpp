@@ -4811,15 +4811,33 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
     return {set, pool, chain.size() - 1, updateAfterBind, VK_NULL_HANDLE, {}, variableCount, {}};
 }
 
+namespace {
+enum BindingPart : std::size_t { PartSnapshots, PartSet, PartWrites, PartUpdate, PartKeep, PartCount };
+enum BindingCount : std::size_t { CountCalls, CountEmpty, CountSnapshots, CountReused, CountUploaded, CountUploadedBytes, CountLargeReused, CountLargeNew, CountWrites, CountRecycled, CountAllocated, CountTotal };
+std::array<std::atomic<std::uint64_t>, PartCount> bindingPartNs{};
+std::array<std::atomic<std::uint64_t>, CountTotal> bindingCounts{};
+
+bool BindingsCounted() {
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    return counted;
+}
+
+void CountBinding(BindingCount which, std::uint64_t amount = 1) {
+    if (BindingsCounted()) bindingCounts[which].fetch_add(amount, std::memory_order_relaxed);
+}
+}
+
 DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount) {
     {
         std::lock_guard lock(mutex);
         if (const auto found = recycled.find({layout, variableCount.value_or(0u)}); found != recycled.end() && !found->second.empty()) {
             const auto allocation = found->second.back();
             found->second.pop_back();
+            CountBinding(CountRecycled);
             return allocation;
         }
     }
+    CountBinding(CountAllocated);
     return Allocate(layout, sizes, updateAfterBind, variableCount);
 }
 
@@ -6238,7 +6256,30 @@ std::size_t ShaderResources::DrawUploadLimit() {
     return limit;
 }
 
+std::string TakeDrawBindingsText() {
+    std::array<std::uint64_t, CountTotal> counts{};
+    for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = bindingCounts[index].exchange(0, std::memory_order_relaxed);
+    std::array<std::uint64_t, PartCount> ns{};
+    for (std::size_t index = 0; index < ns.size(); ++index) ns[index] = bindingPartNs[index].exchange(0, std::memory_order_relaxed);
+    const auto calls = counts[CountCalls];
+    const auto each = [&](std::uint64_t value) { return calls == 0 ? 0.0 : static_cast<double>(value) / static_cast<double>(calls); };
+    char text[640];
+    std::snprintf(text, sizeof(text), "; draw bindings %llu (%llu without snapshots), ns each: snapshots %.0f, set %.0f, writes %.0f, update %.0f, keep %.0f; per call: %.2f snapshots (%.2f reused unwritten, %.2f uploaded of %.0f bytes, %.2f large reused, %.2f large copied), %.2f descriptor writes, sets %llu recycled %llu allocated",
+                  static_cast<unsigned long long>(calls), static_cast<unsigned long long>(counts[CountEmpty]), each(ns[PartSnapshots]), each(ns[PartSet]), each(ns[PartWrites]), each(ns[PartUpdate]), each(ns[PartKeep]), each(counts[CountSnapshots]), each(counts[CountReused]), each(counts[CountUploaded]),
+                  counts[CountUploaded] == 0 ? 0.0 : static_cast<double>(counts[CountUploadedBytes]) / static_cast<double>(counts[CountUploaded]), each(counts[CountLargeReused]), each(counts[CountLargeNew]), each(counts[CountWrites]), static_cast<unsigned long long>(counts[CountRecycled]), static_cast<unsigned long long>(counts[CountAllocated]));
+    return text;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
+    const bool timed = BindingsCounted();
+    auto partMark = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto part = [&](BindingPart which) {
+        if (!timed) return;
+        const auto now = std::chrono::steady_clock::now();
+        bindingPartNs[which].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - partMark).count()), std::memory_order_relaxed);
+        partMark = now;
+    };
+    CountBinding(CountCalls);
     requireGuestBuffers(moved);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
@@ -6294,6 +6335,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         VkDeviceSize offset = 0;
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
+        CountBinding(CountSnapshots);
+        if (buffer != nullptr) CountBinding(CountReused);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
         if (verifySnapshots && buffer != nullptr) {
             static std::atomic<std::uint64_t> checked{0}, differing{0};
@@ -6310,11 +6353,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
+                CountBinding(CountUploaded);
+                CountBinding(CountUploadedBytes, bytes);
                 raw = slice.buffer;
                 offset = slice.offset;
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
+                CountBinding(buffer != nullptr ? CountLargeReused : CountLargeNew);
                 if (buffer == nullptr) {
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
@@ -6330,7 +6376,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
-    if (selected.empty()) return {};
+    part(PartSnapshots);
+    if (selected.empty()) {
+        CountBinding(CountEmpty);
+        return {};
+    }
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<bool, 2> described{};
     thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
@@ -6360,6 +6410,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->fragmentLayout = fragment.layout;
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
+    part(PartSet);
     thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
     auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
     buffers = descriptorBuffers;
@@ -6388,9 +6439,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+    CountBinding(CountWrites, writes.size());
+    part(PartWrites);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    part(PartUpdate);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer, snapshot.buffer->Bytes().size());
+    part(PartKeep);
     return result;
 }
 

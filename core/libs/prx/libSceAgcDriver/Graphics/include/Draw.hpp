@@ -63,6 +63,7 @@ void ThrowInDrawAheadForTest(bool enabled);
 // APS5_NO_DRAW_RECIPE=1).
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, DrawAhead* ahead = nullptr);
 std::string TakeDrawSplitText();
+std::string TakeDrawBindingsText();
 struct DrawPacket;
 struct DrawPacketDeleter {
     void operator()(DrawPacket* packet) const;
