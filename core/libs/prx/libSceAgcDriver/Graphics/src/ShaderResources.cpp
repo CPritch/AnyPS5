@@ -5319,15 +5319,6 @@ void ShaderResources::PrecollectSurfaces() const {
     for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
 }
 
-void ShaderResources::NoteResolverRefreshAbort(std::uint64_t epochSerial) const {
-    refreshAbortEpoch.store(epochSerial, std::memory_order_relaxed);
-}
-
-bool ShaderResources::ResolverRefreshPredicted(std::uint64_t epochSerial) const {
-    const auto aborted = refreshAbortEpoch.load(std::memory_order_relaxed);
-    return aborted != 0 && epochSerial >= aborted && epochSerial - aborted <= 8 && provedEpoch != GuestMemory::CollectEpoch();
-}
-
 bool ShaderResources::EpochProofCurrent() const {
     const auto epoch = GuestMemory::CollectEpoch();
     return epoch != 0 && provedEpoch == epoch && provedProof == GuestMemory::ProofSerial() && provedPending == StorageTexture::PendingSerial();

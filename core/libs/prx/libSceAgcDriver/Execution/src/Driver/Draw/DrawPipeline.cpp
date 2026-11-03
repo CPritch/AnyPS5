@@ -39,7 +39,6 @@ namespace {
 std::string TakeStaleSubmitText();
 thread_local std::uint64_t followedEpoch = 0;
 std::atomic<std::uint64_t> committerEpochChanges{0};
-thread_local std::uint64_t committerEpochSerial = 0;
 std::atomic<std::uint64_t> earlyResolved{0}, earlyDeclined{0}, earlyFailed{0};
 std::atomic<bool> earlyStopped{false};
 struct PendingEarly {
@@ -187,7 +186,7 @@ std::string QueueWaits::Text() {
                 if (count != 0) kinds += (kinds.empty() ? "" : ", ") + std::string(kind < kindNames.size() ? kindNames[kind] : "a draw without an early hook") + " " + std::to_string(count);
             }
             return kinds;
-        }() + "), offered once the committer's own resolve was done " + event(E::LateOffered) + ", offered across a seal " + event(E::AcrossSeal) + ", offered across a label run " + event(E::AcrossLabels) + " (used " + event(E::UsedAcrossLabels) + ", redone for a label's bytes " + event(E::StaleScoped) + ", for its template " + event(E::StaleScopedTemplate) + ")" + ", a draw without an early hook " + event(E::NextNoHook) + "; kept by the gate: recipe " + event(E::KeptRecipe) + ", tessellation " + event(E::KeptTessellation) + ", another epoch " + event(E::KeptEpoch) + ", reads the previous draw's writes " + event(E::KeptReadsWritten) + ", depth over colour " + event(E::KeptDepthColour) + ", predictor " + event(E::KeptPredictor) + ", the template being emitted " + event(E::KeptCurrentTemplate) + ", described ranges written " + event(E::KeptDescribed) + ", a refresh abort predicted " + event(E::KeptRefreshPredicted) + "; aborted at a barrier:";
+        }() + "), offered once the committer's own resolve was done " + event(E::LateOffered) + ", offered across a seal " + event(E::AcrossSeal) + ", offered across a label run " + event(E::AcrossLabels) + " (used " + event(E::UsedAcrossLabels) + ", redone for a label's bytes " + event(E::StaleScoped) + ", for its template " + event(E::StaleScopedTemplate) + ")" + ", a draw without an early hook " + event(E::NextNoHook) + "; kept by the gate: recipe " + event(E::KeptRecipe) + ", tessellation " + event(E::KeptTessellation) + ", another epoch " + event(E::KeptEpoch) + ", reads the previous draw's writes " + event(E::KeptReadsWritten) + ", depth over colour " + event(E::KeptDepthColour) + ", predictor " + event(E::KeptPredictor) + ", the template being emitted " + event(E::KeptCurrentTemplate) + ", described ranges written " + event(E::KeptDescribed) + "; aborted at a barrier:";
         for (std::size_t kind = 1; kind < earlyAborts.size(); ++kind) {
             const auto count = earlyAborts[kind].exchange(0, std::memory_order_relaxed);
             if (count != 0) text += std::string(" ") + GuestMemory::BarrierKindName(static_cast<GuestMemory::BarrierKind>(kind)) + " " + std::to_string(count) + ",";
@@ -959,19 +958,12 @@ std::uint64_t DrawPipeline::FollowedEpoch() {
     return followedEpoch;
 }
 
-std::uint64_t DrawPipeline::CommitterEpochSerial() {
-    return committerEpochSerial + 1;
-}
-
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
     auto& followed = followedEpoch;
     if (followed == token) return;
     followed = token;
     static const bool shared = std::getenv("APS5_NO_SHARED_COMMIT_EPOCH") == nullptr;
-    if (GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer) {
-        committerEpochChanges.fetch_add(1, std::memory_order_relaxed);
-        ++committerEpochSerial;
-    }
+    if (GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer) committerEpochChanges.fetch_add(1, std::memory_order_relaxed);
     if (shared && GuestMemory::CurrentHotThread() == GuestMemory::HotThread::Committer) {
         static AgcDriver::Mutex mutex;
         static std::array<std::pair<std::uint64_t, std::uint64_t>, 32> epochs{};

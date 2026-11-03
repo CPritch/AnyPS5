@@ -2761,6 +2761,25 @@ bool DepthViewMemoPerTarget() {
     return enabled;
 }
 
+bool DepthViewMemoSampling() {
+    static const bool enabled = std::getenv("APS5_NO_DEPTH_VIEW_MEMO_SAMPLING") == nullptr;
+    return enabled;
+}
+
+bool memoizableState(const DepthSurface& surface) {
+    if (surface.pendingClear != 0 || surface.depthFill.has_value() || surface.stencilFill.has_value()) return false;
+    if (!surface.samplingActive) return true;
+    return DepthViewMemoSampling() && DepthViewMemoPerTarget() && surface.clearGeneration == 0u && surface.stencilClearGeneration == 0u && !surface.clearPending && !surface.sampling.unprovenStencil && surface.sampling.refusal.empty();
+}
+
+bool ownsPlanes(const DepthSurface& surface) {
+    const auto depth = depthOwners().find({surface.context.device, surface.target.address});
+    if (depth == depthOwners().end() || depth->second.surface != &surface) return false;
+    if (surface.target.stencilAddress == 0) return true;
+    const auto stencil = stencilOwners().find({surface.context.device, surface.target.stencilAddress});
+    return stencil != stencilOwners().end() && stencil->second.surface == &surface;
+}
+
 bool DepthViewMemoVerified() {
     static const bool verified = std::getenv("APS5_VERIFY_DEPTH_VIEW_MEMO") != nullptr;
     return verified;
@@ -2844,7 +2863,8 @@ DepthViewMemoOutcome depthViewMemoMiss(const Context& context, const DepthTarget
     if (memo.surfacesSerial != surfacesSerial.load(std::memory_order_acquire)) return MissSurface;
     const auto& surface = *memo.surface;
     if (!surface.active->load(std::memory_order_acquire) || surface.retired) return MissSurface;
-    if (surface.samplingActive || surface.pendingClear != 0 || surface.depthFill.has_value() || surface.stencilFill.has_value() || (!DepthViewMemoPerTarget() && drawnDepth != memo.surface) || depthContentWrites() != memo.contentWrites || mirrorEpoch != memo.mirrorEpoch) return MissState;
+    if (!memoizableState(surface) || (!DepthViewMemoPerTarget() && drawnDepth != memo.surface) || depthContentWrites() != memo.contentWrites || mirrorEpoch != memo.mirrorEpoch) return MissState;
+    if (DepthViewMemoPerTarget() && !ownsPlanes(surface)) return MissSurface;
     if (epoch.epoch == 0 || epoch.epoch != memo.epoch || epoch.unwatched != memo.unwatched || epoch.mapping != memo.mapping) return MissEpoch;
     if (memo.stalePlaneWrites != stalePlaneWrites.load(std::memory_order_acquire)) return MissStale;
     if (depthWritten && mirrorable(target) && (surface.staleCount == 0 || surface.staleCount != surface.staleUnits.size())) return MissStale;
@@ -2860,7 +2880,7 @@ void storeDepthViewMemo(const Context& context, const DepthTarget& target, bool 
     const auto count = [](DepthViewStoreOutcome outcome) { depthViewStoreCounts[outcome].fetch_add(1, std::memory_order_relaxed); };
     if (clearedHere) return count(StoreCleared);
     if (epoch.epoch == 0) return count(StoreNoEpoch);
-    if (surface.samplingActive || surface.pendingClear != 0 || surface.depthFill.has_value() || surface.stencilFill.has_value()) return count(StoreSurfaceState);
+    if (!memoizableState(surface)) return count(StoreSurfaceState);
     const DepthViewEpoch now;
     if (now.epoch != epoch.epoch || now.unwatched != epoch.unwatched || now.mapping != epoch.mapping) return count(StoreEpochMoved);
     if (!surface.MemoryNoted()) return count(StoreMemoryUnnoted);

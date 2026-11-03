@@ -305,8 +305,6 @@ public:
     bool DescribedRangesOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
     std::string DescribeRangeOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
     bool EpochProofCurrent() const;
-    void NoteResolverRefreshAbort(std::uint64_t epochSerial) const;
-    bool ResolverRefreshPredicted(std::uint64_t epochSerial) const;
     bool InResourceCache() const { return inResourceCache.load(std::memory_order_acquire); }
     bool Reusable() const { return reusable; }
     void KeepStorageImageBytes(Recorder& recorder) const;
@@ -393,7 +391,6 @@ private:
     friend class AgcDriver::VulkanDevice;
     friend class ResourceCache;
     std::atomic<bool> inResourceCache{false};
-    mutable std::atomic<std::uint64_t> refreshAbortEpoch{0};
     bool refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder);
     std::optional<std::size_t> shaderDataAllocation(const CompiledShader& shader) const;
     VkBuffer shaderDataBuffer(const CompiledShader& shader) const;
