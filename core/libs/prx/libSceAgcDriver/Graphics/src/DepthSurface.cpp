@@ -2738,7 +2738,7 @@ constexpr std::size_t DepthViewLapCount = 8;
 std::array<std::atomic<std::uint64_t>, DepthViewLapCount> depthViewLapNs{};
 std::atomic<std::uint64_t> depthViewCalls{0};
 
-enum DepthViewMemoOutcome : std::size_t { MemoHit, MissTarget, MissHtile, MissSurface, MissState, MissEpoch, MissStale, MissWritten, VerifiedSame, VerifiedSynced, MemoOutcomeCount };
+enum DepthViewMemoOutcome : std::size_t { MemoHit, MissTarget, MissFlags, MissHtile, MissSurface, MissState, MissEpoch, MissStale, MissWritten, VerifiedSame, VerifiedSynced, MemoOutcomeCount };
 std::array<std::atomic<std::uint64_t>, MemoOutcomeCount> depthViewMemoCounts{};
 
 bool DepthViewMemoEnabled() {
@@ -2784,7 +2784,8 @@ struct DepthViewEpoch {
 
 DepthViewMemoOutcome depthViewMemoMiss(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, VkImageAspectFlags htileCleared, const DepthViewEpoch& epoch) {
     const auto& memo = depthViewMemo;
-    if (!memo.valid || memo.device != context.device || memo.depthWritten != depthWritten || memo.stencilTested != stencilTested || !sameDepthTarget(memo.target, target)) return MissTarget;
+    if (!memo.valid || memo.device != context.device || !sameDepthTarget(memo.target, target)) return MissTarget;
+    if (memo.depthWritten != depthWritten || memo.stencilTested != stencilTested) return MissFlags;
     if (htileCleared != 0 || memo.clearedHtileWrites != clearedHtileWrites.load(std::memory_order_acquire)) return MissHtile;
     if (memo.surfacesSerial != surfacesSerial.load(std::memory_order_acquire)) return MissSurface;
     const auto& surface = *memo.surface;
@@ -2883,7 +2884,7 @@ std::string TakeDepthViewLapText() {
     const auto calls = depthViewCalls.exchange(0, std::memory_order_relaxed);
     std::string text = "; depth view parts (" + std::to_string(calls) + " calls, ns each):";
     for (std::size_t part = 0; part < names.size(); ++part) text += std::string(" ") + names[part] + " " + std::to_string(calls == 0 ? 0 : depthViewLapNs[part].exchange(0, std::memory_order_relaxed) / calls) + (part + 1 == names.size() ? "" : ",");
-    constexpr std::array<const char*, MemoOutcomeCount> outcomes{"hits", "missed: another target", "HTILE cleared", "the surface", "its state", "the collect epoch", "stale planes", "planes written", "verified same", "verified with a sync of its own walk"};
+    constexpr std::array<const char*, MemoOutcomeCount> outcomes{"hits", "missed: another target", "the same target with other flags", "HTILE cleared", "the surface", "its state", "the collect epoch", "stale planes", "planes written", "verified same", "verified with a sync of its own walk"};
     text += "; depth view memo:";
     for (std::size_t outcome = 0; outcome < outcomes.size(); ++outcome) text += std::string(" ") + outcomes[outcome] + " " + std::to_string(depthViewMemoCounts[outcome].exchange(0, std::memory_order_relaxed)) + (outcome + 1 == outcomes.size() ? "" : ",");
     return text;
