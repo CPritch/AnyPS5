@@ -929,10 +929,7 @@ void DrawPipeline::resolveAhead() {
 }
 
 bool DrawPipeline::PreProofEnabled() {
-    static const bool enabled = [] {
-        const char* text = std::getenv("APS5_RESOLVER_PRE_PROOF");
-        return text != nullptr && text[0] != '0';
-    }();
+    static const bool enabled = std::getenv("APS5_NO_RESOLVER_PRE_PROOF") == nullptr;
     return enabled;
 }
 
