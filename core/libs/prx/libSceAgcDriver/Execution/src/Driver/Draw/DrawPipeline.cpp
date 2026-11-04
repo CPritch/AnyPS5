@@ -894,7 +894,7 @@ void DrawPipeline::resolveAhead() {
     static const bool spins = std::getenv("APS5_RESOLVER_SPINS") != nullptr;
     static const auto window = [] {
         const char* text = std::getenv("APS5_RESOLVER_SPIN_US");
-        return std::chrono::nanoseconds(std::chrono::microseconds(text != nullptr ? std::strtoll(text, nullptr, 10) : 20));
+        return std::chrono::nanoseconds(std::chrono::microseconds(text != nullptr ? std::strtoll(text, nullptr, 10) : 100));
     }();
     for (;;) {
         const auto preProofDue = [&] { return preProofState.load(std::memory_order_acquire) == PreProofPosted && preProofAfter.load(std::memory_order_acquire) == lastJobTarget && lastJobTemplate != nullptr; };
