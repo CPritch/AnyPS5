@@ -144,6 +144,7 @@ private:
     std::vector<Pool> updateAfterBindPools;
     std::vector<VkDescriptorPool> dedicated;
     std::map<std::pair<VkDescriptorSetLayout, std::uint32_t>, std::vector<SetAllocation>> recycled;
+    const std::uint64_t serial;
     std::vector<SetAllocation> kept;
     Stats stats;
 };

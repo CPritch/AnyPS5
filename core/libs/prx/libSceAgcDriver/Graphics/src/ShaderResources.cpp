@@ -4891,7 +4891,10 @@ std::size_t KeptSets() {
 
 }
 
-DescriptorCache::DescriptorCache(const Context& context) : context(context), destroyLayout(context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")), destroyPool(context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")), resetPool(context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool")), freeDescriptorSets(context.individuallyFreeDescriptorSets ? context.Function<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets") : nullptr) {
+DescriptorCache::DescriptorCache(const Context& context) : context(context), destroyLayout(context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")), destroyPool(context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")), resetPool(context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool")), freeDescriptorSets(context.individuallyFreeDescriptorSets ? context.Function<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets") : nullptr), serial([] {
+    static std::atomic<std::uint64_t> next{0};
+    return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}()) {
     kept.reserve(KeptSets() + 1u);
 }
 
@@ -5045,9 +5048,57 @@ void CountBinding(BindingCount which, std::uint64_t amount = 1) {
 }
 
 DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount) {
-    {
+    static const bool stashed = std::getenv("APS5_NO_RECYCLED_SET_STASH") == nullptr;
+    const std::pair<VkDescriptorSetLayout, std::uint32_t> key{layout, variableCount.value_or(0u)};
+    if (stashed) {
+        struct Entry {
+            std::pair<VkDescriptorSetLayout, std::uint32_t> key{};
+            std::uint64_t used = 0;
+            std::vector<SetAllocation> sets;
+        };
+        struct Stash {
+            std::uint64_t serial = 0;
+            std::uint64_t clock = 0;
+            std::array<Entry, 8> entries;
+        };
+        constexpr std::size_t Batch = 16;
+        thread_local Stash stash;
+        if (stash.serial != serial) {
+            for (auto& entry : stash.entries) entry = Entry{};
+            stash.serial = serial;
+        }
+        auto* entry = &stash.entries[0];
+        for (auto& candidate : stash.entries) {
+            if (!candidate.sets.empty() && candidate.key == key) {
+                entry = &candidate;
+                break;
+            }
+            if (candidate.used < entry->used) entry = &candidate;
+        }
+        entry->used = ++stash.clock;
+        if (entry->sets.empty() || entry->key != key) {
+            std::lock_guard lock(mutex);
+            if (!entry->sets.empty()) {
+                auto& back = recycled[entry->key];
+                back.insert(back.end(), entry->sets.begin(), entry->sets.end());
+                entry->sets.clear();
+            }
+            entry->key = key;
+            if (const auto found = recycled.find(key); found != recycled.end() && !found->second.empty()) {
+                const auto take = std::min(Batch, found->second.size());
+                entry->sets.assign(found->second.end() - static_cast<std::ptrdiff_t>(take), found->second.end());
+                found->second.resize(found->second.size() - take);
+            }
+        }
+        if (!entry->sets.empty()) {
+            auto allocation = std::move(entry->sets.back());
+            entry->sets.pop_back();
+            CountBinding(CountRecycled);
+            return allocation;
+        }
+    } else {
         std::lock_guard lock(mutex);
-        if (const auto found = recycled.find({layout, variableCount.value_or(0u)}); found != recycled.end() && !found->second.empty()) {
+        if (const auto found = recycled.find(key); found != recycled.end() && !found->second.empty()) {
             auto allocation = std::move(found->second.back());
             found->second.pop_back();
             CountBinding(CountRecycled);
