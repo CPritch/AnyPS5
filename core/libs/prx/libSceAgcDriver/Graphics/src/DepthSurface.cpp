@@ -769,7 +769,7 @@ public:
         auto depthGeneration = depthMemory;
         if (mirrorBytes != 0) {
             if (unitGeneration.empty()) return false;
-            const auto oldest = *std::min_element(unitGeneration.begin(), unitGeneration.end());
+            const auto oldest = OldestUnitGeneration();
             if (oldest == 0) return false;
             depthGeneration = std::min(depthGeneration, oldest);
         }
@@ -1050,6 +1050,19 @@ public:
         staleUnits.assign(count, false);
         staleCount = 0;
         unitGeneration.assign(count, 0);
+        oldestUnitGeneration = 0;
+    }
+
+    std::uint64_t OldestUnitGeneration() const {
+        static const bool memo = std::getenv("APS5_NO_OLDEST_UNIT_MEMO") == nullptr;
+        static const bool verify = std::getenv("APS5_VERIFY_OLDEST_UNIT_MEMO") != nullptr;
+        if (unitGeneration.empty()) return 0;
+        if (!memo || verify) {
+            const auto scanned = *std::min_element(unitGeneration.begin(), unitGeneration.end());
+            if (memo) Require(scanned == oldestUnitGeneration, "APS5_VERIFY_OLDEST_UNIT_MEMO: the depth surface's oldest unit generation memo is stale");
+            return scanned;
+        }
+        return oldestUnitGeneration;
     }
 
     bool AnyStale() const {
@@ -1101,6 +1114,7 @@ public:
         for (std::size_t unit = 0; unit < units.size() && unit < unitGeneration.size(); ++unit) {
             if (units[unit]) unitGeneration[unit] = generation;
         }
+        oldestUnitGeneration = unitGeneration.empty() ? 0 : *std::min_element(unitGeneration.begin(), unitGeneration.end());
     }
 
     std::vector<bool> WrittenUnits(const GuestTextureResource& resource, std::uint64_t& generation) {
@@ -1133,7 +1147,7 @@ public:
             changed[0] = GuestMemory::WrittenSince(resource.baseAddress, bytes, unitGeneration[0]);
             return changed;
         }
-        const auto oldest = *std::min_element(unitGeneration.begin(), unitGeneration.end());
+        const auto oldest = OldestUnitGeneration();
         if (oldest != 0u && !GuestMemory::WrittenSince(resource.baseAddress, bytes, oldest)) return changed;
         std::vector<std::uint8_t> stamped(unitGeneration.size(), GuestMemory::BlockUnchanged);
         if (!GuestMemory::ChangedBlocks(resource.baseAddress, bytes, unitGeneration, stamped)) return changed;
@@ -1146,6 +1160,7 @@ public:
         const auto changed = WrittenUnits(resource, generation);
         if ((pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !anyUnit(changed)) {
             unitGeneration.assign(unitGeneration.size(), generation);
+            oldestUnitGeneration = generation;
             return;
         }
         ClearStale(changed);
@@ -1163,6 +1178,7 @@ public:
             }
         }
         unitGeneration.assign(unitGeneration.size(), generation);
+        oldestUnitGeneration = generation;
         const auto mirror = mirrorPlane.storage;
         if (StoresUnits(*mirror)) {
             const auto rects = mirror->UnitRects(changed);
@@ -1222,6 +1238,7 @@ public:
     std::vector<bool> staleUnits;
     std::size_t staleCount = 0;
     std::vector<std::uint64_t> unitGeneration;
+    std::uint64_t oldestUnitGeneration = 0;
     std::uint64_t unitBytes = 0;
     bool syncing = false;
     std::uint64_t scannedEpoch = 0;
@@ -2908,7 +2925,7 @@ void storeDepthViewMemo(const Context& context, const DepthTarget& target, bool 
     if (now.epoch != epoch.epoch || now.unwatched != epoch.unwatched || now.mapping != epoch.mapping) return count(StoreEpochMoved);
     if (!surface.MemoryNoted()) return count(StoreMemoryUnnoted);
     const bool mirrored = mirrorable(target);
-    if (mirrored && (surface.unitGeneration.empty() || *std::min_element(surface.unitGeneration.begin(), surface.unitGeneration.end()) == 0)) return count(StoreMirrorUngenerated);
+    if (mirrored && (surface.unitGeneration.empty() || surface.OldestUnitGeneration() == 0)) return count(StoreMirrorUngenerated);
     const bool stencilMirrored = surface.StencilMirrorable();
     if (stencilMirrored && surface.stencilGeneration == 0) return count(StoreStencilUngenerated);
     count(StoreKept);
