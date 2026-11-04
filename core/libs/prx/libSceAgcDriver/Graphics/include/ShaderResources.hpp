@@ -650,7 +650,9 @@ private:
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
     std::vector<VkWriteDescriptorSet> descriptorWrites;
-    mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
+    mutable std::once_flag drawPoolSizesOnce;
+    mutable std::array<std::vector<VkDescriptorPoolSize>, 2> drawPoolSizes;
+    mutable std::array<bool, 2> drawPoolDescribed{};
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;

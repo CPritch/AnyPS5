@@ -6623,21 +6623,32 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         return {};
     }
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    std::array<bool, 2> described{};
+    const auto poolSizes = [&](std::array<std::vector<VkDescriptorPoolSize>, 2>& counts, std::array<bool, 2>& described) {
+        described = {};
+        for (auto& sizes : counts) sizes.clear();
+        for (const auto& binding : bindings) {
+            const auto set = setOf(binding);
+            described[set] = true;
+            const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+            if (count == 0) continue;
+            auto& sizes = counts[set];
+            const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+            if (held != sizes.end()) held->descriptorCount += count;
+            else sizes.push_back({binding.layout.descriptorType, count});
+        }
+        for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+    };
+    static const bool memoSizes = std::getenv("APS5_NO_DRAW_POOL_SIZE_MEMO") == nullptr;
     thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
-    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
-    for (auto& sizes : counts) sizes.clear();
-    for (const auto& binding : bindings) {
-        const auto set = setOf(binding);
-        described[set] = true;
-        const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
-        if (count == 0) continue;
-        auto& sizes = counts[set];
-        const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
-        if (held != sizes.end()) held->descriptorCount += count;
-        else sizes.push_back({binding.layout.descriptorType, count});
+    auto& ownCounts = ShaderRecompiler::ThreadOwned(countsSlot);
+    std::array<bool, 2> described{};
+    if (memoSizes) {
+        std::call_once(drawPoolSizesOnce, [&] { poolSizes(drawPoolSizes, drawPoolDescribed); });
+        described = drawPoolDescribed;
+    } else {
+        poolSizes(ownCounts, described);
     }
-    for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+    const auto& counts = memoSizes ? drawPoolSizes : ownCounts;
     const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result->cache = context.descriptorCache;
