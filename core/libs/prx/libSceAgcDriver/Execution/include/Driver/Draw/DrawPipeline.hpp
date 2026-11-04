@@ -55,15 +55,24 @@ public:
     static std::string Text();
 };
 
+struct PreProofRequest {
+    const void* emittedTemplate = nullptr;
+    const void* resolvedTemplate = nullptr;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> queuedStores;
+    std::function<void()> finish;
+};
+
 class DrawPipeline {
 public:
     using Commit = std::function<void()>;
     using Prepare = std::function<void()>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
+    using PreProofRequest = DriverDetail::PreProofRequest;
     struct EarlyOffer {
         const std::vector<Range>* writes = nullptr;
         std::span<const Range> depth;
         const void* currentTemplate = nullptr;
+        PreProofRequest* preProof = nullptr;
     };
     using Early = std::function<bool(const EarlyOffer&)>;
     struct Watch {
@@ -93,6 +102,8 @@ public:
     static std::uint64_t EarlyEventCount(EarlyEvent event);
     static bool OfferAcrossLabels();
     static void OfferEarly(std::span<const Range> depth, const void* currentTemplate);
+    static void NoteResolvedTemplate(const void* resolved);
+    static bool PreProofEnabled();
     static void PostResolve(void (*body)(void*), void (*finish)(void*, bool), void* context);
     static void JoinResolve();
     static void WaitResolve();
@@ -221,6 +232,14 @@ private:
     std::atomic<std::uint32_t> preparersSleeping{0};
     void resolveAhead();
     static void joinResolve(bool revoke);
+    void postPreProof(const void* currentTemplate);
+    void runPreProof();
+    void settlePreProof(const void* taken);
+    void consumePreProof();
+    alignas(64) std::atomic<int> preProofState{0};
+    Item* preProofTarget = nullptr;
+    const void* preProofAfter = nullptr;
+    PreProofRequest preProofRequest;
     std::thread resolver;
     alignas(64) std::atomic<int> resolveState{0};
     std::atomic<std::uint32_t> resolverWake{0};

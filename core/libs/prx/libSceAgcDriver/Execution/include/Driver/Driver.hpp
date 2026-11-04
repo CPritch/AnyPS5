@@ -60,6 +60,7 @@ inline std::uint32_t ThreadDimensionGroups(std::uint32_t threads, std::uint32_t 
 struct DrawTail;
 struct DrawAheadSlot;
 struct EarlyDraw;
+struct PreProofRequest;
 
 class Driver {
 public:
@@ -305,6 +306,7 @@ private:
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages);
     void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace = {}, std::uint64_t shape = 0, DrawAheadSlot* ahead = nullptr, EarlyDraw* early = nullptr);
     bool resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape, DrawAheadSlot* ahead, std::uint64_t epoch, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& itemReads, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& previousWrites, std::span<const std::pair<std::uint64_t, std::uint64_t>> previousDepth, const void* currentTemplate, EarlyDraw& early);
+    bool preProveDraw(const std::shared_ptr<VulkanDevice>& localDevice, std::span<const Graphics::CompiledShader> stages, DrawAheadSlot* ahead, std::uint64_t epoch, PreProofRequest& request);
     bool labelPacketQueues(std::span<const std::uint32_t> packet, std::uint32_t opcode);
     bool enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue);
     bool enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state);

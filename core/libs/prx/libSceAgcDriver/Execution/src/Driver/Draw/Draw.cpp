@@ -1399,6 +1399,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             earlyDraw->reads.reserve(32);
         }
         auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, ahead, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), early = std::move(earlyDraw), itemReads = reads](const DrawPipeline::EarlyOffer* offer) mutable {
+            if (offer != nullptr && offer->preProof != nullptr) return preProveDraw(localDevice, stages, ahead.get(), epoch, *offer->preProof);
             if (offer != nullptr) return offer->writes != nullptr && resolveDrawEarly(localDevice, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, trace, shape, ahead.get(), epoch, itemReads, *offer->writes, offer->depth, offer->currentTemplate, *early);
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
@@ -1480,8 +1481,11 @@ DrawPipeline::OwnCause OwnResolveCause(const EarlyDraw* early, DrawPipeline::Ear
 }
 }
 
+thread_local std::uint64_t lastJobEpoch = 0;
+
 void resolveEarlyJob(void* context) {
     auto& early = *static_cast<EarlyDraw*>(context);
+    lastJobEpoch = early.epoch;
     GuestMemory::AdoptCollectEpoch(early.collectEpoch);
     GuestMemory::FollowCollectToken(early.epoch);
     early.handoff.snapshot = Graphics::Recorder::PendingWriteSnapshot();
@@ -1501,6 +1505,7 @@ void resolveEarlyJob(void* context) {
     if (timed) Graphics::ShaderResources::ResetLastProofReuse();
     try {
         early.packet = early.resolver->ResolveDraw(*early.graphics, *early.draw, early.stages, early.snapshots, early.recipeOut, early.trace, early.shape, early.prepared);
+        if (early.packet != nullptr) DrawPipeline::NoteResolvedTemplate(Graphics::DrawPacketTemplate(*early.packet));
     } catch (const GuestMemory::EarlyResolveAbort& abort) {
         early.packet.reset();
         early.abort = abort.kind;
@@ -1539,6 +1544,50 @@ void finishEarlyJob(void* context, bool ran) {
         early.dropped = true;
         DrawPipeline::NoteEarly(DrawPipeline::EarlyEvent::OverlapAfter);
     }
+}
+
+bool Driver::preProveDraw(const std::shared_ptr<VulkanDevice>& localDevice, std::span<const Graphics::CompiledShader> stages, DrawAheadSlot* ahead, std::uint64_t epoch, PreProofRequest& request) {
+    if (ahead == nullptr || ahead->phase.load(std::memory_order_acquire) != DrawAheadSlot::Ready || epoch != lastJobEpoch) return false;
+    const auto& found = ahead->result.found;
+    if (found == nullptr || found.get() == request.emittedTemplate || found.get() == request.resolvedTemplate || request.resolvedTemplate == nullptr) return false;
+    if (!found->InResourceCache() || found->EpochProofCurrent()) return false;
+    struct Held {
+        Graphics::Recorder::DeferredEffects effects;
+        std::vector<Graphics::DrawPacket*> graveyard;
+    };
+    auto held = std::make_shared<Held>();
+    Graphics::ResolverHandoff handoff;
+    handoff.snapshot = Graphics::Recorder::PendingWriteSnapshot();
+    handoff.queuedStores = std::move(request.queuedStores);
+    handoff.abandoned = &held->effects;
+    handoff.graveyard = &held->graveyard;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    bool proved = false;
+    {
+        const Graphics::ResolverScope scope(handoff);
+        struct Disarm {
+            ~Disarm() {
+                GuestMemory::DisarmEarlyResolve();
+                GuestMemory::SetEarlyReadLog(nullptr);
+                DrawPipeline::SkipCommittingReads(false);
+            }
+        } disarm;
+        GuestMemory::SetEarlyReadLog(&reads);
+        DrawPipeline::SkipCommittingReads(true);
+        GuestMemory::ArmEarlyResolve();
+        try {
+            proved = found->Revalidate(stages);
+        } catch (...) {
+            proved = false;
+        }
+    }
+    if (!held->effects.Empty() || !held->graveyard.empty()) {
+        request.finish = [device = localDevice, held] {
+            if (!held->effects.Empty()) device->ApplyDeferredEffects(held->effects);
+            Graphics::BuryPackets(held->graveyard);
+        };
+    }
+    return proved;
 }
 
 bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape, DrawAheadSlot* ahead, std::uint64_t epoch, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& itemReads, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> depth, const void* currentTemplate, EarlyDraw& early) {
