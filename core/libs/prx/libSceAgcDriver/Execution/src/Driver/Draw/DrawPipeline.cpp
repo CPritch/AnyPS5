@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <iterator>
 #include <array>
 #include <limits>
 #include <map>
@@ -1261,6 +1262,8 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
+    static const bool reaped = std::getenv("APS5_NO_RETIRED_REAPER") == nullptr;
+    if (reaped && !reclaim.empty()) handToReaper(reclaim);
     reclaim.clear();
     const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::unique_lock lock(mutex);
@@ -1565,6 +1568,52 @@ void DrawPipeline::run() {
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
 
+void DrawPipeline::handToReaper(std::vector<Item>& handed) {
+    std::lock_guard lock(reapMutex);
+    if (reaperClosing) return;
+    if (!reaper.joinable()) reaper = std::thread([this] { reapRetired(); });
+    if (reaping.empty()) std::swap(reaping, handed);
+    else std::move(handed.begin(), handed.end(), std::back_inserter(reaping));
+    reapWake.notify_one();
+}
+
+void DrawPipeline::reapRetired() {
+    PinPreparerThread("retired reaper");
+    PerformanceTimer::UntraceThisThread();
+    std::vector<Item> dying;
+    for (;;) {
+        {
+            std::unique_lock lock(reapMutex);
+            reapWake.wait(lock, [&] { return !reaping.empty() || reaperClosing; });
+            if (reaping.empty()) return;
+            std::swap(dying, reaping);
+        }
+        try {
+            dying.clear();
+        } catch (...) {
+        }
+    }
+}
+
+void DrawPipeline::stopReaper() {
+    std::thread stopping;
+    {
+        std::lock_guard lock(reapMutex);
+        reaperClosing = true;
+        stopping = std::move(reaper);
+    }
+    reapWake.notify_all();
+    if (stopping.joinable()) {
+        if (stopping.get_id() == std::this_thread::get_id()) stopping.detach();
+        else stopping.join();
+    }
+    std::vector<Item> left;
+    {
+        std::lock_guard lock(reapMutex);
+        std::swap(left, reaping);
+    }
+}
+
 void DrawPipeline::Stop() {
     std::thread committer;
     std::vector<std::thread> stopped;
@@ -1597,9 +1646,11 @@ void DrawPipeline::Stop() {
         committer = std::move(thread);
     }
     wake.notify_all();
-    if (!committer.joinable()) return;
-    if (committer.get_id() == std::this_thread::get_id()) committer.detach();
-    else committer.join();
+    if (committer.joinable()) {
+        if (committer.get_id() == std::this_thread::get_id()) committer.detach();
+        else committer.join();
+    }
+    stopReaper();
 }
 
 void DrawPipeline::ReleaseRetired() {

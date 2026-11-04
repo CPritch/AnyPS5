@@ -186,6 +186,14 @@ private:
     static std::size_t EarlyIndex(const std::deque<Item>& items);
     std::vector<std::pair<Range, std::uint32_t>> queuedWrites;
     std::vector<Item> retired;
+    void handToReaper(std::vector<Item>& items);
+    void reapRetired();
+    void stopReaper();
+    std::thread reaper;
+    std::mutex reapMutex;
+    std::condition_variable reapWake;
+    std::vector<Item> reaping;
+    bool reaperClosing = false;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
     std::atomic<std::uint64_t> retiredItems{0};
