@@ -6766,7 +6766,13 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder, std::uint64_t writer) {
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);
     } else {
-        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+        static const bool reuse = std::getenv("APS5_NO_DRAW_SCRATCH_REUSE") == nullptr;
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+        auto& reused = ShaderRecompiler::ThreadOwned(readsSlot);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
+        auto& reads = reuse ? reused : own;
+        guestMemory.InPlaceReads(reads);
+        recorder.NotePendingReads(reads, kind);
     }
     const auto inRun = std::exchange(afterRunSelf, nullptr);
     if (SkipWriteBack()) return;
@@ -6837,13 +6843,18 @@ void ShaderResources::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
     std::vector<std::pair<VkImage, bool>> images;
+    StorageImages(images);
+    return images;
+}
+
+void ShaderResources::StorageImages(std::vector<std::pair<VkImage, bool>>& images) const {
+    images.clear();
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageTextures[index] != nullptr) images.emplace_back(storageTextures[index]->Image(), storageWritten[index]);
     }
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->StorageSource() != nullptr) images.emplace_back(texture->StorageSource()->Image(), false);
     }
-    return images;
 }
 
 bool ShaderResources::HasCachedStorageImages() const {

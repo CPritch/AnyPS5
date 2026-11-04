@@ -1814,7 +1814,11 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         const auto offer = [&] {
             if (DrawPipeline::ResolveSplit() == 0) return;
             const auto offering = clock();
-            const auto depth = DrawDepthRanges(graphics);
+            static const bool scratchReuse = std::getenv("APS5_NO_DRAW_SCRATCH_REUSE") == nullptr;
+            thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> reusedDepth;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> ownDepth;
+            auto& depth = scratchReuse ? reusedDepth : ownDepth;
+            DrawDepthRanges(graphics, depth);
             DrawPipeline::OfferEarly(depth, Graphics::DrawPacketTemplate(*packet));
             if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Offer, offering);
         };

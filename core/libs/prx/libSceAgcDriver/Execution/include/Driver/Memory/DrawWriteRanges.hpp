@@ -17,6 +17,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const S
 bool ExactDrawWrites();
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawColorRanges(const Graphics::State& graphics);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawDepthRanges(const Graphics::State& graphics);
+void DrawDepthRanges(const Graphics::State& graphics, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages);
 
 }

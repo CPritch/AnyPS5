@@ -2954,7 +2954,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
-    const auto passImages = resources.StorageImages();
+    static const bool scratchReuse = std::getenv("APS5_NO_DRAW_SCRATCH_REUSE") == nullptr;
+    thread_local std::vector<std::pair<VkImage, bool>>* passImagesSlot = nullptr;
+    auto& reusedImages = ShaderRecompiler::ThreadOwned(passImagesSlot);
+    std::vector<std::pair<VkImage, bool>> ownImages;
+    auto& passImages = scratchReuse ? reusedImages : ownImages;
+    resources.StorageImages(passImages);
     thread_local std::vector<std::pair<VkImage, bool>>* passAttachmentsSlot = nullptr;
     auto& passAttachments = ShaderRecompiler::ThreadOwned(passAttachmentsSlot);
     passAttachments.clear();

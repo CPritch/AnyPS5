@@ -194,10 +194,15 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawColorRanges(const Graph
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawDepthRanges(const Graphics::State& graphics) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-    if (!graphics.depth) return ranges;
+    DrawDepthRanges(graphics, ranges);
+    return ranges;
+}
+
+void DrawDepthRanges(const Graphics::State& graphics, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    ranges.clear();
+    if (!graphics.depth) return;
     appendDepthRanges(ranges, *graphics.depth, ExactDrawWrites());
     if (graphics.depth->htileAddress != 0) ranges.emplace_back(graphics.depth->htileAddress, graphics.depth->htileAddress + Graphics::HtileMetadataBytes(graphics.depth->extent));
-    return ranges;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
