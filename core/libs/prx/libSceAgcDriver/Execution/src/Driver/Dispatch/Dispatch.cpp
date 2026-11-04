@@ -34,6 +34,11 @@ bool DispatchItemsEnabled() {
     return enabled;
 }
 
+bool DifferingItemsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DIFFERING_DISPATCH_ITEMS") == nullptr;
+    return enabled;
+}
+
 bool IndirectItemsEnabled() {
     static const bool enabled = std::getenv("APS5_NO_INDIRECT_DISPATCH_ITEMS") == nullptr;
     return enabled;
@@ -436,8 +441,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);
             noRecipeItem = cached && keepVariant != nullptr && NoRecipeItemsEnabled();
+            missItem = !cached && MissItemsEnabled() && DifferingItemsEnabled();
         }
-        if (!pipelined && !noRecipeItem && DrawPipeline::Queue0().Busy()) {
+        if (!pipelined && !noRecipeItem && !missItem && DrawPipeline::Queue0().Busy()) {
             NoteDrainSite(DrainSite::NotPipelined);
             DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         }

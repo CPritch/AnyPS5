@@ -185,6 +185,8 @@ int main() {
         const char* dispatchSwitch = std::getenv("APS5_PIPELINE_DISPATCH");
         const bool pipelinedDispatch = dispatchSwitch == nullptr || dispatchSwitch[0] != '0';
         const bool indirectItems = pipelinedDispatch && std::getenv("APS5_NO_INDIRECT_DISPATCH_ITEMS") == nullptr;
+        const char* missSwitch = std::getenv("APS5_DISPATCH_MISS_ITEMS");
+        const bool differingItems = pipelinedDispatch && (missSwitch == nullptr || missSwitch[0] != '0') && std::getenv("APS5_NO_DIFFERING_DISPATCH_ITEMS") == nullptr;
 
         Shader shader{};
         shader.file_header = 0x34333231;
@@ -297,6 +299,37 @@ int main() {
             std::printf("pipelined dispatch: scalar read round %zu, fill 0x%08x, dispatch drains %llu\n", round, value, static_cast<unsigned long long>(drains));
             if (!pipelinedDispatch) check(drains >= 1, "a dispatch did not drain the pipeline, and APS5_PIPELINE_DISPATCH is off");
             if (pipelinedDispatch) check(drains <= 1, "a dispatch drained the pipeline more than once (" + std::to_string(drains) + ")");
+        }
+        const std::array<std::uint32_t, 3> differingValues{0x5ca1ab01u, 0x5ca1ab02u, 0x5ca1ab03u};
+        for (std::size_t round = 0; round < differingValues.size(); ++round) {
+            const auto value = differingValues[round];
+            std::atomic<bool> released{false};
+            struct Release {
+                std::atomic<bool>& flag;
+                ~Release() { flag.store(true, std::memory_order_release); }
+            } release{released};
+            WaitUntil([] { return DrawPipeline::QueuedItems() == 0; }, "the pipeline to empty before differing round " + std::to_string(round));
+            std::fill_n(Scratch, Lanes, value);
+            const auto descriptor = BufferDescriptor(Scratch, BufferBytes + 64u * static_cast<std::uint32_t>(round + 1));
+            std::copy(descriptor.begin(), descriptor.end(), Table);
+            const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode);
+            DrawPipeline::Queue0().Enqueue([&released] {
+                while (!released.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }, {});
+            auto words = TableDispatch(TableCode.data());
+            Submit(words);
+            WaitUntil([&drainsBefore] { return DrawPipeline::QueuedItems() >= 2 || DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) > drainsBefore; }, "the dispatch with differing captured data handled behind the gate");
+            released.store(true, std::memory_order_release);
+            AgcDriverWaitIdle_nid_postfix();
+            AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
+            const auto drains = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) - drainsBefore;
+            for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+                check(Output[lane] == value + 1u, "differing round " + std::to_string(round) + ": lane " + std::to_string(lane) + " of the output is " + std::to_string(Output[lane]) + ", expected " + std::to_string(value + 1u) + " (the dispatch ran with its earlier captured data)");
+            }
+            std::printf("pipelined dispatch: differing descriptor round %zu, input 0x%08x, dispatch drains %llu\n", round, value, static_cast<unsigned long long>(drains));
+            if (!pipelinedDispatch) check(drains >= 1, "a dispatch did not drain the pipeline, and APS5_PIPELINE_DISPATCH is off");
+            if (pipelinedDispatch && !differingItems) check(drains >= 1, "a dispatch with differing captured data did not drain, and differing dispatch items are off");
+            if (differingItems) check(drains == 0, "a dispatch whose cached entry's data differed drained the pipeline (" + std::to_string(drains) + ")");
         }
         const std::array<std::uint32_t, 4> indirectValues{0x42420001u, 0x43430002u, 0x44440003u, 0x45450004u};
         for (std::size_t round = 0; round < indirectValues.size(); ++round) {
