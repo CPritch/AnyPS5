@@ -1547,12 +1547,23 @@ void finishEarlyJob(void* context, bool ran) {
 }
 
 bool Driver::preProveDraw(const std::shared_ptr<VulkanDevice>& localDevice, std::span<const Graphics::CompiledShader> stages, DrawAheadSlot* ahead, std::uint64_t epoch, PreProofRequest& request) {
-    if (ahead == nullptr || ahead->phase.load(std::memory_order_acquire) != DrawAheadSlot::Ready || epoch != lastJobEpoch || request.token != epoch || !localDevice->ResolverInputsClear()) return false;
+    using O = DrawPipeline::PreProofOutcome;
+    const auto refuse = [](O outcome) {
+        DrawPipeline::NotePreProof(outcome);
+        return false;
+    };
+    if (ahead == nullptr || ahead->phase.load(std::memory_order_acquire) != DrawAheadSlot::Ready) return refuse(O::NotReady);
+    if (epoch != lastJobEpoch || request.token != epoch) return refuse(O::Epoch);
+    if (!localDevice->ResolverInputsClear()) return refuse(O::Writers);
     const auto& found = ahead->result.found;
-    if (found == nullptr || found.get() == request.emittedTemplate || found.get() == request.resolvedTemplate || request.resolvedTemplate == nullptr) return false;
+    if (found == nullptr || request.resolvedTemplate == nullptr) return refuse(O::NoTemplate);
+    if (found.get() == request.emittedTemplate) return refuse(O::Emitted);
+    if (found.get() == request.resolvedTemplate) return refuse(O::Resolved);
     GuestMemory::AdoptCollectEpoch(request.collectEpoch);
     GuestMemory::FollowCollectToken(request.token);
-    if (!found->InResourceCache() || found->EpochProofCurrent() || found->DescribedRangesOverlap(request.excluded)) return false;
+    if (!found->InResourceCache()) return refuse(O::NotCached);
+    if (found->EpochProofCurrent()) return refuse(O::Current);
+    if (found->DescribedRangesOverlap(request.excluded)) return refuse(O::Overlap);
     const auto proofBefore = GuestMemory::ProofSerial();
     struct Held {
         Graphics::Recorder::DeferredEffects effects;
@@ -1590,8 +1601,9 @@ bool Driver::preProveDraw(const std::shared_ptr<VulkanDevice>& localDevice, std:
     }
     if (proved && found->ProvedProofSerial() != proofBefore) {
         found->ForgetProof();
-        proved = false;
+        return refuse(O::ProofMoved);
     }
+    DrawPipeline::NotePreProof(proved ? O::Proved : O::Failed);
     if (!held->effects.Empty() || !held->graveyard.empty()) {
         request.finish = [device = localDevice, held] {
             if (!held->effects.Empty()) device->ApplyDeferredEffects(held->effects);

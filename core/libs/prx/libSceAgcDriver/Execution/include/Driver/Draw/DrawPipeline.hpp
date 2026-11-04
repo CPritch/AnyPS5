@@ -107,6 +107,8 @@ public:
     static void NoteResolvedTemplate(const void* resolved);
     static bool PreProofEnabled();
     static void QuiescePreProof();
+    enum class PreProofOutcome : std::uint8_t { NotReady, Epoch, Writers, NoTemplate, Emitted, Resolved, NotCached, Current, Overlap, Failed, ProofMoved, Proved, Count };
+    static void NotePreProof(PreProofOutcome outcome);
     static void PostResolve(void (*body)(void*), void (*finish)(void*, bool), void* context);
     static void JoinResolve();
     static void WaitResolve();
