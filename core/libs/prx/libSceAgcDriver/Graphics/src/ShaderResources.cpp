@@ -6518,8 +6518,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     };
     const auto keep = [&](DrawBindings::Snapshot snapshot, const std::shared_ptr<Buffer>& owner) {
         if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
-        Require(owner.get() == snapshot.buffer, "a draw snapshot is not owned by its bindings");
-        if (std::find(result->owners.begin(), result->owners.end(), owner) == result->owners.end()) result->owners.push_back(owner);
+        if (!recorder.DrawUploadBatchKept(snapshot.buffer)) {
+            Require(owner.get() == snapshot.buffer, "a draw snapshot is not owned by its bindings");
+            if (std::find(result->owners.begin(), result->owners.end(), owner) == result->owners.end()) result->owners.push_back(owner);
+        }
         result->snapshots.push_back(snapshot);
     };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
@@ -6554,12 +6556,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (deferCopies) {
             const auto pending = std::find_if(pendingNotes.begin(), pendingNotes.end(), [&](const PendingNote& note) { return note.address == begin && note.bytes == bytes && note.stamp == stamp; });
             if (pending != pendingNotes.end()) {
-                const auto owner = std::find_if(result->owners.begin(), result->owners.end(), [&](const auto& held) { return held.get() == pending->buffer; });
-                if (owner != result->owners.end()) {
+                const bool batchKept = recorder.DrawUploadBatchKept(pending->buffer);
+                const auto owner = batchKept ? result->owners.end() : std::find_if(result->owners.begin(), result->owners.end(), [&](const auto& held) { return held.get() == pending->buffer; });
+                if (batchKept || owner != result->owners.end()) {
                     CountBinding(CountSnapshots);
                     CountBinding(CountReused);
                     selected.push_back(index);
-                    keep({begin, pending->buffer, pending->offset, bytes}, *owner);
+                    keep({begin, pending->buffer, pending->offset, bytes}, batchKept ? recorder.DrawUploadOwner(pending->buffer) : *owner);
                     totalSnapshotBytes += bytes;
                     continue;
                 }
@@ -6613,6 +6616,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto generation = snapshotStamp();
         for (const auto& note : pendingNotes) {
             if (note.stamp[0] != generation) continue;
+            if (const auto& current = recorder.DrawUploadOwner(note.buffer); current != nullptr) {
+                recorder.NoteUnwrittenDrawSnapshot(note.address, note.bytes, note.stamp, current, note.offset);
+                continue;
+            }
             const auto owner = std::find_if(result->owners.begin(), result->owners.end(), [&](const auto& held) { return held.get() == note.buffer; });
             if (owner != result->owners.end()) recorder.NoteUnwrittenDrawSnapshot(note.address, note.bytes, note.stamp, *owner, note.offset);
         }

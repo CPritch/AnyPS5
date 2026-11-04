@@ -3694,12 +3694,26 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
         offset = 0;
     }
     drawUploadUsed = offset + bytes;
+    static const bool batchKept = std::getenv("APS5_NO_BATCH_KEPT_UPLOADS") == nullptr;
+    if (batchKept && deferringEffects == nullptr) {
+        ensureOpen();
+        if (drawUploadKept != drawUpload.get() || drawUploadKeptSerial != submissions + 1) {
+            open->kept.push_back(drawUpload);
+            if (open->keptOwners.insert(drawUpload.get()).second) open->keptBytes += drawUpload->Bytes().size();
+            drawUploadKept = drawUpload.get();
+            drawUploadKeptSerial = submissions + 1;
+        }
+    }
     return {drawUpload.get(), offset, drawUpload->Bytes().data() + offset};
 }
 
 const std::shared_ptr<Buffer>& Recorder::DrawUploadOwner(const Buffer* buffer) const {
     static const std::shared_ptr<Buffer> none;
     return buffer == drawUpload.get() ? drawUpload : none;
+}
+
+bool Recorder::DrawUploadBatchKept(const Buffer* buffer) const {
+    return buffer != nullptr && buffer == drawUploadKept && drawUploadKeptSerial == submissions + 1 && deferringEffects == nullptr;
 }
 
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {

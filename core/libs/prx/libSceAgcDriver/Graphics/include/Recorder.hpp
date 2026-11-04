@@ -165,6 +165,7 @@ public:
     };
     UploadSlice DrawUpload(std::size_t bytes);
     const std::shared_ptr<Buffer>& DrawUploadOwner(const Buffer* buffer) const;
+    bool DrawUploadBatchKept(const Buffer* buffer) const;
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
@@ -986,6 +987,8 @@ private:
     void logNoted(std::uint64_t begin, std::uint64_t end);
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
+    const Buffer* drawUploadKept = nullptr;
+    std::uint64_t drawUploadKeptSerial = 0;
     std::vector<VkFence> spare;
     std::vector<VkQueryPool> sparePools;
     mutable AgcDriver::Mutex completedMutex;
