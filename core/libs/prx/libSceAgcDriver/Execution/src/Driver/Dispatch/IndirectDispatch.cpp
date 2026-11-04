@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -70,6 +71,11 @@ std::string Driver::describeIndirectSource() {
 }
 
 std::array<std::uint32_t, 5> Driver::readDispatchArguments(std::uint32_t queue, std::uint64_t arguments, std::uint32_t initiator) {
+    if (!resolvingAhead() && queue == 0 && DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) {
+        const DrawPipeline::Range range{arguments, arguments + 12};
+        if (!DrawPipeline::TargetedWaits()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x16);
+        else if (DrawPipeline::Queue0().Overlaps(arguments, 12)) DrawPipeline::Queue0().WaitWrittenAny(std::span(&range, 1), DrawPipeline::DrainReason::Packet, 0x16);
+    }
     recordQueuedLabelsBeforeRead(queue);
     if (!resolvingAhead()) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Indirect);

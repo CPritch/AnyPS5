@@ -33,6 +33,7 @@ using AgcDriver::DriverDetail::DrawPipeline;
 constexpr std::uint32_t Lanes = 32;
 constexpr std::uint32_t BufferBytes = Lanes * 4u;
 constexpr std::uint32_t DispatchOpcode = 0x15;
+constexpr std::uint32_t IndirectDispatchOpcode = 0x16;
 
 constexpr std::size_t BlockBytes = 65536;
 
@@ -52,6 +53,7 @@ std::uint32_t* Input = nullptr;
 std::uint32_t* Output = nullptr;
 std::uint32_t* Scratch = nullptr;
 std::uint32_t* Table = nullptr;
+std::uint32_t* Arguments = nullptr;
 std::uint32_t* TargetA = nullptr;
 std::uint32_t* TargetB = nullptr;
 
@@ -139,6 +141,29 @@ std::vector<std::uint32_t> TableDispatch(const void* code) {
     return commands;
 }
 
+std::vector<std::uint32_t> IndirectFills(std::uint32_t value) {
+    const auto inputFill = FillPacket(value, Input, BufferBytes);
+    const auto argumentsFill = FillPacket(1u, Arguments, 12u);
+    std::vector<std::uint32_t> words(inputFill.begin(), inputFill.end());
+    words.insert(words.end(), argumentsFill.begin(), argumentsFill.end());
+    return words;
+}
+
+std::vector<std::uint32_t> IndirectDispatch(const void* code) {
+    const auto codeAddress = reinterpret_cast<std::uintptr_t>(code);
+    const auto argumentsAddress = reinterpret_cast<std::uintptr_t>(Arguments);
+    const auto input = BufferDescriptor(Input, BufferBytes);
+    const auto output = BufferDescriptor(Output, BufferBytes);
+    const std::vector<std::uint32_t> commands{
+        0xc0027600u, 0x20cu, static_cast<std::uint32_t>(codeAddress >> 8u), static_cast<std::uint32_t>(codeAddress >> 40u),
+        0xc0037600u, 0x207u, Lanes, 1u, 1u,
+        0xc0017600u, 0x213u, 8u << 1u,
+        0xc0087600u, 0x240u, input[0], input[1], input[2], input[3], output[0], output[1], output[2], output[3],
+        0xc0021600u, static_cast<std::uint32_t>(argumentsAddress), static_cast<std::uint32_t>(argumentsAddress >> 32u), 0x8041u,
+    };
+    return commands;
+}
+
 void Submit(std::vector<std::uint32_t>& words) {
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
     check(sceAgcDriverSubmitDcb(&packet) == 0, "submission failed");
@@ -159,6 +184,7 @@ int main() {
         }
         const char* dispatchSwitch = std::getenv("APS5_PIPELINE_DISPATCH");
         const bool pipelinedDispatch = dispatchSwitch == nullptr || dispatchSwitch[0] != '0';
+        const bool indirectItems = pipelinedDispatch && std::getenv("APS5_NO_INDIRECT_DISPATCH_ITEMS") == nullptr;
 
         Shader shader{};
         shader.file_header = 0x34333231;
@@ -186,6 +212,7 @@ int main() {
         Output = NewBlock();
         Scratch = NewBlock();
         Table = NewBlock();
+        Arguments = NewBlock();
         NewTargetPair();
         check((reinterpret_cast<std::uintptr_t>(TargetA) >> 32u) == (reinterpret_cast<std::uintptr_t>(TargetB) >> 32u), "the two targets do not share their high address dword");
         const auto initialDescriptor = BufferDescriptor(TargetA, BufferBytes);
@@ -270,6 +297,37 @@ int main() {
             std::printf("pipelined dispatch: scalar read round %zu, fill 0x%08x, dispatch drains %llu\n", round, value, static_cast<unsigned long long>(drains));
             if (!pipelinedDispatch) check(drains >= 1, "a dispatch did not drain the pipeline, and APS5_PIPELINE_DISPATCH is off");
             if (pipelinedDispatch) check(drains <= 1, "a dispatch drained the pipeline more than once (" + std::to_string(drains) + ")");
+        }
+        const std::array<std::uint32_t, 4> indirectValues{0x42420001u, 0x43430002u, 0x44440003u, 0x45450004u};
+        for (std::size_t round = 0; round < indirectValues.size(); ++round) {
+            const auto value = indirectValues[round];
+            std::atomic<bool> released{false};
+            struct Release {
+                std::atomic<bool>& flag;
+                ~Release() { flag.store(true, std::memory_order_release); }
+            } release{released};
+            WaitUntil([] { return DrawPipeline::QueuedItems() == 0; }, "the pipeline to empty before indirect round " + std::to_string(round));
+            std::fill_n(Arguments, 3, 0u);
+            const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(IndirectDispatchOpcode);
+            DrawPipeline::Queue0().Enqueue([&released] {
+                while (!released.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }, {});
+            auto fills = IndirectFills(value);
+            Submit(fills);
+            WaitUntil([] { return DrawPipeline::QueuedItems() >= 4; }, "the input and argument fills queued behind the gate");
+            auto dispatch = IndirectDispatch(Code.data());
+            Submit(dispatch);
+            WaitUntil([&drainsBefore] { return DrawPipeline::QueuedItems() >= 5 || DrawPipeline::DrainRequestsByOpcode(IndirectDispatchOpcode) > drainsBefore; }, "the indirect dispatch handled while its arguments are pending");
+            released.store(true, std::memory_order_release);
+            AgcDriverWaitIdle_nid_postfix();
+            AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
+            const auto drains = DrawPipeline::DrainRequestsByOpcode(IndirectDispatchOpcode) - drainsBefore;
+            for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+                check(Output[lane] == value + 1u, "indirect round " + std::to_string(round) + ": lane " + std::to_string(lane) + " of the output is " + std::to_string(Output[lane]) + ", expected " + std::to_string(value + 1u) + " (the indirect dispatch ran before its pending input or argument fill)");
+            }
+            std::printf("pipelined dispatch: indirect round %zu, fill 0x%08x, indirect drains %llu\n", round, value, static_cast<unsigned long long>(drains));
+            if (!indirectItems) check(drains >= 1, "an indirect dispatch did not drain the pipeline, and indirect dispatch items are off");
+            if (indirectItems) check(drains == 0, "an indirect dispatch whose arguments the GPU reads drained the pipeline (" + std::to_string(drains) + ")");
         }
         LibcRunShutdown_nid_postfix();
         std::puts("pipelined dispatch tests passed");

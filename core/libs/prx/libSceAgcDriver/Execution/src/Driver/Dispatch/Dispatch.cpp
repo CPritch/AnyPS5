@@ -34,6 +34,11 @@ bool DispatchItemsEnabled() {
     return enabled;
 }
 
+bool IndirectItemsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_INDIRECT_DISPATCH_ITEMS") == nullptr;
+    return enabled;
+}
+
 bool MissItemsEnabled() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_DISPATCH_MISS_ITEMS");
@@ -174,7 +179,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (indirectArguments == 0 && (packet[4] & 0x2u) != 0) {
         partialGroups = Pm4::PartialGroupThreads({packet[1], packet[2], packet[3]}, {readRegister(queue.shader, 0x207), readRegister(queue.shader, 0x208), readRegister(queue.shader, 0x209)});
     }
-    const bool pipelineCandidate = !resolving && !fromAhead && DispatchItemsEnabled() && DrawPipeline::Active() && indirectArguments == 0 && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
+    const bool pipelineCandidate = !resolving && !fromAhead && DispatchItemsEnabled() && DrawPipeline::Active() && (indirectArguments == 0 || (IndirectItemsEnabled() && Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads) == 0)) && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
     const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClearCompletion;
     Graphics::HtileMaskClear htileMask;
@@ -608,13 +613,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, attach, dataHit, epoch, htileClearCompletion, htileMask, dispatchThreads, shaderMemory, registeredShader] {
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, indirectArguments, threadGroup, address, queueId, recipe, keepVariant, attach, dataHit, epoch, htileClearCompletion, htileMask, dispatchThreads, shaderMemory, registeredShader] {
             DrawPipeline::FollowEpoch(epoch);
-            GuestMemory::SetCurrentPacket(0x15, queueId);
+            GuestMemory::SetCurrentPacket(indirectArguments != 0 ? 0x16 : 0x15, queueId);
             const auto& compiledCommit = *result;
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
             try {
-                std::shared_ptr<RecipeHit> recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(recipe, false);
+                std::shared_ptr<RecipeHit> recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(recipe, indirectArguments != 0);
                 std::shared_ptr<const Recipe> builtRecipe;
                 bool writersNoted = false;
                 for (;;) {
@@ -629,13 +634,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     }
                     if (recipeHit != nullptr) {
                         VulkanDevice::IndirectOutcome outcome{0, 0};
-                        const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
+                        const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], indirectArguments, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit, threadGroup);
                         if (recipeResult == RecipeOutcome::Rebuild) {
                             recipeHit = nullptr;
-                            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
+                            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, indirectArguments != 0);
                             itemRebuilds.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
+                        if (indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
+                    } else if (indirectArguments != 0) {
+                        const auto outcome = localDevice->DispatchIndirect(compiledCommit, indirectArguments, snapshots, address, std::move(prepared), attach == nullptr ? nullptr : &builtRecipe, threadGroup, registeredViews);
+                        countIndirect(outcome.cpuReason, outcome.argumentReadMs);
                     } else {
                         localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() || attach == nullptr ? nullptr : &builtRecipe, htileClearCompletion, registeredViews);
                     }
@@ -650,7 +659,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                         builtRecipe = std::move(own);
                     }
                     attach->recipe.store(std::move(builtRecipe), std::memory_order_release);
-                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, indirectArguments != 0);
                 }
             } catch (const std::exception& error) {
                 char where[64];
