@@ -58,7 +58,7 @@ enum ResolveJobState : int { ResolveIdle, ResolvePosted, ResolveRunning, Resolve
 std::atomic<std::uint64_t> earlyResolveNs{0}, earlyResolveCount{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::CommitterPart::Count)> committerPartNs{}, committerPartCount{};
 std::atomic<std::uint64_t> resolvesPosted{0}, resolvesRevoked{0}, resolvesDoneBeforeJoin{0}, resolvesWaited{0}, resolveWaitNs{0};
-std::atomic<std::uint64_t> preProofsPosted{0}, preProofsRun{0}, preProofsProved{0}, preProofsCancelled{0}, preProofsSkippedJoining{0};
+std::atomic<std::uint64_t> preProofsPosted{0}, preProofsRun{0}, preProofsProved{0}, preProofsCancelled{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::PreProofOutcome::Count)> preProofOutcomes{};
 alignas(64) std::atomic<std::uint64_t> resolveStartNs{0};
 std::atomic<std::uint64_t> resolveBusyNs{0};
@@ -240,7 +240,7 @@ std::string QueueWaits::Text() {
                     text += item;
                 }
             }
-            text += " resolver pre-proofs posted " + take(preProofsPosted) + ", run " + take(preProofsRun) + ", proved " + take(preProofsProved) + ", cancelled " + take(preProofsCancelled) + ", skipped behind a waiting join " + take(preProofsSkippedJoining) + ", by outcome" + [&] {
+            text += " resolver pre-proofs posted " + take(preProofsPosted) + ", run " + take(preProofsRun) + ", proved " + take(preProofsProved) + ", cancelled " + take(preProofsCancelled) + ", by outcome" + [&] {
                 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::PreProofOutcome::Count)> names{"slot not ready", "another epoch", "copied writers listed", "no template", "template being emitted", "template just resolved", "left the cache", "already current", "reads what the draws ahead write", "failed or aborted", "proof break during it", "proved"};
                 std::string outcomes;
                 for (std::size_t index = 0; index < names.size(); ++index) outcomes += std::string(index == 0 ? " " : ", ") + names[index] + " " + take(preProofOutcomes[index]);
@@ -806,9 +806,7 @@ void DrawPipeline::joinResolve(bool revoke) {
             resolvesDoneBeforeJoin.fetch_add(1, std::memory_order_relaxed);
         } else {
             const auto start = std::chrono::steady_clock::now();
-            pipeline.committerJoining.store(true, std::memory_order_relaxed);
             while (pipeline.resolveState.load(std::memory_order_acquire) != ResolveDone) SpinPause();
-            pipeline.committerJoining.store(false, std::memory_order_relaxed);
             resolvesWaited.fetch_add(1, std::memory_order_relaxed);
             lastJoinWaitNs = elapsedNs(start);
             resolveWaitNs.fetch_add(lastJoinWaitNs, std::memory_order_relaxed);
@@ -930,11 +928,7 @@ void DrawPipeline::resolveAhead() {
         }
         heldReadsFrom = nullptr;
         lastJobTarget = jobTarget;
-        static const bool joinSkips = std::getenv("APS5_NO_PRE_PROOF_JOIN_SKIP") == nullptr;
-        const bool skipPreProof = joinSkips && resolvedTemplate != nullptr && committerJoining.load(std::memory_order_relaxed);
-        if (skipPreProof) preProofsSkippedJoining.fetch_add(1, std::memory_order_relaxed);
-        lastJobTemplate = skipPreProof ? nullptr : resolvedTemplate;
-        resolvedTemplate = nullptr;
+        lastJobTemplate = std::exchange(resolvedTemplate, nullptr);
         if (timed) resolveBusyNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
         resolveState.store(ResolveDone, std::memory_order_release);
     }
