@@ -1,5 +1,6 @@
 if(BUILD_TESTING)
     agc_add_draw_pipeline_test(agc_driver_draw_cache_reuse)
+    agc_add_pre_proof_verify_test(agc_driver_draw_cache_reuse)
     agc_add_draw_pipeline_test(agc_driver_draw_data_hit_user_words)
     add_test(NAME agc_driver_draw_cache_reuse_off COMMAND agc_driver_draw_cache_reuse_tests)
     set_tests_properties(agc_driver_draw_cache_reuse_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" SKIP_RETURN_CODE 77)

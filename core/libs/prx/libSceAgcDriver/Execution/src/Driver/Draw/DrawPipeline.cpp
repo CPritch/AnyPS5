@@ -239,7 +239,7 @@ std::string QueueWaits::Text() {
                     text += item;
                 }
             }
-            text += " resolver pre-proofs posted " + take(preProofsPosted) + ", run " + take(preProofsRun) + ", proved " + take(preProofsProved) + ", cancelled at the target " + take(preProofsCancelled) + ",";
+            text += " resolver pre-proofs posted " + take(preProofsPosted) + ", run " + take(preProofsRun) + ", proved " + take(preProofsProved) + ", cancelled " + take(preProofsCancelled) + ", jobs reusing one " + std::to_string(Graphics::ShaderResources::TakePreProvedReuses()) + ",";
             text += " holds carried to the next draw " + take(carriedHolds) + " (released before another item " + take(carriesReleasedEarly) + ", held reads whose target was gone " + take(heldReadsTargetMissing) + "),";
             text += " resolver jobs posted " + std::to_string(posted) + ", revoked unstarted " + take(resolvesRevoked) + ", done before the join " + take(resolvesDoneBeforeJoin) + ", waited for " + std::to_string(waited) + " (" + per(resolveWaitNs.exchange(0, std::memory_order_relaxed), waited) + " ns each), start latency " + per(resolveStartNs.exchange(0, std::memory_order_relaxed), started) + " ns, resolving " + per(resolveBusyNs.exchange(0, std::memory_order_relaxed), started) + " ns a job; recorder methods off the resolver's list:" + GuestMemory::TakeResolverRecorderText() + ";";
         }
@@ -889,7 +889,7 @@ void DrawPipeline::resolveAhead() {
         return std::chrono::nanoseconds(std::chrono::microseconds(text != nullptr ? std::strtoll(text, nullptr, 10) : 20));
     }();
     for (;;) {
-        const auto preProofDue = [&] { return preProofState.load(std::memory_order_acquire) == PreProofPosted && preProofAfter == lastJobTarget && lastJobTemplate != nullptr; };
+        const auto preProofDue = [&] { return preProofState.load(std::memory_order_acquire) == PreProofPosted && preProofAfter.load(std::memory_order_acquire) == lastJobTarget && lastJobTemplate != nullptr; };
         const auto posted = [&] { return resolveState.load(std::memory_order_acquire) == ResolvePosted || resolverClosing.load(std::memory_order_relaxed) || preProofDue(); };
         if (spins && !SpinUntil(HandoffSpinWindow(), posted)) {
             std::this_thread::sleep_for(idleNap);
@@ -943,6 +943,10 @@ void DrawPipeline::NoteResolvedTemplate(const void* resolved) {
 void DrawPipeline::runPreProof() {
     int expected = PreProofPosted;
     if (!preProofState.compare_exchange_strong(expected, PreProofRunning, std::memory_order_acq_rel)) return;
+    if (preProofAfter.load(std::memory_order_acquire) != lastJobTarget || lastJobTemplate == nullptr) {
+        preProofState.store(PreProofDone, std::memory_order_release);
+        return;
+    }
     preProofRequest.resolvedTemplate = lastJobTemplate;
     heldReadsFrom = preProofTarget;
     try {
@@ -954,7 +958,21 @@ void DrawPipeline::runPreProof() {
     preProofState.store(PreProofDone, std::memory_order_release);
 }
 
-void DrawPipeline::postPreProof(const void* currentTemplate) {
+void DrawPipeline::QuiescePreProof() {
+    if (!PreProofEnabled() || committingPipeline == nullptr) return;
+    auto& pipeline = *committingPipeline;
+    int expected = PreProofPosted;
+    if (pipeline.preProofState.compare_exchange_strong(expected, PreProofIdle, std::memory_order_acq_rel)) {
+        preProofsCancelled.fetch_add(1, std::memory_order_relaxed);
+        pipeline.preProofTarget = nullptr;
+        pipeline.preProofAfter.store(nullptr, std::memory_order_relaxed);
+        return;
+    }
+    while (pipeline.preProofState.load(std::memory_order_acquire) == PreProofRunning) SpinPause();
+    if (pipeline.preProofState.load(std::memory_order_acquire) == PreProofDone) pipeline.consumePreProof();
+}
+
+void DrawPipeline::postPreProof(const void* currentTemplate, std::span<const Range> depth, const std::vector<Range>* writes) {
     auto state = preProofState.load(std::memory_order_acquire);
     if (state == PreProofDone) {
         consumePreProof();
@@ -965,12 +983,17 @@ void DrawPipeline::postPreProof(const void* currentTemplate) {
         std::lock_guard lock(mutex);
         const auto* after = static_cast<const Item*>(resolveTarget);
         auto it = std::find_if(items.begin(), items.end(), [&](const Item& item) { return &item == after; });
-        if (it == items.end() || ++it == items.end() || !it->draw || !it->early) return;
+        if (it == items.end()) return;
+        const auto& offered = *it;
+        if (++it == items.end() || !it->draw || !it->early) return;
         preProofTarget = &*it;
-        preProofAfter = after;
-        preProofRequest = PreProofRequest{currentTemplate, nullptr, {}, {}};
+        preProofAfter.store(after, std::memory_order_relaxed);
+        preProofRequest = PreProofRequest{currentTemplate, nullptr, FollowedEpoch(), GuestMemory::ThreadCollectEpoch(), {}, {}};
+        auto& excluded = preProofRequest.excluded;
+        excluded.assign(offered.writes.begin(), offered.writes.end());
+        excluded.insert(excluded.end(), depth.begin(), depth.end());
+        if (writes != nullptr) excluded.insert(excluded.end(), writes->begin(), writes->end());
     }
-    if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr) preProofRequest.queuedStores = recorder->QueuedStoreRanges();
     preProofsPosted.fetch_add(1, std::memory_order_relaxed);
     preProofState.store(PreProofPosted, std::memory_order_release);
     resolverWake.fetch_add(1, std::memory_order_seq_cst);
@@ -982,7 +1005,7 @@ void DrawPipeline::consumePreProof() {
     auto finish = std::move(preProofRequest.finish);
     preProofRequest = PreProofRequest{};
     preProofTarget = nullptr;
-    preProofAfter = nullptr;
+    preProofAfter.store(nullptr, std::memory_order_relaxed);
     preProofState.store(PreProofIdle, std::memory_order_release);
     if (!finish) return;
     if (std::uncaught_exceptions() == 0) {
@@ -1001,7 +1024,7 @@ void DrawPipeline::settlePreProof(const void* taken) {
     if (preProofState.compare_exchange_strong(expected, PreProofIdle, std::memory_order_acq_rel)) {
         preProofsCancelled.fetch_add(1, std::memory_order_relaxed);
         preProofTarget = nullptr;
-        preProofAfter = nullptr;
+        preProofAfter.store(nullptr, std::memory_order_relaxed);
         return;
     }
     while (preProofState.load(std::memory_order_acquire) == PreProofRunning) SpinPause();
@@ -1094,7 +1117,7 @@ void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentT
     try {
         const bool resolved = hook(EarlyOffer{writes, depth, currentTemplate});
         (resolved ? earlyResolved : earlyDeclined).fetch_add(1, std::memory_order_relaxed);
-        if (resolved && PreProofEnabled() && committingPipeline != nullptr) committingPipeline->postPreProof(currentTemplate);
+        if (resolved && PreProofEnabled() && ResolveSplit() >= 2 && postedNext == 1 && committingPipeline != nullptr) committingPipeline->postPreProof(currentTemplate, depth, writes);
     } catch (const ProcessShutdown&) {
         throw;
     } catch (...) {

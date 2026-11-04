@@ -4702,7 +4702,7 @@ ResolverScope::ResolverScope(const ResolverHandoff& handoff) {
     foundMultisampleTargets = handoff.multisampleTargets;
     borrowedShapeMemo = static_cast<std::unordered_map<std::uint64_t, ShapeEntry>*>(handoff.shapeMemo);
     packetGraveyard = handoff.graveyard;
-    Recorder::SetResolverState(true, handoff.snapshot.get(), &handoff.queuedStores, handoff.abandoned);
+    Recorder::SetResolverState(true, handoff.snapshot.get(), handoff.queuedStoresUnknown ? nullptr : &handoff.queuedStores, handoff.abandoned);
 }
 
 ResolverScope::~ResolverScope() {

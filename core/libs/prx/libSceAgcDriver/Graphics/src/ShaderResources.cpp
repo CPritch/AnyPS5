@@ -3849,6 +3849,8 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const auto drawWriters = DrawCopiedWriters();
     const bool labels = completionStoresMatter();
     if ((context.copiedWriters == nullptr || context.copiedWriters->empty()) && drawWriters->empty() && !labels) return false;
+    static const bool resolverWriters = std::getenv("APS5_NO_RESOLVER_WRITER_BARRIER") == nullptr;
+    if (resolverWriters && GuestMemory::OnResolverThread() && ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !drawWriters->empty())) GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::ResolverPath, __builtin_return_address(0));
     if (!recorder->PendingWriteOverlaps(address, bytes)) return false;
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); });
@@ -4038,6 +4040,19 @@ void ShaderResources::ResetLastProofReuse() {
     lastProofReuse = ProofReuse::Off;
 }
 
+namespace {
+thread_local bool preProving = false;
+std::atomic<std::uint64_t> preProvedReuses{0};
+}
+
+void ShaderResources::SetPreProving(bool on) {
+    preProving = on;
+}
+
+std::uint64_t ShaderResources::TakePreProvedReuses() {
+    return preProvedReuses.exchange(0, std::memory_order_relaxed);
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     lastProofReuse = ProofReuse::Off;
     if (!registeredImageViewsCurrent(registeredImageViews)) {
@@ -4065,6 +4080,19 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 noteEpochProof(true, true, !ok);
                 return ok;
             }
+            if (preProved.load(std::memory_order_relaxed) && GuestMemory::OnResolverThread()) {
+                preProvedReuses.fetch_add(1, std::memory_order_relaxed);
+                static const unsigned verifyEvery = [] {
+                    const char* text = std::getenv("APS5_VERIFY_RESOLVER_PRE_PROOF");
+                    return text == nullptr ? 0u : static_cast<unsigned>(std::strtoul(text, nullptr, 10));
+                }();
+                thread_local unsigned verifyCount = 0;
+                if (verifyEvery != 0 && ++verifyCount % verifyEvery == 0 && !revalidateFull(shaders, report)) {
+                    std::fprintf(stderr, "[rescache] APS5_VERIFY_RESOLVER_PRE_PROOF: a template proved by the resolver's pre-proof failed a full proof at its reuse\n");
+                    std::fflush(stderr);
+                    std::abort();
+                }
+            }
             if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
             noteEpochProof(true, false, false);
             static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
@@ -4074,6 +4102,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const bool ok = revalidateFull(shaders, report);
         noteEpochProof(false, false, false);
         if (ok) {
+            preProved.store(preProving, std::memory_order_relaxed);
             provedEpoch.store(epoch, std::memory_order_relaxed);
             provedProof.store(proof, std::memory_order_relaxed);
             provedPending.store(pending, std::memory_order_relaxed);

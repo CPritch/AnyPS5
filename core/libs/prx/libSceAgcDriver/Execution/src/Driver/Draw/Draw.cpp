@@ -1547,10 +1547,13 @@ void finishEarlyJob(void* context, bool ran) {
 }
 
 bool Driver::preProveDraw(const std::shared_ptr<VulkanDevice>& localDevice, std::span<const Graphics::CompiledShader> stages, DrawAheadSlot* ahead, std::uint64_t epoch, PreProofRequest& request) {
-    if (ahead == nullptr || ahead->phase.load(std::memory_order_acquire) != DrawAheadSlot::Ready || epoch != lastJobEpoch) return false;
+    if (ahead == nullptr || ahead->phase.load(std::memory_order_acquire) != DrawAheadSlot::Ready || epoch != lastJobEpoch || request.token != epoch || !localDevice->ResolverInputsClear()) return false;
     const auto& found = ahead->result.found;
     if (found == nullptr || found.get() == request.emittedTemplate || found.get() == request.resolvedTemplate || request.resolvedTemplate == nullptr) return false;
-    if (!found->InResourceCache() || found->EpochProofCurrent()) return false;
+    GuestMemory::AdoptCollectEpoch(request.collectEpoch);
+    GuestMemory::FollowCollectToken(request.token);
+    if (!found->InResourceCache() || found->EpochProofCurrent() || found->DescribedRangesOverlap(request.excluded)) return false;
+    const auto proofBefore = GuestMemory::ProofSerial();
     struct Held {
         Graphics::Recorder::DeferredEffects effects;
         std::vector<Graphics::DrawPacket*> graveyard;
@@ -1558,7 +1561,7 @@ bool Driver::preProveDraw(const std::shared_ptr<VulkanDevice>& localDevice, std:
     auto held = std::make_shared<Held>();
     Graphics::ResolverHandoff handoff;
     handoff.snapshot = Graphics::Recorder::PendingWriteSnapshot();
-    handoff.queuedStores = std::move(request.queuedStores);
+    handoff.queuedStoresUnknown = true;
     handoff.abandoned = &held->effects;
     handoff.graveyard = &held->graveyard;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
@@ -1575,11 +1578,19 @@ bool Driver::preProveDraw(const std::shared_ptr<VulkanDevice>& localDevice, std:
         GuestMemory::SetEarlyReadLog(&reads);
         DrawPipeline::SkipCommittingReads(true);
         GuestMemory::ArmEarlyResolve();
+        struct PreProving {
+            PreProving() { Graphics::ShaderResources::SetPreProving(true); }
+            ~PreProving() { Graphics::ShaderResources::SetPreProving(false); }
+        } preProving;
         try {
             proved = found->Revalidate(stages);
         } catch (...) {
             proved = false;
         }
+    }
+    if (proved && found->ProvedProofSerial() != proofBefore) {
+        found->ForgetProof();
+        proved = false;
     }
     if (!held->effects.Empty() || !held->graveyard.empty()) {
         request.finish = [device = localDevice, held] {
@@ -1770,7 +1781,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
                         const auto itemReads = QueuedDrawReadRanges(drawParameters, stages);
                         const auto* targetWrites = DrawPipeline::CommittingWrites();
                         if (rangesOverlap(*scoped, itemReads) || rangesOverlap(*scoped, early->reads) || (targetWrites != nullptr && rangesOverlap(*scoped, *targetWrites)) || Graphics::DrawPacketReadsOverlap(*early->packet, *scoped)) stale = E::StaleScoped;
-                        else if (!Graphics::RevalidateDrawPacketTemplate(*early->packet, stages)) stale = E::StaleScopedTemplate;
+                        else if (DrawPipeline::QuiescePreProof(), !Graphics::RevalidateDrawPacketTemplate(*early->packet, stages)) stale = E::StaleScopedTemplate;
                         else {
                             stale = E::Used;
                             acrossLabels = true;
@@ -1816,6 +1827,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
             }();
             static unsigned verifyCount = 0;
             if (verifyEvery != 0 && ++verifyCount % verifyEvery == 0) {
+                DrawPipeline::QuiescePreProof();
                 auto verify = localDevice->ResolveDraw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, nullptr);
                 const auto differs = Graphics::CompareDrawPackets(*packet, *verify);
                 DrawPipeline::NoteEarly(differs == 0 ? DrawPipeline::EarlyEvent::VerifyMatched : DrawPipeline::EarlyEvent::VerifyDiffered);
@@ -1835,6 +1847,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         }
         std::uint64_t ownResolveNs = 0;
         if (packet == nullptr) {
+            DrawPipeline::QuiescePreProof();
             const auto resolving = clock();
             packet = localDevice->ResolveDraw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, prepared);
             if (timed) {

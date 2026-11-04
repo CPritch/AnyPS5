@@ -2412,7 +2412,8 @@ bool Recorder::QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) con
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::NoteEarlyRead(address, bytes);
     if (GuestMemory::OnResolverThread()) {
-        if (resolverQueuedStores == nullptr || bytes == 0) return false;
+        if (bytes == 0) return false;
+        if (resolverQueuedStores == nullptr) GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::ResolverRecorder, __builtin_return_address(0));
         const auto end = address + bytes;
         return std::any_of(resolverQueuedStores->begin(), resolverQueuedStores->end(), [&](const auto& store) { return address < store.second && store.first < end; });
     }

@@ -86,6 +86,7 @@ struct ResolverHandoff {
     void* shapeMemo = nullptr;
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> snapshot;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> queuedStores;
+    bool queuedStoresUnknown = false;
     Recorder::DeferredEffects* abandoned = nullptr;
     std::vector<DrawPacket*>* graveyard = nullptr;
     const std::vector<FoundMultisampleTarget>* multisampleTargets = nullptr;

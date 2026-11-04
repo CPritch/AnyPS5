@@ -306,6 +306,10 @@ public:
     bool DescribedRangesOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
     std::string DescribeRangeOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
     bool EpochProofCurrent() const;
+    std::uint64_t ProvedProofSerial() const { return provedProof.load(std::memory_order_relaxed); }
+    void ForgetProof() { provedEpoch.store(0, std::memory_order_relaxed); }
+    static void SetPreProving(bool on);
+    static std::uint64_t TakePreProvedReuses();
     bool InResourceCache() const { return inResourceCache.load(std::memory_order_acquire); }
     bool Reusable() const { return reusable; }
     void KeepStorageImageBytes(Recorder& recorder) const;
@@ -699,6 +703,7 @@ private:
     std::atomic<std::uint64_t> provedEpoch{0};
     std::atomic<std::uint64_t> provedProof{0};
     std::atomic<std::uint64_t> provedPending{0};
+    std::atomic<bool> preProved{false};
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;

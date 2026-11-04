@@ -58,7 +58,9 @@ public:
 struct PreProofRequest {
     const void* emittedTemplate = nullptr;
     const void* resolvedTemplate = nullptr;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> queuedStores;
+    std::uint64_t token = 0;
+    std::uint64_t collectEpoch = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> excluded;
     std::function<void()> finish;
 };
 
@@ -104,6 +106,7 @@ public:
     static void OfferEarly(std::span<const Range> depth, const void* currentTemplate);
     static void NoteResolvedTemplate(const void* resolved);
     static bool PreProofEnabled();
+    static void QuiescePreProof();
     static void PostResolve(void (*body)(void*), void (*finish)(void*, bool), void* context);
     static void JoinResolve();
     static void WaitResolve();
@@ -232,13 +235,13 @@ private:
     std::atomic<std::uint32_t> preparersSleeping{0};
     void resolveAhead();
     static void joinResolve(bool revoke);
-    void postPreProof(const void* currentTemplate);
+    void postPreProof(const void* currentTemplate, std::span<const Range> depth, const std::vector<Range>* writes);
     void runPreProof();
     void settlePreProof(const void* taken);
     void consumePreProof();
     alignas(64) std::atomic<int> preProofState{0};
     Item* preProofTarget = nullptr;
-    const void* preProofAfter = nullptr;
+    std::atomic<const void*> preProofAfter{nullptr};
     PreProofRequest preProofRequest;
     std::thread resolver;
     alignas(64) std::atomic<int> resolveState{0};
