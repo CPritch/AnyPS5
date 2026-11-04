@@ -1557,12 +1557,12 @@ bool Driver::preProveDraw(const std::shared_ptr<VulkanDevice>& localDevice, std:
     if (!localDevice->ResolverInputsClear()) return refuse(O::Writers);
     const auto& found = ahead->result.found;
     if (found == nullptr || request.resolvedTemplate == nullptr) return refuse(O::NoTemplate);
-    if (found.get() == request.emittedTemplate) return refuse(O::Emitted);
-    if (found.get() == request.resolvedTemplate) return refuse(O::Resolved);
     GuestMemory::AdoptCollectEpoch(request.collectEpoch);
     GuestMemory::FollowCollectToken(request.token);
-    if (!found->InResourceCache()) return refuse(O::NotCached);
     if (found->EpochProofCurrent()) return refuse(O::Current);
+    if (found.get() == request.emittedTemplate) return refuse(O::Emitted);
+    if (found.get() == request.resolvedTemplate) return refuse(O::Resolved);
+    if (!found->InResourceCache()) return refuse(O::NotCached);
     if (found->DescribedRangesOverlap(request.excluded)) return refuse(O::Overlap);
     const auto proofBefore = GuestMemory::ProofSerial();
     struct Held {
