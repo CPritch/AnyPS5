@@ -240,6 +240,7 @@ private:
     void settlePreProof(const void* taken);
     void consumePreProof();
     alignas(64) std::atomic<int> preProofState{0};
+    std::atomic<bool> committerJoining{false};
     Item* preProofTarget = nullptr;
     std::atomic<const void*> preProofAfter{nullptr};
     PreProofRequest preProofRequest;
