@@ -6832,20 +6832,37 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
 
 void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
     static const bool memo = std::getenv("APS5_NO_GUARD_CHECK_MEMO") == nullptr;
-    const bool remembered = memo && moved.empty();
+    static const bool movedMemo = std::getenv("APS5_NO_MOVED_GUARD_MEMO") == nullptr;
+    const bool remembered = memo && (moved.empty() || movedMemo);
     const auto depthGeneration = remembered ? DepthGuardGeneration() : 0;
     const auto colorGeneration = remembered ? MultisampleGuardGeneration() : 0;
-    if (remembered && guardsCheckedDepth.load(std::memory_order_acquire) == depthGeneration && guardsCheckedColor.load(std::memory_order_acquire) == colorGeneration) return;
+    std::uint64_t movedSignature = 0;
+    for (const auto& entry : moved) {
+        auto mixed = static_cast<std::uint64_t>(entry.allocation) + 0x9e3779b97f4a7c15ull;
+        mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ull;
+        mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebull;
+        movedSignature ^= mixed ^ (mixed >> 31);
+    }
+    const auto check = [&](std::uint64_t address, std::size_t bytes) {
+        RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
+        RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
+    };
+    if (remembered && guardsCheckedDepth.load(std::memory_order_acquire) == depthGeneration && guardsCheckedColor.load(std::memory_order_acquire) == colorGeneration && guardsCheckedMoved.load(std::memory_order_acquire) == movedSignature) {
+        for (const auto& entry : moved) {
+            if (entry.allocation < allocations.size() && allocations[entry.allocation].guest) check(entry.address, entry.size);
+        }
+        return;
+    }
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         if (!item.guest) continue;
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         const auto address = override != moved.end() ? override->address : item.address;
         const auto bytes = override != moved.end() ? override->size : item.size;
-        RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
-        RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
+        check(address, bytes);
     }
     if (remembered) {
+        guardsCheckedMoved.store(movedSignature, std::memory_order_relaxed);
         guardsCheckedColor.store(colorGeneration, std::memory_order_relaxed);
         guardsCheckedDepth.store(depthGeneration, std::memory_order_release);
     }
