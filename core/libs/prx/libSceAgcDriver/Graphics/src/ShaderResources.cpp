@@ -6689,7 +6689,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         selected.push_back(index);
         keep({begin, raw, offset, bytes}, buffer != nullptr ? buffer : recorder.DrawUploadOwner(raw));
         totalSnapshotBytes += bytes;
-        CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+        if (CaptureTrace::Enabled()) CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     for (const auto& pending : pendingCopies) copy(pending);
     if (!pendingNotes.empty()) {
@@ -6756,6 +6756,48 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
     auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
     writes = descriptorWrites;
+    static const bool planned = std::getenv("APS5_NO_DRAW_WRITE_PLAN") == nullptr;
+    if (planned) {
+        std::call_once(drawWritePlanOnce, [&] {
+            auto& plan = drawWritePlan;
+            plan.writeSets.assign(descriptorWrites.size(), 0);
+            plan.writeBuffers.assign(descriptorWrites.size(), -1);
+            plan.allocationSlots.assign(allocations.size(), {});
+            std::size_t write = 0;
+            for (const auto& binding : bindings) {
+                const auto original = setOf(binding) == 0 ? _set : fragment.set;
+                while (write < descriptorWrites.size() && descriptorWrites[write].dstBinding == binding.layout.binding && descriptorWrites[write].dstSet == original) {
+                    plan.writeSets[write] = setOf(binding) == 0 ? 0 : 1;
+                    if (!binding.allocations.empty()) {
+                        const auto offset = descriptorWrites[write].pBufferInfo - descriptorBuffers.data();
+                        plan.writeBuffers[write] = offset;
+                        for (std::size_t element = 0; element < binding.allocations.size(); ++element) plan.allocationSlots[binding.allocations[element]].push_back(static_cast<std::size_t>(offset) + element);
+                    }
+                    ++write;
+                }
+            }
+            plan.complete = write == descriptorWrites.size();
+        });
+        const auto& plan = drawWritePlan;
+        Require(plan.complete, "draw snapshot writes disagree with their descriptor bindings");
+        for (std::size_t write = 0; write < writes.size(); ++write) {
+            writes[write].dstSet = plan.writeSets[write] == 0 ? result->allocation.set : result->fragmentAllocation.set;
+            if (plan.writeBuffers[write] >= 0) writes[write].pBufferInfo = buffers.data() + plan.writeBuffers[write];
+        }
+        for (std::size_t index = 0; index < selected.size(); ++index) {
+            const auto& snapshot = result->snapshots[index];
+            const auto range = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+            for (const auto slot : plan.allocationSlots[selected[index]]) buffers[slot] = range;
+        }
+        CountBinding(CountWrites, writes.size());
+        part(PartWrites);
+        context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        part(PartUpdate);
+        recorder.Keep(result);
+        for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer, snapshot.buffer->Bytes().size());
+        part(PartKeep);
+        return result;
+    }
     thread_local std::vector<std::size_t>* indicesSlot = nullptr;
     auto& snapshotIndices = ShaderRecompiler::ThreadOwned(indicesSlot);
     snapshotIndices.assign(allocations.size(), selected.size());

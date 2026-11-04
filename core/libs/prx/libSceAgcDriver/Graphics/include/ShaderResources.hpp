@@ -656,6 +656,14 @@ private:
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
     std::vector<VkWriteDescriptorSet> descriptorWrites;
+    struct DrawWritePlan {
+        std::vector<std::uint8_t> writeSets;
+        std::vector<std::ptrdiff_t> writeBuffers;
+        std::vector<std::vector<std::size_t>> allocationSlots;
+        bool complete = false;
+    };
+    mutable std::once_flag drawWritePlanOnce;
+    mutable DrawWritePlan drawWritePlan;
     mutable std::once_flag drawPoolSizesOnce;
     mutable std::array<std::vector<VkDescriptorPoolSize>, 2> drawPoolSizes;
     mutable std::array<bool, 2> drawPoolDescribed{};
