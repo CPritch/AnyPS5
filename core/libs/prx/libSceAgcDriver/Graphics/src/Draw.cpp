@@ -2944,9 +2944,22 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
     // (VulkanDevice::dispatch); the flush ends an open pass, so it comes before the decision.
+    static const bool scratchReads = std::getenv("APS5_NO_DRAW_SCRATCH_REUSE") == nullptr;
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* touchReadsSlot = nullptr;
+    auto& touchReads = ShaderRecompiler::ThreadOwned(touchReadsSlot);
+    bool touchReadsKnown = false;
     const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
         const auto bytes = static_cast<std::size_t>(end - begin);
-        if (resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes)) return true;
+        if (resources.WritesOverlap(begin, bytes)) return true;
+        if (!scratchReads) {
+            if (resources.ReadsOverlap(begin, bytes)) return true;
+        } else {
+            if (!touchReadsKnown) {
+                resources.InPlaceReads(touchReads);
+                touchReadsKnown = true;
+            }
+            if (std::any_of(touchReads.begin(), touchReads.end(), [&](const auto& range) { return begin < range.second && range.first < end; })) return true;
+        }
         if (!gpuIndirect) return false;
         return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
     };
@@ -5041,6 +5054,7 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
     const auto shaders = packet.shaders;
     const auto snapshots = packet.snapshots;
     auto& prepared = packet.prepared;
+    if (packet.ready && prepared.resolved.resources != nullptr) prepared.resolved.resources->PrefetchBindings(prepared.resolved.moved);
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     std::optional<GuestMemory::PrecollectedScope> precollected;
     if (prepared.ahead.ahead != nullptr && !prepared.ahead.verify && !prepared.ahead.ahead->walks.walks.empty()) precollected.emplace(&prepared.ahead.ahead->walks);
@@ -5054,7 +5068,6 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
             if (!RefreshCachedStorage(context, binding.resident)) {
                 redo = true;
                 break;
-    if (packet.ready && prepared.resolved.resources != nullptr) prepared.resolved.resources->PrefetchBindings(prepared.resolved.moved);
             }
             materializeRegisterClear(context, binding.color, *binding.resident);
         } catch (const std::exception&) {
