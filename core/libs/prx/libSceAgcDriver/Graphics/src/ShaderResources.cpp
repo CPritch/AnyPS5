@@ -1768,7 +1768,7 @@ std::shared_ptr<StorageTexture> repeatStorageSurface(const Context& context, con
     const auto mapping = memo ? GuestAllocations::GuestAllocationsGeneration_nid_postfix() : 0;
     if (memo) {
         for (const auto& entry : memos) {
-            if (entry.stored != stored.get() || entry.device != context.device || entry.storage != storageGeneration || entry.depth != depthGeneration || entry.mapping != mapping || !(entry.requested == requested)) continue;
+            if (entry.stored != stored.get() || entry.device != context.device || entry.storage != storageGeneration || entry.depth != depthGeneration || !(entry.requested == requested) || (entry.mapping != mapping && GuestAllocations::GuestAllocationsChangedSince_nid_postfix(entry.mapping, entry.viewedAddress, static_cast<std::size_t>(entry.viewedBytes)))) continue;
             if (DepthPlanesStale()) static_cast<void>(FlushDepthPlanes(entry.viewedAddress, static_cast<std::size_t>(entry.viewedBytes), DepthPlaneScope::Overlapped));
             TextureCounts().storageHits.fetch_add(1, std::memory_order_relaxed);
             return stored;
@@ -2149,7 +2149,11 @@ bool SameTable(const ReusedTable& table, VkDevice device, const ShaderRecompiler
 ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state) {
     if (state.epoch == 0) return nullptr;
     auto& tables = ReusedTables();
-    std::erase_if(tables, [&](const ReusedTable& table) { return table.state != state; });
+    std::erase_if(tables, [&](const ReusedTable& table) {
+        if (table.state.epoch != state.epoch || table.state.unwatched != state.unwatched || table.state.depthSurfaces != state.depthSurfaces) return true;
+        if (table.state.allocations == state.allocations) return false;
+        return std::any_of(table.queries.begin(), table.queries.end(), [&](const GuestMemory::UnchangedQuery& query) { return GuestAllocations::GuestAllocationsChangedSince_nid_postfix(table.state.allocations, query.address, query.bytes); });
+    });
     for (auto& table : tables) {
         if (SameTable(table, device, binding)) return &table;
     }
@@ -6777,7 +6781,12 @@ const ShaderResources::DrawBindings* ShaderResources::BindingsForEmit(Recorder& 
     }
     static const bool lockedStamp = std::getenv("APS5_LOCKED_SNAPSHOT_STAMP") != nullptr;
     const std::array<std::uint64_t, 3> stamp{lockedStamp ? GuestMemory::TrackerGeneration() : GuestMemory::PublishedTrackerGeneration(), GuestMemory::CollectEpoch(), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
-    auto stampCause = !ahead->stamped ? JobCountTotal : ahead->stamp[1] != stamp[1] ? JobStampEpoch : ahead->stamp[2] != stamp[2] ? JobStampRegistry : ahead->stamp[0] != stamp[0] ? JobStampTracker : JobCountTotal;
+    const auto registryMoved = [&] {
+        if (ahead->stamp[2] == stamp[2]) return false;
+        if (ahead->bindings == nullptr) return true;
+        return std::any_of(ahead->bindings->snapshots.begin(), ahead->bindings->snapshots.end(), [&](const auto& snapshot) { return snapshot.address != 0 && GuestAllocations::GuestAllocationsChangedSince_nid_postfix(ahead->stamp[2], snapshot.address, snapshot.bytes); });
+    };
+    auto stampCause = !ahead->stamped ? JobCountTotal : ahead->stamp[1] != stamp[1] ? JobStampEpoch : registryMoved() ? JobStampRegistry : ahead->stamp[0] != stamp[0] ? JobStampTracker : JobCountTotal;
     if (stampCause == JobStampTracker && ahead->bindings != nullptr) {
         thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
         auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);

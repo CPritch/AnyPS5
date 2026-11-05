@@ -3956,7 +3956,7 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
         return containingDrawSnapshot(address, bytes, offset);
     }
     if (offset != nullptr) *offset = 0;
-    const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const bool sameRegistry = !GuestAllocations::GuestAllocationsChangedSince_nid_postfix(found->second.registryGeneration, address, bytes);
     if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
         if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
             eraseDrawSnapshot(found);
@@ -3980,7 +3980,7 @@ std::shared_ptr<Buffer> Recorder::containingDrawSnapshot(std::uint64_t address, 
         --entry;
         const auto& [start, use, held] = entry->first;
         if (use != SnapshotUse::Storage || start + held < address + bytes || (address - start) % alignment != 0) continue;
-        if (entry->second.registryGeneration != registry || !GuestMemory::UnchangedSince(address, bytes, entry->second.generation)) continue;
+        if ((entry->second.registryGeneration != registry && GuestAllocations::GuestAllocationsChangedSince_nid_postfix(entry->second.registryGeneration, start, held)) || !GuestMemory::UnchangedSince(address, bytes, entry->second.generation)) continue;
         auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
         recency.splice(recency.end(), recency, entry->second.recent);
         *offset = address - start;
@@ -4066,7 +4066,7 @@ bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, Snaps
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     const auto found = indexRanges.find({address, use, bytes});
     if (found == indexRanges.end()) return false;
-    if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+    if (GuestAllocations::GuestAllocationsChangedSince_nid_postfix(found->second.registryGeneration, address, bytes) || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
         indexRangeRecency.erase(found->second.recent);
         indexRanges.erase(found);
         return false;

@@ -1693,6 +1693,10 @@ bool tokenWalkShare() {
     return shared;
 }
 
+bool mappingHolds(std::uint64_t stamp, std::uint64_t now, std::uint64_t first, std::uint64_t stop) {
+    return stamp == now || !GuestAllocations::GuestAllocationsChangedSince_nid_postfix(stamp, static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first));
+}
+
 bool sharedWalkCovers(std::uint64_t token, std::uint64_t first, std::uint64_t stop, std::uint64_t unwatched, std::uint64_t mapping) {
     auto& share = precollectShare();
     std::lock_guard lock(share.mutex);
@@ -1701,7 +1705,7 @@ bool sharedWalkCovers(std::uint64_t token, std::uint64_t first, std::uint64_t st
         const auto after = walks.upper_bound(first);
         if (after == walks.begin()) return false;
         const auto& walk = std::prev(after)->second;
-        return walk.unwatched == unwatched && walk.mapping == mapping && walk.begin <= first && stop <= walk.end;
+        return walk.unwatched == unwatched && walk.begin <= first && stop <= walk.end && mappingHolds(walk.mapping, mapping, first, stop);
     }
     return false;
 }
@@ -1889,7 +1893,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
     if (const auto* precollected = useMemo ? HostThreadSlot<const PrecollectedWrites*, PrecollectedSlot>::Get() : nullptr; precollected != nullptr && precollected->epoch != 0 && precollected->epoch == HostThreadSlot<std::uint64_t, CollectTokenSlot>::Get()) {
         for (const auto& walk : precollected->walks) {
-            if (walk.unwatched == unwatched && walk.mapping == mapping && walk.begin <= first && stop <= walk.end) {
+            if (walk.unwatched == unwatched && walk.begin <= first && stop <= walk.end && mappingHolds(walk.mapping, mapping, first, stop)) {
                 precollectedHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.stable.load(std::memory_order_acquire);
             }
@@ -1900,13 +1904,13 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         // initialized and watched; nothing below the lock needs asking.
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
-            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
+            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end && mappingHolds(found->second.mapping, mapping, first, stop)) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.stable.load(std::memory_order_acquire);
             }
         }
         for (const auto& entry : threadCollectMemo().entries) {
-            if (entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end) {
+            if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end && mappingHolds(entry.mapping, mapping, first, stop)) {
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
@@ -1928,7 +1932,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
-            if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.mapping == mapping && entry.begin <= cursor && stop <= entry.end) {
+            if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.begin <= cursor && stop <= entry.end && mappingHolds(entry.mapping, mapping, cursor, stop)) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation;
             }
@@ -1980,7 +1984,7 @@ bool Precollect(PrecollectedWrites& into, std::uint64_t address, std::size_t byt
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const auto covers = [&](const PrecollectedWrites::Walk& walk) { return walk.unwatched == unwatched && walk.mapping == mapping && walk.begin <= first && stop <= walk.end; };
+    const auto covers = [&](const PrecollectedWrites::Walk& walk) { return walk.unwatched == unwatched && walk.begin <= first && stop <= walk.end && mappingHolds(walk.mapping, mapping, first, stop); };
     if (std::any_of(into.walks.begin(), into.walks.end(), covers)) return true;
     auto& share = precollectShare();
     if (into.epoch != 0) {
@@ -2499,12 +2503,13 @@ TrackerQueryMemo& trackerQuerySlot(TrackerQueryKind kind, std::span<const Unchan
 }
 
 bool trackerQueryRemembered(const TrackerQueryMemo& memo, TrackerQueryKind kind, std::span<const UnchangedQuery> queries, const TrackerQueryState& state) {
-    if (memo.kind != kind || memo.count != queries.size() || memo.unwatched != state.unwatched || memo.mapping != state.mapping) return false;
+    if (memo.kind != kind || memo.count != queries.size() || memo.unwatched != state.unwatched) return false;
     for (std::size_t index = 0; index < queries.size(); ++index) {
         const auto& held = memo.queries[index];
         if (held.address != queries[index].address || held.bytes != queries[index].bytes || held.generation != queries[index].generation) return false;
     }
-    return true;
+    if (memo.mapping == state.mapping) return true;
+    return std::none_of(queries.begin(), queries.end(), [&](const UnchangedQuery& query) { return GuestAllocations::GuestAllocationsChangedSince_nid_postfix(memo.mapping, query.address, query.bytes); });
 }
 
 void trackerQueryRemember(TrackerQueryMemo& memo, TrackerQueryKind kind, std::span<const UnchangedQuery> queries, const TrackerQueryState& state) {
@@ -2837,7 +2842,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
     const auto unwatched = unwatchSerial.load(std::memory_order_relaxed);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool memoized = collectMemoEnabled() && std::any_of(threadHintMemo.entries.begin(), threadHintMemo.entries.end(), [&](const WriteTracker::Memo& entry) {
-        return entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end;
+        return entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end && mappingHolds(entry.mapping, mapping, first, stop);
     });
     if (memoized) {
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);

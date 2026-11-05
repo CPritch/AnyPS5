@@ -764,6 +764,11 @@ public:
         return mirrorPlane.storage.get();
     }
 
+    bool PlanesMappingChangedSince(std::uint64_t stamp, std::uint64_t mirrorBytes, std::uint64_t stencilMirrorBytes) const {
+        if (GuestAllocations::GuestAllocationsChangedSince_nid_postfix(stamp, target.address, static_cast<std::size_t>(std::max(depthBytes(), mirrorBytes)))) return true;
+        return target.stencilAddress != 0 && GuestAllocations::GuestAllocationsChangedSince_nid_postfix(stamp, target.stencilAddress, static_cast<std::size_t>(std::max(stencilBytes(), stencilMirrorBytes)));
+    }
+
     bool PlanesUnwrittenSince(std::uint64_t mirrorBytes, std::uint64_t stencilMirrorBytes) const {
         if (depthMemory == 0 || (target.stencilAddress != 0 && stencilMemory == 0)) return false;
         auto depthGeneration = depthMemory;
@@ -3000,7 +3005,11 @@ DepthViewMemoOutcome depthViewMemoMiss(const Context& context, const DepthTarget
     if (!surface.active->load(std::memory_order_acquire) || surface.retired) return MissSurface;
     if (!memoizableState(surface) || (!DepthViewMemoPerTarget() && drawnDepth != memo.surface) || depthContentWrites() != memo.contentWrites || mirrorEpoch != memo.mirrorEpoch) return MissState;
     if (DepthViewMemoPerTarget() && !ownsPlanes(surface)) return MissSurface;
-    if (epoch.epoch == 0 || epoch.epoch != memo.epoch || epoch.unwatched != memo.unwatched || epoch.mapping != memo.mapping) return MissEpoch;
+    if (epoch.epoch == 0 || epoch.epoch != memo.epoch || epoch.unwatched != memo.unwatched) return MissEpoch;
+    if (epoch.mapping != memo.mapping) {
+        if (surface.PlanesMappingChangedSince(memo.mapping, memo.mirrorBytes, memo.stencilMirrorBytes)) return MissEpoch;
+        if (target.htileAddress != 0 && GuestAllocations::GuestAllocationsChangedSince_nid_postfix(memo.mapping, target.htileAddress, static_cast<std::size_t>(HtileMetadataBytes(target.extent)))) return MissEpoch;
+    }
     if (memo.stalePlaneWrites != stalePlaneWrites.load(std::memory_order_acquire)) return MissStale;
     if (depthWritten && mirrorable(target) && (surface.staleCount == 0 || surface.staleCount != surface.staleUnits.size())) return MissStale;
     if (surface.StencilMirrorable() && !surface.stencilStale) return MissStale;

@@ -633,7 +633,7 @@ ShaderRecompiler::SrtWriteStamp ShaderMemory::stampWrites(void* context, std::ui
 
 bool ShaderMemory::Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp) {
     CaptureTotals().vouchCalls.fetch_add(1, std::memory_order_relaxed);
-    if (stamp.generation == 0 || bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes || stamp.layout != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return false;
+    if (stamp.generation == 0 || bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes || GuestAllocations::GuestAllocationsChangedSince_nid_postfix(stamp.layout, address, bytes)) return false;
     if (pending != nullptr && pending(address, static_cast<std::size_t>(bytes), {}) != PendingWrite::None) return false;
     GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
     if (GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes)) == 0) return false;
