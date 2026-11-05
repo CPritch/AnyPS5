@@ -109,6 +109,14 @@ Outcome ProofsFollowTheImports() {
         Require(Graphics::HostImportsReconciledUnchanged(probe, proof), "host import proofs: an unrelated registration broke the proof, although every import stayed in place");
     }
     Require(Graphics::HostImportsReconciledUnchanged(probe, proof), "host import proofs: removing an unrelated registration broke the proof, although every import stayed in place");
+    bool keptPlainProof = false;
+    for (int attempt = 0; attempt < 3 && !keptPlainProof; ++attempt) {
+        proof = Graphics::HostImportsIdentity(probe);
+        GuestBlock other(OtherBytes);
+        keptPlainProof = Graphics::HostImportsUnchanged(probe, proof);
+    }
+    Require(keptPlainProof == (std::getenv("APS5_NO_IMPORT_JOURNAL") == nullptr && std::getenv("APS5_NO_ALLOCATION_JOURNAL") == nullptr), "host import proofs: the plain proof must survive an unrelated change with the journal and fall without it");
+    proof = Graphics::HostImportsIdentity(probe);
 
     Require(Fill(*device, guest.Address()), "host import proofs: the first window of " + Hex(guest.Address()) + " cannot be filled");
     Require(Graphics::HostImportCovers(probe, guest.Address(), ProbeBytes), "host import proofs: the first window of " + Hex(guest.Address()) + " is not imported");
@@ -117,6 +125,7 @@ Outcome ProofsFollowTheImports() {
 
     GuestAllocations::Mutation().Remove(guest.Data());
     GuestAllocations::Mutation().Add(guest.Data(), BlockBytes, true, true, true);
+    Require(!Graphics::HostImportsUnchanged(probe, proof), "host import proofs: an unmap and a remap over an import left the plain proof standing");
     Require(!Graphics::HostImportsReconciledUnchanged(probe, proof), "host import proofs: the range of " + Hex(guest.Address()) + " was mapped again, but the proof over its imports held");
     return Outcome::Passed;
 }

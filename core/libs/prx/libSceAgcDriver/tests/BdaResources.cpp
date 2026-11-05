@@ -241,6 +241,37 @@ void importSpanTests(const Context& context) {
     ::operator delete(block, std::align_val_t{piece});
 }
 
+void importJournalTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    void* block = ::operator new(16 * piece, std::align_val_t{piece});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(guest, true);
+    Require(HostImportFor(importing, first, piece) != nullptr, "the journal fixture was not imported");
+    change(guest + 8 * piece, true);
+    const auto* kept = HostImportFor(importing, first, piece);
+    Require(kept != nullptr && kept->base == first && kept->bytes == piece, "a mapping elsewhere lost an unrelated import");
+    change(guest + 8 * piece, false);
+    change(guest + piece, true);
+    const auto* grown = HostImportFor(importing, first, 2 * piece);
+    Require(grown != nullptr && grown->bytes == 2 * piece, "an adjacent mapping did not grow the import");
+    change(guest + piece, false);
+    Require(HostImportFor(importing, first + piece, 16) == nullptr, "an unmap overlapping an import left the import");
+    const auto* shrunk = HostImportFor(importing, first, piece);
+    Require(shrunk != nullptr && shrunk->bytes == piece, "the import was not remade over what stayed mapped");
+    change(guest, false);
+    Require(HostImportFor(importing, first, piece) == nullptr, "a removed range is still imported");
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 void importRunGrowthTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     void* block = ::operator new(2 * piece, std::align_val_t{piece});
@@ -4703,6 +4734,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     addressTableKeyTests();
     snapshotTableTests(context, access);
     importSpanTests(context);
+    importJournalTests(context);
     importRunGrowthTests(context);
     importRunReplacedTests(context);
     failedImportRemapTests(context, access);

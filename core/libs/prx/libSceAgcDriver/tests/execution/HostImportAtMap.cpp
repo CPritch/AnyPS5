@@ -85,6 +85,7 @@ void Reconcile(AgcDriver::VulkanDevice& device, const GuestAllocation& probe) {
     const std::array<std::uint32_t, 4> pattern{5u, 6u, 7u, 8u};
     Require(device.FillBuffer(probe.Address(), BlockBytes, pattern), "host import at map: the probe fill was not imported");
     device.WaitIdle();
+    static_cast<void>(device.ImportsIdentity());
 }
 
 void Import(AgcDriver::VulkanDevice& device, const GuestAllocations::Mapped& ranges, std::uint64_t generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {

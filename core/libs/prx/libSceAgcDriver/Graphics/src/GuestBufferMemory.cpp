@@ -336,6 +336,7 @@ struct HostImports {
     std::map<std::pair<std::uint64_t, std::uint64_t>, GateRefusal> gateRefusals;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
+    std::uint64_t proofGeneration = 0;
     std::vector<RefreshedRange> refreshedRanges;
     std::uint64_t refreshedWindow = 0;
     std::uint64_t refreshedBudget = 0;
@@ -2515,6 +2516,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         state.refreshedWindow = 0;
         state.pendingImports.clear();
         state.refreshedGeneration = 0;
+        state.proofGeneration = 0;
         ++state.epoch;
     }
     if (state.destroyBuffer == nullptr) state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
@@ -2523,6 +2525,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     if (generation == state.refreshedGeneration) return;
     GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::Import, __builtin_return_address(0));
     state.refreshedGeneration = generation;
+    state.proofGeneration = generation;
     state.gateRefusals.clear();
     const auto budget = effectiveBudget(context, state);
     const auto window = importWindow.load(std::memory_order_relaxed);
@@ -2605,6 +2608,120 @@ const HostImport* importAccess(const Context& context, HostImports& state, std::
 // Whether the imports need reconciling before a lookup: the registry changed since the last walk.
 bool importsStale(const Context& context, const HostImports& state) {
     return state.device != context.device || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration;
+}
+
+bool importJournalEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_IMPORT_JOURNAL") == nullptr;
+    return enabled;
+}
+
+bool verifyImportJournal() {
+    static const bool enabled = std::getenv("APS5_VERIFY_IMPORT_JOURNAL") != nullptr;
+    return enabled;
+}
+
+std::pair<std::uint64_t, std::uint64_t> widened(std::uint64_t begin, std::uint64_t end) {
+    auto first = begin == 0 ? 0 : begin - 1;
+    auto last = end == std::numeric_limits<std::uint64_t>::max() ? end : end + 1;
+    if (const auto window = importWindow.load(std::memory_order_relaxed); window != 0) {
+        first = std::min(first, begin / window * window);
+        last = std::max(last, begin / window * window + window);
+    }
+    return {first, last};
+}
+
+std::pair<std::uint64_t, std::uint64_t> importExtent(const HostImport& entry) {
+    auto begin = entry.base;
+    auto end = entry.base + entry.bytes;
+    const auto include = [&](const std::shared_ptr<const GuestAllocations::Range>& range) {
+        if (range == nullptr) return;
+        begin = std::min<std::uint64_t>(begin, range->address);
+        end = std::max<std::uint64_t>(end, range->address + range->bytes);
+    };
+    include(entry.range);
+    for (const auto& range : entry.ranges) include(range);
+    return widened(begin, end);
+}
+
+std::pair<std::uint64_t, std::uint64_t> mappedExtent(std::uint64_t base, std::uint64_t bytes, const GuestAllocations::Mapped& mapped) {
+    auto begin = base;
+    auto end = base + bytes;
+    for (const auto& weak : mapped) {
+        if (const auto range = weak.lock(); range != nullptr) {
+            begin = std::min<std::uint64_t>(begin, range->address);
+            end = std::max<std::uint64_t>(end, range->address + range->bytes);
+        }
+    }
+    return widened(begin, end);
+}
+
+void verifyImportKept(const Context& context, HostImports& state, const HostImport& entry) {
+    const auto before = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    const bool same = sameRange(entry, lease, effectiveBudget(context, state));
+    if (same || before != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return;
+    std::fprintf(stderr, "FATAL: APS5_VERIFY_IMPORT_JOURNAL: the journal kept the import of 0x%llx+0x%llx, which a full reconcile would drop\n", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes));
+    std::abort();
+}
+
+const HostImport* importKeptByJournal(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end) {
+    if (!importJournalEnabled() || state.device != context.device || state.refreshedGeneration == 0 || state.refreshedWindow != importWindow.load(std::memory_order_relaxed) || effectiveBudget(context, state) != state.refreshedBudget) return nullptr;
+    const auto* entry = peekImport(state, begin, end);
+    if (entry == nullptr) return nullptr;
+    const auto [first, last] = importExtent(*entry);
+    if (GuestAllocations::GuestAllocationsChangedSince_nid_postfix(state.refreshedGeneration, static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) return nullptr;
+    if (verifyImportJournal()) verifyImportKept(context, state, *entry);
+    return entry;
+}
+
+bool absorbUnrelatedChanges(const Context& context, HostImports& state) {
+    if (!importJournalEnabled() || state.device != context.device || state.refreshedGeneration == 0 || !state.pendingImports.empty()) return false;
+    if (importWindow.load(std::memory_order_relaxed) != state.refreshedWindow || effectiveBudget(context, state) != state.refreshedBudget) return false;
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::uint64_t through = 0;
+    if (!GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(state.refreshedGeneration, &spans, &through)) return false;
+    const auto touched = [&](std::pair<std::uint64_t, std::uint64_t> extent) {
+        const auto found = std::upper_bound(spans.begin(), spans.end(), extent.first, [](std::uint64_t value, const auto& span) { return value < span.second; });
+        return found != spans.end() && found->first < extent.second;
+    };
+    for (const auto& [base, entry] : state.imports) {
+        if (touched(importExtent(entry))) return false;
+    }
+    for (const auto& [key, entry] : state.failed) {
+        if (touched(mappedExtent(entry.base, entry.bytes, entry.ranges))) return false;
+    }
+    for (const auto& [key, entry] : state.failedJoins) {
+        if (touched(mappedExtent(entry.base, entry.bytes, entry.ranges))) return false;
+    }
+    for (const auto& [key, entry] : state.failedBlocks) {
+        if (touched(widened(key.first, key.first + key.second))) return false;
+    }
+    for (const auto& [key, entry] : state.refusals) {
+        if (touched(widened(key.first, key.first + key.second))) return false;
+    }
+    for (const auto& [key, entry] : state.evictingRefusals) {
+        if (touched(widened(key.first, key.first + key.second))) return false;
+    }
+    for (const auto& [key, end] : state.sparseRunEnds) {
+        if (touched(widened(key, std::max(end, key + 1)))) return false;
+    }
+    for (const auto& [key, joins] : state.sparseRunJoins) {
+        if (touched(widened(key, key + 1))) return false;
+    }
+    if (verifyImportJournal()) {
+        for (const auto& [base, entry] : state.imports) verifyImportKept(context, state, entry);
+    }
+    state.gateRefusals.clear();
+    state.refreshedGeneration = through;
+    return true;
+}
+
+bool importsCurrent(const Context& context, HostImports& state) {
+    return !importsStale(context, state) || absorbUnrelatedChanges(context, state);
+}
+
+void reconcileImports(const Context& context, HostImports& state) {
+    if (!importsCurrent(context, state)) refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix());
 }
 
 // The mirror registry: by range base. The map is protected by `mutex` (findMirror runs in a build's
@@ -4435,6 +4552,13 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
 #ifdef _WIN32
     settleUnwatchedImports(context, state);
 #endif
+    if (importsStale(context, state)) {
+        if (const auto* kept = importKeptByJournal(context, state, address, address + bytes)) {
+            kept->lastUse = ++state.useCounter;
+            return kept;
+        }
+        static_cast<void>(absorbUnrelatedChanges(context, state));
+    }
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
         if (recentImportsEnabled()) {
@@ -4468,7 +4592,13 @@ const HostImport* ExistingHostImportFor(const Context& context, std::uint64_t ad
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
-    if (importsStale(context, state)) return nullptr;
+    if (importsStale(context, state)) {
+        if (const auto* kept = importKeptByJournal(context, state, address, address + bytes)) {
+            kept->lastUse = ++state.useCounter;
+            return kept;
+        }
+        if (!absorbUnrelatedChanges(context, state)) return nullptr;
+    }
     return findImport(state, address, address + bytes);
 }
 
@@ -4478,10 +4608,7 @@ bool WatchedAfterSettle(const Context& context, std::uint64_t address, std::size
         ensurePinWaiter();
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
-        if (importsStale(context, state)) {
-            const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-            refreshImports(context, state, lease);
-        }
+        reconcileImports(context, state);
         settleImportsNow(context, state, address, address + bytes);
     }
 #endif
@@ -4713,6 +4840,7 @@ void GuestBufferMemory::AcquireRegistered() {
         {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
+            if (current != nullptr && importsStale(context, state)) static_cast<void>(absorbUnrelatedChanges(context, state));
             const auto keeps = [&](ImageMirror* mirror) { return heapMirrorWatched(*mirror) || !importsNow(context, state, current->lease, mirror->base); };
             if (current == nullptr) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
             else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
@@ -4799,7 +4927,7 @@ void GuestBufferMemory::AcquireRegistered() {
         {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
-            if (importable) refreshImports(context, state, lease);
+            if (importable && !importsCurrent(context, state)) refreshImports(context, state, lease);
             if (importFloor == 0) importFloor = state.useCounter + 1;
             state.buildFloor = importFloor;
             // Taken before the pass: the imports it takes are the registry's ones (just reconciled, so
@@ -7058,7 +7186,7 @@ std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, st
     std::lock_guard lock(state.mutex);
     // An import whose registered range changed must not be reused: reconcile first, as an upload
     // does (the walk only runs when the registry changed since the last one).
-    if (reconcile && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) static_cast<void>(refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix()));
+    if (reconcile && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) reconcileImports(context, state);
     auto found = state.imports.upper_bound(address);
     if (found == state.imports.begin()) return 0;
     --found;
@@ -7075,7 +7203,7 @@ bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof)
     if (proof.device == VK_NULL_HANDLE || proof.device != context.device) return false;
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
-    return state.device == proof.device && state.epoch == proof.epoch && state.refreshedGeneration == proof.refreshedGeneration && !importsStale(context, state);
+    return state.device == proof.device && state.epoch == proof.epoch && state.proofGeneration == proof.refreshedGeneration && importsCurrent(context, state);
 }
 
 bool HostImportsReconciledUnchanged(const Context& context, const HostImportsProof& proof) {
@@ -7083,15 +7211,15 @@ bool HostImportsReconciledUnchanged(const Context& context, const HostImportsPro
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     if (state.device != proof.device) return false;
-    if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix());
+    if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) reconcileImports(context, state);
     return state.device == proof.device && state.epoch == proof.epoch && state.inserted == proof.inserted;
 }
 
 HostImportsProof HostImportsIdentity(const Context& context) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
-    if (importsStale(context, state)) return {};
-    return {state.device, state.epoch, state.refreshedGeneration, state.inserted};
+    if (!importsCurrent(context, state)) return {};
+    return {state.device, state.epoch, state.proofGeneration, state.inserted};
 }
 
 }
