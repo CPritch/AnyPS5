@@ -1,5 +1,6 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -9,6 +10,7 @@
 #include <limits>
 #include <iterator>
 #include <map>
+#include <span>
 #include <stdexcept>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -39,9 +41,27 @@
 namespace GuestAllocations {
 namespace {
 
+struct LeaseIndexEntry {
+    std::uint64_t address;
+    std::uint64_t end;
+    const std::pair<const std::uint64_t, std::shared_ptr<const Range>>* node;
+    bool readable;
+};
+
+constexpr std::size_t LeaseIndexDirtyLimit = 32;
+
+struct LeaseIndex {
+    bool valid = false;
+    std::vector<LeaseIndexEntry> entries;
+    std::array<std::pair<std::uint64_t, std::uint64_t>, LeaseIndexDirtyLimit> dirty{};
+    std::size_t dirtyCount = 0;
+};
+
 struct Registry {
     std::mutex mutex;
     std::map<std::uint64_t, std::shared_ptr<const Range>> ranges;
+    LeaseIndex leaseIndex;
+    bool wholeChangePending = false;
     bool mainImageRegistered = false;
     std::map<std::uintptr_t, std::uintptr_t> registeredImages;
     std::shared_ptr<const Lease::Ranges> readableLease;
@@ -57,6 +77,78 @@ Registry& registry() {
 
 std::uint64_t freshBacking() {
     return ++registry().backingSerials;
+}
+
+bool leasePatchEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_LEASE_PATCH") == nullptr;
+    return enabled;
+}
+
+bool verifyLeasePatch() {
+    static const bool enabled = std::getenv("APS5_VERIFY_LEASE_PATCH") != nullptr;
+    return enabled;
+}
+
+void noteRangeDirty(std::uint64_t address, std::uint64_t bytes) {
+    auto& index = registry().leaseIndex;
+    if (!index.valid) return;
+    if (index.dirtyCount == LeaseIndexDirtyLimit) {
+        index.valid = false;
+        index.dirtyCount = 0;
+        return;
+    }
+    index.dirty[index.dirtyCount++] = {address, address + std::max<std::uint64_t>(bytes, 1)};
+}
+
+void indexRangesFrom(std::vector<LeaseIndexEntry>& entries, std::uint64_t begin, std::uint64_t end) {
+    const auto& ranges = registry().ranges;
+    auto it = ranges.upper_bound(begin);
+    if (it != ranges.begin()) --it;
+    for (; it != ranges.end() && it->first < end; ++it) {
+        const auto& range = *it->second;
+        if (range.bytes == 0 || range.address + range.bytes <= begin) continue;
+        entries.push_back({range.address, range.address + range.bytes, &*it, range.readable});
+    }
+}
+
+const std::vector<LeaseIndexEntry>& currentLeaseIndex() {
+    auto& index = registry().leaseIndex;
+    if (!leasePatchEnabled() || !index.valid) {
+        index.entries.clear();
+        index.entries.reserve(registry().ranges.size());
+        indexRangesFrom(index.entries, 0, std::numeric_limits<std::uint64_t>::max());
+        index.valid = leasePatchEnabled();
+        index.dirtyCount = 0;
+        return index.entries;
+    }
+    thread_local std::vector<LeaseIndexEntry> replacement;
+    for (std::size_t slot = 0; slot < index.dirtyCount; ++slot) {
+        const auto [begin, end] = index.dirty[slot];
+        auto first = std::lower_bound(index.entries.begin(), index.entries.end(), begin, [](const LeaseIndexEntry& entry, std::uint64_t value) { return entry.end <= value; });
+        auto last = first;
+        auto replacedBegin = begin;
+        auto replacedEnd = end;
+        while (last != index.entries.end() && last->address < end) {
+            replacedBegin = std::min(replacedBegin, last->address);
+            replacedEnd = std::max(replacedEnd, last->end);
+            ++last;
+        }
+        replacement.clear();
+        indexRangesFrom(replacement, replacedBegin, replacedEnd);
+        const auto at = index.entries.erase(first, last);
+        index.entries.insert(at, replacement.begin(), replacement.end());
+    }
+    index.dirtyCount = 0;
+    if (verifyLeasePatch()) {
+        std::vector<LeaseIndexEntry> walked;
+        indexRangesFrom(walked, 0, std::numeric_limits<std::uint64_t>::max());
+        const bool same = walked.size() == index.entries.size() && std::equal(walked.begin(), walked.end(), index.entries.begin(), [](const LeaseIndexEntry& left, const LeaseIndexEntry& right) { return left.address == right.address && left.end == right.end && left.node == right.node && left.readable == right.readable; });
+        if (!same) {
+            std::fprintf(stderr, "FATAL: APS5_VERIFY_LEASE_PATCH: the patched lease index (%zu ranges) differs from the registry (%zu ranges)\n", index.entries.size(), walked.size());
+            std::abort();
+        }
+    }
+    return index.entries;
 }
 
 void renewBacking(std::uintptr_t address, std::size_t bytes) {
@@ -79,6 +171,149 @@ bool isRetiring(const Range& range) {
 }
 
 std::atomic<std::uint64_t> generation{1};
+
+constexpr std::uint64_t FineBucketBytes = 1ull << 16;
+constexpr std::size_t FineBuckets = 1u << 18;
+constexpr std::uint64_t CoarseBucketBytes = 1ull << 24;
+constexpr std::size_t CoarseBuckets = 1u << 16;
+constexpr std::uint64_t FineSpanLimit = 256;
+constexpr std::uint64_t CoarseSpanLimit = 4096;
+constexpr std::size_t JournalCapacity = 8192;
+constexpr std::size_t VerifySnapshots = 256;
+
+std::atomic<std::uint64_t> fineChanged[FineBuckets]{};
+std::atomic<std::uint64_t> coarseChanged[CoarseBuckets]{};
+std::atomic<std::uint64_t> wideChanged[CoarseBuckets]{};
+std::atomic<std::uint64_t> wholeChanged{0};
+
+struct JournalEntry {
+    std::uint64_t generation = 0;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+};
+
+using SnapshotRanges = std::vector<Range>;
+
+struct ChangeJournal {
+    std::mutex mutex;
+    std::vector<JournalEntry> entries;
+    std::size_t next = 0;
+    std::uint64_t oldestComplete = 1;
+    std::map<std::uint64_t, std::shared_ptr<const SnapshotRanges>> snapshots;
+    std::shared_ptr<const SnapshotRanges> latest;
+};
+
+ChangeJournal& changeJournal() {
+    static auto* value = [] {
+        auto* journal = new ChangeJournal;
+        journal->entries.resize(JournalCapacity);
+        return journal;
+    }();
+    return *value;
+}
+
+bool journalEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_ALLOCATION_JOURNAL") == nullptr;
+    return enabled;
+}
+
+bool verifyJournal() {
+    static const bool enabled = std::getenv("APS5_VERIFY_ALLOCATION_JOURNAL") != nullptr;
+    return enabled;
+}
+
+bool sameRangeFields(const Range& left, const Range& right) {
+    return left.address == right.address && left.bytes == right.bytes && left.readable == right.readable && left.writable == right.writable && left.allocationAddress == right.allocationAddress && left.allocationBytes == right.allocationBytes && left.releasable == right.releasable && left.gpu == right.gpu && left.backingSerial == right.backingSerial;
+}
+
+std::vector<JournalEntry> differingEntries(const SnapshotRanges& before, const SnapshotRanges& after) {
+    std::vector<JournalEntry> differing;
+    const auto add = [&](const Range& range) { differing.push_back({0, range.address, range.address + std::max<std::uint64_t>(range.bytes, 1)}); };
+    std::size_t first = 0;
+    std::size_t second = 0;
+    while (first < before.size() || second < after.size()) {
+        if (second == after.size() || (first < before.size() && before[first].address < after[second].address)) {
+            add(before[first++]);
+        } else if (first == before.size() || after[second].address < before[first].address) {
+            add(after[second++]);
+        } else {
+            if (!sameRangeFields(before[first], after[second])) {
+                add(before[first]);
+                add(after[second]);
+            }
+            ++first;
+            ++second;
+        }
+    }
+    return differing;
+}
+
+[[noreturn]] void journalDisagreement(const char* what, std::uint64_t begin, std::uint64_t end, std::uint64_t since, std::uint64_t now) {
+    std::fprintf(stderr, "FATAL: APS5_VERIFY_ALLOCATION_JOURNAL: %s: 0x%llx-0x%llx between generations %llu and %llu\n", what, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(since), static_cast<unsigned long long>(now));
+    std::abort();
+}
+
+void markBuckets(std::atomic<std::uint64_t>* table, std::size_t count, std::uint64_t granule, std::uint64_t begin, std::uint64_t end, std::uint64_t stamp) {
+    for (auto bucket = begin / granule; bucket <= (end - 1) / granule; ++bucket) table[bucket % count].store(stamp, std::memory_order_release);
+}
+
+bool anyBucketNewer(const std::atomic<std::uint64_t>* table, std::size_t count, std::uint64_t granule, std::uint64_t begin, std::uint64_t end, std::uint64_t stamp) {
+    for (auto bucket = begin / granule; bucket <= (end - 1) / granule; ++bucket) {
+        if (table[bucket % count].load(std::memory_order_acquire) > stamp) return true;
+    }
+    return false;
+}
+
+void markChanged(std::uint64_t stamp, std::uint64_t begin, std::uint64_t end) {
+    const auto coarse = (end - 1) / CoarseBucketBytes - begin / CoarseBucketBytes + 1;
+    if (coarse > CoarseSpanLimit) {
+        wholeChanged.store(stamp, std::memory_order_release);
+        return;
+    }
+    markBuckets(coarseChanged, CoarseBuckets, CoarseBucketBytes, begin, end, stamp);
+    if ((end - 1) / FineBucketBytes - begin / FineBucketBytes + 1 > FineSpanLimit) markBuckets(wideChanged, CoarseBuckets, CoarseBucketBytes, begin, end, stamp);
+    else markBuckets(fineChanged, FineBuckets, FineBucketBytes, begin, end, stamp);
+}
+
+std::uint64_t publishChanges(std::span<const JournalEntry> changes, bool whole, std::shared_ptr<const SnapshotRanges> snapshot) {
+    auto& journal = changeJournal();
+    std::lock_guard lock(journal.mutex);
+    const auto stamp = generation.load(std::memory_order_relaxed) + 1;
+    if (journalEnabled()) {
+        if (whole) {
+            wholeChanged.store(stamp, std::memory_order_release);
+            journal.oldestComplete = stamp;
+        }
+        for (const auto& change : changes) {
+            if (change.end <= change.begin) continue;
+            markChanged(stamp, change.begin, change.end);
+            auto& slot = journal.entries[journal.next];
+            if (slot.generation != 0) journal.oldestComplete = std::max(journal.oldestComplete, slot.generation);
+            slot = {stamp, change.begin, change.end};
+            journal.next = (journal.next + 1) % JournalCapacity;
+        }
+        if (verifyJournal()) {
+            if (snapshot != nullptr) journal.latest = std::move(snapshot);
+            if (journal.latest != nullptr) {
+                journal.snapshots[stamp] = journal.latest;
+                if (journal.snapshots.size() > VerifySnapshots) journal.snapshots.erase(journal.snapshots.begin());
+            }
+        }
+    }
+    generation.store(stamp, std::memory_order_release);
+    return stamp;
+}
+
+void verifyUnchangedAnswer(std::uint64_t since, std::uint64_t now, std::uint64_t begin, std::uint64_t end) {
+    auto& journal = changeJournal();
+    std::lock_guard lock(journal.mutex);
+    const auto before = journal.snapshots.find(since);
+    const auto after = journal.snapshots.find(now);
+    if (before == journal.snapshots.end() || after == journal.snapshots.end()) return;
+    for (const auto& differing : differingEntries(*before->second, *after->second)) {
+        if (differing.begin < end && begin < differing.end) journalDisagreement("the journal answers unchanged where the registry snapshots differ", begin, end, since, now);
+    }
+}
 std::atomic<void (*)(std::uintptr_t, std::size_t)> invalidator{nullptr};
 std::atomic<bool (*)(std::uintptr_t, std::size_t)> pinWaiter{nullptr};
 std::atomic<void (*)(const Mapped&, std::uint64_t)> gpuMapObserver{nullptr};
@@ -103,12 +338,20 @@ void require(bool condition, const char* reason) {
 struct MutationState {
     std::unique_lock<std::mutex> lock;
     std::vector<std::pair<std::uintptr_t, std::size_t>> changed;
+    std::vector<JournalEntry> journaled;
     std::vector<std::pair<std::uintptr_t, std::size_t>> gpuMapped;
     std::vector<std::pair<std::uintptr_t, std::size_t>> unpinned;
 };
 
 void recordChange(void* mutation, const void* pointer, std::size_t bytes) {
-    if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    if (mutation == nullptr) {
+        registry().wholeChangePending = true;
+        return;
+    }
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    auto* state = static_cast<MutationState*>(mutation);
+    state->journaled.push_back({0, address, address + std::max<std::uint64_t>(bytes, 1)});
+    if (bytes != 0) state->changed.emplace_back(address, bytes);
 }
 
 #if !defined(_WIN32) && !defined(__APPLE__) && !defined(__EMSCRIPTEN__)
@@ -158,16 +401,46 @@ bool backWritableImageAnonymously() {
 }
 
 void* GuestAllocationsBegin_nid_postfix() {
+    changeJournal();
     auto* state = new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
-    registry().readableLease.reset();
-    registry().allLease.reset();
+    if (!leasePatchEnabled()) {
+        registry().readableLease.reset();
+        registry().allLease.reset();
+    }
     return state;
 }
 
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     auto* state = static_cast<MutationState*>(mutation);
     for (const auto& [address, bytes] : state->unpinned) renewBacking(address, bytes);
-    const auto ended = generation.fetch_add(1, std::memory_order_release) + 1;
+    const bool whole = std::exchange(registry().wholeChangePending, false);
+    std::shared_ptr<const SnapshotRanges> snapshot;
+    if (journalEnabled() && verifyJournal()) {
+        auto ranges = std::make_shared<SnapshotRanges>();
+        ranges->reserve(registry().ranges.size());
+        for (const auto& [address, range] : registry().ranges) ranges->push_back(*range);
+        auto& journal = changeJournal();
+        std::shared_ptr<const SnapshotRanges> previous;
+        {
+            std::lock_guard lock(journal.mutex);
+            previous = journal.latest;
+        }
+        if (previous != nullptr && !whole) {
+            for (const auto& differing : differingEntries(*previous, *ranges)) {
+                const bool covered = std::any_of(state->journaled.begin(), state->journaled.end(), [&](const JournalEntry& entry) { return differing.begin < entry.end && entry.begin < differing.end; });
+                if (!covered) journalDisagreement("a mutation changed a range it did not journal", differing.begin, differing.end, 0, generation.load());
+            }
+        }
+        snapshot = std::move(ranges);
+    }
+    const bool unchanged = journalEnabled() && !whole && state->journaled.empty();
+    const auto ended = publishChanges(state->journaled, whole, std::move(snapshot));
+    std::shared_ptr<const Lease::Ranges> retiredReadable;
+    std::shared_ptr<const Lease::Ranges> retiredAll;
+    if (!unchanged) {
+        retiredReadable = std::move(registry().readableLease);
+        retiredAll = std::move(registry().allLease);
+    }
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
     }
@@ -190,9 +463,9 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     const Mapped weak(mapped.begin(), mapped.end());
     mapped.clear();
     const bool noted = !state->gpuMapped.empty();
-    registry().readableLease.reset();
-    registry().allLease.reset();
     delete state;
+    retiredReadable.reset();
+    retiredAll.reset();
     if (!weak.empty()) observer(weak, ended);
     if (noted) gpuMapObserverCalls.fetch_sub(1);
 }
@@ -201,12 +474,70 @@ std::uint64_t GuestAllocationsGeneration_nid_postfix() {
     return generation.load(std::memory_order_acquire);
 }
 
+bool GuestAllocationsChangedSince_nid_postfix(std::uint64_t since, std::uintptr_t address, std::size_t bytes) {
+    const auto now = generation.load(std::memory_order_acquire);
+    if (since == now) return false;
+    if (!journalEnabled() || since == 0 || since > now) return true;
+    const std::uint64_t begin = address;
+    const auto span = std::max<std::uint64_t>(bytes, 1);
+    if (span > std::numeric_limits<std::uint64_t>::max() - begin) return true;
+    const auto end = begin + span;
+    if (wholeChanged.load(std::memory_order_acquire) > since) return true;
+    bool changed;
+    if ((end - 1) / FineBucketBytes - begin / FineBucketBytes + 1 <= FineSpanLimit) {
+        changed = anyBucketNewer(fineChanged, FineBuckets, FineBucketBytes, begin, end, since) || anyBucketNewer(wideChanged, CoarseBuckets, CoarseBucketBytes, begin, end, since);
+    } else if ((end - 1) / CoarseBucketBytes - begin / CoarseBucketBytes + 1 <= CoarseSpanLimit) {
+        changed = anyBucketNewer(coarseChanged, CoarseBuckets, CoarseBucketBytes, begin, end, since);
+    } else {
+        changed = true;
+    }
+    if (!changed && verifyJournal()) verifyUnchangedAnswer(since, now, begin, end);
+    return changed;
+}
+
+bool GuestAllocationsChangesSince_nid_no_patch(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>* spans, std::uint64_t* through) {
+    spans->clear();
+    if (!journalEnabled() || since == 0) return false;
+    auto& journal = changeJournal();
+    std::lock_guard lock(journal.mutex);
+    *through = generation.load(std::memory_order_relaxed);
+    if (since == *through) return true;
+    if (since > *through || since < journal.oldestComplete || wholeChanged.load(std::memory_order_relaxed) > since) return false;
+    for (std::size_t walked = 1; walked <= JournalCapacity; ++walked) {
+        const auto& entry = journal.entries[(journal.next + JournalCapacity - walked) % JournalCapacity];
+        if (entry.generation <= since) break;
+        spans->emplace_back(entry.begin, entry.end);
+    }
+    std::sort(spans->begin(), spans->end());
+    std::size_t kept = 0;
+    for (const auto& span : *spans) {
+        if (kept != 0 && span.first <= (*spans)[kept - 1].second) (*spans)[kept - 1].second = std::max((*spans)[kept - 1].second, span.second);
+        else (*spans)[kept++] = span;
+    }
+    spans->resize(kept);
+    return true;
+}
+
+bool GuestAllocationsAnyGpuRange_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    std::lock_guard lock(registry().mutex);
+    const auto& ranges = registry().ranges;
+    const std::uint64_t end = address + std::max<std::size_t>(bytes, 1);
+    auto it = ranges.upper_bound(address);
+    if (it != ranges.begin()) --it;
+    for (; it != ranges.end() && it->first < end; ++it) {
+        const auto& range = *it->second;
+        if (range.gpu && range.readable && range.bytes != 0 && range.address + range.bytes > address) return true;
+    }
+    return false;
+}
+
 void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t, std::size_t)) {
     invalidator.store(callback, std::memory_order_release);
 }
 
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes) {
-    generation.fetch_add(1, std::memory_order_release);
+    const JournalEntry change{0, address, address + std::max<std::uint64_t>(bytes, 1)};
+    publishChanges(std::span(&change, 1), false, nullptr);
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
 }
 
@@ -216,7 +547,11 @@ void GuestAllocationsSetGpuMapObserver_nid_postfix(void (*callback)(const Mapped
 }
 
 void GuestAllocationsNoteGpuMapping_nid_postfix(void* mutation, const void* pointer, std::size_t bytes) {
-    if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->gpuMapped.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    if (mutation == nullptr || bytes == 0) return;
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    auto* state = static_cast<MutationState*>(mutation);
+    state->journaled.push_back({0, address, address + bytes});
+    state->gpuMapped.emplace_back(address, bytes);
 }
 
 void GuestAllocationsSetPinWaiter_nid_postfix(bool (*callback)(std::uintptr_t, std::size_t)) {
@@ -256,6 +591,8 @@ void registerImage(const void* image) {
     }
     require(registered, "guest image has no committed pages");
     state.ranges.swap(replacement);
+    state.leaseIndex.valid = false;
+    state.wholeChangePending = true;
     state.registeredImages.emplace(reinterpret_cast<std::uintptr_t>(image), cursor);
 }
 }
@@ -359,6 +696,8 @@ std::uintptr_t registerImagePages(const ImagePages& collected) {
         page = std::next(last);
     }
     state.ranges.swap(replacement);
+    state.leaseIndex.valid = false;
+    state.wholeChangePending = true;
     return static_cast<std::uintptr_t>(std::prev(pages.end())->first + pageSize);
 }
 }
@@ -403,6 +742,7 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, image, end - begin);
     recordChange(mutation, image, end - begin);
     std::erase_if(state.ranges, [&](const auto& entry) { return !entry.second->releasable && entry.second->allocationAddress >= begin && entry.second->allocationAddress < end; });
+    state.leaseIndex.valid = false;
     state.registeredImages.erase(found);
 }
 
@@ -419,6 +759,7 @@ void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t 
         require(previous.address + previous.bytes <= address, "overlapping guest allocation");
     }
     ranges.emplace(address, std::make_shared<const Range>(Range{address, bytes, readable, writable, address, bytes, true, gpu, freshBacking()}));
+    noteRangeDirty(address, bytes);
 }
 
 [[noreturn]] void PinnedFailure(std::uintptr_t address, std::size_t bytes, const char* why) {
@@ -455,9 +796,19 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         const decltype(unmark)& release;
         ~Unmark() { release(); }
     } unmarkOnExit{unmark};
+    int cacheDrops = 0;
     for (;;) {
-        registry().readableLease.reset();
-        registry().allLease.reset();
+        if (registry().readableLease != nullptr || registry().allLease != nullptr) {
+            auto droppedReadable = std::move(registry().readableLease);
+            auto droppedAll = std::move(registry().allLease);
+            if (leasePatchEnabled() && cacheDrops++ < 2 && state != nullptr && state->lock.owns_lock()) {
+                state->lock.unlock();
+                droppedReadable.reset();
+                droppedAll.reset();
+                state->lock.lock();
+                continue;
+            }
+        }
         bool pinned = false;
         auto it = ranges.upper_bound(address);
         if (it != ranges.begin()) --it;
@@ -471,7 +822,10 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         }
         if (!pinned) {
             unmark();
-            if (state != nullptr && bytes != 0) state->unpinned.emplace_back(address, bytes);
+            if (state != nullptr && bytes != 0) {
+                state->journaled.push_back({0, address, end});
+                state->unpinned.emplace_back(address, bytes);
+            }
             return;
         }
         if (!marked && state != nullptr && state->lock.owns_lock()) {
@@ -653,6 +1007,7 @@ void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
     const auto range = GuestAllocationsFind_nid_postfix(mutation, pointer);
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, range.bytes);
     recordChange(mutation, pointer, range.bytes);
+    noteRangeDirty(range.address, range.bytes);
     auto& ranges = registry().ranges;
     const auto exact = ranges.find(range.address);
     if (exact != ranges.end() && exact->second->allocationBytes == exact->second->bytes) {
@@ -709,10 +1064,20 @@ struct StagedPatch {
     }
     void apply() noexcept {
         auto& ranges = registry().ranges;
-        for (const auto key : patch.erased) ranges.erase(key);
+        for (const auto key : patch.erased) {
+            if (const auto found = ranges.find(key); found != ranges.end()) noteRangeDirty(key, found->second->bytes);
+            ranges.erase(key);
+        }
+        for (const auto& [key, range] : patch.inserted) noteRangeDirty(key, range->bytes);
         ranges.merge(staged);
     }
 };
+
+void recordReplaced(void* mutation, const RangePatch& patch) {
+    for (const auto key : patch.erased) {
+        if (const auto found = registry().ranges.find(key); found != registry().ranges.end()) recordChange(mutation, reinterpret_cast<const void*>(key), found->second->bytes);
+    }
+}
 
 bool allocationRemains(const Range& range, const RangePatch& patch) {
     for (const auto& [key, entry] : patch.inserted) {
@@ -733,6 +1098,7 @@ void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, st
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
     recordChange(mutation, pointer, bytes);
     const auto patch = replaceRange(pointer, bytes, false, readable, writable, gpu);
+    recordReplaced(mutation, patch);
     StagedPatch staged(patch);
     apply();
     staged.apply();
@@ -761,6 +1127,7 @@ void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std:
         const auto pieceEnd = std::min<std::uint64_t>(end, range.address + range.bytes);
         const auto patch = replaceRange(reinterpret_cast<const void*>(cursor), pieceEnd - cursor, true, false, false, false);
         const bool last = !allocationRemains(range, patch);
+        recordReplaced(mutation, patch);
         StagedPatch staged(patch);
         apply(reinterpret_cast<const void*>(cursor), pieceEnd - cursor, reinterpret_cast<const void*>(range.allocationAddress), last);
         staged.apply();
@@ -779,12 +1146,14 @@ void GuestAllocationsSetUnmapObserver_nid_postfix(void (*callback)(std::uintptr_
 Lease GuestAllocationsAcquire_nid_postfix() {
     std::lock_guard lock(registry().mutex);
     if (auto shared = registry().readableLease) return Lease(std::move(shared));
+    const bool retiring = !registry().retiring.empty();
+    const auto& index = currentLeaseIndex();
     auto ranges = std::make_shared<Lease::Ranges>();
-    ranges->reserve(registry().ranges.size());
-    for (const auto& [address, range] : registry().ranges) {
-        if (range->readable && range->bytes != 0 && !isRetiring(*range)) ranges->push_back(range);
+    ranges->reserve(index.size());
+    for (const auto& entry : index) {
+        if (entry.readable && (!retiring || !isRetiring(*entry.node->second))) ranges->push_back(entry.node->second);
     }
-    if (registry().retiring.empty()) registry().readableLease = ranges;
+    if (!retiring) registry().readableLease = ranges;
     return Lease(std::move(ranges));
 }
 
@@ -829,9 +1198,11 @@ Lease GuestAllocationsAcquireRegistered_nid_postfix() {
     if (registry().retiring.empty()) {
         if (auto shared = registry().readableLease) return Lease(std::move(shared));
     }
+    const auto& index = currentLeaseIndex();
     auto ranges = std::make_shared<Lease::Ranges>();
-    for (const auto& [address, range] : registry().ranges) {
-        if (range->readable && range->bytes != 0) ranges->push_back(range);
+    ranges->reserve(index.size());
+    for (const auto& entry : index) {
+        if (entry.readable) ranges->push_back(entry.node->second);
     }
     if (registry().retiring.empty()) registry().readableLease = ranges;
     return Lease(std::move(ranges));
@@ -856,12 +1227,14 @@ std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t a
 Lease GuestAllocationsAcquireAll_nid_postfix() {
     std::lock_guard lock(registry().mutex);
     if (auto shared = registry().allLease) return Lease(std::move(shared));
+    const bool retiring = !registry().retiring.empty();
+    const auto& index = currentLeaseIndex();
     auto ranges = std::make_shared<Lease::Ranges>();
-    ranges->reserve(registry().ranges.size());
-    for (const auto& [address, range] : registry().ranges) {
-        if (range->bytes != 0 && !isRetiring(*range)) ranges->push_back(range);
+    ranges->reserve(index.size());
+    for (const auto& entry : index) {
+        if (!retiring || !isRetiring(*entry.node->second)) ranges->push_back(entry.node->second);
     }
-    if (registry().retiring.empty()) registry().allLease = ranges;
+    if (!retiring) registry().allLease = ranges;
     return Lease(std::move(ranges));
 }
 

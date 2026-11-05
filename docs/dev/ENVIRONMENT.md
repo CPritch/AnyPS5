@@ -833,4 +833,8 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_TRACE_TIMERS` | presence | `core/libs/prx/libkernel/Time/Time.cpp` |  | on Windows, runs a timed-wait selftest at startup and prints mean, p50 and max latencies |
 | `APS5_TRACE_USLEEP` | presence | `core/libs/prx/libkernel/Time/Time.cpp` |  | reports every 2000 usleep calls the guest call sites that sleep most |
 | `APS5_TRACE_WAITS` | presence | `core/libs/prx/libkernel/Time/Time.cpp` |  | aggregates blocking waits per guest call site and prints the longest-waiting sites every 3 s |
+| `APS5_NO_ALLOCATION_JOURNAL` | presence | `core/libs/prx/libc/src/GuestAllocations.cpp` |  | turns off what is on by default: the journal of changed guest allocation ranges; every proof falls back to the global generation |
+| `APS5_VERIFY_ALLOCATION_JOURNAL` | presence | `core/libs/prx/libc/src/GuestAllocations.cpp` |  | keeps registry snapshots per generation, aborts if a mutation changed a range it did not journal or if the journal answers unchanged where the snapshots differ |
+| `APS5_NO_LEASE_PATCH` | presence | `core/libs/prx/libc/src/GuestAllocations.cpp` |  | turns off what is on by default: patching the sorted lease index by the changed ranges and keeping the cached leases across mutations that changed nothing and dropping them outside the registry lock; every lease walks the registry |
+| `APS5_VERIFY_LEASE_PATCH` | presence | `core/libs/prx/libc/src/GuestAllocations.cpp` |  | compares the patched lease index with a registry walk at every lease and aborts on a difference |
 

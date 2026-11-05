@@ -114,8 +114,9 @@ void leaseSnapshotTests() {
     Require(held.use_count() == 2, "the kept snapshot does not hold the range once");
     {
         GuestAllocations::Mutation mutation;
+        mutation.RequireUnpinned(memory.data(), 64);
     }
-    Require(held.use_count() == 1, "a snapshot outlived a registry change");
+    Require(held.expired(), "a snapshot outlived a registry change");
     std::weak_ptr<const GuestAllocations::Range> readable;
     {
         const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
