@@ -16,6 +16,7 @@ using ShaderRecompiler::ShaderStage;
 alignas(256) std::array<std::array<std::uint32_t, 64>, 4> texels{};
 alignas(256) std::array<std::array<std::uint32_t, 64>, 4> outputs{};
 constexpr std::array<std::uint32_t, 8> code{0x7e3c0300u, 0x7e3e0280u, 0xf0001108u, 0x00010a1eu, 0x34060082u, 0xe0701000u, 0x80000a03u, 0xbf810000u};
+constexpr std::array<std::uint32_t, 8> alphaCode{0x7e3c0300u, 0x7e3e0280u, 0xf0001808u, 0x00010a1eu, 0x34060082u, 0xe0701000u, 0x80000a03u, 0xbf810000u};
 constexpr std::array<std::uint32_t, 10> storeCode{0x7e3c0300u, 0x7e3e0280u, 0x7e1402ffu, 123u, 0xf0201108u, 0x00010a1eu, 0x34060082u, 0xe0701000u, 0x80000a03u, 0xbf810000u};
 
 ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, std::uint32_t index, bool nullImage, bool store) {
@@ -36,6 +37,25 @@ ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, std::
         if (binding.role == ShaderRecompiler::DescriptorRole::GuestImages) Require(binding.count == 1u, "single image expanded into unused descriptor slots");
     }
     return result;
+}
+
+ShaderRecompiler::RecompileResult CompileNull(AgcDriver::VulkanDevice& device, std::uint32_t word3, std::span<const std::uint32_t> instructions) {
+    const auto output = reinterpret_cast<std::uintptr_t>(outputs[0].data());
+    std::array<std::uint32_t, 12> userData{static_cast<std::uint32_t>(output), static_cast<std::uint32_t>(output >> 32u), 256u, 0x31016facu};
+    userData[7] = word3;
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    ShaderRecompiler::RecompileRequest request{{ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(instructions.data()), instructions, 0u, {}}, {32u, 0u, userData, compute, std::nullopt, std::nullopt}, device.ComputeTarget(32u)};
+    return ShaderRecompiler::Recompile(request);
+}
+
+void RunBlankImages(AgcDriver::VulkanDevice& device) {
+    const auto blank = CompileNull(device, 0u, alphaCode);
+    const auto selected = CompileNull(device, 0xfacu, alphaCode);
+    Require(blank.Identity().low == selected.Identity().low && blank.Identity().high == selected.Identity().high, "a null image without selectors keys another module than one with the identity selectors");
+    outputs[0].fill(0xdeadbeefu);
+    device.Dispatch(blank, 1u, 1u, 1u);
+    device.WaitIdle();
+    for (std::uint32_t pixel = 0u; pixel < 32u; ++pixel) Require(outputs[0][pixel] == 0u, "the alpha of a null image without selectors is not zero");
 }
 
 void Run(AgcDriver::VulkanDevice& device) {
@@ -62,6 +82,7 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Run(*device);
+        RunBlankImages(*device);
         std::cout << "typed heap execution tests passed\n";
         return 0;
     } catch (const std::exception& error) {

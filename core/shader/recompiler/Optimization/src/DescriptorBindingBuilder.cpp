@@ -406,7 +406,8 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if (std::ranges::any_of(modes, [](const ImageResource& mode) { return mode.conversionFormat == FmaskExpansion; })) plan.specialization.push_back({PipelineSpecialization::FmaskFormatBase + index, modes.at(imageModes[index]).conversionFormat == FmaskExpansion ? (snapshot.images.at(index).dwords[1] >> 20u) & 0x1ffu : 0u});
         const auto first = PipelineSpecialization::ImageBase + index * PipelineSpecialization::ImageWords;
         plan.specialization.push_back({first, imageModes[index]});
-        for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, (snapshot.images.at(index).dwords[3] >> (component * 3u)) & 7u});
+        const bool blank = (snapshot.images.at(index).dwords[3] & 0xfffu) == 0u && ResourceMaterializer::NullImageDescriptor(info.images[index], snapshot.images.at(index));
+        for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, blank ? 4u + component : (snapshot.images.at(index).dwords[3] >> (component * 3u)) & 7u});
         const auto& image = info.images[index];
         if (image.resourceClass != ImageResourceClass::Storage || !image.written || image.atomic) continue;
         const auto code = (snapshot.images.at(index).dwords[1] >> 20u) & 0x1ffu;
