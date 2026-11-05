@@ -5049,6 +5049,50 @@ DrawPacketPtr ResolveDraw(const Context& context, const State& state, const Pm4:
     return packet;
 }
 
+namespace {
+
+bool TargetRefreshMemoOn() {
+    static const bool enabled = std::getenv("APS5_NO_TARGET_REFRESH_MEMO") == nullptr;
+    return enabled;
+}
+
+bool TargetRefreshMemoVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_TARGET_REFRESH_MEMO") != nullptr;
+    return verified;
+}
+
+struct TargetRefreshStamp {
+    std::uint64_t epoch = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t mapping = 0;
+    std::uint64_t tracker = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t writes = 0;
+    std::uint64_t published = 0;
+    std::uint64_t cache = 0;
+    std::uint64_t generation = 0;
+    DccKeys keys{};
+    static TargetRefreshStamp Now(const StorageTexture& resident) {
+        return {GuestMemory::ThreadCollectEpoch(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), GuestMemory::PublishedTrackerGeneration(), StorageTexture::PendingSerial(), Recorder::WriteGeneration(), Recorder::PublishGeneration(), StorageCacheRemovals(), resident.Generation(), resident.UploadedKeys()};
+    }
+    bool Usable() const { return epoch != 0 && generation != 0; }
+    bool operator==(const TargetRefreshStamp&) const = default;
+};
+
+struct TargetRefreshMemo {
+    const StorageTexture* resident = nullptr;
+    std::uint64_t dccAddress = 0;
+    TargetRefreshStamp stamp{};
+};
+
+TargetRefreshMemo& targetRefreshMemo(const StorageTexture* resident) {
+    thread_local std::array<TargetRefreshMemo, 16> memos{};
+    const auto at = reinterpret_cast<std::uintptr_t>(resident);
+    return memos[((at >> 6u) ^ (at >> 11u)) & 15u];
+}
+
+}
+
 void EmitDraw(const Context& context, DrawPacket& packet) {
     const auto& state = *packet.state;
     const auto& draw = packet.draw;
@@ -5066,11 +5110,18 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
         auto& binding = prepared.targets[index];
         deferredColorRefreshes.fetch_add(1, std::memory_order_relaxed);
         try {
+            auto& memo = targetRefreshMemo(binding.resident.get());
+            const auto before = TargetRefreshStamp::Now(*binding.resident);
+            const bool same = TargetRefreshMemoOn() && before.Usable() && memo.resident == binding.resident.get() && memo.dccAddress == binding.color.dccAddress && memo.stamp == before;
+            if (same && !TargetRefreshMemoVerified()) continue;
             if (!RefreshCachedStorage(context, binding.resident)) {
                 redo = true;
                 break;
             }
             materializeRegisterClear(context, binding.color, *binding.resident);
+            const auto after = TargetRefreshStamp::Now(*binding.resident);
+            if (same) Require(after == before, "the target refresh memo skipped a refresh that changed the target");
+            memo = {binding.resident.get(), binding.color.dccAddress, after};
         } catch (const std::exception&) {
             redo = true;
             break;

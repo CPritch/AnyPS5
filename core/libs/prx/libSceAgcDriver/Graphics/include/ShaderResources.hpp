@@ -70,6 +70,7 @@ bool StorageImageCached(const Context& context, const StorageTexture* image);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
 std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& stored);
 std::shared_ptr<StorageTexture> FindRepeatStorageSurface(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& stored);
+std::uint64_t StorageCacheRemovals();
 bool RefreshCachedStorage(const Context& context, const std::shared_ptr<StorageTexture>& texture);
 
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
