@@ -362,6 +362,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorTargetTransfer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Pipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineLibrary.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCompilePool.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineJournal.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/RuntimeSwitches.cpp
@@ -628,6 +629,16 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     endif()
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
+
+function(agc_tests_wait_for_compiles)
+    get_directory_property(agcDirectoryTests TESTS)
+    foreach(agcDirectoryTest IN LISTS agcDirectoryTests)
+        if(NOT agcDirectoryTest MATCHES "^agc_driver_async_compile")
+            set_property(TEST ${agcDirectoryTest} APPEND PROPERTY ENVIRONMENT "APS5_NO_ASYNC_COMPILE=1")
+        endif()
+    endforeach()
+endfunction()
+cmake_language(DEFER CALL agc_tests_wait_for_compiles)
 
 function(agc_add_default_test agcTest)
     string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")

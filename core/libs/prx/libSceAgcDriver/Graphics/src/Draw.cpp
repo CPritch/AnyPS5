@@ -4007,7 +4007,27 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         selected.stencilReplayReference = reference;
         selected.stencilFront.reference = reference;
         selected.stencilBack.reference = reference;
-        auto selectedPipeline = stencilReplay.empty() ? CachedPipeline(context, selected, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+        std::shared_ptr<Pipeline> selectedPipeline;
+        if (!stencilReplay.empty()) {
+            selectedPipeline = stencilReplay.front().second;
+        } else if (!AsyncCompileEnabled()) {
+            selectedPipeline = CachedPipeline(context, selected, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        } else {
+            const auto layouts = resources->SetLayouts();
+            const auto attachments = lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            auto wanted = WantCachedPipeline(context, selected, inputs.VertexLayout(), layouts, shaders, attachments, false);
+            if (wanted.pipeline == nullptr && !wanted.direct) {
+                if (const auto reason = DrawCompileWait(selected, shaders, context.recorder, lean)) {
+                    selectedPipeline = AwaitCachedPipeline(context, selected, inputs.VertexLayout(), layouts, shaders, attachments, *reason);
+                } else {
+                    NoteDroppedDraw(wanted.queued);
+                    report(" dropped until its pipeline is built");
+                    return false;
+                }
+            } else {
+                selectedPipeline = wanted.direct ? CachedPipeline(context, selected, inputs.VertexLayout(), *resources, shaders, attachments) : std::move(wanted.pipeline);
+            }
+        }
         Require(!selectedPipeline->SplitsFaces() && !selectedPipeline->SplitsSecondChannel(), "stencil replay refuses pipeline face or channel splits");
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
@@ -4038,7 +4058,26 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             pipeline = aheadPipeline;
             storeHash = prepared.ahead.ahead->storeHash;
         } else if (!repeated) {
-            pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
+            if (!AsyncCompileEnabled()) {
+                pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
+            } else if (pipelineState.tessellationCapture != nullptr) {
+                NoteDirectCompile(DirectCompile::TessellationCapture);
+                pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
+            } else {
+                auto wanted = WantCachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, false);
+                if (wanted.pipeline != nullptr) {
+                    pipeline = std::move(wanted.pipeline);
+                    storeHash = wanted.storeHash;
+                } else if (wanted.direct) {
+                    pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
+                } else if (const auto reason = DrawCompileWait(pipelineState, shaders, context.recorder, lean)) {
+                    pipeline = AwaitCachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, *reason, &storeHash);
+                } else {
+                    NoteDroppedDraw(wanted.queued);
+                    report(" dropped until its pipeline is built");
+                    return false;
+                }
+            }
         }
         if (aheadPipeline != nullptr && pipeline != aheadPipeline) {
             std::vector<std::byte> aheadKey;
@@ -4912,6 +4951,7 @@ bool DrawPacketTemplateGone(const DrawPacket& packet) {
 }
 
 std::uint32_t CompareDrawPackets(const DrawPacket& first, const DrawPacket& second) {
+    if (!first.ready || !second.ready) return 0;
     const auto& a = first.prepared;
     const auto& b = second.prepared;
     std::uint32_t differs = 0;
@@ -5103,7 +5143,7 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
         if (view != prepared.depthFound.view) {
             deferredDepthViewsChanged.fetch_add(1, std::memory_order_relaxed);
             redo = true;
-        } else if (writesDepthTarget(state)) {
+        } else if (packet.ready && writesDepthTarget(state)) {
             NoteDepthSurfaceWrite(context, *state.depth);
         }
     }
@@ -5258,7 +5298,23 @@ void PrepareDrawAhead(const Context& context, const State& state, const Pm4::Dra
         masked->colors[index].format = AttachmentProxyFormat(context, color.format);
         masked->blends.at(color.exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
     }
+    if (AsyncCompileEnabled() && state.tessellationCapture == nullptr) {
+        auto wanted = WantCachedPipeline(context, masked.has_value() ? *masked : state, ahead.VertexLayout(), ahead.layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL, false);
+        if (wanted.pipeline != nullptr) {
+            ahead.pipeline = std::move(wanted.pipeline);
+            ahead.storeHash = wanted.storeHash;
+        }
+        return;
+    }
     ahead.pipeline = CachedPipeline(context, masked.has_value() ? *masked : state, ahead.VertexLayout(), ahead.layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL, nullptr, &ahead.storeHash);
+}
+
+std::optional<CompileWait> DrawCompileWait(const State& state, std::span<const CompiledShader> shaders, const Recorder* recorder, bool lean) {
+    if (ShadersWriteMemory(shaders)) return CompileWait::GuestWrites;
+    if (recorder == nullptr || !lean) return CompileWait::NotRecorded;
+    if (recorder->CountingSamples() && !state.depthWrite && std::ranges::all_of(state.blends, [](const VkPipelineColorBlendAttachmentState& blend) { return blend.colorWriteMask == 0u; })) return CompileWait::Occlusion;
+    if (std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.tileMode == ColorTileMode::Linear; })) return CompileWait::LinearTarget;
+    return std::nullopt;
 }
 
 void CountDrawAhead(DrawAheadEvent event) {

@@ -58,6 +58,7 @@ void CountDrawAhead(DrawAheadEvent event);
 std::array<std::uint64_t, static_cast<std::size_t>(DrawAheadEvent::Count)> DrawAheadTotals();
 std::string DrawAheadReport();
 bool DrawAheadDisabled();
+std::optional<CompileWait> DrawCompileWait(const State& state, std::span<const CompiledShader> shaders, const Recorder* recorder, bool lean);
 void ThrowInDrawAheadForTest(bool enabled);
 
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw

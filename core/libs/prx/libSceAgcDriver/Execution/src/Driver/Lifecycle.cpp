@@ -194,6 +194,7 @@ void Driver::stop() {
     DrawFinisher::Get().ReleaseRan();
     StopWorkerSampler();
     CloseRegistrationPreparation();
+    Graphics::StopPipelineCompilePool();
     Graphics::StopPipelineLibraryWorker();
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     Graphics::ReportHostImports();

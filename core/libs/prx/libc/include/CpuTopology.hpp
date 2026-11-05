@@ -15,6 +15,7 @@
 #include <fstream>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -376,6 +377,44 @@ inline void PinHelperThread(const char* role) {
         return;
     }
     if (mask != 0) PinTraced(role, nullptr, mask);
+}
+
+inline std::uint64_t BackgroundCompileMaskFor(const std::vector<std::uint64_t>& efficientCores) {
+    std::uint64_t mask = 0;
+    for (std::size_t index = efficientCores.size() / 2; index < efficientCores.size(); ++index) mask |= efficientCores[index];
+    return mask;
+}
+
+inline std::uint64_t BackgroundCompileMask() {
+    static const std::uint64_t mask = [] {
+        const auto requested = MaskFromEnvironment("APS5_ASYNC_COMPILE_AFFINITY_MASK");
+        if (requested != 0) return requested;
+#ifdef __linux__
+        const auto& layout = Get();
+        if (layout.hybrid) {
+            const auto placed = BackgroundCompileMaskFor(CoresFromSysfs("/sys/devices/system/cpu", layout.efficient & layout.process));
+            if (placed != 0) return placed;
+        }
+#endif
+        return SharedWithoutNamedPins(GetPlacement().shared);
+    }();
+    return mask;
+}
+
+inline unsigned BackgroundCompileThreads() {
+    const auto logical = static_cast<unsigned>(std::popcount(BackgroundCompileMask()));
+    if (logical == 0) return 2;
+    return Get().hybrid ? std::max(1u, logical / 2u) : std::max(2u, logical / 4u);
+}
+
+inline void PinBackgroundCompileThread(const char* role, int niceness) {
+    if (const auto named = NamedPinMask(role); named != 0) PinTraced(role, nullptr, named);
+    else if (const auto mask = BackgroundCompileMask(); mask != 0) PinTraced(role, nullptr, mask);
+#ifdef __linux__
+    if (niceness > 0) static_cast<void>(setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), niceness));
+#else
+    (void)niceness;
+#endif
 }
 
 inline void PinGuestThread(const char* role) {

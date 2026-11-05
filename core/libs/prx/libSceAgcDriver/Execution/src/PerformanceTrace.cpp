@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TraceFile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCompilePool.hpp"
 #include "prx/libSceAgcDriver/TraceRevision.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include <array>
@@ -188,6 +189,7 @@ std::vector<std::pair<std::string, std::string>> environment() {
 TraceSummary identity(std::uint32_t width, std::uint32_t height, const VulkanDevice* device) {
     TraceSummary summary;
     summary.commit = APS5_TRACE_COMMIT;
+    summary.asyncCompile = Graphics::AsyncCompileSummaryJson();
     if (APS5_TRACE_DIRTY >= 0) summary.dirty = APS5_TRACE_DIRTY != 0;
     summary.environment = environment();
     summary.gpu = device != nullptr ? device->DeviceName() : std::string();

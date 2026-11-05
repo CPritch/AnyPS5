@@ -75,7 +75,10 @@ inline void Check(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 
+void NoteHotThreadModule();
+
 inline VkShaderModule CreateShaderModule(PFN_vkCreateShaderModule create, VkDevice device, bool graphicsPipelineLibrary, const std::uint32_t* code, std::size_t bytes, const char* operation) {
+    NoteHotThreadModule();
     std::vector<std::uint32_t> keyed(code, code + bytes / sizeof(std::uint32_t));
     if (!graphicsPipelineLibrary && keyed.size() > 2) keyed[2] ^= 0x8000u;
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};

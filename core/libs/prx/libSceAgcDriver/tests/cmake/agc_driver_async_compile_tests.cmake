@@ -1,0 +1,6 @@
+target_include_directories(agc_driver_async_compile_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+if(BUILD_TESTING)
+    set_property(TEST agc_driver_async_compile APPEND PROPERTY ENVIRONMENT "APS5_ASYNC_COMPILE_THREADS=1;APS5_NO_PIPELINE_JOURNAL=1")
+    add_test(NAME agc_driver_async_compile_pool COMMAND agc_driver_async_compile_tests pool)
+    set_tests_properties(agc_driver_async_compile_pool PROPERTIES ENVIRONMENT "APS5_ASYNC_COMPILE_THREADS=1;APS5_ASYNC_COMPILE_QUEUE=4" TIMEOUT 30)
+endif()

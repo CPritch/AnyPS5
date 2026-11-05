@@ -4443,7 +4443,11 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
 }
 
-bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders) {
+std::vector<VkFormat> VulkanDevice::PrebuildDepthFormats() const {
+    return Graphics::UsedDepthFormats();
+}
+
+bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders, VkFormat depthFormat) {
     PerformanceTimer timing("Vulkan.GraphicsPipelinePrebuild");
     std::optional<Graphics::Context> contextCopy;
     const auto& context = contextRef(contextCopy);
@@ -4459,6 +4463,11 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
     state.blend.colorWriteMask = 15;
     state.blends.push_back(state.blend);
     state.renderExtent = {1, 1};
+    if (depthFormat != VK_FORMAT_UNDEFINED) {
+        state.depth = Graphics::DepthTarget{0, 0, {1, 1}, depthFormat, 1.0f, 0};
+        state.depthTest = true;
+        state.depthCompare = VK_COMPARE_OP_LESS;
+    }
     std::vector<Graphics::CompiledShader> group(shaders.begin(), shaders.end());
     if (group.size() == 1u) {
         const bool vertex = group.front().stage == ShaderRecompiler::ShaderStage::Fragment;
@@ -5851,6 +5860,15 @@ VkPipeline VulkanDevice::splitComputePipeline(const Graphics::Context& context, 
 
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
     const auto pipelineKey = ComputePipelineKey::Of(shader, pushStages != 0);
+    if (!pipelineKey.identity.Empty() && Graphics::AsyncCompileEnabled() && Graphics::OnHotCompileThread()) {
+        {
+            std::lock_guard pipelines(state->computePipelinesMutex);
+            if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) return found->second;
+        }
+        std::shared_ptr<ComputePipelineObjects> built;
+        Graphics::RunOnCompilePool(Graphics::CompileWait::Dispatch, [&] { built = computePipeline(context, shader, setLayout, layoutKey, pushStages, programAddress); });
+        return built;
+    }
     std::promise<std::shared_ptr<ComputePipelineObjects>> building;
     if (!pipelineKey.identity.Empty()) {
         std::shared_future<std::shared_ptr<ComputePipelineObjects>> other;

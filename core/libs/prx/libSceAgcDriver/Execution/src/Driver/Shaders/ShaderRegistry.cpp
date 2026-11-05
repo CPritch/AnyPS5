@@ -1423,6 +1423,7 @@ void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Gra
         const std::array<Graphics::CompiledShader, 1> shaders{{{stage, result.get(), pushOffset}}};
         try {
             static_cast<void>(device->PrebuildGraphicsLibraries(stages, shaders));
+            for (const auto format : device->PrebuildDepthFormats()) static_cast<void>(device->PrebuildGraphicsLibraries(stages, shaders, format));
         } catch (const std::exception& error) {
             APS5_LOG_OUT("shader library prebuild skipped: %s", error.what());
         }
@@ -1572,7 +1573,7 @@ public:
         static auto* pool = [] {
             const char* text = std::getenv("APS5_PREBUILD_THREADS");
             std::lock_guard lifecycle(Lifecycle());
-            auto* created = new RegistrationPreparePool(Closing() ? 0u : text != nullptr ? std::max(1u, static_cast<unsigned>(std::strtoul(text, nullptr, 10))) : std::max(2u, std::thread::hardware_concurrency() / 2u));
+            auto* created = new RegistrationPreparePool(Closing() ? 0u : text != nullptr ? std::max(1u, static_cast<unsigned>(std::strtoul(text, nullptr, 10))) : std::max(2u, std::thread::hardware_concurrency() / 2u), true);
             PrebuildSlot().store(created);
             return created;
         }();
@@ -1713,7 +1714,7 @@ private:
     }
 #endif
 
-    explicit RegistrationPreparePool(unsigned count) {
+    explicit RegistrationPreparePool(unsigned count, bool backgroundCompiles = false) : background(backgroundCompiles) {
 #ifdef _WIN32
         for (unsigned index = 0; index < count; ++index) {
             unsigned id = 0;
@@ -1750,7 +1751,8 @@ private:
 
     static void* Main(void* argument) {
         auto& pool = *static_cast<RegistrationPreparePool*>(argument);
-        CpuTopology::PinHelperThread("shader prepare");
+        if (pool.background) CpuTopology::PinBackgroundCompileThread("library prebuild", 10);
+        else CpuTopology::PinHelperThread("shader prepare");
         PerformanceTrace::BindThread("shader prepare", TraceThread::DefaultCapacity / 8);
         for (;;) {
             Task task;
@@ -1800,6 +1802,7 @@ private:
         std::uint64_t program = 0;
     };
 
+    const bool background;
     std::mutex mutex;
     std::condition_variable ready;
     std::condition_variable idle;

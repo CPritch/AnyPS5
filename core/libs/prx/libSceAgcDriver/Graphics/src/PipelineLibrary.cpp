@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string_view>
 
 namespace AgcDriver::Graphics {
@@ -45,6 +46,7 @@ struct DeviceLibraries {
     std::vector<VkShaderModule> modules;
     std::map<Key, VkPipelineLayout> layouts;
     std::array<std::map<Key, VkPipeline>, 4> parts;
+    std::array<std::set<Key>, 4> partsBuilding;
     PipelineLibraryCounters counters;
 };
 
@@ -53,6 +55,7 @@ struct LibraryStore {
     std::map<VkDevice, DeviceLibraries> devices;
     std::condition_variable idle;
     std::condition_variable work;
+    std::condition_variable partBuilt;
     std::deque<std::pair<VkDevice, std::function<void()>>> jobs;
     std::map<VkDevice, std::size_t> pending;
     std::map<VkDevice, std::size_t> activeBuilds;
@@ -86,7 +89,7 @@ void enqueue(LibraryStore& store, VkDevice device, std::function<void()> job) {
     if (store.stopping) return;
     if (!store.worker.joinable()) {
         store.worker = std::thread([&store] {
-            CpuTopology::PinHelperThread("pipeline library");
+            CpuTopology::PinBackgroundCompileThread("pipeline library", 10);
             runJobs(store);
         });
         runningWorkers.fetch_add(1, std::memory_order_acq_rel);
@@ -192,10 +195,13 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         auto key = Combined(*partKeys[part], *contextKeys[part]);
         key.push_back(static_cast<std::byte>(optimize));
         auto& cache = device.parts[part];
+        auto& building = device.partsBuilding[part];
+        store.partBuilt.wait(lock, [&] { return !building.contains(key); });
         if (const auto found = cache.find(key); found != cache.end()) {
             libraries.push_back(found->second);
             continue;
         }
+        building.insert(key);
         PerformanceTimer timing("Vulkan.GraphicsPipelineLibrary");
         VkGraphicsPipelineLibraryCreateInfoEXT library{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, flags[part] == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT ? &rendering : &shaderRendering};
         library.flags = flags[part];
@@ -239,6 +245,8 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
         }
         lock.lock();
+        building.erase(key);
+        store.partBuilt.notify_all();
         Check(created, "vkCreateGraphicsPipelines library");
         if (const auto raced = cache.find(key); raced != cache.end()) {
             device.destroyPipeline(context.device, handle, nullptr);

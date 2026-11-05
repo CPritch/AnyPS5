@@ -391,7 +391,8 @@ public:
     };
     IndirectDrawSupport DrawIndirectSupport() const;
     void EnqueueDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
-    bool PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders);
+    bool PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders, VkFormat depthFormat = VK_FORMAT_UNDEFINED);
+    std::vector<VkFormat> PrebuildDepthFormats() const;
 
 public:
     // The device's Graphics::Context: a copy of the one built at setup (its instance functions

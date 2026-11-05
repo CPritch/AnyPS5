@@ -151,6 +151,9 @@ int main() {
         zen5.performant = 0x3c0full;
         zen5.efficient = 0xfc3f0ull;
         zen5.hybrid = true;
+        const std::vector<std::uint64_t> efficientCores{0x4010ull, 0x8020ull, 0x10040ull, 0x20080ull, 0x40100ull, 0x80200ull};
+        Require(CpuTopology::BackgroundCompileMaskFor(efficientCores) == 0xe0380ull, "background compiles on the later half of the efficient cores");
+        Require(CpuTopology::BackgroundCompileMaskFor({}) == 0ull, "no efficient cores give no background compile mask");
         const auto placement = CpuTopology::PlacementFor(zen5, cores);
         Require(placement.Active() && placement.worker == 0x401ull && placement.finisher == 0x802ull && placement.committer == 0x1004ull, "a performant core each for the worker, finisher and committer");
         Require(placement.shared == 0xfe3f8ull, "every other thread on the fourth performant core and the efficient cores");

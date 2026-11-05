@@ -1369,6 +1369,27 @@ void reportPipelines(PipelineStore& store) {
 
 }
 
+namespace {
+
+struct UsedDepthFormatList {
+    std::mutex mutex;
+    std::vector<VkFormat> formats{VK_FORMAT_D32_SFLOAT_S8_UINT};
+};
+
+UsedDepthFormatList& usedDepthFormats() {
+    static auto* used = new UsedDepthFormatList();
+    return *used;
+}
+
+void noteUsedDepthFormat(const State& state) {
+    if (!state.depth) return;
+    auto& used = usedDepthFormats();
+    std::lock_guard lock(used.mutex);
+    if (std::ranges::find(used.formats, state.depth->format) == used.formats.end()) used.formats.push_back(state.depth->format);
+}
+
+}
+
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     return CachedPipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout);
 }
@@ -1432,6 +1453,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     // Built outside the mutex: a draw that finds its pipeline resident is not held behind another
     // thread's build (the journal replay builds here too), and a device's driver compiles in
     // parallel when several threads build at once.
+    noteUsedDepthFormat(state);
     auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     const bool replaying = PipelineJournalReplaying();
     {
@@ -1496,6 +1518,114 @@ std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint6
     return it->pipeline;
 }
 
+namespace {
+
+struct OwnedPipelineBuild {
+    Context context;
+    State state;
+    VertexInputLayout vertexInput;
+    std::vector<std::uint32_t> mainKey;
+    std::vector<std::uint32_t> fragmentKey;
+    PipelineSetLayouts layouts;
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
+    std::vector<CompiledShader> shaders;
+    VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+};
+
+std::shared_ptr<Pipeline> residentPipeline(PipelineStore& store, const Context& context, std::uint64_t hash, const std::vector<std::byte>& key, bool& collision) {
+    collision = false;
+    const auto found = store.index.find(hash);
+    if (found == store.index.end()) return nullptr;
+    const auto it = found->second;
+    if (it->key != key) {
+        collision = true;
+        return nullptr;
+    }
+    if (!alive(*it, context)) return nullptr;
+    store.entries.splice(store.entries.end(), store.entries, it);
+    return it->pipeline;
+}
+
+}
+
+std::vector<VkFormat> UsedDepthFormats() {
+    auto& used = usedDepthFormats();
+    std::lock_guard lock(used.mutex);
+    return used.formats;
+}
+
+PipelineWanted WantCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool urgent) {
+    PipelineWanted wanted;
+    auto& store = Pipelines();
+    struct WantedKeyStorage {};
+    auto& key = HostThreadLocal<std::vector<std::byte>, WantedKeyStorage>();
+    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (key.empty()) {
+        NoteDirectCompile(DirectCompile::PrivatePipeline);
+        wanted.direct = true;
+        return wanted;
+    }
+    const auto hash = hashKey(key);
+    {
+        std::lock_guard lock(store.mutex);
+        bool collision = false;
+        if (auto pipeline = residentPipeline(store, context, hash, key, collision)) {
+            ++store.hits;
+            ++store.totals.hits;
+            wanted.pipeline = std::move(pipeline);
+            wanted.storeHash = hash;
+            return wanted;
+        }
+        if (collision) {
+            NoteDirectCompile(DirectCompile::PrivatePipeline);
+            wanted.direct = true;
+            return wanted;
+        }
+    }
+    const auto request = RequestPipelineCompile(context.device, hash, [&]() -> std::function<void()> {
+        auto build = std::make_shared<OwnedPipelineBuild>(OwnedPipelineBuild{context});
+        build->state = CanonicalPipelineState(state);
+        build->vertexInput = vertexInput;
+        build->mainKey.assign(resources.mainKey.begin(), resources.mainKey.end());
+        build->fragmentKey.assign(resources.fragmentKey.begin(), resources.fragmentKey.end());
+        build->layouts = {resources.main, resources.fragment, resources.split, build->mainKey, build->fragmentKey};
+        build->attachmentLayout = attachmentLayout;
+        for (const auto& shader : shaders) {
+            build->results.push_back(std::make_shared<const ShaderRecompiler::RecompileResult>(*shader.program));
+            build->shaders.push_back({shader.stage, build->results.back().get(), shader.pushConstantOffset, nullptr});
+        }
+        return [build, hash] {
+            std::vector<std::byte> ownKey;
+            pipelineKey(ownKey, build->context, build->state, build->vertexInput, build->layouts, build->shaders, build->attachmentLayout);
+            if (ownKey.empty() || hashKey(ownKey) != hash) throw std::runtime_error("AGC graphics: a canonical pipeline state keys differently from its draw");
+            static_cast<void>(CachedPipeline(build->context, build->state, build->vertexInput, build->layouts, build->shaders, build->attachmentLayout));
+        };
+    }, urgent);
+    wanted.storeHash = hash;
+    wanted.queued = request == CompileRequest::Queued;
+    if (request == CompileRequest::Failed || request == CompileRequest::Closed) {
+        NoteDirectCompile(request == CompileRequest::Failed ? DirectCompile::FailedBuild : DirectCompile::PoolClosed);
+        wanted.direct = true;
+    }
+    return wanted;
+}
+
+std::shared_ptr<Pipeline> AwaitCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, CompileWait reason, std::uint64_t* storeHash) {
+    if (storeHash != nullptr) *storeHash = 0;
+    auto wanted = WantCachedPipeline(context, state, vertexInput, resources, shaders, attachmentLayout, true);
+    if (wanted.pipeline != nullptr) {
+        if (storeHash != nullptr) *storeHash = wanted.storeHash;
+        return std::move(wanted.pipeline);
+    }
+    if (!wanted.direct) {
+        const auto started = std::chrono::steady_clock::now();
+        const bool built = AwaitPipelineCompile(context.device, wanted.storeHash);
+        NoteCompileWait(reason, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count()));
+        if (!built) NoteDirectCompile(DirectCompile::FailedBuild);
+    }
+    return CachedPipeline(context, state, vertexInput, resources, shaders, attachmentLayout, nullptr, storeHash);
+}
+
 void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
 }
@@ -1516,6 +1646,7 @@ bool PipelineStoreCanGrow() {
 }
 
 void ClearCachedPipelines(VkDevice device) {
+    DrainPipelineCompiles(device);
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     for (auto it = store.entries.begin(); it != store.entries.end();) {

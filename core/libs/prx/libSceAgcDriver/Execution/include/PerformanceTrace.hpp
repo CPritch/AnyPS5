@@ -302,6 +302,7 @@ struct TraceSummary {
     std::optional<std::pair<double, double>> interval;
     std::optional<TraceHost> host;
     std::optional<TraceTitle> title;
+    std::string asyncCompile;
 };
 
 struct TraceBenchInterval {
@@ -660,6 +661,7 @@ public:
             }
             output += ",\"trace_dropped_threads\":{" + droppedThreads + "}";
         }
+        if (!summary.asyncCompile.empty()) output += ",\"async_compile\":" + summary.asyncCompile;
         output += ",\"trace\":";
         AppendString(output, summary.trace);
         output += "}\n";
