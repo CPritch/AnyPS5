@@ -4856,6 +4856,10 @@ private:
 };
 
 namespace {
+std::atomic<std::uint64_t> lazyPlaneStores{0};
+bool PlaneStoreReason(const char* reason) {
+    return reason != nullptr && (std::strcmp(reason, "stencil plane store") == 0 || std::strcmp(reason, "depth plane store") == 0);
+}
 std::array<std::array<std::atomic<std::uint64_t>, 3>, 5> pendingCleanCounts{};
 std::size_t pendingThreadKind() {
     if (GuestMemory::OnResolverThread()) return 1;
@@ -4875,6 +4879,7 @@ std::string TakePendingCleanText() {
         for (std::size_t kind = 0; kind < 3; ++kind) text += std::string(kind == 0 ? " " : "/") + std::to_string(pendingCleanCounts[event][kind].exchange(0, std::memory_order_relaxed));
         text += ",";
     }
+    text += " plane stores left in the unit shadows " + std::to_string(lazyPlaneStores.exchange(0, std::memory_order_relaxed)) + ",";
     return text;
 }
 
@@ -4884,6 +4889,19 @@ void CountHookKeptByCpu() {
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool waited, VkDevice device) {
     static_cast<void>(FlushDepthPlanes(address, bytes));
+    const bool lazyPlane = scope != PublishScope::None && LazyWriteBack() && PlaneStoreReason(reason);
+    struct LazyNote {
+        bool on;
+        std::uint64_t address;
+        std::size_t bytes;
+        ~LazyNote() {
+            if (on) NoteLazyPublish(address, bytes);
+        }
+    } lazyNote{lazyPlane && VerifyLazyWriteBack(), address, bytes};
+    if (lazyPlane && !lazyNote.on) {
+        scope = PublishScope::None;
+        lazyPlaneStores.fetch_add(1, std::memory_order_relaxed);
+    }
     if (published != nullptr) *published = false;
     const auto nothingToStore = [&] {
         auto& pending = Pending();

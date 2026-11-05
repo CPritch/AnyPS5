@@ -158,6 +158,9 @@ std::string ShadowReport();
 // APS5_SHADOW_VERIFY=1: after a shadow-sourced upload, the units read must carry no stamp newer
 // than their generation (counted as mismatches otherwise).
 bool ShadowVerify();
+bool LazyWriteBack();
+bool VerifyLazyWriteBack();
+void NoteLazyPublish(std::uint64_t address, std::size_t bytes);
 
 }
 
