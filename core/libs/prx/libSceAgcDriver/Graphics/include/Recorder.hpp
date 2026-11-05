@@ -137,6 +137,14 @@ public:
     void ApplyDeferred(DeferredEffects& effects);
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
+    static bool BatchKeeps();
+    static bool VerifyBatchKeeps();
+    template <class T>
+    void KeepOnce(const std::shared_ptr<T>& object) {
+        if (object != nullptr && keepOnceFirst(object.get())) keepFirst(object);
+    }
+    void VerifyKept(std::shared_ptr<void> object);
+    std::shared_ptr<void>& OpenBindingsBlock();
     void KeepBytes(const void* owner, std::size_t bytes);
     enum class UploadScratch : std::uint8_t { Tiled = 0, Linear, Count };
     std::shared_ptr<DeviceBuffer> UploadScratchBuffer(UploadScratch kind, std::size_t bytes);
@@ -664,6 +672,8 @@ private:
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
+        std::vector<std::shared_ptr<void>> keptPerDraw;
+        std::vector<const void*> keptOnceObjects;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
@@ -985,6 +995,21 @@ private:
     std::array<NotedRange, 1024> notedRanges{};
     std::uint64_t notedSerial = 0;
     void logNoted(std::uint64_t begin, std::uint64_t end);
+    bool keepOnceFirst(const void* object);
+    void keepFirst(std::shared_ptr<void> object);
+    void verifyBatchKeeps(const Batch& batch);
+    struct KeptOnceEntry {
+        const void* object = nullptr;
+        std::uint64_t serial = 0;
+    };
+    std::vector<KeptOnceEntry> keptOnce;
+    std::size_t keptOnceCount = 0;
+    std::uint64_t keptOnceSerial = 0;
+    std::array<const void*, 4> keepBytesMemo{};
+    std::uint64_t keepBytesMemoSerial = 0;
+    std::uint32_t keepBytesMemoNext = 0;
+    std::shared_ptr<void> openBindingsBlock;
+    std::uint64_t openBindingsSerial = 0;
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
     const Buffer* drawUploadKept = nullptr;

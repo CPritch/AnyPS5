@@ -6334,15 +6334,88 @@ bool ShaderResources::LayoutUpdateAfterBind() const {
     return updateAfterBind;
 }
 
+void ShaderResources::DrawBindings::Release() {
+    if (cache != nullptr) {
+        const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
+            if (set.set == VK_NULL_HANDLE) return;
+            if (setLayout != VK_NULL_HANDLE) cache->Recycle(setLayout, set);
+            else cache->Free(set);
+        };
+        release(layout, allocation);
+        release(fragmentLayout, fragmentAllocation);
+    }
+    cache = nullptr;
+    layout = VK_NULL_HANDLE;
+    fragmentLayout = VK_NULL_HANDLE;
+    allocation = {};
+    fragmentAllocation = {};
+    snapshots.clear();
+    owners.clear();
+}
+
 ShaderResources::DrawBindings::~DrawBindings() {
-    if (cache == nullptr) return;
-    const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
-        if (set.set == VK_NULL_HANDLE) return;
-        if (setLayout != VK_NULL_HANDLE) cache->Recycle(setLayout, set);
-        else cache->Free(set);
-    };
-    release(layout, allocation);
-    release(fragmentLayout, fragmentAllocation);
+    Release();
+}
+
+namespace {
+
+struct SharedBindingStorage {
+    std::mutex mutex;
+    std::vector<ShaderResources::DrawBindings*> free;
+};
+
+SharedBindingStorage& BindingStorage() {
+    static auto* storage = new SharedBindingStorage();
+    return *storage;
+}
+
+thread_local std::vector<ShaderResources::DrawBindings*>* ownBindingsSlot = nullptr;
+
+ShaderResources::DrawBindings* TakeBindingStorage() {
+    auto& own = ShaderRecompiler::ThreadOwned(ownBindingsSlot);
+    if (own.empty()) {
+        auto& shared = BindingStorage();
+        std::lock_guard lock(shared.mutex);
+        const auto take = std::min<std::size_t>(shared.free.size(), 256);
+        own.assign(shared.free.end() - static_cast<std::ptrdiff_t>(take), shared.free.end());
+        shared.free.resize(shared.free.size() - take);
+    }
+    if (own.empty()) return new ShaderResources::DrawBindings();
+    auto* taken = own.back();
+    own.pop_back();
+    return taken;
+}
+
+void GiveBindingStorage(ShaderResources::DrawBindings* item) {
+    item->Release();
+    ShaderRecompiler::ThreadOwned(ownBindingsSlot).push_back(item);
+}
+
+struct BatchBindings {
+    std::vector<ShaderResources::DrawBindings*> items;
+    BatchBindings() { items.reserve(1024); }
+    BatchBindings(const BatchBindings&) = delete;
+    BatchBindings& operator=(const BatchBindings&) = delete;
+    ~BatchBindings() {
+        for (auto* item : items) item->Release();
+        auto& shared = BindingStorage();
+        std::lock_guard lock(shared.mutex);
+        for (auto* item : items) {
+            if (shared.free.size() < 65536) shared.free.push_back(item);
+            else delete item;
+        }
+    }
+};
+
+BatchBindings& OpenBatchBindings(Recorder& recorder) {
+    auto& block = recorder.OpenBindingsBlock();
+    if (block == nullptr) {
+        block = std::make_shared<BatchBindings>();
+        recorder.Keep(block);
+    }
+    return *static_cast<BatchBindings*>(block.get());
+}
+
 }
 
 namespace {
@@ -6539,6 +6612,37 @@ std::string TakeDrawBindingsText() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
+    if (Recorder::BatchKeeps() && !movedOnly) {
+        auto* item = PrepareBatchDrawBindings(recorder, moved);
+        return item != nullptr ? std::shared_ptr<DrawBindings>(recorder.OpenBindingsBlock(), item) : std::shared_ptr<DrawBindings>{};
+    }
+    auto result = std::make_shared<DrawBindings>();
+    if (!prepareDrawBindings(*result, recorder, moved, movedOnly)) return {};
+    recorder.Keep(result);
+    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer, snapshot.buffer->Bytes().size());
+    return result;
+}
+
+ShaderResources::DrawBindings* ShaderResources::PrepareBatchDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+    auto* item = TakeBindingStorage();
+    bool made = false;
+    try {
+        made = prepareDrawBindings(*item, recorder, moved, false);
+    } catch (...) {
+        GiveBindingStorage(item);
+        throw;
+    }
+    if (!made) {
+        GiveBindingStorage(item);
+        return nullptr;
+    }
+    OpenBatchBindings(recorder).items.push_back(item);
+    for (const auto& snapshot : item->snapshots) recorder.KeepBytes(snapshot.buffer, snapshot.buffer->Bytes().size());
+    return item;
+}
+
+bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
+    auto* const result = &bound;
     const bool timed = BindingsCounted();
     auto partMark = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto part = [&](BindingPart which) {
@@ -6549,14 +6653,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     };
     CountBinding(CountCalls);
     requireGuestBuffers(moved);
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return false;
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
     guestMemory.InPlaceReads(reads);
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
-    auto result = std::make_shared<DrawBindings>();
     thread_local std::vector<std::size_t>* selectedSlot = nullptr;
     auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
     selected.clear();
@@ -6707,7 +6810,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     part(PartSnapshots);
     if (selected.empty()) {
         CountBinding(CountEmpty);
-        return {};
+        return false;
     }
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     const auto poolSizes = [&](std::array<std::vector<VkDescriptorPoolSize>, 2>& counts, std::array<bool, 2>& described) {
@@ -6793,10 +6896,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         part(PartWrites);
         context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
         part(PartUpdate);
-        recorder.Keep(result);
-        for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer, snapshot.buffer->Bytes().size());
         part(PartKeep);
-        return result;
+        return true;
     }
     thread_local std::vector<std::size_t>* indicesSlot = nullptr;
     auto& snapshotIndices = ShaderRecompiler::ThreadOwned(indicesSlot);
@@ -6824,10 +6925,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     part(PartWrites);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     part(PartUpdate);
-    recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer, snapshot.buffer->Bytes().size());
     part(PartKeep);
-    return result;
+    return true;
 }
 
 void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {

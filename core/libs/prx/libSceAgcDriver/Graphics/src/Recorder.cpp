@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ReferenceStorage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -1421,6 +1422,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
 }
 
 Recorder::~Recorder() {
+    DrainSpentDrawPackets();
     if (std::getenv("APS5_PARALLEL_RECORD_REPORT") != nullptr) std::fprintf(stderr, "[secondary] %llu render passes opened, %llu ended in secondary command buffers, %llu draws recorded on the recorder thread\n", static_cast<unsigned long long>(secondaryPassesOpened.load(std::memory_order_relaxed)), static_cast<unsigned long long>(secondaryPassesEnded.load(std::memory_order_relaxed)), static_cast<unsigned long long>(secondaryJobsRecorded.load(std::memory_order_relaxed)));
     std::lock_guard gpu(GuestMemory::GpuMutex());
     try {
@@ -3629,6 +3631,92 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     open->keptBytes += bytes;
 }
 
+bool Recorder::BatchKeeps() {
+    static const bool enabled = std::getenv("APS5_NO_BATCH_KEEPS") == nullptr;
+    return enabled;
+}
+
+bool Recorder::VerifyBatchKeeps() {
+    static const bool enabled = BatchKeeps() && std::getenv("APS5_VERIFY_BATCH_KEEPS") != nullptr;
+    return enabled;
+}
+
+bool Recorder::keepOnceFirst(const void* object) {
+    if (deferringEffects != nullptr) return true;
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    ensureOpen();
+    const auto serial = submissions + 1;
+    if (keptOnce.empty()) keptOnce.resize(4096);
+    if (serial != keptOnceSerial) {
+        keptOnceSerial = serial;
+        keptOnceCount = 0;
+    }
+    if ((keptOnceCount + 1) * 2 > keptOnce.size()) {
+        std::vector<KeptOnceEntry> grown(keptOnce.size() * 2);
+        const auto mask = grown.size() - 1;
+        for (const auto& entry : keptOnce) {
+            if (entry.serial != serial) continue;
+            auto at = static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(entry.object) >> 4u) * 0x9e3779b97f4a7c15ull >> 20u) & mask;
+            while (grown[at].serial == serial) at = (at + 1) & mask;
+            grown[at] = entry;
+        }
+        keptOnce = std::move(grown);
+    }
+    const auto mask = keptOnce.size() - 1;
+    auto at = static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(object) >> 4u) * 0x9e3779b97f4a7c15ull >> 20u) & mask;
+    for (;;) {
+        auto& entry = keptOnce[at];
+        if (entry.serial != serial) {
+            entry = {object, serial};
+            ++keptOnceCount;
+            return true;
+        }
+        if (entry.object == object) return false;
+        at = (at + 1) & mask;
+    }
+}
+
+void Recorder::keepFirst(std::shared_ptr<void> object) {
+    if (VerifyBatchKeeps() && deferringEffects == nullptr) {
+        ensureOpen();
+        open->keptOnceObjects.push_back(object.get());
+    }
+    Keep(std::move(object));
+}
+
+void Recorder::VerifyKept(std::shared_ptr<void> object) {
+    if (object == nullptr) return;
+    ensureOpen();
+    open->keptPerDraw.push_back(std::move(object));
+}
+
+std::shared_ptr<void>& Recorder::OpenBindingsBlock() {
+    ensureOpen();
+    if (openBindingsSerial != submissions + 1) {
+        openBindingsSerial = submissions + 1;
+        openBindingsBlock.reset();
+    }
+    return openBindingsBlock;
+}
+
+void Recorder::verifyBatchKeeps(const Batch& batch) {
+    std::unordered_set<const void*> perDraw;
+    for (const auto& object : batch.keptPerDraw) perDraw.insert(object.get());
+    std::unordered_set<const void*> once(batch.keptOnceObjects.begin(), batch.keptOnceObjects.end());
+    std::unordered_set<const void*> kept;
+    for (const auto& object : batch.kept) kept.insert(object.get());
+    const auto missing = std::count_if(perDraw.begin(), perDraw.end(), [&](const void* object) { return !once.contains(object) || !kept.contains(object); });
+    const auto extra = std::count_if(once.begin(), once.end(), [&](const void* object) { return !perDraw.contains(object); });
+    static std::atomic<std::uint64_t> batches{0}, objects{0};
+    objects.fetch_add(perDraw.size(), std::memory_order_relaxed);
+    if (missing != 0 || extra != 0) {
+        std::fprintf(stderr, "[batch-keeps] APS5_VERIFY_BATCH_KEEPS: batch %llu keeps %zu objects once and %zu per draw: %lld of the per-draw set not kept, %lld kept beyond it\n", static_cast<unsigned long long>(batch.serial), once.size(), perDraw.size(), static_cast<long long>(missing), static_cast<long long>(extra));
+        std::fflush(stderr);
+        std::abort();
+    }
+    if (batches.fetch_add(1, std::memory_order_relaxed) % 1024 == 0) std::fprintf(stderr, "[batch-keeps] verified %llu batches, %llu distinct objects, none differing\n", static_cast<unsigned long long>(batches.load(std::memory_order_relaxed)), static_cast<unsigned long long>(objects.load(std::memory_order_relaxed)));
+}
+
 void Recorder::KeepThroughHold(std::shared_ptr<void> object) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::AssertGpuLockHeld("Recorder::KeepThroughHold");
@@ -3653,6 +3741,15 @@ void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     }
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     ensureOpen();
+    const bool memo = BatchKeeps();
+    if (memo) {
+        if (keepBytesMemoSerial != submissions + 1) {
+            keepBytesMemoSerial = submissions + 1;
+            keepBytesMemo.fill(nullptr);
+        }
+        if (std::find(keepBytesMemo.begin(), keepBytesMemo.end(), owner) != keepBytesMemo.end()) return;
+        keepBytesMemo[keepBytesMemoNext++ % keepBytesMemo.size()] = owner;
+    }
     if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
 }
 
@@ -4685,6 +4782,7 @@ void Recorder::Submit() {
     // every packet or submission end until a real batch is next submitted.
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     dropStaleHoldKept();
+    openBindingsBlock.reset();
     if (open == nullptr) return;
     static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
     if (counted) {
@@ -5205,6 +5303,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Reap);
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     inFlightKeptBytes -= batch->keptBytes;
+    if (VerifyBatchKeeps()) verifyBatchKeeps(*batch);
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;

@@ -212,6 +212,7 @@ public:
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
         std::vector<std::shared_ptr<Buffer>> owners;
+        void Release();
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -221,6 +222,7 @@ public:
         std::span<const std::uint32_t> words;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
+    DrawBindings* PrepareBatchDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
     struct MovedPlan {
         std::vector<MovedBuffer> moved;
         std::vector<std::pair<std::uint64_t, std::size_t>> checks;
@@ -499,6 +501,7 @@ private:
     std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read, std::uint32_t extent);
     std::uint64_t guestBufferBytes(std::span<const std::uint32_t> words) const;
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
+    bool prepareDrawBindings(DrawBindings& result, Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const;
     void requireGuestBuffers(std::span<const MovedBuffer> moved = {}) const;
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).

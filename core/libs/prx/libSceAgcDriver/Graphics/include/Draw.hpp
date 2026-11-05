@@ -101,6 +101,13 @@ public:
     ResolverScope& operator=(const ResolverScope&) = delete;
 };
 void BuryPackets(std::vector<DrawPacket*>& packets);
+constexpr unsigned SpentPacketLanes = 2;
+void SetSpentPacketWake(void (*wake)(unsigned lane));
+void StartSpentPacketLane(unsigned lane);
+void StopSpentPacketLane(unsigned lane);
+bool SpentDrawPacketsWaiting(unsigned lane);
+bool ReapSpentDrawPacket(unsigned lane);
+void DrainSpentDrawPackets();
 void ApplyDrawMemoKeeps(const Context& context, DrawPacket& packet);
 void SetRedoHook(void (*hook)());
 enum class DrawPacketField : std::uint8_t { Template, Pipeline, Targets, Framebuffer, Inputs, Moved, Depth, Refreshes, Flags, Count };

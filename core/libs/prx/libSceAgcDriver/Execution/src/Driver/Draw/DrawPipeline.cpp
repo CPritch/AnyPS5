@@ -881,6 +881,13 @@ void installFaultReport() {
 }
 #endif
 
+void DrawPipeline::WakeResolverForSpent(unsigned) {
+    auto& pipeline = Queue0();
+    pipeline.resolverWake.fetch_add(1, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (pipeline.resolverSleeping.load(std::memory_order_seq_cst) != 0) pipeline.resolverWake.notify_one();
+}
+
 void DrawPipeline::resolveAhead() {
 #ifdef __linux__
     installFaultReport();
@@ -888,6 +895,11 @@ void DrawPipeline::resolveAhead() {
     GuestMemory::MarkResolverThread();
     PinResolverThread("draw resolver");
     PerformanceTimer::UntraceThisThread();
+    Graphics::SetSpentPacketWake(&WakeResolverForSpent);
+    Graphics::StartSpentPacketLane(0);
+    struct StopSpent {
+        ~StopSpent() { Graphics::StopSpentPacketLane(0); }
+    } stopSpent;
     constexpr std::chrono::microseconds idleNap{20};
     static const bool spins = std::getenv("APS5_RESOLVER_SPINS") != nullptr;
     static const auto window = [] {
@@ -896,7 +908,7 @@ void DrawPipeline::resolveAhead() {
     }();
     for (;;) {
         const auto preProofDue = [&] { return preProofState.load(std::memory_order_acquire) == PreProofPosted && preProofAfter.load(std::memory_order_acquire) == lastJobTarget && lastJobTemplate != nullptr; };
-        const auto posted = [&] { return resolveState.load(std::memory_order_acquire) == ResolvePosted || resolverClosing.load(std::memory_order_relaxed) || preProofDue(); };
+        const auto posted = [&] { return resolveState.load(std::memory_order_acquire) == ResolvePosted || resolverClosing.load(std::memory_order_relaxed) || preProofDue() || Graphics::SpentDrawPacketsWaiting(0); };
         if (spins && !SpinUntil(HandoffSpinWindow(), posted)) {
             std::this_thread::sleep_for(idleNap);
             continue;
@@ -912,6 +924,7 @@ void DrawPipeline::resolveAhead() {
         if (resolverClosing.load(std::memory_order_acquire)) return;
         if (resolveState.load(std::memory_order_acquire) != ResolvePosted) {
             if (preProofDue()) runPreProof();
+            else Graphics::ReapSpentDrawPacket(0);
             continue;
         }
         int expected = ResolvePosted;

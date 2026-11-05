@@ -238,6 +238,39 @@ void SharedOwnerCountsOncePerBatch() {
     recorder.Sync();
 }
 
+void KeepOnceKeepsOneReferencePerBatch() {
+    mock = MockDevice{};
+    std::weak_ptr<int> watch;
+    std::vector<std::shared_ptr<int>> many;
+    for (int index = 0; index < 8192; ++index) many.push_back(std::make_shared<int>(index));
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(mockContext());
+        auto object = std::make_shared<int>(1);
+        auto second = std::make_shared<int>(2);
+        watch = object;
+        for (int use = 0; use < 3; ++use) {
+            recorder.KeepOnce(object);
+            recorder.KeepOnce(second);
+        }
+        Expect(object.use_count() == 2 && second.use_count() == 2, "three uses in one batch hold " + std::to_string(object.use_count() - 1) + " references");
+        std::shared_ptr<int> none;
+        recorder.KeepOnce(none);
+        recorder.Submit();
+        recorder.KeepOnce(object);
+        Expect(object.use_count() == 3, "the next batch shares the submitted batch's reference");
+        object.reset();
+        Expect(!watch.expired(), "a batch dropped an object it keeps once");
+        for (int round = 0; round < 2; ++round) {
+            for (const auto& item : many) recorder.KeepOnce(item);
+        }
+        Expect(std::all_of(many.begin(), many.end(), [](const auto& item) { return item.use_count() == 2; }), "a grown table kept an object twice");
+        recorder.Sync();
+    }
+    Expect(watch.expired(), "a finished batch still holds an object it kept once");
+    Expect(std::all_of(many.begin(), many.end(), [](const auto& item) { return item.use_count() == 1; }), "a grown table left a reference behind");
+}
+
 void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleResult = VK_ERROR_DEVICE_LOST) {
     mock = MockDevice{};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -309,6 +342,7 @@ int main() {
         SyncedWithinTwiceTheBudget();
         CountFollowsEveryPath();
         SharedOwnerCountsOncePerBatch();
+        KeepOnceKeepsOneReferencePerBatch();
         FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_HOST_MEMORY);

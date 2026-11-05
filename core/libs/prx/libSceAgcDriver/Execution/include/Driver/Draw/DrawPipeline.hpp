@@ -236,6 +236,7 @@ private:
     std::atomic<std::uint32_t> prepareWake{0};
     std::atomic<std::uint32_t> preparersSleeping{0};
     void resolveAhead();
+    static void WakeResolverForSpent(unsigned lane);
     static void joinResolve(bool revoke);
     void postPreProof(const void* currentTemplate, std::span<const Range> depth, const std::vector<Range>* writes);
     void runPreProof();
