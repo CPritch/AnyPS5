@@ -5569,18 +5569,8 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
         const auto first = snapshotRecorder.DrawUpload(16);
         const auto second = snapshotRecorder.DrawUpload(16);
         Require(second.buffer == first.buffer && second.offset >= first.offset + 16 && second.offset % alignment == 0, "upload slices overlap or are not aligned");
-        std::array<std::byte, 16> firstBytes{};
-        firstBytes.fill(std::byte{0xa5});
-        Recorder::CopyToDrawUpload(first.bytes, firstBytes.data(), firstBytes.size());
-        Require(!Recorder::StagedDrawUploads() || first.bytes != first.buffer->Bytes().data() + first.offset, "a staged upload slice writes the memory the GPU reads");
         const auto whole = snapshotRecorder.DrawUpload(Recorder::DrawUploadChunk);
         Require(whole.buffer != second.buffer && whole.offset == 0, "a full upload chunk was not replaced");
-        Require(std::memcmp(first.buffer->Bytes().data() + first.offset, firstBytes.data(), firstBytes.size()) == 0, "replacing the upload chunk lost a staged slice");
-        std::array<std::byte, 64> lateBytes{};
-        lateBytes.fill(std::byte{0x3c});
-        Recorder::CopyToDrawUpload(whole.bytes, lateBytes.data(), lateBytes.size());
-        snapshotRecorder.FlushDrawUploads();
-        Require(std::memcmp(whole.buffer->Bytes().data(), lateBytes.data(), lateBytes.size()) == 0, "a flush did not store the staged upload");
         snapshotRecorder.Sync();
     }
     recorder.Activate();

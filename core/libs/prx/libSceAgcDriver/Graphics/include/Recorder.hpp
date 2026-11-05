@@ -182,8 +182,6 @@ public:
     };
     PendingWriteMark PendingWritesMark(std::uint64_t address, std::size_t bytes) const;
     static bool AlignedUploadCopies();
-    static bool StagedDrawUploads();
-    void FlushDrawUploads();
     static void CopyToDrawUpload(std::byte* destination, const std::byte* source, std::size_t bytes);
     const std::shared_ptr<Buffer>& DrawUploadOwner(const Buffer* buffer) const;
     bool DrawUploadBatchKept(const Buffer* buffer) const;
@@ -1025,11 +1023,6 @@ private:
     std::uint64_t openBindingsSerial = 0;
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
-    std::vector<std::byte> drawUploadShadowStore;
-    std::byte* drawUploadShadow = nullptr;
-    std::size_t drawUploadShadowBytes = 0;
-    VkDeviceSize drawUploadFlushed = 0;
-    VkDeviceSize drawUploadVerified = 0;
     const Buffer* drawUploadKept = nullptr;
     std::uint64_t drawUploadKeptSerial = 0;
     std::vector<VkFence> spare;
