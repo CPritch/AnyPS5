@@ -1190,7 +1190,7 @@ bool DrawPipeline::SealsBreakProofs() {
 }
 
 bool DrawPipeline::OfferAcrossLabels() {
-    static const bool across = std::getenv("APS5_OFFER_ACROSS_LABELS") != nullptr && GuestMemory::ScopedLabelBreaks();
+    static const bool across = std::getenv("APS5_NO_OFFER_ACROSS_LABELS") == nullptr && GuestMemory::ScopedLabelBreaks();
     return across;
 }
 

@@ -6661,7 +6661,7 @@ ShaderResources::JobBindings ShaderResources::JobBindingsMode() {
 
 namespace {
 
-enum JobBindingCount : std::size_t { JobEmits, JobOwn, JobDeclined, JobMatched, JobStampTracker, JobStampEpoch, JobStampRegistry, JobDisturbed, JobSelection, JobFewer, JobBytes, JobTaken, JobRedone, JobVerified, JobVerifyFewer, JobVerifyDiffers, JobWithSnapshots, JobCountTotal };
+enum JobBindingCount : std::size_t { JobEmits, JobOwn, JobDeclined, JobMatched, JobStampTracker, JobStampEpoch, JobStampRegistry, JobDisturbed, JobSelection, JobFewer, JobBytes, JobTaken, JobRedone, JobVerified, JobVerifyFewer, JobVerifyDiffers, JobWithSnapshots, JobTrackerRanges, JobCountTotal };
 std::array<std::atomic<std::uint64_t>, JobCountTotal> jobBindingCounts{};
 
 void CountJobBindings(JobBindingCount count) {
@@ -6672,7 +6672,7 @@ std::string JobBindingsLine() {
     const auto at = [](JobBindingCount count) { return static_cast<unsigned long long>(jobBindingCounts[count].load(std::memory_order_relaxed)); };
     const auto compared = at(JobEmits) - at(JobDeclined);
     char text[640];
-    std::snprintf(text, sizeof(text), "[job-bindings] draws %llu, without a job's bindings %llu, job declined %llu, compared %llu: matched %llu (%.1f %% of compared, %.1f %% of draws); differing: stamp tracker %llu, epoch %llu, registry %llu, disturbed at the emit %llu, selection %llu, job selected fewer %llu, bytes %llu; taken %llu, redone %llu, verified %llu (job selected fewer %llu, differing %llu), made with snapshots %llu", at(JobEmits) + at(JobOwn), at(JobOwn), at(JobDeclined), compared, at(JobMatched), compared == 0 ? 0.0 : 100.0 * static_cast<double>(at(JobMatched)) / static_cast<double>(compared), at(JobEmits) + at(JobOwn) == 0 ? 0.0 : 100.0 * static_cast<double>(at(JobMatched)) / static_cast<double>(at(JobEmits) + at(JobOwn)), at(JobStampTracker), at(JobStampEpoch), at(JobStampRegistry), at(JobDisturbed), at(JobSelection), at(JobFewer), at(JobBytes), at(JobTaken), at(JobRedone), at(JobVerified), at(JobVerifyFewer), at(JobVerifyDiffers), at(JobWithSnapshots));
+    std::snprintf(text, sizeof(text), "[job-bindings] draws %llu, without a job's bindings %llu, job declined %llu, compared %llu: matched %llu (%.1f %% of compared, %.1f %% of draws); differing: stamp tracker %llu, epoch %llu, registry %llu, disturbed at the emit %llu, selection %llu, job selected fewer %llu, bytes %llu; taken %llu, redone %llu, verified %llu (job selected fewer %llu, differing %llu), made with snapshots %llu, tracker moved over other memory %llu", at(JobEmits) + at(JobOwn), at(JobOwn), at(JobDeclined), compared, at(JobMatched), compared == 0 ? 0.0 : 100.0 * static_cast<double>(at(JobMatched)) / static_cast<double>(compared), at(JobEmits) + at(JobOwn) == 0 ? 0.0 : 100.0 * static_cast<double>(at(JobMatched)) / static_cast<double>(at(JobEmits) + at(JobOwn)), at(JobStampTracker), at(JobStampEpoch), at(JobStampRegistry), at(JobDisturbed), at(JobSelection), at(JobFewer), at(JobBytes), at(JobTaken), at(JobRedone), at(JobVerified), at(JobVerifyFewer), at(JobVerifyDiffers), at(JobWithSnapshots), at(JobTrackerRanges));
     return text;
 }
 
@@ -6761,7 +6761,19 @@ const ShaderResources::DrawBindings* ShaderResources::BindingsForEmit(Recorder& 
     }
     static const bool lockedStamp = std::getenv("APS5_LOCKED_SNAPSHOT_STAMP") != nullptr;
     const std::array<std::uint64_t, 3> stamp{lockedStamp ? GuestMemory::TrackerGeneration() : GuestMemory::PublishedTrackerGeneration(), GuestMemory::CollectEpoch(), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
-    const auto stampCause = !ahead->stamped ? JobCountTotal : ahead->stamp[0] != stamp[0] ? JobStampTracker : ahead->stamp[1] != stamp[1] ? JobStampEpoch : ahead->stamp[2] != stamp[2] ? JobStampRegistry : JobCountTotal;
+    auto stampCause = !ahead->stamped ? JobCountTotal : ahead->stamp[1] != stamp[1] ? JobStampEpoch : ahead->stamp[2] != stamp[2] ? JobStampRegistry : ahead->stamp[0] != stamp[0] ? JobStampTracker : JobCountTotal;
+    if (stampCause == JobStampTracker && ahead->bindings != nullptr) {
+        thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
+        auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
+        queries.clear();
+        for (const auto& snapshot : ahead->bindings->snapshots) {
+            if (snapshot.address != 0) queries.push_back({snapshot.address, snapshot.bytes, ahead->stamp[0]});
+        }
+        if (GuestMemory::UnchangedSinceAll(queries)) {
+            stampCause = JobCountTotal;
+            CountJobBindings(JobTrackerRanges);
+        }
+    }
     if (mode == JobBindings::Shadow) {
         const auto* own = PrepareBatchDrawBindings(recorder, moved);
         const auto compared = CompareBindings(ahead->bindings, own);

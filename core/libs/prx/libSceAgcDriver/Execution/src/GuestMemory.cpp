@@ -2147,7 +2147,7 @@ struct BreakProofsAfter {
 }
 
 bool ScopedLabelBreaks() {
-    static const bool scoped = std::getenv("APS5_SCOPED_LABEL_BREAKS") != nullptr;
+    static const bool scoped = std::getenv("APS5_NO_SCOPED_LABEL_BREAKS") == nullptr;
     return scoped;
 }
 
