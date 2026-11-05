@@ -2152,6 +2152,7 @@ ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::Descriptor
     std::erase_if(tables, [&](const ReusedTable& table) {
         if (table.state.epoch != state.epoch || table.state.unwatched != state.unwatched || table.state.depthSurfaces != state.depthSurfaces) return true;
         if (table.state.allocations == state.allocations) return false;
+        if (std::any_of(table.elements.begin(), table.elements.end(), [](const ReusedTableElement& element) { return element.rejected; })) return true;
         return std::any_of(table.queries.begin(), table.queries.end(), [&](const GuestMemory::UnchangedQuery& query) { return GuestAllocations::GuestAllocationsChangedSince_nid_postfix(table.state.allocations, query.address, query.bytes); });
     });
     for (auto& table : tables) {
