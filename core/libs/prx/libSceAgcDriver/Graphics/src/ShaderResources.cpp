@@ -51,10 +51,6 @@
 
 namespace AgcDriver::Graphics {
 namespace {
-std::atomic<std::uint64_t> storageCacheRemovals{0};
-}
-
-namespace {
 
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
@@ -301,7 +297,6 @@ void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     }
     if (it->texture.use_count() > 1) noteReleased(it->texture, ReleaseSite::EvictedHeld);
     cache.index.erase(it->key);
-    storageCacheRemovals.fetch_add(1, std::memory_order_relaxed);
     cache.entries.erase(it);
     ++cache.erasures;
 }
@@ -1307,7 +1302,6 @@ std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::li
     cache.bytes -= it->accounted;
     cache.index.erase(it->key);
     cache.byImage.erase(it->texture.get());
-    storageCacheRemovals.fetch_add(1, std::memory_order_relaxed);
     cache.entries.erase(it);
     cache.generation.fetch_add(1, std::memory_order_release);
     return texture;
@@ -1605,7 +1599,6 @@ void ClearCachedTextures(VkDevice device) {
             storage.bytes -= it->accounted;
             storage.index.erase(it->key);
             storage.byImage.erase(it->texture.get());
-            storageCacheRemovals.fetch_add(1, std::memory_order_relaxed);
             it = storage.entries.erase(it);
             storage.generation.fetch_add(1, std::memory_order_release);
         }
@@ -1813,10 +1806,6 @@ std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, con
 
 std::shared_ptr<StorageTexture> FindRepeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
     return repeatStorageSurface(context, requested, stored, false);
-}
-
-std::uint64_t StorageCacheRemovals() {
-    return storageCacheRemovals.load(std::memory_order_relaxed);
 }
 
 bool RefreshCachedStorage(const Context& context, const std::shared_ptr<StorageTexture>& texture) {
