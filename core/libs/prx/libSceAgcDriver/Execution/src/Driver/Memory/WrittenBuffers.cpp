@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include <atomic>
+#include <cstdio>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -101,8 +103,40 @@ void Driver::noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint
     writtenBuffers.Push({0, begin, end, ++writtenBufferSerial, queue, false});
 }
 
+namespace {
+
+bool mayWriteGuestBuffers(const ShaderRecompiler::RecompileResult& compiled) {
+    for (const auto& binding : compiled.bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            if (element >= binding.bufferWritten.size() || binding.bufferWritten[element]) return true;
+        }
+    }
+    return false;
+}
+
+}
+
 void Driver::noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue) {
+    static const bool memo = std::getenv("APS5_NO_DRAW_WRITER_MEMO") == nullptr;
+    static const bool verified = std::getenv("APS5_VERIFY_DRAW_WRITER_MEMO") != nullptr;
     for (const auto& stage : stages) {
+        if (memo) {
+            std::atomic_ref<std::int8_t> known(stage.program->writesGuestBuffersMemo);
+            auto writes = known.load(std::memory_order_relaxed);
+            if (writes < 0) {
+                writes = mayWriteGuestBuffers(*stage.program) ? 1 : 0;
+                known.store(writes, std::memory_order_relaxed);
+            }
+            if (writes == 0) {
+                if (verified && mayWriteGuestBuffers(*stage.program)) {
+                    std::fprintf(stderr, "[draw-writers] APS5_VERIFY_DRAW_WRITER_MEMO: a program remembered as writing no buffer writes one\n");
+                    std::fflush(stderr);
+                    std::abort();
+                }
+                continue;
+            }
+        }
         forEachWrittenBuffer(*stage.program, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { noteForeignWriter(begin, end, queue); });
     }
 }

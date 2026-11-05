@@ -939,6 +939,7 @@ struct ResultKeyMemo {
 };
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
+    mutable std::int8_t writesGuestBuffersMemo = -1;
     ResultKeyMemo drawKeyMemo;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
