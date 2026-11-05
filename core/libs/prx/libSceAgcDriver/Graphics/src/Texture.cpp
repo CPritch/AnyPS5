@@ -135,6 +135,7 @@ std::atomic<std::uint64_t> queuedReadHeld{0};
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
 std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
+std::atomic<std::uint64_t> laneRefreshesProved{0};
 std::array<std::atomic<std::uint64_t>, 4> labelReadbackCounts{};
 std::atomic<std::uint64_t> untrackedCompares{0};
 std::atomic<std::uint64_t> storeSerials{0};
@@ -2436,7 +2437,9 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         epochRefreshes.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
+    if (provedFirst && epoch != 0 && GuestMemory::OnResolverThread() && refreshProvedOnLane(epoch)) return true;
     if (provedFirst) GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverRefresh);
+    const std::lock_guard imageLock(proofMutex);
     const auto proofBefore = GuestMemory::ProofSerial();
     const auto pendingBefore = PendingSerial();
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -2796,7 +2799,24 @@ bool StorageTexture::otherPendingOverlaps() const {
     return std::any_of(pending.textures.begin(), pending.textures.end(), pendingInside) || std::any_of(pending.flushing.begin(), pending.flushing.end(), overlapping);
 }
 
-bool StorageTexture::refreshProved() {
+bool StorageTexture::refreshProvedOnLane(std::uint64_t epoch) {
+    static const bool enabled = std::getenv("APS5_NO_PROVED_LANE_REFRESH") == nullptr;
+    if (!enabled) return false;
+    std::unique_lock imageLock(proofMutex, std::try_to_lock);
+    if (!imageLock.owns_lock() || !layerBehind.empty() || refreshProof.generation == 0) return false;
+    const auto proofBefore = GuestMemory::ProofSerial();
+    const auto pendingBefore = PendingSerial();
+    if (AnyPendingCpuWrites(context) || !refreshProved(true) || GuestMemory::ProofSerial() != proofBefore || PendingSerial() != pendingBefore) return false;
+    provedEpoch.store(epoch, std::memory_order_relaxed);
+    provedProof.store(proofBefore, std::memory_order_relaxed);
+    provedPending.store(pendingBefore, std::memory_order_relaxed);
+    NoteProved();
+    refreshesProved.fetch_add(1, std::memory_order_relaxed);
+    laneRefreshesProved.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool StorageTexture::refreshProved(bool lane) {
     const auto fail = [](std::uint8_t code) {
         lastProvedFail = code;
         return false;
@@ -2804,7 +2824,7 @@ bool StorageTexture::refreshProved() {
     if (refreshProof.generation == 0) return fail(1);
     if (generation != refreshProof.generation) return fail(2);
     if (uploadedKeys != refreshProof.keys) return fail(3);
-    if (!GuestMemory::GpuMutex().HeldByThisThread()) return fail(4);
+    if (!lane && !GuestMemory::GpuMutex().HeldByThisThread()) return fail(4);
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
@@ -2867,6 +2887,10 @@ void StorageTexture::takeRefreshProof(bool aliased) {
 
 std::uint64_t StorageTexture::RefreshesProved() {
     return refreshesProved.load(std::memory_order_relaxed);
+}
+
+std::uint64_t StorageTexture::LaneRefreshesProved() {
+    return laneRefreshesProved.load(std::memory_order_relaxed);
 }
 
 std::uint64_t StorageTexture::UntrackedCompares() {

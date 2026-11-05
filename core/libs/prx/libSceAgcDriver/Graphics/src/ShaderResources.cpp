@@ -1891,6 +1891,96 @@ ShaderResources::ShaderResources(const Context& context, const CompiledShader& c
 
 namespace {
 
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::AheadEvent::Count)> aheadEvents{};
+
+}
+
+void ShaderResources::CountAhead(AheadEvent event) {
+    aheadEvents[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::AheadEvent::Count)> ShaderResources::AheadCounts() {
+    std::array<std::uint64_t, static_cast<std::size_t>(AheadEvent::Count)> counts{};
+    for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = aheadEvents[index].load(std::memory_order_relaxed);
+    return counts;
+}
+
+bool ShaderResources::BuildableAhead(std::span<const CompiledShader> shaders) {
+    return !shaders.empty() && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) {
+        return shader.program != nullptr && shader.stage != ShaderRecompiler::ShaderStage::Compute && std::none_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
+    });
+}
+
+ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, AheadBuild) : context(context), guestMemory(context) {
+    Require(BuildableAhead(shaders), "a template built ahead needs graphics stages without address tables");
+    drawBuild = true;
+    builtAhead = true;
+    uploadDeferred = true;
+    prepareAddressBindings(shaders, {});
+    buildPrepare(shaders, &target, colorAttachments, indexAddress, indexBytes);
+}
+
+bool ShaderResources::CompleteAhead() {
+    Require(builtAhead && uploadDeferred && !completed, "a template built ahead completes once");
+    if (!registeredImageViewsCurrent(registeredImageViews)) {
+        CountAhead(AheadEvent::ViewsMoved);
+        return false;
+    }
+    phaseStart = std::chrono::steady_clock::now();
+    try {
+        const AgcDriver::DriverDetail::DrawPipeline::LaneSerial uploadAlone;
+        requireGuestBuffers();
+        guestMemory.UploadPrepare(usesBda);
+        timing.uploadMs = phase(BuildPhase::Upload);
+    } catch (...) {
+        release();
+        throw;
+    }
+    uploadDeferred = false;
+    {
+        const AgcDriver::DriverDetail::DrawPipeline::LaneSerial completeAlone;
+        buildComplete();
+    }
+    CountAhead(AheadEvent::Completed);
+    return true;
+}
+
+std::string ShaderResources::DifferenceFrom(const ShaderResources& other) const {
+    if (layoutKey != other.layoutKey || fragmentLayoutKey != other.fragmentLayoutKey || splitSets != other.splitSets || updateAfterBind != other.updateAfterBind) return "set layouts";
+    if (bindings.size() != other.bindings.size()) return "binding count";
+    for (std::size_t index = 0; index < bindings.size(); ++index) {
+        const auto& a = bindings[index];
+        const auto& b = other.bindings[index];
+        if (a.layout.binding != b.layout.binding || a.layout.descriptorType != b.layout.descriptorType || a.layout.descriptorCount != b.layout.descriptorCount || a.layout.stageFlags != b.layout.stageFlags || a.flags != b.flags || a.set != b.set || a.allocations != b.allocations || a.imageAllocations != b.imageAllocations) return "binding " + std::to_string(index);
+    }
+    if (allocations.size() != other.allocations.size()) return "allocation count";
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& a = allocations[index];
+        const auto& b = other.allocations[index];
+        if (a.address != b.address || a.size != b.size || a.guest != b.guest || a.role != b.role || a.written != b.written || a.writeOnly != b.writeOnly || a.adjustment != b.adjustment || a.pushByte != b.pushByte || a.dataAllocation != b.dataAllocation || a.dataByte != b.dataByte || a.dataWords != b.dataWords || (a.buffer == nullptr) != (b.buffer == nullptr)) return "allocation " + std::to_string(index);
+        if (a.buffer != nullptr && !a.guest && a.role != ShaderRecompiler::DescriptorRole::ImageTableMap && !std::equal(a.buffer->Bytes().begin(), a.buffer->Bytes().begin() + static_cast<std::ptrdiff_t>(a.size), b.buffer->Bytes().begin())) return "data words of allocation " + std::to_string(index);
+    }
+    if (textures != other.textures || textureFirstLayer != other.textureFirstLayer || textureBaseLevel != other.textureBaseLevel || textureSrgb != other.textureSrgb) return "sampled textures";
+    if (storageTextures != other.storageTextures || storageMips != other.storageMips || storageFirstLayer != other.storageFirstLayer || storageWritten != other.storageWritten || storageAtomic != other.storageAtomic || storageAtomic64 != other.storageAtomic64 || multisampleStorageViews != other.multisampleStorageViews) return "storage images";
+    if (samplers.size() != other.samplers.size()) return "sampler count";
+    for (std::size_t index = 0; index < samplers.size(); ++index) {
+        if ((samplers[index] == nullptr) != (other.samplers[index] == nullptr) || (samplers[index] != nullptr && samplers[index]->Handle() != other.samplers[index]->Handle())) return "sampler " + std::to_string(index);
+    }
+    if (descriptorImages.size() != other.descriptorImages.size() || !std::equal(descriptorImages.begin(), descriptorImages.end(), other.descriptorImages.begin(), [](const VkDescriptorImageInfo& a, const VkDescriptorImageInfo& b) { return a.sampler == b.sampler && a.imageView == b.imageView && a.imageLayout == b.imageLayout; })) return "image descriptor words";
+    if (descriptorBuffers.size() != other.descriptorBuffers.size() || !std::equal(descriptorBuffers.begin(), descriptorBuffers.end(), other.descriptorBuffers.begin(), [](const VkDescriptorBufferInfo& a, const VkDescriptorBufferInfo& b) { return a.range == b.range; })) return "buffer descriptor words";
+    if (descriptorWrites.size() != other.descriptorWrites.size()) return "descriptor writes";
+    if (dataWordsHash != other.dataWordsHash || pushPatches != other.pushPatches) return "data words and push patches";
+    if (dataPatches.size() != other.dataPatches.size() || !std::equal(dataPatches.begin(), dataPatches.end(), other.dataPatches.begin(), [](const DataPatch& a, const DataPatch& b) { return a.allocation == b.allocation && a.byte == b.byte && a.adjustment == b.adjustment; })) return "data patches";
+    if (guestMemory.InPlaceReads() != other.guestMemory.InPlaceReads() || guestMemory.DeviceReads() != other.guestMemory.DeviceReads() || guestMemory.Writes() != other.guestMemory.Writes() || guestMemory.CopiedBytes() != other.guestMemory.CopiedBytes() || guestMemory.HasCopiedWrites() != other.guestMemory.HasCopiedWrites() || guestMemory.HasGpuCopies() != other.guestMemory.HasGpuCopies()) return "uploads";
+    if (writeOnlyRanges != other.writeOnlyRanges) return "write-only ranges";
+    if (reusable != other.reusable || directRegions.size() != other.directRegions.size() || !std::equal(directRegions.begin(), directRegions.end(), other.directRegions.begin(), [](const DirectRegion& a, const DirectRegion& b) { return a.begin == b.begin && a.end == b.end; })) return "reusability";
+    if (describedRanges.size() != other.describedRanges.size() || !std::equal(describedRanges.begin(), describedRanges.end(), other.describedRanges.begin(), [](const DescribedRange& a, const DescribedRange& b) { return a.address == b.address && a.bytes == b.bytes && a.dccAddress == b.dccAddress && a.imageTable == b.imageTable; })) return "described ranges";
+    if ((bda == nullptr) != (other.bda == nullptr) || faultChecks != other.faultChecks) return "fault buffer";
+    return {};
+}
+
+namespace {
+
 // Whether a compute stage maps registered guest memory through BDA tables (see prepareAddressBindings).
 bool UsesAddressTables(const CompiledShader& compute) {
     Require(compute.program != nullptr, "missing compiled shader");
@@ -2451,9 +2541,11 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         // collects cost the same wherever they run.
         if (precollectImages()) phase(BuildPhase::Precollect);
         if (drawBuild && !usesBda && std::all_of(allocations.begin(), allocations.end(), [&](const Allocation& allocation) { return !allocation.guest || allocation.pushByte >= 0 || (allocation.dataAllocation >= 0 && allocation.dataByte < allocations[static_cast<std::size_t>(allocation.dataAllocation)].size); })) guestMemory.AllowAdjustedRegions();
-        requireGuestBuffers();
-        guestMemory.UploadPrepare(usesBda);
-        timing.uploadMs = phase(BuildPhase::Upload);
+        if (!uploadDeferred) {
+            requireGuestBuffers();
+            guestMemory.UploadPrepare(usesBda);
+            timing.uploadMs = phase(BuildPhase::Upload);
+        }
         splitSets = SplitsSets(context, shaders);
         std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
         bool tablesUpdateAfterBind = false;

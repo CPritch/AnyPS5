@@ -183,6 +183,15 @@ public:
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
     void Complete();
     bool Completed() const { return completed; }
+    struct AheadBuild {};
+    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, AheadBuild);
+    static bool BuildableAhead(std::span<const CompiledShader> shaders);
+    bool BuiltAhead() const { return builtAhead; }
+    bool CompleteAhead();
+    std::string DifferenceFrom(const ShaderResources& other) const;
+    enum class AheadEvent : std::size_t { Made, Failed, Completed, ViewsMoved, Dropped, Verified, Count };
+    static void CountAhead(AheadEvent event);
+    static std::array<std::uint64_t, static_cast<std::size_t>(AheadEvent::Count)> AheadCounts();
     ~ShaderResources();
     ShaderResources(const ShaderResources&) = delete;
     ShaderResources& operator=(const ShaderResources&) = delete;
@@ -781,6 +790,8 @@ private:
     // Stage A runs without the device lock (a deferred, non-address-based build).
     bool unlockedPrepare = false;
     bool completed = false;
+    bool builtAhead = false;
+    bool uploadDeferred = false;
     std::chrono::steady_clock::time_point phaseStart;
 };
 

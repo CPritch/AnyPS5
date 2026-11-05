@@ -475,6 +475,7 @@ public:
     static std::uint64_t SlabRetiles();
     static std::uint64_t PaddingSeedCopies();
     static std::uint64_t RefreshesProved();
+    static std::uint64_t LaneRefreshesProved();
     static std::uint64_t ClearHandOvers();
     static std::uint64_t HandedOverSuperseded();
     static void SetClearHandOver(bool enabled);
@@ -488,6 +489,8 @@ private:
     std::atomic<std::uint64_t> provedEpoch{0};
     std::atomic<std::uint64_t> provedProof{0};
     std::atomic<std::uint64_t> provedPending{0};
+    std::recursive_mutex proofMutex;
+    bool refreshProvedOnLane(std::uint64_t epoch);
     StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
     // The regions of every array layer, or of the tracked layers `layers` selects.
     std::vector<VkBufferImageCopy> CopyRegions(const std::vector<bool>* layers = nullptr) const;
@@ -637,7 +640,7 @@ private:
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration();
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
-    bool refreshProved();
+    bool refreshProved(bool lane = false);
     void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
