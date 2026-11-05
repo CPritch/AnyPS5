@@ -1529,6 +1529,7 @@ int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) 
 #endif
         auto* insidePointer = reinterpret_cast<void*>(inside);
         const auto insideBytes = static_cast<std::size_t>(insideEnd - inside);
+        auto changedBytes = insideBytes;
 #ifdef _WIN32
         if (nativeProtection != PROT_NONE && hostStack) CommitReservedPages(insidePointer, insideBytes);
         const bool protectedPages = mprotect(insidePointer, insideBytes, nativeProtection) == 0;
@@ -1541,6 +1542,7 @@ int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) 
 #if defined(__linux__)
         if (!protectedPages && errno == ENOMEM) {
             MapUnmappedPages(insidePointer, static_cast<std::size_t>((stackEnd & ~hostPageMask) - inside));
+            changedBytes = static_cast<std::size_t>((stackEnd & ~hostPageMask) - inside);
             protectedPages = mprotect(insidePointer, insideBytes, nativeProtection) == 0;
         }
 #endif
@@ -1548,7 +1550,7 @@ int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) 
         if (!protectedPages) throw std::system_error(errno, std::generic_category(), "mprotect failed");
         if (inside != requested) RecordProtection(requestedPointer, static_cast<std::size_t>(inside - requested), prot);
         NoteGuestStackProtection(inside, insideBytes, (prot & 3) == 3);
-        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(inside, insideBytes);
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(inside, changedBytes);
         RecordProtection(insidePointer, insideBytes, prot);
         return 0;
     }
