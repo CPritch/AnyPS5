@@ -225,7 +225,9 @@ int main() {
         Require(bindingsDiffer == 0, "a job's bindings differed from the emit's");
         if (std::getenv("APS5_DRAW_PIPELINE") != nullptr && std::string(std::getenv("APS5_DRAW_PIPELINE")) != "0") {
             Require(used != 0, "no early packet was used");
-            if (DrawPipeline::ResolveLanes() && std::getenv("APS5_NO_RESOLVE_LANES") == nullptr) Require(twoAhead != 0, "no job was posted two ahead");
+            Require(DrawPipeline::ResolveLanes() == (std::getenv("APS5_RESOLVE_LANES") != nullptr), "the second lane does not follow its switch");
+            if (DrawPipeline::ResolveLanes()) Require(twoAhead != 0, "no job was posted two ahead");
+            else Require(twoAhead == 0, "a job was posted two ahead without the second lane");
             const bool jobs = DrawPipeline::ResolveLanes() && ShaderResources::JobBindingsMode() != ShaderResources::JobBindings::Off;
             if (jobs && std::getenv("APS5_VERIFY_RESOLVE_SPLIT") == nullptr) Require(ShaderResources::JobBindingsWithSnapshots() != 0, "no job made bindings with snapshots");
             if (jobs && ShaderResources::JobBindingsMode() == ShaderResources::JobBindings::On && std::getenv("APS5_VERIFY_JOB_BINDINGS") != nullptr && std::getenv("APS5_VERIFY_RESOLVE_SPLIT") == nullptr) Require(ShaderResources::JobBindingsVerified() != 0, "no job's bindings were verified");

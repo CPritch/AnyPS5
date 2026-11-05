@@ -6669,7 +6669,7 @@ void ShaderResources::AheadDrawBindings::Drop() {
 }
 
 ShaderResources::JobBindings ShaderResources::JobBindingsMode() {
-    static const JobBindings mode = !Recorder::BatchKeeps() || std::getenv("APS5_NO_JOB_BINDINGS") != nullptr ? JobBindings::Off : std::getenv("APS5_JOB_BINDINGS_SHADOW") != nullptr ? JobBindings::Shadow : JobBindings::On;
+    static const JobBindings mode = !Recorder::BatchKeeps() || !AgcDriver::DriverDetail::DrawPipeline::ResolveLanes() ? JobBindings::Off : std::getenv("APS5_JOB_BINDINGS_SHADOW") != nullptr ? JobBindings::Shadow : std::getenv("APS5_JOB_BINDINGS") != nullptr ? JobBindings::On : JobBindings::Off;
     return mode;
 }
 

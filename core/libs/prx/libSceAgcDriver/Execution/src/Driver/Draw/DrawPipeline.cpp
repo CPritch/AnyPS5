@@ -725,7 +725,7 @@ void DrawPipeline::NoteJobClass(std::size_t jobClass, std::uint64_t jobNs, std::
 }
 
 bool DrawPipeline::ResolveLanes() {
-    static const bool enabled = std::getenv("APS5_NO_RESOLVE_LANES") == nullptr && std::getenv("APS5_NO_CARRY_RESOLVE_HOLD") == nullptr && ResolveSplit() == 2;
+    static const bool enabled = std::getenv("APS5_RESOLVE_LANES") != nullptr && std::getenv("APS5_NO_CARRY_RESOLVE_HOLD") == nullptr && ResolveSplit() == 2;
     return enabled;
 }
 
@@ -755,7 +755,7 @@ DrawPipeline::ResolvePhaseScope::~ResolvePhaseScope() {
 }
 
 bool DrawPipeline::ParallelResolve() {
-    static const bool enabled = std::getenv("APS5_NO_PARALLEL_RESOLVE") == nullptr;
+    static const bool enabled = std::getenv("APS5_PARALLEL_RESOLVE") != nullptr;
     return enabled;
 }
 
