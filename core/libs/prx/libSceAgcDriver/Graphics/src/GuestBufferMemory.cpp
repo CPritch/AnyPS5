@@ -2649,7 +2649,7 @@ std::pair<std::uint64_t, std::uint64_t> widened(std::uint64_t begin, std::uint64
     return {first, last};
 }
 
-std::pair<std::uint64_t, std::uint64_t> importExtent(const HostImport& entry) {
+std::pair<std::uint64_t, std::uint64_t> importRangesExtent(const HostImport& entry) {
     auto begin = entry.base;
     auto end = entry.base + entry.bytes;
     const auto include = [&](const std::shared_ptr<const GuestAllocations::Range>& range) {
@@ -2659,6 +2659,11 @@ std::pair<std::uint64_t, std::uint64_t> importExtent(const HostImport& entry) {
     };
     include(entry.range);
     for (const auto& range : entry.ranges) include(range);
+    return {begin, end};
+}
+
+std::pair<std::uint64_t, std::uint64_t> importExtent(const HostImport& entry) {
+    const auto [begin, end] = importRangesExtent(entry);
     return widened(begin, end);
 }
 
@@ -2674,13 +2679,101 @@ std::pair<std::uint64_t, std::uint64_t> mappedExtent(std::uint64_t base, std::ui
     return widened(begin, end);
 }
 
-void verifyImportKept(const Context& context, HostImports& state, const HostImport& entry) {
+struct KeptBytes {
+    bool current = true;
+    std::shared_ptr<const GuestAllocations::Range> kept;
+    std::shared_ptr<const GuestAllocations::Range> found;
+};
+
+KeptBytes keptBytes(const HostImport& entry, const GuestAllocations::Lease& lease) {
+    std::uint64_t reached = entry.base;
+    for (const auto& range : entry.ranges) {
+        const auto current = leasedRangeOwner(lease, range->address);
+        if (current == nullptr || current.owner_before(range) || range.owner_before(current) || range->address > reached) return {false, range, current};
+        reached = range->address + range->bytes;
+    }
+    if (entry.ranges.empty() || reached < entry.base + entry.bytes) return {false, entry.ranges.empty() ? entry.range : entry.ranges.back(), nullptr};
+    return {};
+}
+
+bool refreshedDiffersWithin(const HostImports& state, const GuestAllocations::Lease& lease, std::uint64_t low, std::uint64_t high) {
+    auto seen = std::lower_bound(state.refreshedRanges.begin(), state.refreshedRanges.end(), low, [](const RefreshedRange& range, std::uint64_t value) { return range.address + range.bytes <= value; });
+    auto now = std::lower_bound(lease.begin(), lease.end(), low, [](const auto& range, std::uint64_t value) { return range->address + range->bytes <= value; });
+    for (;;) {
+        const bool moreSeen = seen != state.refreshedRanges.end() && seen->address < high;
+        const bool moreNow = now != lease.end() && (*now)->address < high;
+        if (!moreSeen || !moreNow) return moreSeen || moreNow;
+        if (seen->address != (*now)->address || seen->range.owner_before(*now) || now->owner_before(seen->range)) return true;
+        ++seen;
+        ++now;
+    }
+}
+
+std::string describeRange(const std::shared_ptr<const GuestAllocations::Range>& range) {
+    if (range == nullptr) return "none";
+    char text[128];
+    std::snprintf(text, sizeof(text), "0x%llx+0x%llx %c%c%s backing %llu", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes), range->readable ? 'r' : '-', range->writable ? 'w' : '-', range->gpu ? " gpu" : "", static_cast<unsigned long long>(range->backingSerial));
+    return text;
+}
+
+std::string describeRun(const GuestAllocations::Lease& lease, const RunBounds& bounds) {
+    if (!bounds.found) return "none";
+    char text[96];
+    std::snprintf(text, sizeof(text), "0x%llx+0x%llx over %zu ranges", static_cast<unsigned long long>(lease[bounds.first]->address), static_cast<unsigned long long>(lease[bounds.last]->address + lease[bounds.last]->bytes - lease[bounds.first]->address), bounds.last - bounds.first + 1);
+    return text;
+}
+
+std::string describeKeptImport(const Context& context, HostImports& state, const HostImport& entry, const GuestAllocations::Lease& lease, const KeptBytes& bytes, bool same, const char* path, std::uint64_t begin, std::uint64_t end) {
+    const auto budget = effectiveBudget(context, state);
+    const auto window = importWindow.load(std::memory_order_relaxed);
+    const auto [extentBegin, extentEnd] = importRangesExtent(entry);
+    const auto [testedBegin, testedEnd] = widened(extentBegin, extentEnd);
+    const auto run = importRunBounds(lease, entry.base, std::numeric_limits<std::uint64_t>::max(), budget);
+    const auto freeRun = importRunBounds(lease, entry.base);
+    const auto [viewBegin, viewEnd] = run.found ? std::pair<std::uint64_t, std::uint64_t>{lease[run.first]->address, lease[run.last]->address + lease[run.last]->bytes} : std::pair<std::uint64_t, std::uint64_t>{0, 0};
+    const auto [viewTestedBegin, viewTestedEnd] = run.found ? widened(viewBegin, viewEnd) : std::pair<std::uint64_t, std::uint64_t>{0, 0};
+    const bool differs = refreshedDiffersWithin(state, lease, testedBegin, testedEnd);
+    const bool pending = state.pendingImports.contains(entry.base);
+    const bool checks = window == 0 || window != state.refreshedWindow || budget != state.refreshedBudget || pending || differs;
+    const bool memoryDiffers = run.found != freeRun.found || (run.found && (run.first != freeRun.first || run.last != freeRun.last));
+    const bool expired = run.found && rememberedRun(state.refusals, lease, run.first, run.last) != nullptr;
+    const char* cause = !bytes.current ? "stale: a range under the import's own bytes is gone or was replaced"
+        : same ? "none"
+        : differs ? "a neighbour change older than the last reconcile, which ran against a lease that had not seen it"
+        : memoryDiffers || expired ? "refusal memory: the budget or the failure records moved, not the registry"
+        : pending ? "made since the last reconcile from a lease without the neighbour, or stepped down, and awaiting its re-check"
+        : "stepped down when it was made: the run was refused or overlapped a held import";
+    char head[640];
+    std::snprintf(head, sizeof(head), "import 0x%llx+0x%llx (%zu ranges, joined %d, pending %d) via %s of 0x%llx-0x%llx; kept extent 0x%llx-0x%llx, journal tested 0x%llx-0x%llx; reconcile extent 0x%llx-0x%llx, it would test 0x%llx-0x%llx; ", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes), entry.ranges.size(), entry.joined ? 1 : 0, pending ? 1 : 0, path, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(extentBegin), static_cast<unsigned long long>(extentEnd), static_cast<unsigned long long>(testedBegin), static_cast<unsigned long long>(testedEnd), static_cast<unsigned long long>(viewBegin), static_cast<unsigned long long>(viewEnd), static_cast<unsigned long long>(viewTestedBegin), static_cast<unsigned long long>(viewTestedEnd));
+    char tail[256];
+    std::snprintf(tail, sizeof(tail), "; registry since the last reconcile in the tested span: %s; a reconcile would check it: %s, drop it: %s; generation %llu reconciled at %llu; budget %llu live %llu window %llu", differs ? "differs" : "same", checks ? "yes" : "no", checks && !same ? "yes" : "no", static_cast<unsigned long long>(GuestAllocations::GuestAllocationsGeneration_nid_postfix()), static_cast<unsigned long long>(state.refreshedGeneration), static_cast<unsigned long long>(budget), static_cast<unsigned long long>(state.liveBytes), static_cast<unsigned long long>(window));
+    char keptRun[96];
+    std::snprintf(keptRun, sizeof(keptRun), "0x%llx+0x%llx over %zu ranges", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes), entry.ranges.size());
+    return std::string(head) + "kept run " + keptRun + ", reconcile run " + describeRun(lease, run) + ", without refusal memory " + describeRun(lease, freeRun) + "; own bytes " + (bytes.current ? "unchanged" : "CHANGED: kept range " + describeRange(bytes.kept) + ", registry now " + describeRange(bytes.found)) + tail + "; cause: " + cause;
+}
+
+GuestAllocations::Lease keptVerifyLease;
+
+void verifyImportKept(const Context& context, HostImports& state, const HostImport& entry, const char* path, std::uint64_t begin, std::uint64_t end) {
     const auto before = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const auto lease = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
-    const bool same = sameRange(entry, lease, effectiveBudget(context, state));
-    if (same || before != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || GuestAllocations::GuestAllocationsMutationWaiting_nid_postfix()) return;
-    std::fprintf(stderr, "FATAL: APS5_VERIFY_IMPORT_JOURNAL: the journal kept the import of 0x%llx+0x%llx, which a full reconcile would drop\n", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes));
-    std::abort();
+    auto lease = keptVerifyLease;
+    if (lease.empty()) {
+        std::uint64_t published = 0;
+        if (!GuestAllocations::GuestAllocationsAcquireSettled_nid_no_patch(&lease, &published) || published != before) return;
+    }
+    const auto budget = effectiveBudget(context, state);
+    const auto bytes = keptBytes(entry, lease);
+    const bool same = sameRange(entry, lease, budget);
+    if (bytes.current && same) return;
+    const auto text = describeKeptImport(context, state, entry, lease, bytes, same, path, begin, end);
+    if (!bytes.current) {
+        const auto [first, last] = importExtent(entry);
+        if (keptVerifyLease.empty() && std::string_view(path) == "lookup" && GuestAllocations::GuestAllocationsChangedSince_nid_postfix(state.refreshedGeneration, static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) return;
+        std::fprintf(stderr, "FATAL: APS5_VERIFY_IMPORT_JOURNAL: the journal kept an import over bytes that changed: %s\n", text.c_str());
+        std::abort();
+    }
+    static std::atomic<std::uint32_t> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 64) std::fprintf(stderr, "[import-journal] kept over a run a reconcile would rebuild, bytes intact: %s\n", text.c_str());
 }
 
 const HostImport* importKeptByJournal(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end) {
@@ -2689,7 +2782,7 @@ const HostImport* importKeptByJournal(const Context& context, HostImports& state
     if (entry == nullptr) return nullptr;
     const auto [first, last] = importExtent(*entry);
     if (GuestAllocations::GuestAllocationsChangedSince_nid_postfix(state.refreshedGeneration, static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) return nullptr;
-    if (verifyImportJournal()) verifyImportKept(context, state, *entry);
+    if (verifyImportJournal()) verifyImportKept(context, state, *entry, "lookup", begin, end);
     return entry;
 }
 
@@ -2728,7 +2821,7 @@ bool absorbUnrelatedChanges(const Context& context, HostImports& state) {
         if (touched(widened(key, key + 1))) return false;
     }
     if (verifyImportJournal()) {
-        for (const auto& [base, entry] : state.imports) verifyImportKept(context, state, entry);
+        for (const auto& [base, entry] : state.imports) verifyImportKept(context, state, entry, "absorb", base, base + entry.bytes);
     }
     state.gateRefusals.clear();
     state.refreshedGeneration = through;
@@ -4377,6 +4470,10 @@ void SetImportWatch(const Context& context, ImportWatch watch) {
     state.gateRefusals.clear();
 }
 
+void SetKeptImportVerifyLease(GuestAllocations::Lease lease) {
+    keptVerifyLease = std::move(lease);
+}
+
 void SetHostImportWindow(std::uint64_t bytes) {
     importWindow.store(bytes, std::memory_order_relaxed);
 }
@@ -4900,8 +4997,10 @@ void GuestBufferMemory::AcquireRegistered() {
             if (region != held.base.end() && region->begin < high) return false;
             if (std::any_of(held.copied.begin(), held.copied.end(), [&](const CopiedRange& range) { return range.begin < high && low < range.end; })) return false;
         }
-        if (verifySpacePatch() && generation == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && !GuestAllocations::GuestAllocationsMutationWaiting_nid_postfix()) {
-            for (const auto& range : GuestAllocations::GuestAllocationsAcquire_nid_postfix()) {
+        GuestAllocations::Lease settled;
+        std::uint64_t settledAt = 0;
+        if (verifySpacePatch() && GuestAllocations::GuestAllocationsAcquireSettled_nid_no_patch(&settled, &settledAt) && settledAt == generation) {
+            for (const auto& range : settled) {
                 if (!range->gpu || !range->readable) continue;
                 const auto end = range->address + range->bytes;
                 const auto covers = [&](std::uint64_t first, std::uint64_t last) { return first <= range->address && end <= last; };
@@ -5048,12 +5147,9 @@ void GuestBufferMemory::AcquireRegistered() {
                         auto& state = Imports();
                         std::lock_guard lock(state.mutex);
                         if (const auto* entry = findImport(state, kept.begin, kept.end); entry != nullptr && entry == kept.direct) {
-                            if (verifySpacePatch()) {
-                                for (auto index = static_cast<std::size_t>(&range - &lease[0]); index < lease.size() && lease[index]->address < kept.end; ++index) {
-                                    if (importAllocation(context, state, lease[index]->address, lease, ImportRequester::Build, 0, false) == entry) continue;
-                                    std::fprintf(stderr, "FATAL: APS5_VERIFY_SPACE_PATCH: the copied region 0x%llx-0x%llx differs from the import of its range at 0x%llx\n", static_cast<unsigned long long>(kept.begin), static_cast<unsigned long long>(kept.end), static_cast<unsigned long long>(lease[index]->address));
-                                    std::abort();
-                                }
+                            if (verifySpacePatch() && !keptBytes(*entry, lease).current) {
+                                std::fprintf(stderr, "FATAL: APS5_VERIFY_SPACE_PATCH: the copied region 0x%llx-0x%llx rests on an import over bytes that changed\n", static_cast<unsigned long long>(kept.begin), static_cast<unsigned long long>(kept.end));
+                                std::abort();
                             }
                             Region region{kept.begin, kept.end, kept.writable, {}, nullptr};
                             region.hostBacked = true;

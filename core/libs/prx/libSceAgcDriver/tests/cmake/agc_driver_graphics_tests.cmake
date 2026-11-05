@@ -57,6 +57,28 @@ if(BUILD_TESTING)
         set_tests_properties(agc_command_batch_fence_failure PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_import_journal_verify COMMAND agc_driver_graphics_tests --import-journal-verify)
+    set_tests_properties(agc_import_journal_verify PROPERTIES TIMEOUT 60 ENVIRONMENT "APS5_VERIFY_IMPORT_JOURNAL=1;APS5_VERIFY_ALLOCATION_JOURNAL=1;APS5_VERIFY_LEASE_PATCH=1;APS5_VERIFY_SPACE_PATCH=1")
+    if(WIN32)
+        set_tests_properties(agc_import_journal_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_import_journal_keep COMMAND agc_driver_graphics_tests --import-journal-verify)
+    set_tests_properties(agc_import_journal_keep PROPERTIES TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_import_journal_keep PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    foreach(kind remapped unmapped reprotected member shrunk joined windowed absorbed)
+        add_test(NAME agc_import_journal_stale_${kind} COMMAND agc_driver_graphics_tests --import-journal-stale ${kind})
+        set_tests_properties(agc_import_journal_stale_${kind} PROPERTIES TIMEOUT 60
+            ENVIRONMENT "APS5_VERIFY_IMPORT_JOURNAL=1"
+            PASS_REGULAR_EXPRESSION "FATAL: APS5_VERIFY_IMPORT_JOURNAL: the journal kept an import over bytes that changed: .*own bytes CHANGED")
+    endforeach()
+    add_test(NAME agc_import_journal_stale_control COMMAND agc_driver_graphics_tests --import-journal-stale control)
+    set_tests_properties(agc_import_journal_stale_control PROPERTIES TIMEOUT 60
+        ENVIRONMENT "APS5_VERIFY_IMPORT_JOURNAL=1"
+        FAIL_REGULAR_EXPRESSION "FATAL: APS5_VERIFY_IMPORT_JOURNAL")
     add_test(NAME agc_pending_metadata_trust COMMAND agc_driver_graphics_tests --pending-metadata-trust)
     set_tests_properties(agc_pending_metadata_trust PROPERTIES TIMEOUT 20)
     if(WIN32)

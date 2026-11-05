@@ -13059,6 +13059,24 @@ int main(int argc, char** argv) {
             stencilReferenceUnusedTests();
             return 0;
         }
+        if (argc == 3 && std::string_view(argv[1]) == "--import-journal-stale") {
+            mock = MockVulkan{};
+            auto journalContext = mockContext();
+            journalContext.bufferDeviceAddress = true;
+            journalContext.limits.maxStorageBufferRange = 1u << 27;
+            RunImportJournalStaleTest(journalContext, argv[2]);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--import-journal-verify") {
+            mock = MockVulkan{};
+            auto journalContext = mockContext();
+            journalContext.bufferDeviceAddress = true;
+            journalContext.limits.maxStorageBufferRange = 1u << 27;
+            RunImportJournalVerifyTests(journalContext);
+            Require(mock.live == 0, "the import journal tests leaked Vulkan objects");
+            std::cout << "import journal verify tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--command-batch-fence-failure") {
             commandBatchFenceFailureTests();
             return 0;

@@ -15,7 +15,9 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <initializer_list>
@@ -270,6 +272,156 @@ void importJournalTests(const Context& context) {
     change(guest, false);
     Require(HostImportFor(importing, first, piece) == nullptr, "a removed range is still imported");
     ::operator delete(block, std::align_val_t{piece});
+}
+
+constexpr std::size_t JournalPiece = 65536;
+constexpr std::size_t JournalWindow = std::size_t{8} << 20u;
+
+struct JournalFixture {
+    Context importing;
+    std::uint8_t* guest = nullptr;
+    std::uint64_t window = 0;
+    explicit JournalFixture(const Context& context) : importing(context) {
+        importing.hostImportAlignment = JournalPiece;
+        guest = static_cast<std::uint8_t*>(::operator new(8 * JournalWindow, std::align_val_t{JournalWindow}));
+        SetHostImportWindow(JournalWindow);
+        ClearHostImports(importing.device);
+    }
+    ~JournalFixture() {
+        SetHostImportBudget(0);
+        SetHostImportWindow(0);
+        ClearHostImports(importing.device);
+        ::operator delete(guest, std::align_val_t{JournalWindow});
+    }
+    std::uint8_t* At(std::size_t window, std::size_t piece) const { return guest + window * JournalWindow + piece * JournalPiece; }
+    std::uint64_t Address(std::size_t window, std::size_t piece) const { return reinterpret_cast<std::uintptr_t>(At(window, piece)); }
+    void Add(std::size_t window, std::size_t piece, bool gpu = true, std::size_t pieces = 1) const {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(At(window, piece), pieces * JournalPiece, true, false, gpu);
+    }
+    void Remove(std::size_t window, std::size_t piece) const {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(At(window, piece));
+    }
+};
+
+void journalSeesNeighboursTest(const Context& context) {
+    JournalFixture fixture(context);
+    const auto& importing = fixture.importing;
+    fixture.Add(0, 2);
+    const auto address = fixture.Address(0, 2);
+    Require(HostImportFor(importing, address, JournalPiece) != nullptr, "the neighbour fixture was not imported");
+    fixture.Add(0, 3);
+    const auto* grown = HostImportFor(importing, address, JournalPiece);
+    Require(grown != nullptr && grown->base == address && grown->bytes == 2 * JournalPiece, "the journal kept an import over a mapping right next to it");
+    fixture.Add(0, 6);
+    const auto* same = HostImportFor(importing, address, JournalPiece);
+    Require(same == grown, "a mapping in the import's window that its run does not reach replaced the import");
+    fixture.Add(0, 4);
+    fixture.Add(0, 5);
+    const auto* block = HostImportFor(importing, address, JournalPiece);
+    Require(block != nullptr && block->bytes >= 2 * JournalPiece, "a run grown two ranges away lost its import");
+    fixture.Remove(0, 6);
+    fixture.Remove(0, 5);
+    fixture.Remove(0, 4);
+    fixture.Remove(0, 3);
+    const auto* shrunk = HostImportFor(importing, address, JournalPiece);
+    Require(shrunk != nullptr && shrunk->base == address && shrunk->bytes == JournalPiece, "a neighbour's unmap did not shrink the import to what stays mapped");
+    fixture.Remove(0, 2);
+}
+
+void keptOverOlderLeaseTest(const Context& context) {
+    JournalFixture fixture(context);
+    const auto& importing = fixture.importing;
+    fixture.Add(0, 2);
+    const auto address = fixture.Address(0, 2);
+    const auto neighbour = fixture.Address(0, 3);
+    const auto* entry = HostImportFor(importing, address, JournalPiece);
+    Require(entry != nullptr && entry->bytes == JournalPiece, "the older lease fixture was not imported");
+    {
+        GuestBufferMemory building(importing);
+        building.AcquireRegistered();
+        fixture.Add(0, 3);
+        building.Upload(true);
+        building.WriteBack();
+    }
+    fixture.Add(2, 0, false);
+    static_cast<void>(HostImportsIdentity(importing));
+    const auto* kept = HostImportFor(importing, address, JournalPiece);
+    Require(kept != nullptr && kept->base <= address && address + JournalPiece <= kept->base + kept->bytes, "the import over the older lease's range is gone");
+    bool neighbourBound = false;
+    {
+        GuestBufferMemory next(importing);
+        next.AcquireRegistered();
+        next.Upload(true);
+        const auto ranges = next.AddressRanges();
+        neighbourBound = std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= neighbour && neighbour < range.end; });
+        next.WriteBack();
+    }
+    Require(neighbourBound, "the neighbour the older lease missed is missing from the next address space");
+    const auto* whole = HostImportFor(importing, address, 2 * JournalPiece);
+    Require(whole != nullptr && whole->base == address && whole->bytes == 2 * JournalPiece, "the run over a neighbour the older lease missed has no import");
+    const auto* second = HostImportFor(importing, neighbour, JournalPiece);
+    Require(second == whole && HostImportOffset(*second, neighbour) == HostImportOffset(*whole, address) + JournalPiece, "the neighbour the older lease missed resolved to a wrong offset");
+    fixture.Remove(2, 0);
+    fixture.Remove(0, 3);
+    fixture.Remove(0, 2);
+}
+
+void keptOverRefusalFlipTest(const Context& context) {
+    JournalFixture fixture(context);
+    const auto& importing = fixture.importing;
+    fixture.Add(3, 0, true, 2);
+    Require(HostImportFor(importing, fixture.Address(3, 0), 2 * JournalPiece) != nullptr, "the refusal fixture's other range was not imported");
+    SetHostImportBudget(HostImportLiveBytes() + JournalPiece);
+    fixture.Add(0, 2);
+    fixture.Add(0, 3);
+    {
+        GuestBufferMemory building(importing);
+        building.AcquireRegistered();
+    }
+    const auto address = fixture.Address(0, 2);
+    const auto* entry = ExistingHostImportFor(importing, address, JournalPiece);
+    Require(entry != nullptr && entry->bytes == JournalPiece, "the budget did not step the run down to one range");
+    fixture.Remove(3, 0);
+    const auto* kept = HostImportFor(importing, address, JournalPiece);
+    Require(kept == entry, "an unmap elsewhere that freed budget replaced an import it did not touch");
+    SetHostImportBudget(0);
+    fixture.Remove(0, 3);
+    fixture.Remove(0, 2);
+}
+
+void keptJoinedImportTest(const Context& context) {
+    JournalFixture fixture(context);
+    const auto& importing = fixture.importing;
+    const std::size_t large = 256;
+    fixture.Add(0, 0, true, large);
+    fixture.Add(2, 0, true, large);
+    const auto request = fixture.Address(2, 0) - 16;
+    Require(HostImportFor(importing, fixture.Address(0, 0), 16) != nullptr && HostImportFor(importing, fixture.Address(2, 0), 16) != nullptr, "the joined fixture was not imported");
+    {
+        GuestBufferMemory building(importing);
+        building.AcquireRegistered();
+        building.AddReadable(request, 32);
+        building.Upload(true);
+        building.WriteBack();
+    }
+    const auto* joined = HostImportFor(importing, request, 32);
+    Require(joined != nullptr && joined->joined && joined->bytes == 2 * large * JournalPiece, "the joined fixture was not joined");
+    const auto buffer = joined->buffer;
+    fixture.Add(7, 0, false);
+    Require(HostImportFor(importing, request, 32) == joined, "a change elsewhere lost a joined import");
+    fixture.Add(4, 0, true, large);
+    const auto* neighboured = HostImportFor(importing, request, 32);
+    Require(neighboured != nullptr && neighboured->buffer == buffer && HostImportOffset(*neighboured, request) == fixture.Address(2, 0) - 16 - fixture.Address(0, 0), "a range next to a joined import changed what the join binds");
+    const auto* past = HostImportFor(importing, fixture.Address(4, 0), 16);
+    Require(past != nullptr && past->base == fixture.Address(4, 0) && HostImportOffset(*past, fixture.Address(4, 0)) == past->lead, "the range past a joined import has no import of its own");
+    fixture.Remove(4, 0);
+    fixture.Remove(7, 0);
+    fixture.Remove(2, 0);
+    const auto* alone = HostImportFor(importing, fixture.Address(0, 0), 16);
+    Require(alone != nullptr && !alone->joined && alone->bytes == large * JournalPiece, "the joined import outlived one of its ranges");
+    fixture.Remove(0, 0);
 }
 
 void importRunGrowthTests(const Context& context) {
@@ -4556,6 +4708,84 @@ void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) 
     static_cast<void>(context);
     static_cast<void>(access);
 #endif
+}
+
+void RunImportJournalVerifyTests(const Context& context) {
+    journalSeesNeighboursTest(context);
+    keptOverOlderLeaseTest(context);
+    keptOverRefusalFlipTest(context);
+    keptJoinedImportTest(context);
+}
+
+void RunImportJournalStaleTest(const Context& context, std::string_view kind) {
+    std::signal(SIGABRT, [](int) { std::_Exit(0); });
+    JournalFixture fixture(context);
+    const auto& importing = fixture.importing;
+    const auto replaced = [](const GuestAllocations::Lease& lease, std::uint64_t address, const std::function<std::shared_ptr<const GuestAllocations::Range>(const GuestAllocations::Range&)>& make) {
+        auto ranges = std::make_shared<GuestAllocations::Lease::Ranges>();
+        for (const auto& range : lease) {
+            if (range->address != address) {
+                ranges->push_back(range);
+            } else if (auto changed = make(*range)) {
+                ranges->push_back(std::move(changed));
+            }
+        }
+        return GuestAllocations::Lease(std::move(ranges));
+    };
+    const auto copied = [](const GuestAllocations::Range& range) { return std::make_shared<const GuestAllocations::Range>(range); };
+    std::uint64_t request = fixture.Address(0, 2);
+    std::uint64_t changed = request;
+    std::function<std::shared_ptr<const GuestAllocations::Range>(const GuestAllocations::Range&)> make = copied;
+    if (kind == "joined") {
+        const std::size_t large = 256;
+        fixture.Add(0, 0, true, large);
+        fixture.Add(2, 0, true, large);
+        request = fixture.Address(2, 0) - 16;
+        changed = fixture.Address(2, 0);
+        Require(HostImportFor(importing, fixture.Address(0, 0), 16) != nullptr && HostImportFor(importing, fixture.Address(2, 0), 16) != nullptr, "the joined fixture was not imported");
+        GuestBufferMemory building(importing);
+        building.AcquireRegistered();
+        building.AddReadable(request, 32);
+        building.Upload(true);
+        building.WriteBack();
+        const auto* joined = HostImportFor(importing, request, 32);
+        Require(joined != nullptr && joined->joined, "the joined fixture was not joined");
+    } else if (kind == "windowed") {
+        SetHostImportRangeWindow(JournalWindow);
+        fixture.Add(0, 0, true, 3 * 128);
+        request = fixture.Address(0, 2);
+        changed = fixture.Address(0, 0);
+        const auto* windowed = HostImportFor(importing, request, JournalPiece);
+        Require(windowed != nullptr && windowed->bytes < 3 * JournalWindow, "the windowed fixture imported the whole range");
+    } else {
+        fixture.Add(0, 2);
+        fixture.Add(0, 3);
+        const auto* whole = HostImportFor(importing, request, 2 * JournalPiece);
+        Require(whole != nullptr && whole->bytes == 2 * JournalPiece, "the run fixture was not imported");
+        if (kind == "member" || kind == "shrunk") changed = fixture.Address(0, 3);
+        if (kind == "unmapped") make = [](const GuestAllocations::Range&) { return std::shared_ptr<const GuestAllocations::Range>{}; };
+        if (kind == "reprotected") make = [](const GuestAllocations::Range& range) {
+            auto protectedRange = range;
+            protectedRange.writable = !range.writable;
+            return std::make_shared<const GuestAllocations::Range>(protectedRange);
+        };
+        if (kind == "shrunk") make = [](const GuestAllocations::Range& range) {
+            auto shorter = range;
+            shorter.bytes = range.bytes / 2;
+            return std::make_shared<const GuestAllocations::Range>(shorter);
+        };
+    }
+    if (kind == "absorbed") {
+        fixture.Add(0, 6, false);
+        Require(HostImportFor(importing, request, 16) != nullptr, "the absorbed fixture lost its import to a reconcile");
+    }
+    fixture.Add(7, 0, false);
+    const auto current = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
+    SetKeptImportVerifyLease(kind == "control" ? current : replaced(current, changed, make));
+    if (kind == "absorbed") static_cast<void>(HostImportsIdentity(importing));
+    else static_cast<void>(HostImportFor(importing, request, 16));
+    SetKeptImportVerifyLease({});
+    std::cout << "the verify let a kept import of " << kind << " bytes pass\n";
 }
 
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
