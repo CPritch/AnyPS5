@@ -40,6 +40,7 @@ public:
 
     size_type size() const { return values != nullptr ? values->size() : 0; }
     bool empty() const { return size() == 0; }
+    const T* data() const { return Get().data(); }
     const_reference operator[](size_type index) const { return (*values)[index]; }
     const_reference at(size_type index) const { return Get().at(index); }
     const_reference front() const { return values->front(); }

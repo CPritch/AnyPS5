@@ -122,8 +122,99 @@ std::string_view TrimmedReason(std::string_view reason) {
 }
 
 
+struct DrawTailStorage {
+    std::vector<DrawProgram> writablePrograms;
+    std::vector<ShaderRecompiler::MemoryRegion> memory;
+    std::vector<ShaderRecompiler::LinkedProgram> linked;
+    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
+    std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
+    std::vector<ShaderRecompiler::RecompileResult> results;
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> compiledStages;
+    std::vector<Graphics::CompiledShader> stages;
+    std::vector<const ShaderRecompiler::RecompileResult*> programResults;
+    std::vector<StageCapture> stageCaptures;
+    std::vector<std::shared_ptr<DispatchVariant>> matched;
+    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions;
+    std::vector<std::shared_ptr<DispatchVariant>> fresh;
+    std::vector<bool> recompiled;
+    DrawDataCandidates dataCandidates;
+    std::vector<bool> reused;
+    std::vector<StageDataHit> stageData;
+    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+
+    void Clear() {
+        writablePrograms.clear();
+        memory.clear();
+        linked.clear();
+        vertexInfos.clear();
+        for (auto& reads : decodeReads) reads.clear();
+        results.clear();
+        compiledStages.clear();
+        stages.clear();
+        programResults.clear();
+        stageCaptures.clear();
+        matched.clear();
+        for (auto& regions : matchedRegions) regions.clear();
+        fresh.clear();
+        recompiled.clear();
+        dataCandidates.clear();
+        reused.clear();
+        stageData.clear();
+        snapshots.clear();
+        recipeStages.clear();
+    }
+};
+
+namespace {
+
+struct DrawStoragePool {
+    AgcDriver::Mutex mutex;
+    std::vector<std::unique_ptr<DrawTailStorage>> free;
+};
+
+DrawStoragePool& drawStoragePool() {
+    static auto* pool = new DrawStoragePool();
+    return *pool;
+}
+
+bool DrawStoragePooled() {
+    static const bool pooled = std::getenv("APS5_NO_DRAW_STORAGE_POOL") == nullptr;
+    return pooled;
+}
+
+struct DrawStorageReturn {
+    void operator()(DrawTailStorage* storage) const {
+        std::unique_ptr<DrawTailStorage> owned(storage);
+        if (!DrawStoragePooled()) return;
+        constexpr std::size_t MostFree = 1024;
+        owned->Clear();
+        auto& pool = drawStoragePool();
+        std::lock_guard lock(pool.mutex);
+        if (pool.free.size() < MostFree) pool.free.push_back(std::move(owned));
+    }
+};
+
+using DrawStorageHandle = std::unique_ptr<DrawTailStorage, DrawStorageReturn>;
+
+DrawStorageHandle AcquireDrawStorage() {
+    if (DrawStoragePooled()) {
+        auto& pool = drawStoragePool();
+        std::lock_guard lock(pool.mutex);
+        if (!pool.free.empty()) {
+            auto* storage = pool.free.back().release();
+            pool.free.pop_back();
+            return DrawStorageHandle(storage);
+        }
+    }
+    return DrawStorageHandle(new DrawTailStorage());
+}
+
+}
+
 struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
+    DrawStorageHandle storage = AcquireDrawStorage();
     bool profile = false;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
@@ -144,26 +235,28 @@ struct DrawTail {
     std::uint64_t shapeKey = 0;
     DrawRelocationPending relocationPending{};
     ShaderRecompiler::ShaderPixelStageInfo pixel{};
-    std::vector<DrawProgram> writablePrograms;
+    decltype(DrawTailStorage::writablePrograms)& writablePrograms = storage->writablePrograms;
     const std::vector<DrawProgram>* programs = nullptr;
-    std::vector<ShaderRecompiler::MemoryRegion> memory;
-    std::vector<ShaderRecompiler::LinkedProgram> linked;
-    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
-    std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
+    decltype(DrawTailStorage::memory)& memory = storage->memory;
+    decltype(DrawTailStorage::linked)& linked = storage->linked;
+    decltype(DrawTailStorage::vertexInfos)& vertexInfos = storage->vertexInfos;
+    decltype(DrawTailStorage::decodeReads)& decodeReads = storage->decodeReads;
     std::unique_ptr<ShaderMemory> shaderMemory;
-    std::vector<ShaderRecompiler::RecompileResult> results;
-    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> compiledStages;
-    std::vector<Graphics::CompiledShader> stages;
+    decltype(DrawTailStorage::snapshots)& snapshots = storage->snapshots;
+    decltype(DrawTailStorage::recipeStages)& recipeStages = storage->recipeStages;
+    decltype(DrawTailStorage::results)& results = storage->results;
+    decltype(DrawTailStorage::compiledStages)& compiledStages = storage->compiledStages;
+    decltype(DrawTailStorage::stages)& stages = storage->stages;
     std::uint32_t pushCursorBytes = 0;
-    std::vector<const ShaderRecompiler::RecompileResult*> programResults;
-    std::vector<StageCapture> stageCaptures;
-    std::vector<std::shared_ptr<DispatchVariant>> matched;
-    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions;
-    std::vector<std::shared_ptr<DispatchVariant>> fresh;
-    std::vector<bool> recompiled;
-    DrawDataCandidates dataCandidates;
-    std::vector<bool> reused;
-    std::vector<StageDataHit> stageData;
+    decltype(DrawTailStorage::programResults)& programResults = storage->programResults;
+    decltype(DrawTailStorage::stageCaptures)& stageCaptures = storage->stageCaptures;
+    decltype(DrawTailStorage::matched)& matched = storage->matched;
+    decltype(DrawTailStorage::matchedRegions)& matchedRegions = storage->matchedRegions;
+    decltype(DrawTailStorage::fresh)& fresh = storage->fresh;
+    decltype(DrawTailStorage::recompiled)& recompiled = storage->recompiled;
+    decltype(DrawTailStorage::dataCandidates)& dataCandidates = storage->dataCandidates;
+    decltype(DrawTailStorage::reused)& reused = storage->reused;
+    decltype(DrawTailStorage::stageData)& stageData = storage->stageData;
     bool drawHit = false;
     bool verifyHit = false;
     bool stageEntries = false;
@@ -1237,7 +1330,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             stages.insert(stages.begin() + 1, {{Stage::TessellationControl, &results[first], 0}, {Stage::TessellationEvaluation, &results[first + 1], 0}});
         }
     }
-    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    auto& snapshots = tail.snapshots;
     const auto snapshot = [&] {
         snapshots.clear();
         snapshots.reserve(memory.size());
@@ -1357,7 +1450,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 const auto commitQueue = submission.queue;
                 const auto commitPacket = tail.packetOpcode;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::span<const Graphics::CompiledShader>(stages), snapshots = std::span<const Graphics::GuestMemorySnapshot>(snapshots), commitQueue, commitPacket, epoch, storage = std::move(tail.storage), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)] {
                     DrawPipeline::FollowEpoch(epoch);
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
                     commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0);
@@ -1388,7 +1481,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return drawn();
     }
 
-    std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    auto& recipeStages = tail.recipeStages;
     if (registerKey && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
@@ -1444,7 +1537,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             earlyDraw->depth.reserve(4);
             earlyDraw->reads.reserve(32);
         }
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, ahead, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), early = std::move(earlyDraw), itemReads = reads](const DrawPipeline::EarlyOffer* offer) mutable {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::span<const Graphics::CompiledShader>(stages), snapshots = std::span<const Graphics::GuestMemorySnapshot>(snapshots), recipe = std::move(recipe), recipeStages = &recipeStages, drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, ahead, storage = std::move(tail.storage), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), early = std::move(earlyDraw), itemReads = reads](const DrawPipeline::EarlyOffer* offer) mutable {
             if (offer != nullptr && offer->preProof != nullptr) return preProveDraw(localDevice, stages, ahead.get(), epoch, *offer->preProof);
             if (offer != nullptr && offer->probe != nullptr) {
                 thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> probedDepth;
@@ -1455,11 +1548,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             }
             if (offer != nullptr) {
                 early->twoAhead = offer->twoAhead;
-                return offer->writes != nullptr && resolveDrawEarly(localDevice, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, trace, shape, ahead.get(), epoch, itemReads, *offer->writes, offer->depth, offer->currentTemplate, offer->nextTemplate, *early);
+                return offer->writes != nullptr && resolveDrawEarly(localDevice, decode->state, drawParameters, stages, snapshots, recipe, *recipeStages, trace, shape, ahead.get(), epoch, itemReads, *offer->writes, offer->depth, offer->currentTemplate, offer->nextTemplate, *early);
             }
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, shape, ahead.get(), early.get());
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, *recipeStages, drawKey, trace, shape, ahead.get(), early.get());
             return false;
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));

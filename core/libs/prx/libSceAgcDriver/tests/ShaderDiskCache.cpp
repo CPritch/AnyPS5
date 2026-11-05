@@ -148,7 +148,7 @@ bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) 
     return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.bufferExtent == right.bufferExtent && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
 }
 
-bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
+bool sameBindings(const BindingList& left, const BindingList& right) {
     if (left.size() != right.size()) return false;
     for (std::size_t i = 0; i < left.size(); ++i) {
         if (!sameBinding(left[i], right[i])) return false;
@@ -279,8 +279,8 @@ RecompileResult sampleResult() {
     result.registrationModule = true;
     result.specialization = {{512, 4}, {516, 0x3f800000u}, {517, 0}};
     result.vertexAttributes = {{1, 4, {{0x1000u, 0x20000u, 0x30u, 0x4u}}, 2}, {5, 2, {{9u, 8u, 7u, 6u}}, 0}};
-    result.vertexInputs[0].outputMask = 5u;
-    result.vertexAttributes[0].formatComponents = 3u;
+    result.vertexInputs.Mutable()[0].outputMask = 5u;
+    result.vertexAttributes.Mutable()[0].formatComponents = 3u;
     result.vertexOffsetSgpr = 12;
     result.instanceOffsetSgpr = -1;
     result.vertexOffsetShared = true;
@@ -786,10 +786,10 @@ void verifyArtifactStorageIsolation() {
     const auto before = ShaderDiskCache::EncodeEntry(key, variant);
     result.bindings[0].guestDescriptor[0] ^= 0x10000u;
     result.pushConstants[0] ^= std::byte{0xff};
-    result.vertexAttributes[0].resource.fields[0] ^= 0x10000u;
+    result.vertexAttributes.Mutable()[0].resource.fields[0] ^= 0x10000u;
     variant.artifact = result;
     require(ShaderDiskCache::EncodeEntry(key, variant) == before, "invocation data changed the stored artifact");
-    result.vertexInputs[0].components = 2;
+    result.vertexInputs.Mutable()[0].components = 2;
     variant.artifact = result;
     require(ShaderDiskCache::EncodeEntry(key, variant) != before, "the stored artifact ignores vertex input metadata");
 }
@@ -1604,7 +1604,7 @@ void verifyVertexTypeSpecialization() {
         }
     }
     auto invalid = artifact;
-    invalid.vertexInputPatches.front().word = static_cast<std::uint32_t>(original.size());
+    invalid.vertexInputPatches.Mutable().front().word = static_cast<std::uint32_t>(original.size());
     bool rejected = false;
     try { static_cast<void>(SpecializeVertexInputTypes(invalid, std::array{0u, 0u})); }
     catch (const std::runtime_error&) { rejected = true; }

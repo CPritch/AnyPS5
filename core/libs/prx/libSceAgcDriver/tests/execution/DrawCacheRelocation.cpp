@@ -327,7 +327,7 @@ void VertexTableRunsMoveWithTheirPointer() {
     Require(variant.rebases.size() == 1u && variant.rebases[0].kind == VariantRebase::Kind::VertexBase && variant.rebases[0].target == 0u && variant.rebases[0].source == sharpPosition, "the vertex attribute is not rebased from the V#'s base word");
 
     auto other = compiled;
-    other.vertexAttributes[0].resource.fields[2] = 4u;
+    other.vertexAttributes.Mutable()[0].resource.fields[2] = 4u;
     PoolRelocation refused;
     Require(!Driver::vertexTableRelocation(program, info, reads, other, use, refused), "a vertex stage whose result was built from another V# was relocatable");
     auto outside = reads;

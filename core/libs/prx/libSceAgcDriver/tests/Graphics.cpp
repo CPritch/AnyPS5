@@ -9089,7 +9089,7 @@ void barycentricEmulationTests() {
         ValidateProvokingVertex(context, lastState, patchShaders);
         expectFailure([&] { ValidateProvokingVertex(context, lastState, shaders); }, "last provoking vertex requires VK_EXT_provoking_vertex");
         RecompileResult flatVertices = fragment;
-        for (auto& parameter : flatVertices.fragmentParameters) parameter.flat = true;
+        for (auto& parameter : flatVertices.fragmentParameters.Mutable()) parameter.flat = true;
         const std::array<CompiledShader, 4> flatPatchShaders{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::TessellationControl, &patches.control, 0}, {ShaderStage::TessellationEvaluation, &patches.evaluation, 0}, {ShaderStage::Fragment, &flatVertices, 0}}};
         expectFailure([&] { ValidateProvokingVertex(context, lastState, flatPatchShaders); }, "explicit per-vertex flat interpolation");
     }
@@ -9353,13 +9353,13 @@ void rectListTests() {
         const std::array<CompiledShader, 4> parameterShaders{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::TessellationControl, control, 0}, {ShaderStage::TessellationEvaluation, &auxiliary.evaluation, 0}, {ShaderStage::Fragment, &fragment, 0}}};
         ValidateShaders(parameterShaders, parameterState, VkPhysicalDeviceSubgroupProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES}, false);
     }
-    fragment.fragmentParameters[0].perVertex = true;
+    fragment.fragmentParameters.Mutable()[0].perVertex = true;
     auto explicitInterpolation = BuildRectListShaders(vertex, fragment, target);
     Require(!explicitInterpolation.control.spirv.empty() && !explicitInterpolation.evaluation.spirv.empty(), "rect-list shaders for an explicitly interpolated parameter are empty");
-    fragment.fragmentParameters[0].custom = true;
+    fragment.fragmentParameters.Mutable()[0].custom = true;
     expectFailure([&] { static_cast<void>(BuildRectListShaders(vertex, fragment, target)); }, "per-vertex interpolation");
-    fragment.fragmentParameters[0].perVertex = false;
-    fragment.fragmentParameters[0].custom = false;
+    fragment.fragmentParameters.Mutable()[0].perVertex = false;
+    fragment.fragmentParameters.Mutable()[0].custom = false;
     vertex.parameterExports.clear();
     auto unexported = BuildRectListShaders(vertex, fragment, target);
     Require(!unexported.control.spirv.empty() && !unexported.evaluation.spirv.empty(), "rect-list shaders with an unexported parameter are empty");
@@ -11655,7 +11655,7 @@ void validationTests() {
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "missing attribute metadata");
         vertex.vertexAttributes.push_back(attribute);
         AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false);
-        vertex.vertexAttributes[0].components = 2;
+        vertex.vertexAttributes.Mutable()[0].components = 2;
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "metadata disagrees");
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 2, 1) == 80, "incorrect strided vertex range");
         Require(AgcDriver::Graphics::VertexBufferReadOffset(attribute, 2, 7) == 64, "vertex range includes records before the first vertex");

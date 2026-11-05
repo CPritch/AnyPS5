@@ -30,7 +30,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchDataWords(
     }
     if (auto hit = findPatchMemo(1, variant.compiled, nullptr, key)) return std::move(hit->result);
     auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
-    auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
+    auto& descriptor = patched->bindings.Patch(variant.flatBinding).guestDescriptor;
     for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
         if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
     }

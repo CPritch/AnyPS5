@@ -754,7 +754,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
             if (inputInfo.vertex->fetchEmbedded) {
                 for (const auto& block : program.Blocks()) {
                     for (const auto* instruction : block->Instructions()) {
-                        if (instruction->Opcode() == IrOpcode::GetAttribute && instruction->Argument(0)->Resolve()->ImmediateU32() == input.location) result.vertexInputs.back().outputMask |= 1u << instruction->Argument(1)->Resolve()->ImmediateU32();
+                        if (instruction->Opcode() == IrOpcode::GetAttribute && instruction->Argument(0)->Resolve()->ImmediateU32() == input.location) result.vertexInputs.Mutable().back().outputMask |= 1u << instruction->Argument(1)->Resolve()->ImmediateU32();
                     }
                 }
             }
@@ -1220,7 +1220,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             const auto kind = numeric == IrTextureNumericClass::Float ? 0u : numeric == IrTextureNumericClass::Sint ? 1u : 2u;
             vertexClasses.at(input.location) = kind;
             std::uint32_t selectors = kind << 12u;
-            auto& formatComponents = result.vertexAttributes.back().formatComponents;
+            auto& formatComponents = result.vertexAttributes.Mutable().back().formatComponents;
             formatComponents = 1u;
             for (std::uint32_t component = 0; component < 4u; ++component) {
                 const auto selector = (input.outputMask & (1u << component)) != 0u ? (resource.fields[3] >> (component * 3u)) & 7u : 0u;
@@ -1537,6 +1537,15 @@ bool MaskedResultMemo() {
     return masked;
 }
 
+}
+
+bool SharedResultBindings() {
+    static const bool shared = std::getenv("APS5_NO_SHARED_RESULT_BINDINGS") == nullptr;
+    return shared;
+}
+
+namespace {
+
 bool VerifyMaskedResultMemo() {
     static const bool verify = std::getenv("APS5_VERIFY_MASKED_RESULT_MEMO") != nullptr;
     return verify;
@@ -1555,7 +1564,7 @@ struct ResultMemoCounters {
 
 void applyMemoPatch(RecompileResult& result, const MemoPatch& patch, const ResourceSnapshot& snapshot) {
     for (const auto& [binding, resources] : patch.buffers) {
-        auto& words = result.bindings.at(binding).guestDescriptor;
+        auto& words = result.bindings.Patch(binding).guestDescriptor;
         if (words.size() != resources.size() * 4u) throw std::runtime_error("a patched guest buffer binding changed its width");
         for (std::size_t element = 0; element < resources.size(); ++element) std::copy_n(snapshot.buffers.at(resources[element]).dwords.begin(), 4u, words.begin() + element * 4u);
     }
@@ -1564,12 +1573,12 @@ void applyMemoPatch(RecompileResult& result, const MemoPatch& patch, const Resou
             if (patch.userWords.size() * sizeof(std::uint32_t) > result.pushConstants.size()) throw std::runtime_error("patched user data lies outside the push data");
             for (std::size_t word = 0; word < patch.userWords.size(); ++word) std::memcpy(result.pushConstants.data() + word * sizeof(std::uint32_t), &snapshot.userData.at(patch.userWords[word]), sizeof(std::uint32_t));
         } else {
-            auto& words = result.bindings.at(patch.shaderData).guestDescriptor;
+            auto& words = result.bindings.Patch(patch.shaderData).guestDescriptor;
             if (patch.userWords.size() > words.size()) throw std::runtime_error("patched user data lies outside the shader data");
             for (std::size_t word = 0; word < patch.userWords.size(); ++word) words[word] = snapshot.userData.at(patch.userWords[word]);
         }
     }
-    if (patch.flattenedSrt != MemoPatch::NoBinding) result.bindings.at(patch.flattenedSrt).guestDescriptor = snapshot.flattenedSrt;
+    if (patch.flattenedSrt != MemoPatch::NoBinding) result.bindings.Patch(patch.flattenedSrt).guestDescriptor = snapshot.flattenedSrt;
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
 }
 
@@ -1613,6 +1622,10 @@ std::uint64_t vectorBytes(const std::vector<bool>& values) {
 template<typename TValue>
 std::uint64_t vectorBytes(const CowVector<TValue>& values) {
     return vectorBytes(values.Get());
+}
+
+std::uint64_t vectorBytes(const BindingList& values) {
+    return static_cast<std::uint64_t>(values.size()) * sizeof(DescriptorBinding);
 }
 
 std::uint64_t descriptorBindingBytes(const DescriptorBinding& binding) {

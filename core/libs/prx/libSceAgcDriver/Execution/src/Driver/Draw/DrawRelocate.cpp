@@ -714,21 +714,22 @@ void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     for (const auto& [slot, value] : variant.shaderDataPatches) {
         const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
         if (at + sizeof(std::uint32_t) <= rebased->pushConstants.size()) std::memcpy(rebased->pushConstants.data() + at, &value, sizeof(value));
-        for (auto& binding : rebased->bindings) {
-            if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData && slot < binding.guestDescriptor.size()) binding.guestDescriptor[slot] = value;
+        for (std::size_t index = 0; index < rebased->bindings.size(); ++index) {
+            const auto& binding = std::as_const(rebased->bindings)[index];
+            if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData && slot < binding.guestDescriptor.size()) rebased->bindings.Patch(index).guestDescriptor[slot] = value;
         }
     }
     for (const auto& [binding, word, value] : variant.descriptorPatches) {
-        if (binding < rebased->bindings.size() && word < rebased->bindings[binding].guestDescriptor.size()) rebased->bindings[binding].guestDescriptor[word] = value;
+        if (binding < rebased->bindings.size() && word < std::as_const(rebased->bindings)[binding].guestDescriptor.size()) rebased->bindings.Patch(binding).guestDescriptor[word] = value;
     }
     std::shared_ptr<ShaderRecompiler::ShaderVertexStageInfo> info;
     for (const auto& patch : variant.rebasedWords) {
         if (patch.kind == VariantRebase::Kind::BufferWord) {
-            if (patch.target < rebased->bindings.size() && patch.word < rebased->bindings[patch.target].guestDescriptor.size()) rebased->bindings[patch.target].guestDescriptor[patch.word] = patch.value;
+            if (patch.target < rebased->bindings.size() && patch.word < std::as_const(rebased->bindings)[patch.target].guestDescriptor.size()) rebased->bindings.Patch(patch.target).guestDescriptor[patch.word] = patch.value;
             continue;
         }
         if (patch.target >= rebased->vertexAttributes.size() || patch.word >= 4u) continue;
-        auto& attribute = rebased->vertexAttributes[patch.target];
+        auto& attribute = rebased->vertexAttributes.Mutable()[patch.target];
         attribute.resource.fields[patch.word] = patch.value;
         if (variant.vertexInfo == nullptr || attribute.location >= variant.vertexInfo->resources.size()) continue;
         if (info == nullptr) info = std::make_shared<ShaderRecompiler::ShaderVertexStageInfo>(*variant.vertexInfo);

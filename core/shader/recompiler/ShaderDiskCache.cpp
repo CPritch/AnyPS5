@@ -85,10 +85,10 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 288, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 192, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 240, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(ShaderInvocation) == 200, "ShaderInvocation changed: update the invocation encoder");
 #if defined(__cpp_lib_atomic_shared_ptr)
-static_assert(sizeof(RecompileResult) == 528, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(RecompileResult) == 480, "RecompileResult changed: update EncodeResult and DecodeResult");
 #endif
 static_assert(sizeof(DescriptorBinding) == 320, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
@@ -322,8 +322,8 @@ public:
         out.insert(out.end(), bytes.begin(), bytes.end());
     }
 
-    template<typename TValue, typename TEncode>
-    void List(const std::vector<TValue>& values, TEncode&& encode) {
+    template<typename TValues, typename TEncode>
+    void List(const TValues& values, TEncode&& encode) {
         Value<std::uint64_t>(values.size());
         for (const auto& value : values) encode(*this, value);
     }
@@ -587,14 +587,14 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.shaderDataDwords);
     reader.Value(result.imageMetadataDword);
     reader.Value(result.runtimeImageCount);
-    reader.Values(result.runtimeImageResources);
+    reader.Values(result.runtimeImageResources.Mutable());
     reader.Value(result.registrationModule);
-    reader.List(result.vertexInputPatches, 20, [](Reader& in, VertexInputPatch& patch) {
+    reader.List(result.vertexInputPatches.Mutable(), 20, [](Reader& in, VertexInputPatch& patch) {
         in.Value(patch.location);
         in.Value(patch.word);
         for (auto& value : patch.values) in.Value(value);
     });
-    reader.List(result.vertexInputs, 16, [](Reader& in, VertexInput& attribute) {
+    reader.List(result.vertexInputs.Mutable(), 16, [](Reader& in, VertexInput& attribute) {
         in.Value(attribute.location);
         in.Value(attribute.components);
         in.Value(attribute.fetchIndex);
@@ -610,8 +610,8 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.fullSubgroups);
     reader.Value(result.functionLdsBuffer);
     reader.Value(result.meshWindowBuffer);
-    reader.Values(result.parameterExports);
-    reader.List(result.fragmentParameters, 10, [](Reader& in, FragmentParameter& parameter) {
+    reader.Values(result.parameterExports.Mutable());
+    reader.List(result.fragmentParameters.Mutable(), 10, [](Reader& in, FragmentParameter& parameter) {
         in.Value(parameter.location);
         in.Value(parameter.sourceLocation);
         in.Value(parameter.flat);
@@ -640,7 +640,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
         });
         result.meshBarycentrics = std::move(layout);
     }
-    reader.Values(result.stencilReferences);
+    reader.Values(result.stencilReferences.Mutable());
     reader.Value(result.stencilReplaySafe);
     reader.Value(result.bdaWrites);
     reader.Value(result.layerReplaySafe);
@@ -688,17 +688,17 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
 
 void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     invocation.specializationId = 0;
-    reader.List(invocation.specialization, 8, [](Reader& in, PipelineSpecializationConstant& constant) {
+    reader.List(invocation.specialization.Mutable(), 8, [](Reader& in, PipelineSpecializationConstant& constant) {
         in.Value(constant.id);
         in.Value(constant.value);
     });
-    reader.List(invocation.bindings, 8, decodeBinding);
+    reader.List(invocation.bindings.Mutable(), 8, decodeBinding);
     std::vector<std::uint8_t> pushConstants;
     reader.Values(pushConstants);
     invocation.pushConstants.resize(pushConstants.size());
     if (!pushConstants.empty()) std::memcpy(invocation.pushConstants.data(), pushConstants.data(), pushConstants.size());
     reader.Value(invocation.readsDepthRemapPush);
-    reader.List(invocation.vertexAttributes, 32, [](Reader& in, VertexAttribute& attribute) {
+    reader.List(invocation.vertexAttributes.Mutable(), 32, [](Reader& in, VertexAttribute& attribute) {
         in.Value(attribute.location);
         in.Value(attribute.components);
         for (auto& field : attribute.resource.fields) in.Value(field);
@@ -1959,7 +1959,7 @@ bool DecodeResult(std::span<const std::byte> bytes, RecompileResult& result, std
     decodeArtifact(reader, result);
     decodeInvocation(reader, result);
     reader.Value(result.workgroupMemoryDwords);
-    reader.Values(result.shaderDataUserWords);
+    reader.Values(result.shaderDataUserWords.Mutable());
     result.cacheHit = false;
     return reader.Done() && result.runtimeAbiVersion == RuntimeAbi::Version;
 }

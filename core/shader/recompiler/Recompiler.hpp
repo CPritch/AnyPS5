@@ -8,9 +8,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <iterator>
+#include <stdexcept>
 #include <memory>
 #include <optional>
 #include <span>
@@ -565,6 +569,120 @@ struct DescriptorBinding {
     CowVector<std::uint32_t> bufferExtent;
 };
 
+[[nodiscard]] bool SharedResultBindings();
+
+class BindingList {
+public:
+    using value_type = DescriptorBinding;
+    using size_type = std::size_t;
+    using difference_type = std::ptrdiff_t;
+    using iterator = std::vector<DescriptorBinding>::iterator;
+
+    class const_iterator {
+    public:
+        using iterator_category = std::random_access_iterator_tag;
+        using iterator_concept = std::random_access_iterator_tag;
+        using value_type = DescriptorBinding;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const DescriptorBinding*;
+        using reference = const DescriptorBinding&;
+
+        const_iterator() = default;
+        const_iterator(const BindingList* list, std::size_t index) : list(list), index(index) {}
+        reference operator*() const { return (*list)[index]; }
+        pointer operator->() const { return &(*list)[index]; }
+        reference operator[](difference_type offset) const { return (*list)[index + static_cast<std::size_t>(offset)]; }
+        const_iterator& operator++() { ++index; return *this; }
+        const_iterator operator++(int) { auto kept = *this; ++index; return kept; }
+        const_iterator& operator--() { --index; return *this; }
+        const_iterator operator--(int) { auto kept = *this; --index; return kept; }
+        const_iterator& operator+=(difference_type offset) { index += static_cast<std::size_t>(offset); return *this; }
+        const_iterator& operator-=(difference_type offset) { index -= static_cast<std::size_t>(offset); return *this; }
+        friend const_iterator operator+(const_iterator at, difference_type offset) { return at += offset; }
+        friend const_iterator operator+(difference_type offset, const_iterator at) { return at += offset; }
+        friend const_iterator operator-(const_iterator at, difference_type offset) { return at -= offset; }
+        friend difference_type operator-(const const_iterator& left, const const_iterator& right) { return static_cast<difference_type>(left.index) - static_cast<difference_type>(right.index); }
+        friend bool operator==(const const_iterator& left, const const_iterator& right) { return left.index == right.index; }
+        friend auto operator<=>(const const_iterator& left, const const_iterator& right) { return left.index <=> right.index; }
+
+    private:
+        const BindingList* list = nullptr;
+        std::size_t index = 0;
+    };
+
+    BindingList() = default;
+    BindingList(std::vector<DescriptorBinding> values) { *this = std::move(values); }
+    BindingList(std::initializer_list<DescriptorBinding> values) : BindingList(std::vector<DescriptorBinding>(values)) {}
+    BindingList& operator=(std::initializer_list<DescriptorBinding> values) { return *this = std::vector<DescriptorBinding>(values); }
+    BindingList& operator=(std::vector<DescriptorBinding> values) {
+        patched.clear();
+        patchedMask = 0;
+        base = values.empty() ? nullptr : std::make_shared<std::vector<DescriptorBinding>>(std::move(values));
+        return *this;
+    }
+
+    [[nodiscard]] size_type size() const { return base != nullptr ? base->size() : 0; }
+    [[nodiscard]] bool empty() const { return size() == 0; }
+    const DescriptorBinding& operator[](size_type index) const {
+        if (patchedMask == 0 || index >= 64u || (patchedMask >> index & 1u) == 0) return (*base)[index];
+        return patched[patchedRank(index)];
+    }
+    const DescriptorBinding& at(size_type index) const {
+        if (index >= size()) throw std::out_of_range("a result's binding index is out of range");
+        return (*this)[index];
+    }
+    const DescriptorBinding& front() const { return (*this)[0]; }
+    const DescriptorBinding& back() const { return (*this)[size() - 1]; }
+    const_iterator begin() const { return {this, 0}; }
+    const_iterator end() const { return {this, size()}; }
+    const_iterator cbegin() const { return begin(); }
+    const_iterator cend() const { return end(); }
+
+    std::vector<DescriptorBinding>& Mutable() {
+        if (base == nullptr) base = std::make_shared<std::vector<DescriptorBinding>>();
+        else if (base.use_count() > 1 || patchedMask != 0) base = std::make_shared<std::vector<DescriptorBinding>>(flattened());
+        patched.clear();
+        patchedMask = 0;
+        return *base;
+    }
+    DescriptorBinding& operator[](size_type index) { return Mutable()[index]; }
+    DescriptorBinding& at(size_type index) { return Mutable().at(index); }
+    DescriptorBinding& front() { return Mutable().front(); }
+    DescriptorBinding& back() { return Mutable().back(); }
+    iterator begin() { return Mutable().begin(); }
+    iterator end() { return Mutable().end(); }
+    void push_back(DescriptorBinding value) { Mutable().push_back(std::move(value)); }
+    template<typename... Arguments>
+    decltype(auto) emplace_back(Arguments&&... arguments) { return Mutable().emplace_back(std::forward<Arguments>(arguments)...); }
+    void reserve(size_type count) { Mutable().reserve(count); }
+    void resize(size_type count) { Mutable().resize(count); }
+    void clear() { *this = std::vector<DescriptorBinding>{}; }
+
+    DescriptorBinding& Patch(size_type index) {
+        if (index >= size()) throw std::out_of_range("a patched binding index is out of range");
+        if (index >= 64u || !SharedResultBindings() || (patchedMask == 0 && base.use_count() == 1)) return Mutable()[index];
+        const auto rank = patchedRank(index);
+        if ((patchedMask >> index & 1u) != 0) return patched[rank];
+        patchedMask |= std::uint64_t{1} << index;
+        return *patched.insert(patched.begin() + static_cast<std::ptrdiff_t>(rank), (*base)[index]);
+    }
+
+private:
+    [[nodiscard]] std::size_t patchedRank(size_type index) const {
+        return static_cast<std::size_t>(std::popcount(patchedMask & ((std::uint64_t{1} << index) - 1u)));
+    }
+    [[nodiscard]] std::vector<DescriptorBinding> flattened() const {
+        std::vector<DescriptorBinding> values;
+        values.reserve(size());
+        for (const auto& binding : *this) values.push_back(binding);
+        return values;
+    }
+
+    std::shared_ptr<std::vector<DescriptorBinding>> base;
+    std::vector<DescriptorBinding> patched;
+    std::uint64_t patchedMask = 0;
+};
+
 struct ImageTableEntryPoison {
     std::array<std::uint32_t, 8> words{};
     std::uint32_t dwordCount = 0;
@@ -745,19 +863,19 @@ struct VertexInputPatch {
 };
 
 struct CompiledShaderArtifact {
-    std::vector<VertexInputPatch> vertexInputPatches;
+    CowVector<VertexInputPatch> vertexInputPatches;
     SharedSpirv spirv;
     std::uint32_t memoryOffsetDword = 0;
     std::uint32_t shaderDataDwords = 0;
     std::uint32_t imageMetadataDword = 0;
     std::uint32_t runtimeImageCount = 0;
-    std::vector<std::uint32_t> runtimeImageResources;
+    CowVector<std::uint32_t> runtimeImageResources;
     bool registrationModule = false;
     std::uint32_t bdaAbiVersion = 0;
     std::uint32_t windowLaneGuards = 0;
     std::uint32_t descriptorFaults = 0;
     std::uint32_t runtimeAbiVersion = RuntimeAbi::Version;
-    std::vector<VertexInput> vertexInputs;
+    CowVector<VertexInput> vertexInputs;
     std::int32_t vertexOffsetSgpr = -1;
     std::int32_t instanceOffsetSgpr = -1;
     bool vertexOffsetShared = false;
@@ -768,11 +886,11 @@ struct CompiledShaderArtifact {
     bool fullSubgroups = false;
     bool functionLdsBuffer = false;
     bool meshWindowBuffer = false;
-    std::vector<std::uint32_t> parameterExports;
-    std::vector<FragmentParameter> fragmentParameters;
+    CowVector<std::uint32_t> parameterExports;
+    CowVector<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;
     std::optional<MeshBarycentricLayout> meshBarycentrics;
-    std::vector<std::uint32_t> stencilReferences;
+    CowVector<std::uint32_t> stencilReferences;
     bool stencilReplaySafe = false;
     bool bdaWrites = false;
     bool layerReplaySafe = false;
@@ -781,12 +899,12 @@ struct CompiledShaderArtifact {
 };
 
 struct ShaderInvocation {
-    std::vector<PipelineSpecializationConstant> specialization;
+    CowVector<PipelineSpecializationConstant> specialization;
     std::uint64_t specializationId = 0;
-    std::vector<DescriptorBinding> bindings;
+    BindingList bindings;
     std::vector<std::byte> pushConstants;
     bool readsDepthRemapPush = false;
-    std::vector<VertexAttribute> vertexAttributes;
+    CowVector<VertexAttribute> vertexAttributes;
     std::uint64_t userDataRegisterReads = 0;
     std::uint32_t poisonedSrtReads = 0;
     CowVector<ImageTableEntryPoison> imageTablePoison;
@@ -824,7 +942,7 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     ResultKeyMemo drawKeyMemo;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
-    std::vector<std::uint32_t> shaderDataUserWords;
+    CowVector<std::uint32_t> shaderDataUserWords;
     [[nodiscard]] std::uint64_t PipelineVariantId() const { return specializationId != 0 ? specializationId : variantId; }
     [[nodiscard]] PipelineIdentity Identity() const {
         const auto hash = spirv.ContentHash();
