@@ -2676,9 +2676,9 @@ std::pair<std::uint64_t, std::uint64_t> mappedExtent(std::uint64_t base, std::ui
 
 void verifyImportKept(const Context& context, HostImports& state, const HostImport& entry) {
     const auto before = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    const auto lease = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
     const bool same = sameRange(entry, lease, effectiveBudget(context, state));
-    if (same || before != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return;
+    if (same || before != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || GuestAllocations::GuestAllocationsMutationWaiting_nid_postfix()) return;
     std::fprintf(stderr, "FATAL: APS5_VERIFY_IMPORT_JOURNAL: the journal kept the import of 0x%llx+0x%llx, which a full reconcile would drop\n", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes));
     std::abort();
 }
@@ -4900,7 +4900,7 @@ void GuestBufferMemory::AcquireRegistered() {
             if (region != held.base.end() && region->begin < high) return false;
             if (std::any_of(held.copied.begin(), held.copied.end(), [&](const CopiedRange& range) { return range.begin < high && low < range.end; })) return false;
         }
-        if (verifySpacePatch() && generation == GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+        if (verifySpacePatch() && generation == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && !GuestAllocations::GuestAllocationsMutationWaiting_nid_postfix()) {
             for (const auto& range : GuestAllocations::GuestAllocationsAcquire_nid_postfix()) {
                 if (!range->gpu || !range->readable) continue;
                 const auto end = range->address + range->bytes;

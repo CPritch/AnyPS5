@@ -518,6 +518,11 @@ bool GuestAllocationsChangesSince_nid_no_patch(std::uint64_t since, std::vector<
     return true;
 }
 
+bool GuestAllocationsMutationWaiting_nid_postfix() {
+    std::lock_guard lock(registry().mutex);
+    return !registry().retiring.empty();
+}
+
 bool GuestAllocationsAnyGpuRange_nid_postfix(std::uintptr_t address, std::size_t bytes) {
     std::lock_guard lock(registry().mutex);
     const auto& ranges = registry().ranges;
