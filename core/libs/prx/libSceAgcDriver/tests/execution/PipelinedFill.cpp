@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferFill.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
 #include <atomic>
@@ -161,6 +163,71 @@ void InputsAfterQueuedLabels() {
     }
 }
 
+#ifndef _WIN32
+void EndSubmitsCoalesceBehindQueuedWork() {
+    constexpr std::size_t Submissions = 6;
+    constexpr std::size_t BlockBytes = 65536;
+    if (DrawPipeline::Depth() < 3 * Submissions) return;
+    auto* words = static_cast<std::uint32_t*>(std::aligned_alloc(BlockBytes, BlockBytes));
+    Require(words != nullptr, "the fill block was not allocated");
+    GuestAllocations::Mutation().Add(words, BlockBytes, true, true, true);
+    struct Registered {
+        std::uint32_t* words;
+        ~Registered() {
+            GuestAllocations::Mutation().Remove(words);
+            std::free(words);
+        }
+    } registered{words};
+    std::fill_n(words, BlockBytes / 4, 0xcafebabeu);
+    Pattern = {0x21212121u, 0, 0, 0};
+    Control = {256, 0, 0, 0};
+    std::array<std::vector<std::uint32_t>, Submissions> packets;
+    const auto offset = [](std::size_t index) { return index * 2048; };
+    for (std::size_t index = 0; index < Submissions; ++index) {
+        AppendFill(packets[index], Pattern.data(), Control.data(), words + offset(index) / 4);
+        AppendLabel(packets[index], words + (offset(index) + 1024) / 4, static_cast<std::uint32_t>(index + 1));
+    }
+    {
+        std::vector<std::uint32_t> warm;
+        AppendFill(warm, Pattern.data(), Control.data(), words + (BlockBytes - 2048) / 4);
+        Packet packet{warm.data(), static_cast<std::uint32_t>(warm.size()), 0, {}};
+        AgcDriver::Submit(&packet, 0);
+        Finish();
+    }
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    Require(recorder != nullptr, "the recorder is not active");
+    const auto before = recorder->Submissions();
+    Blocker blocker;
+    blocker.Enqueue();
+    for (auto& packetWords : packets) {
+        Packet packet{packetWords.data(), static_cast<std::uint32_t>(packetWords.size()), 0, {}};
+        AgcDriver::Submit(&packet, 0);
+    }
+    auto seen = DrawPipeline::Queue0().Outstanding();
+    auto settled = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - settled < std::chrono::milliseconds(500)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (const auto now = DrawPipeline::Queue0().Outstanding(); now != seen) {
+            seen = now;
+            settled = std::chrono::steady_clock::now();
+        }
+    }
+    const auto queued = seen;
+    blocker.Release();
+    Finish();
+    blocker.Join();
+    const auto batches = recorder->Submissions() - before;
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(words), BlockBytes);
+    for (std::size_t index = 0; index < Submissions; ++index) {
+        Require(words[offset(index) / 4] == 0x21212121u, "a fill behind a coalesced end submit never ran");
+        Require(words[(offset(index) + 1024) / 4] == index + 1, "a label behind a coalesced end submit never landed");
+    }
+    if (std::getenv("APS5_NO_COALESCED_END_SUBMITS") != nullptr) Require(queued < Submissions || batches >= Submissions, "the switch left end submits coalesced: " + std::to_string(batches));
+    else Require(queued < Submissions || (batches <= Submissions / 2 && batches != 0), "the queued submissions' batches were not coalesced: " + std::to_string(batches) + " behind " + std::to_string(queued) + " items");
+}
+
+#endif
+
 void FillIntoFullPipeline() {
     Output.fill(0xcafebabeu);
     Pattern = {0x5a5a5a5au, 0, 0, 0};
@@ -257,6 +324,9 @@ int main() {
             if (!device) return VulkanTestSkipped;
         }
         InputsAfterQueuedLabels();
+#ifndef _WIN32
+        EndSubmitsCoalesceBehindQueuedWork();
+#endif
         FillIntoFullPipeline();
         SatisfiedWaitKeepsUnrelatedQueuedWork();
         SatisfiedWaitDrainsOverlappingQueuedWork();

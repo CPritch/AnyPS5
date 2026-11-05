@@ -1123,6 +1123,14 @@ void DrawPipeline::SettleCarriedBoundary() {
     ReleaseCarriedHold();
 }
 
+bool DrawPipeline::Committing() {
+    return committingPipeline != nullptr;
+}
+
+bool DrawPipeline::ItemsBehindCommit() const {
+    return outstanding.load(std::memory_order_acquire) >= 2;
+}
+
 bool DrawPipeline::CarryHold() {
     static const bool enabled = std::getenv("APS5_NO_CARRY_RESOLVE_HOLD") == nullptr;
     const auto next = std::exchange(postedNext, 0);

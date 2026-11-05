@@ -168,6 +168,8 @@ public:
     static void NoteJobClass(std::size_t jobClass, std::uint64_t jobNs, std::uint64_t waitNs);
     static bool CarryHold();
     static bool HoldCarried();
+    static bool Committing();
+    bool ItemsBehindCommit() const;
     static void ReleaseCarriedHold() noexcept;
     static void SetCarryRelease(void (*release)());
     static void NoteOwnResolve(OwnCause cause, std::uint64_t resolveNs, std::uint64_t emitNs);

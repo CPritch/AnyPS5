@@ -1,3 +1,5 @@
 if(BUILD_TESTING)
     agc_add_draw_pipeline_test(agc_driver_pipelined_fill)
+    add_test(NAME agc_driver_pipelined_fill_no_coalesced_end_submits COMMAND agc_driver_pipelined_fill_tests)
+    set_tests_properties(agc_driver_pipelined_fill_no_coalesced_end_submits PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PIPELINE=1;APS5_NO_COALESCED_END_SUBMITS=1" SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()

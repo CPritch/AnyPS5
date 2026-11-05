@@ -78,13 +78,16 @@ void Driver::deferCompletion(const Submission& submission) {
 void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress) {
     const bool work = !deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     if (!work && !progress) return;
+    static const bool coalesce = std::getenv("APS5_NO_COALESCED_END_SUBMITS") == nullptr;
+    const bool behind = coalesce && !progress && DrawPipeline::Committing() && DrawPipeline::Queue0().ItemsBehindCommit();
+    if (behind && deferredLabels().labels.empty()) return;
     ++submissionCosts(0).endSubmits;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();
     if (work) {
         recordDeferredLabels(localDevice.get(), 0);
-        if (localDevice != nullptr) localDevice->SubmitRecorded(true);
+        if (localDevice != nullptr && !behind) localDevice->SubmitRecorded(true);
     }
     if (progress) progress->Publish(localDevice, localDevice ? localDevice->SubmittedEpoch() : 0);
 }
