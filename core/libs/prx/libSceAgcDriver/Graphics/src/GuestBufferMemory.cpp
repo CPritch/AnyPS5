@@ -539,7 +539,11 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     // Results shadowed for the import reach its (old) buffer first where the memory is still a
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
-    RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
+    const auto current = AnyShadowedOverlaps(it->second.base, static_cast<std::size_t>(it->second.bytes)) ? GuestAllocations::GuestAllocationsAcquire_nid_postfix() : GuestAllocations::Lease{};
+    RetireShadow(device, it->second, [&lease, &current, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) {
+        const auto covers = [&](const GuestAllocations::Lease& ranges) { return runCovers(ranges, begin, end) || (joined && joinedCovers(ranges, begin, end)); };
+        return covers(lease) || covers(current);
+    });
     ++state.epoch;
     GuestMemory::BreakProofs(GuestMemory::ProofBreak::Import);
     state.liveBytes -= it->second.pinnedBytes;
@@ -6322,6 +6326,9 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
         if (acquired.empty()) acquired = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
         return acquired;
     };
+    const auto reconcileRanges = [&]() -> GuestAllocations::Lease {
+        return lease.empty() && space != nullptr && space->keptThrough.load(std::memory_order_acquire) != space->generation ? GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix() : importRanges();
+    };
     // Sub-range mirrors were found by UploadPrepare, possibly long before this lock was taken: one
     // whose Range went meanwhile (the guest reprotected its image) is dropped as findMirror would
     // have dropped it, and the region takes the import or copy path below instead; a confirmed one
@@ -6343,7 +6350,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
-        if (importsStale(context, state)) refreshImports(context, state, importRanges());
+        if (importsStale(context, state)) refreshImports(context, state, reconcileRanges());
         importsRefreshed = true;
         for (const auto& region : regions) {
             if (!region.pending || region.mirror != nullptr || region.direct != nullptr || sparseHeapCandidate(region)) continue;
@@ -6358,7 +6365,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
         // pointer instead of trusting it.
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
-        if (importsStale(context, state)) refreshImports(context, state, importRanges());
+        if (importsStale(context, state)) refreshImports(context, state, reconcileRanges());
         importsRefreshed = true;
         if (state.epoch != space->importsEpoch) {
             Spaces().dissolvedImports.fetch_add(1, std::memory_order_relaxed);
@@ -6399,7 +6406,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             std::lock_guard lock(state.mutex);
             // Imports are made on demand for the registered range around each region.
             if (!importsRefreshed) {
-                if (importsStale(context, state)) refreshImports(context, state, importRanges());
+                if (importsStale(context, state)) refreshImports(context, state, reconcileRanges());
                 importsRefreshed = true;
             }
             // An import taken by UploadPrepare (or at the lease) is still the registry's unless one

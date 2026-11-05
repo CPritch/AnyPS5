@@ -424,6 +424,41 @@ void keptJoinedImportTest(const Context& context) {
     fixture.Remove(0, 0);
 }
 
+void oldSpaceLeaseTest(const Context& context) {
+    if (!AddressSpaceCounters().enabled || std::getenv("APS5_NO_SPACE_PATCH") != nullptr) return;
+    JournalFixture fixture(context);
+    const auto& importing = fixture.importing;
+    fixture.Add(0, 0);
+    const auto build = [&] {
+        GuestBufferMemory building(importing);
+        building.AcquireRegistered();
+        building.Upload(true);
+        building.WriteBack();
+    };
+    build();
+    fixture.Add(1, 0, false);
+    const auto later = fixture.Address(1, 0);
+    const auto* entry = HostImportFor(importing, later, JournalPiece);
+    Require(entry != nullptr, "the range mapped after the space was built was not imported");
+    const auto epoch = HostImportEpoch();
+    const auto before = AddressSpaceCounters();
+    {
+        GuestBufferMemory building(importing);
+        building.AcquireRegistered();
+        fixture.Add(2, 0, false);
+        building.Upload(true);
+        building.WriteBack();
+    }
+    const auto after = AddressSpaceCounters();
+    Require(after.hits == before.hits + 1, "the build over the kept space did not use the kept space");
+    Require(HostImportCovers(importing, later, JournalPiece), "reconciling against the kept space's old lease retired an import of a range mapped after it");
+    Require(HostImportEpoch() == epoch, "reconciling against the kept space's old lease moved the import epoch");
+    Require(HostImportFor(importing, later, JournalPiece) == entry, "reconciling against the kept space's old lease replaced an import nothing touched");
+    fixture.Remove(2, 0);
+    fixture.Remove(1, 0);
+    fixture.Remove(0, 0);
+}
+
 void importRunGrowthTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     void* block = ::operator new(2 * piece, std::align_val_t{piece});
@@ -4715,6 +4750,7 @@ void RunImportJournalVerifyTests(const Context& context) {
     keptOverOlderLeaseTest(context);
     keptOverRefusalFlipTest(context);
     keptJoinedImportTest(context);
+    oldSpaceLeaseTest(context);
 }
 
 void RunImportJournalStaleTest(const Context& context, std::string_view kind) {
