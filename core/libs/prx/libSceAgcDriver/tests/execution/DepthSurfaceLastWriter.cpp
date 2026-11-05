@@ -260,6 +260,26 @@ void Run(const Context& context) {
     RetireDepthSurfaces(context.device, plane + 0x100, 0x1000);
     DepthSurfaceView(context, Depth(plane), false);
     Require(DepthViewMemoHits() == hits + (memo ? 3u : 0u), "a retired depth surface took the memo");
+
+    constexpr std::size_t Rotation = 6;
+    std::vector<std::uint64_t> rotated;
+    for (std::size_t index = 0; index < Rotation; ++index) {
+        const auto address = reinterpret_cast<std::uint64_t>(AllocateWatched(2 * Block));
+        AgcDriver::GuestMemory::CollectWrites(address, 2 * Block);
+        rotated.push_back(address);
+    }
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    for (const auto address : rotated) DepthSurfaceView(context, Depth(address));
+    for (const auto address : rotated) DepthSurfaceView(context, Depth(address));
+    const auto rotatedHits = DepthViewMemoHits();
+    for (const auto address : rotated) DepthSurfaceView(context, Depth(address));
+    const bool wide = memo && std::getenv("APS5_NO_WIDE_DEPTH_VIEW_MEMO") == nullptr;
+    Require(!wide || DepthViewMemoHits() == rotatedHits + Rotation, "six depth targets in rotation did not all take the memo");
+    Require(wide || DepthViewMemoHits() == rotatedHits, "the narrow memo kept more targets than it holds");
+    AgcDriver::GuestMemory::MarkWritten(rotated.front() + 0x100, 4);
+    const auto storedHits = DepthViewMemoHits();
+    DepthSurfaceView(context, Depth(rotated.front()));
+    Require(DepthViewMemoHits() == storedHits, "a driver store over a rotated depth plane took the memo");
 }
 
 }

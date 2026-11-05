@@ -2840,29 +2840,41 @@ struct DepthViewMemo {
     std::uint64_t htileGeneration = 0;
 };
 
-constexpr std::size_t DepthViewMemoSlots = 4;
-thread_local std::array<DepthViewMemo, DepthViewMemoSlots> depthViewMemos;
+constexpr std::size_t DepthViewMemoCapacity = 32;
+thread_local std::array<DepthViewMemo, DepthViewMemoCapacity> depthViewMemos;
 thread_local std::size_t depthViewMemoNext = 0;
+thread_local std::size_t depthViewMemoLast = 0;
+
+std::size_t depthViewMemoSlots() {
+    static const std::size_t slots = std::getenv("APS5_NO_WIDE_DEPTH_VIEW_MEMO") == nullptr ? DepthViewMemoCapacity : std::size_t{4};
+    return slots;
+}
 
 DepthViewMemo* findDepthViewMemo(const Context& context, const DepthTarget& target) {
-    const std::size_t slots = DepthViewMemoPerTarget() ? DepthViewMemoSlots : 1u;
+    const std::size_t slots = DepthViewMemoPerTarget() ? depthViewMemoSlots() : 1u;
+    if (auto& last = depthViewMemos[depthViewMemoLast]; depthViewMemoLast < slots && last.valid && last.device == context.device && sameDepthTarget(last.target, target)) return &last;
     for (std::size_t slot = 0; slot < slots; ++slot) {
         auto& memo = depthViewMemos[slot];
-        if (memo.valid && memo.device == context.device && sameDepthTarget(memo.target, target)) return &memo;
+        if (memo.valid && memo.device == context.device && sameDepthTarget(memo.target, target)) {
+            depthViewMemoLast = slot;
+            return &memo;
+        }
     }
     return nullptr;
 }
 
 DepthViewMemo& depthViewMemoSlot(const Context& context, const DepthTarget& target) {
     if (!DepthViewMemoPerTarget()) return depthViewMemos[0];
-    for (auto& memo : depthViewMemos) {
+    const auto slots = depthViewMemoSlots();
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        auto& memo = depthViewMemos[slot];
         if (memo.device == context.device && sameDepthTarget(memo.target, target)) return memo;
     }
-    for (auto& memo : depthViewMemos) {
-        if (!memo.valid) return memo;
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (!depthViewMemos[slot].valid) return depthViewMemos[slot];
     }
     auto& memo = depthViewMemos[depthViewMemoNext];
-    depthViewMemoNext = (depthViewMemoNext + 1) % DepthViewMemoSlots;
+    depthViewMemoNext = (depthViewMemoNext + 1) % slots;
     depthViewStoreCounts[StoreEvictedValid].fetch_add(1, std::memory_order_relaxed);
     return memo;
 }
