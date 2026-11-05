@@ -4665,6 +4665,15 @@ void GuestBufferMemory::RecordEvicted(std::uint64_t address) {
     if (!WasEvicted(address)) evictedRanges.push_back(address);
 }
 
+static bool importsUnchangedRange(const GuestAllocations::Lease& before, const GuestAllocations::Lease& now, std::size_t index, std::size_t& at) {
+    const auto& range = now[index];
+    while (at < before.size() && before[at]->address < range->address) ++at;
+    if (at >= before.size() || before[at].get() != range.get()) return false;
+    const bool low = index == 0 ? at == 0 : at != 0 && before[at - 1].get() == now[index - 1].get();
+    const bool high = index + 1 == now.size() ? at + 1 == before.size() : at + 1 < before.size() && before[at + 1].get() == now[index + 1].get();
+    return low && high;
+}
+
 void GuestBufferMemory::AcquireRegistered() {
     struct BuildingScope {
         explicit BuildingScope(GuestBufferMemory* self) { buildingBufferMemory = self; }
@@ -4782,6 +4791,10 @@ void GuestBufferMemory::AcquireRegistered() {
     if (space == nullptr) {
         // Pending GPU results in these ranges are stored when Upload prepares each region.
         lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        static const bool reuseSpaceImports = std::getenv("APS5_NO_SPACE_IMPORT_REUSE") == nullptr;
+        static const bool verifySpaceImports = std::getenv("APS5_VERIFY_SPACE_IMPORT_REUSE") != nullptr;
+        const auto previousSpace = reuseSpaceImports && addressSpaceCacheEnabled() ? spaces.current.load() : std::shared_ptr<const AddressSpace>{};
+        std::size_t previousAt = 0;
         lap(timing.leaseUs, at);
         {
             auto& state = Imports();
@@ -4830,7 +4843,18 @@ void GuestBufferMemory::AcquireRegistered() {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
                 const auto refusals = state.budgetRefusals;
-                entry = importAllocation(context, state, range->address, lease, ImportRequester::Build, 0, false);
+                const auto leaseIndex = static_cast<std::size_t>(&range - &lease[0]);
+                const HostImport* unchanged = previousSpace != nullptr && importsUnchangedRange(previousSpace->lease, lease, leaseIndex, previousAt) && !importsStale(context, state) ? findImport(state, range->address, range->address + range->bytes) : nullptr;
+                if (unchanged != nullptr && !verifySpaceImports) {
+                    unchanged->lastUse = ++state.useCounter;
+                    entry = unchanged;
+                } else {
+                    entry = importAllocation(context, state, range->address, lease, ImportRequester::Build, 0, false);
+                    if (unchanged != nullptr && entry != unchanged) {
+                        static std::atomic<std::uint64_t> differing{0};
+                        if (differing.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[space-imports] APS5_VERIFY_SPACE_IMPORT_REUSE: the import of 0x%llx+0x%llx differs from the one kept across the rebuild\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes));
+                    }
+                }
                 overBudget = state.budgetRefusals != refusals;
                 covering = entry;
                 if (entry != nullptr) {

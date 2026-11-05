@@ -457,6 +457,50 @@ void spaceImportRunTests(const Context& context) {
     ::operator delete(block, std::align_val_t{piece});
 }
 
+void spaceImportReuseTests(const Context& context) {
+    if (!AddressSpaceCounters().enabled) return;
+    constexpr std::size_t piece = 65536;
+    void* block = ::operator new(8 * piece, std::align_val_t{piece});
+    std::memset(block, 0x6d, 8 * piece);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, true, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto kept = reinterpret_cast<std::uint64_t>(guest);
+    const auto later = reinterpret_cast<std::uint64_t>(guest + 4 * piece);
+    const auto build = [&](std::uint64_t address, const char* failure) {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.AddReadable(address + 64, 512);
+        leased.Upload(true);
+        std::uint32_t adjustment = 0;
+        const auto view = leased.Descriptor(address + 64, 512, adjustment);
+        Require(view.buffer != VK_NULL_HANDLE && view.range >= 512, failure);
+        const auto ranges = leased.AddressRanges();
+        Require(std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= address && address + piece <= range.end; }), failure);
+        leased.WriteBack();
+    };
+    change(guest, true);
+    build(kept, "the first build of a space has no import of its range");
+    change(guest + 4 * piece, true);
+    build(kept, "a space rebuilt for an unrelated new range lost the kept range's import");
+    build(later, "a space rebuilt for an unrelated new range has no import of the new range");
+    change(guest + piece, true);
+    build(kept, "a space rebuilt for a range next to a kept one lost its import");
+    build(kept + piece, "a space rebuilt for a range next to a kept one has no import of it");
+    change(guest + 4 * piece, false);
+    build(kept, "a space rebuilt after an unrelated unmap lost the kept range's import");
+    change(guest + piece, false);
+    build(kept, "a space rebuilt after its neighbour's unmap lost the kept range's import");
+    change(guest, false);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 void spaceReadListTests(const Context& context) {
     if (!AddressSpaceCounters().enabled) return;
     constexpr std::size_t piece = 65536;
@@ -4665,6 +4709,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     spaceImportRunTests(context);
     spaceWritableWritesTests(context);
     spaceReadListTests(context);
+    spaceImportReuseTests(context);
     importWindowTests(context);
     spaceReadAcrossImportsTests(context, access);
     spaceReadAcrossImportsWrittenTests(context);
