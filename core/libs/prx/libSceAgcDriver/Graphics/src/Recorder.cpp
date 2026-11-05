@@ -4431,6 +4431,25 @@ std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes
     return newest;
 }
 
+Recorder::PendingWriteMark Recorder::PendingWritesMark(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    PendingWriteMark mark{};
+    if (bytes == 0) return mark;
+    const auto end = address + bytes;
+    const auto scan = [&](const Batch& batch) {
+        for (std::size_t i = 0; i < batch.writes.size(); ++i) {
+            if (address >= batch.writes[i].second || batch.writes[i].first >= end) continue;
+            const auto note = batch.writeNotes[i];
+            ++mark.count;
+            mark.newest = std::max(mark.newest, note);
+            mark.oldest = mark.count == 1 ? note : std::min(mark.oldest, note);
+        }
+    };
+    if (open != nullptr) scan(*open);
+    for (const auto& batch : inFlight) scan(*batch);
+    return mark;
+}
+
 std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t address, std::size_t bytes) const {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     std::vector<PendingWrite> found;

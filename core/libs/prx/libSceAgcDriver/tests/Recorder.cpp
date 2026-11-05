@@ -1413,7 +1413,24 @@ void spaceWriteSyncTests(const Device& device, Recorder& recorder) {
     ::operator delete(block, std::align_val_t{65536});
 }
 
+void pendingMarkTests(Recorder& recorder) {
+    const auto empty = recorder.PendingWritesMark(0x70000, 0x100);
+    Require(empty == Recorder::PendingWriteMark{}, "a range with no pending write has a mark");
+    recorder.NotePendingWrite(0x70000, 0x100);
+    const auto one = recorder.PendingWritesMark(0x70000, 0x100);
+    Require(one.count == 1 && one.newest != 0, "a pending write over the range is not in its mark");
+    recorder.NotePendingWrite(0x90000, 0x100);
+    Require(recorder.PendingWritesMark(0x70000, 0x100) == one, "a write elsewhere changed the range's mark");
+    recorder.NotePendingWrite(0x70080, 0x10);
+    const auto two = recorder.PendingWritesMark(0x70000, 0x100);
+    Require(two.count == 2 && two.newest > one.newest, "a second write over the range did not change its mark");
+    recorder.Sync();
+    recorder.Reap();
+    Require(recorder.PendingWritesMark(0x70000, 0x100) == Recorder::PendingWriteMark{}, "a finished batch's writes stayed in the mark");
+}
+
 void writeSettledTests(const Device& device, Recorder& recorder) {
+    pendingMarkTests(recorder);
     Require(recorder.PendingWriteSettled(0x50000, 0x100), "an unwritten range is not settled");
     recorder.NotePendingWrite(0x50000, 0x100);
     Require(recorder.PendingWriteOverlaps(0x50000, 0x100) && !recorder.PendingWriteSettled(0x50000, 0x100) && recorder.PendingWriteSettled(0x50100, 0x100), "an open batch's write counts as settled");

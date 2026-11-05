@@ -257,9 +257,17 @@ void Run(const Context& context) {
     Require(DepthViewMemoHits() == hits + (memo ? 2u : 0u), "a call that does not write depth took the memo of one that does");
     DepthSurfaceView(context, Depth(plane), false);
     Require(DepthViewMemoHits() == hits + (memo ? 3u : 0u), "the same read-only depth target twice did not take the memo");
+    const bool flagKeyed = memo && std::getenv("APS5_NO_FLAG_KEYED_DEPTH_VIEW_MEMO") == nullptr;
+    DepthSurfaceView(context, Depth(plane));
+    Require(DepthViewMemoHits() == hits + (memo ? 3u : 0u) + (flagKeyed ? 1u : 0u), "flipping the depth write flag back did not take that flag's memo");
+    AgcDriver::GuestMemory::MarkWritten(plane + 0x200, 4);
+    DepthSurfaceView(context, Depth(plane), false);
+    Require(DepthViewMemoHits() == hits + (memo ? 3u : 0u) + (flagKeyed ? 1u : 0u), "a driver store over the depth plane took the read-only memo");
+    DepthSurfaceView(context, Depth(plane), false);
+    const auto retiredHits = DepthViewMemoHits();
     RetireDepthSurfaces(context.device, plane + 0x100, 0x1000);
     DepthSurfaceView(context, Depth(plane), false);
-    Require(DepthViewMemoHits() == hits + (memo ? 3u : 0u), "a retired depth surface took the memo");
+    Require(DepthViewMemoHits() == retiredHits, "a retired depth surface took the memo");
 
     constexpr std::size_t Rotation = 6;
     std::vector<std::uint64_t> rotated;

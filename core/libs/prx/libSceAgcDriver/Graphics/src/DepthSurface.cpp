@@ -2153,6 +2153,28 @@ std::map<std::uint64_t, std::uint64_t>& htileReads() {
     return *reads;
 }
 
+struct LandedHtile {
+    Recorder::PendingWriteMark mark{};
+    std::uint64_t collected = 0;
+    std::size_t bytes = 0;
+    bool stencil = false;
+};
+
+std::map<std::uint64_t, LandedHtile>& landedHtiles() {
+    static auto* landed = new std::map<std::uint64_t, LandedHtile>();
+    return *landed;
+}
+
+bool PendingHtileMemo() {
+    static const bool enabled = std::getenv("APS5_NO_PENDING_HTILE_MEMO") == nullptr;
+    return enabled;
+}
+
+bool PendingHtileMemoVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_PENDING_HTILE_MEMO") != nullptr;
+    return verified;
+}
+
 struct KnownHtile {
     std::size_t bytes;
     std::uint32_t word;
@@ -2372,6 +2394,21 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
     const bool remember = MetadataTrust::Level() >= 2;
     PendingHtile resolved;
+    Recorder::PendingWriteMark pendingMark{};
+    bool landedSame = false;
+    if (pending && pendingFills && PendingHtileMemo()) {
+        pendingMark = recorder->PendingWritesMark(target.htileAddress, bytes);
+        std::lock_guard lock(htileReadsMutex());
+        const auto found = landedHtiles().find(target.htileAddress);
+        landedSame = found != landedHtiles().end() && found->second.mark == pendingMark && found->second.collected == collected && found->second.bytes == bytes && found->second.stencil == target.htileStencil;
+        if (landedSame && !PendingHtileMemoVerified()) return 0;
+    }
+    const auto noteLanded = [&] {
+        if (PendingHtileMemo()) landedHtiles()[target.htileAddress] = {pendingMark, collected, bytes, target.htileStencil};
+    };
+    const auto checkLanded = [&](VkImageAspectFlags found) {
+        if (landedSame) Require(found == 0, "the pending HTILE memo skipped a store-back that found a clear");
+    };
     if (pending && pendingFills) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
         const auto publish = Recorder::PublishGeneration();
@@ -2389,8 +2426,10 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
         }
         if (const auto landed = resolved.word) {
             const VkImageAspectFlags cleared = (VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u)) & HtileFillClears(*landed, target.htileStencil);
+            checkLanded(cleared);
             if (cleared == 0) {
                 std::lock_guard lock(htileReadsMutex());
+                noteLanded();
                 htileReads()[target.htileAddress] = collected;
                 if (remember) noteKnownHtileLocked(target.htileAddress, bytes, *landed, collected);
                 return 0;
@@ -2406,8 +2445,10 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
         } else if (!resolved.words.empty()) {
             VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
             for (const auto word : resolved.words) cleared &= HtileFillClears(word, target.htileStencil);
+            checkLanded(cleared);
             if (cleared == 0) {
                 std::lock_guard lock(htileReadsMutex());
+                noteLanded();
                 htileReads()[target.htileAddress] = collected;
                 mixedHtiles()[target.htileAddress] = {publish, written, collected, bytes};
                 if (remember) noteKnownHtileLocked(target.htileAddress, bytes, std::nullopt, collected);
@@ -2425,6 +2466,7 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     if (!resolved.checks.empty() && GuestMemory::UnchangedSince(target.htileAddress, bytes, collected)) CheckPendingHtile(MetadataTrust::Process(), resolved, words);
     VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
+    checkLanded(cleared);
     auto generation = collected;
     if (cleared != 0) {
         for (auto& word : words) word = expandedHtileWord(word, target.htileStencil, cleared);
@@ -2846,22 +2888,52 @@ struct DepthViewMemo {
     std::uint64_t htileGeneration = 0;
 };
 
-constexpr std::size_t DepthViewMemoCapacity = 32;
-thread_local std::array<DepthViewMemo, DepthViewMemoCapacity> depthViewMemos;
+constexpr std::size_t DepthViewMemoCapacity = 128;
+struct DepthViewMemos {
+    std::array<std::uint64_t, DepthViewMemoCapacity> tags{};
+    std::array<DepthViewMemo, DepthViewMemoCapacity> memos{};
+};
+thread_local DepthViewMemos* depthViewMemoSlotsOwned = nullptr;
 thread_local std::size_t depthViewMemoNext = 0;
 thread_local std::size_t depthViewMemoLast = 0;
 
+DepthViewMemos& ownDepthViewMemos() {
+    if (depthViewMemoSlotsOwned == nullptr) {
+        thread_local std::unique_ptr<DepthViewMemos> owned = std::make_unique<DepthViewMemos>();
+        depthViewMemoSlotsOwned = owned.get();
+    }
+    return *depthViewMemoSlotsOwned;
+}
+
 std::size_t depthViewMemoSlots() {
-    static const std::size_t slots = std::getenv("APS5_NO_WIDE_DEPTH_VIEW_MEMO") == nullptr ? DepthViewMemoCapacity : std::size_t{4};
+    static const std::size_t slots = std::getenv("APS5_NO_WIDE_DEPTH_VIEW_MEMO") != nullptr ? std::size_t{4} : std::getenv("APS5_NO_FLAG_KEYED_DEPTH_VIEW_MEMO") != nullptr ? std::size_t{32} : DepthViewMemoCapacity;
     return slots;
 }
 
-DepthViewMemo* findDepthViewMemo(const Context& context, const DepthTarget& target) {
+bool DepthViewMemoFlagKeyed() {
+    static const bool enabled = std::getenv("APS5_NO_FLAG_KEYED_DEPTH_VIEW_MEMO") == nullptr;
+    return enabled;
+}
+
+std::uint64_t depthViewMemoTag(const DepthTarget& target, bool depthWritten, bool stencilTested) {
+    const std::uint64_t flags = DepthViewMemoFlagKeyed() ? (depthWritten ? 2u : 0u) | (stencilTested ? 1u : 0u) : 0u;
+    return (target.address << 2u) ^ flags ^ (static_cast<std::uint64_t>(target.firstSlice) << 50u);
+}
+
+bool depthViewMemoMatches(const DepthViewMemo& memo, const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested) {
+    if (memo.device != context.device || !sameDepthTarget(memo.target, target)) return false;
+    return !DepthViewMemoFlagKeyed() || (memo.depthWritten == depthWritten && memo.stencilTested == stencilTested);
+}
+
+DepthViewMemo* findDepthViewMemo(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested) {
+    auto& own = ownDepthViewMemos();
     const std::size_t slots = DepthViewMemoPerTarget() ? depthViewMemoSlots() : 1u;
-    if (auto& last = depthViewMemos[depthViewMemoLast]; depthViewMemoLast < slots && last.valid && last.device == context.device && sameDepthTarget(last.target, target)) return &last;
+    if (auto& last = own.memos[depthViewMemoLast]; depthViewMemoLast < slots && last.valid && depthViewMemoMatches(last, context, target, depthWritten, stencilTested)) return &last;
+    const auto tag = depthViewMemoTag(target, depthWritten, stencilTested);
     for (std::size_t slot = 0; slot < slots; ++slot) {
-        auto& memo = depthViewMemos[slot];
-        if (memo.valid && memo.device == context.device && sameDepthTarget(memo.target, target)) {
+        if (own.tags[slot] != tag) continue;
+        auto& memo = own.memos[slot];
+        if (memo.valid && depthViewMemoMatches(memo, context, target, depthWritten, stencilTested)) {
             depthViewMemoLast = slot;
             return &memo;
         }
@@ -2869,20 +2941,25 @@ DepthViewMemo* findDepthViewMemo(const Context& context, const DepthTarget& targ
     return nullptr;
 }
 
-DepthViewMemo& depthViewMemoSlot(const Context& context, const DepthTarget& target) {
-    if (!DepthViewMemoPerTarget()) return depthViewMemos[0];
+DepthViewMemo& depthViewMemoSlot(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested) {
+    auto& own = ownDepthViewMemos();
+    const auto tag = depthViewMemoTag(target, depthWritten, stencilTested);
+    const auto claim = [&](std::size_t slot) -> DepthViewMemo& {
+        own.tags[slot] = tag;
+        return own.memos[slot];
+    };
+    if (!DepthViewMemoPerTarget()) return claim(0);
     const auto slots = depthViewMemoSlots();
     for (std::size_t slot = 0; slot < slots; ++slot) {
-        auto& memo = depthViewMemos[slot];
-        if (memo.device == context.device && sameDepthTarget(memo.target, target)) return memo;
+        if (own.tags[slot] == tag && depthViewMemoMatches(own.memos[slot], context, target, depthWritten, stencilTested)) return claim(slot);
     }
     for (std::size_t slot = 0; slot < slots; ++slot) {
-        if (!depthViewMemos[slot].valid) return depthViewMemos[slot];
+        if (!own.memos[slot].valid) return claim(slot);
     }
-    auto& memo = depthViewMemos[depthViewMemoNext];
+    const auto next = depthViewMemoNext;
     depthViewMemoNext = (depthViewMemoNext + 1) % slots;
     depthViewStoreCounts[StoreEvictedValid].fetch_add(1, std::memory_order_relaxed);
-    return memo;
+    return claim(next);
 }
 
 std::uint64_t depthContentWrites() {
@@ -2913,7 +2990,7 @@ bool htileUnchangedForMemo(const Context& context, const DepthTarget& target, co
 }
 
 DepthViewMemoOutcome depthViewMemoMiss(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, VkImageAspectFlags htileCleared, const DepthViewEpoch& epoch, DepthViewMemo*& found) {
-    found = findDepthViewMemo(context, target);
+    found = findDepthViewMemo(context, target, depthWritten, stencilTested);
     if (found == nullptr) return MissTarget;
     const auto& memo = *found;
     if (memo.depthWritten != depthWritten || memo.stencilTested != stencilTested) return MissFlags;
@@ -2932,7 +3009,7 @@ DepthViewMemoOutcome depthViewMemoMiss(const Context& context, const DepthTarget
 }
 
 void storeDepthViewMemo(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, DepthSurface& surface, bool clearedHere, const DepthViewEpoch& epoch) {
-    auto& memo = depthViewMemoSlot(context, target);
+    auto& memo = depthViewMemoSlot(context, target, depthWritten, stencilTested);
     memo.valid = false;
     if (!DepthViewMemoEnabled()) return;
     const auto count = [](DepthViewStoreOutcome outcome) { depthViewStoreCounts[outcome].fetch_add(1, std::memory_order_relaxed); };
