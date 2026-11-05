@@ -4710,6 +4710,8 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         const char* value = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
         const auto parsed = value ? std::strtoull(value, nullptr, 10) : 0ull;
         fixedCapacity = parsed != 0;
+        static const bool wideBase = std::getenv("APS5_NO_WIDE_RESOURCE_CACHE") == nullptr;
+        if (wideBase && baseEntries == InitialEntries) baseEntries = WideInitialEntries;
         capacity = fixedCapacity ? static_cast<std::size_t>(parsed) : baseEntries;
     }
     noteUse(key);

@@ -830,6 +830,7 @@ public:
     std::uint64_t TableElements() const;
     static std::uint64_t TableElementBudget();
     static constexpr std::size_t InitialEntries = 1024;
+    static constexpr std::size_t WideInitialEntries = 4096;
     static constexpr std::size_t MaximumEntries = 16384;
 
 private:
