@@ -1,5 +1,8 @@
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestHeap.hpp"
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -251,6 +254,100 @@ void leaseIndex() {
     expect();
 }
 
+struct RemovalPath {
+    const char* name;
+    void (*change)(std::byte*);
+};
+
+std::weak_ptr<const Range> rangeAt(const Lease& lease, const void* pointer) {
+    for (const auto& range : lease) {
+        if (range->address == reinterpret_cast<std::uint64_t>(pointer)) return range;
+    }
+    return {};
+}
+
+void cachedSnapshotsFollowRemovals() {
+    auto* base = arena() + 3 * Granule;
+    const std::vector<RemovalPath> paths{
+        {"Remove", [](std::byte* at) { Mutation mutation; mutation.Remove(at); }},
+        {"Unmap", [](std::byte* at) { Mutation mutation; mutation.Unmap(at, 65536, [](const void*, std::size_t, const void*, bool) {}); }},
+        {"a partial Unmap", [](std::byte* at) { Mutation mutation; mutation.Unmap(at + 4096, 4096, [](const void*, std::size_t, const void*, bool) {}); }},
+        {"Protect", [](std::byte* at) { Mutation mutation; mutation.Protect(at, 65536, false, false, true, [] {}); }},
+        {"a partial Protect", [](std::byte* at) { Mutation mutation; mutation.Protect(at + 4096, 4096, true, false, true, [] {}); }},
+    };
+    for (const auto& path : paths) {
+        {
+            Mutation mutation;
+            mutation.Add(base, 65536, true, true, true);
+        }
+        std::weak_ptr<const Range> old;
+        {
+            const auto readable = GuestAllocationsAcquire_nid_postfix();
+            const auto all = GuestAllocationsAcquireAll_nid_postfix();
+            old = rangeAt(readable, base);
+            check(!old.expired(), "the snapshot holds the added range");
+            check(old.use_count() >= 3, "the cached snapshots hold the range");
+        }
+        path.change(base);
+        if (!old.expired()) {
+            std::fprintf(stderr, "guest allocation journal test failed: a cached snapshot outlived %s\n", path.name);
+            std::exit(1);
+        }
+        const auto end = reinterpret_cast<std::uint64_t>(base) + 65536;
+        std::vector<std::pair<const void*, std::size_t>> pieces;
+        for (const auto& range : GuestAllocationsAcquireAll_nid_postfix()) {
+            if (range->address >= reinterpret_cast<std::uint64_t>(base) && range->address < end) pieces.emplace_back(reinterpret_cast<const void*>(range->address), range->bytes);
+        }
+        Mutation mutation;
+        for (const auto& [pointer, bytes] : pieces) mutation.Unmap(pointer, bytes, [](const void*, std::size_t, const void*, bool) {});
+    }
+}
+
+std::atomic<int> pinWaits{0};
+Lease* pinnedLease = nullptr;
+
+bool releasePinnedLease(std::uintptr_t, std::size_t) {
+    ++pinWaits;
+    if (pinnedLease != nullptr) pinnedLease->clear();
+    return true;
+}
+
+void aHeldLeaseBlocksRemoval() {
+    auto* base = arena() + 3 * Granule;
+    {
+        Mutation mutation;
+        mutation.Add(base, 65536, true, true, true);
+    }
+    GuestAllocationsSetPinWaiter_nid_postfix(&releasePinnedLease);
+    Lease held = GuestAllocationsAcquire_nid_postfix();
+    pinnedLease = &held;
+    const auto old = rangeAt(held, base);
+    check(!old.expired(), "the held lease covers the range");
+    pinWaits = 0;
+    {
+        Mutation mutation;
+        mutation.Remove(base);
+    }
+    check(pinWaits >= 1 && held.empty() && old.expired(), "a removal finished while a lease still held the range");
+    pinnedLease = nullptr;
+    GuestAllocationsSetPinWaiter_nid_postfix(nullptr);
+}
+
+void heapFreeDropsSnapshots() {
+    auto* pointer = GuestHeap::GuestHeapAllocate_nid_postfix(4096);
+    std::weak_ptr<const Range> old;
+    {
+        const auto lease = GuestAllocationsAcquire_nid_postfix();
+        old = rangeAt(lease, pointer);
+        check(!old.expired(), "the heap block is leased");
+    }
+    const auto stamp = now();
+    GuestHeap::GuestHeapFree_nid_postfix(pointer);
+    check(old.expired(), "a cached snapshot outlived a heap free");
+    check(changed(stamp, pointer, 4096), "a heap free must invalidate a proof over the block");
+    check(rangeAt(GuestAllocationsAcquire_nid_postfix(), pointer).expired(), "a freed heap block is still leased");
+}
+
 }
 
 int main() {
@@ -261,6 +358,9 @@ int main() {
     noopMutation(journal);
     spansAndScale(journal);
     leaseIndex();
+    cachedSnapshotsFollowRemovals();
+    aHeldLeaseBlocksRemoval();
+    heapFreeDropsSnapshots();
     std::puts("guest allocation journal tests passed");
     return 0;
 }

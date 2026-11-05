@@ -13,6 +13,9 @@
 #include <array>
 #include <thread>
 #include <atomic>
+#include <chrono>
+#include <exception>
+#include <utility>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -101,6 +104,99 @@ bool Imported(VkDevice device, std::uint64_t address, std::size_t bytes) {
     return AgcDriver::Graphics::HostImportCovers(probe, address, bytes);
 }
 
+
+void LeaseWaitLockTests(AgcDriver::VulkanDevice& device, const GuestAllocation& probe) {
+    if (!device.CanWaitUnlocked()) {
+        std::puts("host import at map: no timeline semaphores, the lease wait lock tests are skipped");
+        return;
+    }
+    const auto context = device.graphicsContext();
+    const auto createSemaphore = context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore");
+    const auto destroySemaphore = context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore");
+    const auto signalSemaphore = context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR");
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+    VkSemaphore gate = VK_NULL_HANDLE;
+    Require(createSemaphore(context.device, &info, nullptr, &gate) == VK_SUCCESS, "host import at map: cannot create the lease wait gate");
+    const auto open = [&](std::uint64_t value) {
+        VkSemaphoreSignalInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        signal.semaphore = gate;
+        signal.value = value;
+        Require(signalSemaphore(context.device, &signal) == VK_SUCCESS, "host import at map: cannot open the lease wait gate");
+    };
+    auto& mutex = AgcDriver::GuestMemory::GpuMutex();
+    const std::array<std::uint32_t, 4> pattern{13u, 14u, 15u, 16u};
+    const auto heldBatch = [&](std::uint64_t value) {
+        Require(device.FillBuffer(probe.Address(), BlockBytes, pattern), "host import at map: the lease wait fill was not imported");
+        auto* recorder = AgcDriver::Graphics::Recorder::Active();
+        Require(recorder != nullptr, "host import at map: no active recorder for the lease wait");
+        recorder->Commands();
+        recorder->HoldNextSubmit(gate, value);
+        recorder->Submit();
+        return std::pair{recorder, recorder->Submissions()};
+    };
+    std::uint64_t gateValue = 1;
+    {
+        std::unique_lock gpu(mutex);
+        const auto [recorder, serial] = heldBatch(gateValue);
+        {
+            std::lock_guard nested(mutex);
+            Require(!recorder->FinishUpToUnlocked(serial), "host import at map: a nested GPU lock was given up around a lease wait");
+        }
+        Require(recorder->CompletedThrough() < serial, "host import at map: the refused wait finished a batch its gate still holds");
+        open(gateValue++);
+        recorder->FinishUpTo(serial);
+    }
+    if (std::getenv("APS5_NO_LEASE_WAIT_UNLOCKED") != nullptr) {
+        std::unique_lock gpu(mutex);
+        const auto [recorder, serial] = heldBatch(gateValue);
+        Require(!recorder->FinishUpToUnlocked(serial), "host import at map: APS5_NO_LEASE_WAIT_UNLOCKED left the lease wait unlocked");
+        Require(recorder->CompletedThrough() < serial, "host import at map: the refused wait finished a batch its gate still holds");
+        open(gateValue++);
+        recorder->FinishUpTo(serial);
+    } else {
+        std::atomic<bool> holding{false};
+        std::atomic<bool> finished{false};
+        std::exception_ptr failure;
+        AgcDriver::Graphics::Recorder* waiting = nullptr;
+        std::uint64_t waitedSerial = 0;
+        std::thread waiter([&] {
+            try {
+                std::lock_guard gpu(mutex);
+                const auto [recorder, serial] = heldBatch(gateValue);
+                waiting = recorder;
+                waitedSerial = serial;
+                holding = true;
+                Require(recorder->FinishUpToUnlocked(serial), "host import at map: the lease wait refused to release the GPU lock");
+                Require(mutex.HeldByThisThread(), "host import at map: the unlocked lease wait did not retake the GPU lock");
+                Require(recorder->CompletedThrough() >= serial, "host import at map: the unlocked lease wait did not finish its batch");
+                finished = true;
+            } catch (...) {
+                failure = std::current_exception();
+                holding = true;
+            }
+        });
+        while (!holding) std::this_thread::yield();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        bool taken = false;
+        while (!taken && !failure && std::chrono::steady_clock::now() < deadline) {
+            taken = mutex.try_lock();
+            if (!taken) std::this_thread::yield();
+        }
+        const bool finishedWhileGated = finished.load();
+        if (taken) mutex.unlock();
+        open(gateValue++);
+        waiter.join();
+        if (failure) std::rethrow_exception(failure);
+        Require(taken, "host import at map: the lease wait never released the GPU lock while its batch was held");
+        Require(!finishedWhileGated, "host import at map: the lease wait finished although its gate was closed");
+        Require(finished.load() && waiting != nullptr && waitedSerial != 0, "host import at map: the lease wait did not finish after its gate opened");
+    }
+    device.WaitIdle();
+    destroySemaphore(context.device, gate, nullptr);
+}
+
 }
 
 int main() {
@@ -183,36 +279,7 @@ int main() {
         release = true;
         holder.join();
         Require(unlocked && Imported(handle, contended.Address(), AllocationBytes), "host import at map: a mapping on a device that already imports needed the GPU lock");
-        {
-            std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
-            const std::array<std::uint32_t, 4> pattern{13u, 14u, 15u, 16u};
-            Require(device->FillBuffer(probe.Address(), BlockBytes, pattern), "host import at map: the lease wait fill was not imported");
-            auto* recorder = AgcDriver::Graphics::Recorder::Active();
-            Require(recorder != nullptr, "host import at map: no active recorder for the lease wait");
-            recorder->Submit();
-            const auto serial = recorder->Submissions();
-            {
-                std::lock_guard nested(AgcDriver::GuestMemory::GpuMutex());
-                Require(!recorder->FinishUpToUnlocked(serial), "host import at map: a nested GPU lock was given up around a lease wait");
-            }
-            std::atomic<bool> taken{false};
-            std::thread other([&] {
-                std::lock_guard otherLock(AgcDriver::GuestMemory::GpuMutex());
-                taken = true;
-            });
-            const bool unlocked = recorder->FinishUpToUnlocked(serial);
-            if (std::getenv("APS5_NO_LEASE_WAIT_UNLOCKED") != nullptr) {
-                Require(!unlocked, "host import at map: APS5_NO_LEASE_WAIT_UNLOCKED left the wait unlocked");
-                recorder->FinishUpTo(serial);
-                gpu.unlock();
-            } else {
-                Require(unlocked && AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "host import at map: the unlocked lease wait did not retake the GPU lock");
-                Require(recorder->CompletedThrough() >= serial, "host import at map: the unlocked lease wait did not finish its batch");
-                gpu.unlock();
-            }
-            other.join();
-            Require(taken.load(), "host import at map: another thread never took the GPU lock around the lease wait");
-        }
+        LeaseWaitLockTests(*device, probe);
         std::puts("host import at map tests passed");
         return 0;
     } catch (const std::exception& error) {

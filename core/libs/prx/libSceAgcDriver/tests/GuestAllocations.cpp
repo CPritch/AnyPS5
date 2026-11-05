@@ -114,7 +114,7 @@ void leaseSnapshotTests() {
     Require(held.use_count() == 2, "the kept snapshot does not hold the range once");
     {
         GuestAllocations::Mutation mutation;
-        mutation.RequireUnpinned(memory.data(), 64);
+        mutation.Protect(memory.data(), 64, true, true, true, [] {});
     }
     Require(held.expired(), "a snapshot outlived a registry change");
     std::weak_ptr<const GuestAllocations::Range> readable;
