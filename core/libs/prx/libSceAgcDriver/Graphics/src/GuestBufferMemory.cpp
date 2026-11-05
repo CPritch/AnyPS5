@@ -122,6 +122,7 @@ struct ImageMirror {
 // costs no GPU wait. APS5_NO_ADDRESS_SPACE_CACHE=1 restores the per-build path.
 struct GuestBufferMemory::AddressSpace {
     std::uint64_t generation = 0;
+    mutable std::atomic<std::uint64_t> keptThrough{0};
     std::uint64_t importsEpoch = 0;
     VkDevice device = VK_NULL_HANDLE;
     // Identity for the life of this space (see CachedAddressTable).
@@ -168,8 +169,26 @@ static thread_local std::vector<RefreshBlock>* buildingBlocks = nullptr;
 
 struct RetiredImport;
 
+struct SpaceOutline {
+    struct Piece {
+        std::uint64_t address;
+        std::uint64_t bytes;
+        std::uint64_t backing;
+    };
+    struct DirectRegion {
+        std::uint64_t begin;
+        std::uint64_t end;
+        bool writable;
+        const HostImport* direct;
+    };
+    VkDevice device = VK_NULL_HANDLE;
+    std::vector<Piece> ranges;
+    std::vector<DirectRegion> regions;
+};
+
 struct AddressSpaceCache {
     AtomicSharedPtr<const GuestBufferMemory::AddressSpace> current;
+    AtomicSharedPtr<const SpaceOutline> outline;
     std::atomic<std::uint64_t> serials{0};
     // Set by the waiter's drop, cleared by the next publish: the rebuild's reason.
     std::atomic<bool> droppedByWaiter{false};
@@ -4792,6 +4811,35 @@ void GuestBufferMemory::RecordEvicted(std::uint64_t address) {
     if (!WasEvicted(address)) evictedRanges.push_back(address);
 }
 
+static bool spacePatchEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_SPACE_PATCH") == nullptr;
+    return enabled;
+}
+
+static bool verifySpacePatch() {
+    static const bool enabled = std::getenv("APS5_VERIFY_SPACE_PATCH") != nullptr;
+    return enabled;
+}
+
+static bool outlineSameOver(const SpaceOutline& outline, const GuestAllocations::Lease& now, std::size_t index, std::size_t& at, std::uint64_t end) {
+    const auto same = [](const SpaceOutline::Piece& piece, const GuestAllocations::Range& range) { return piece.address == range.address && piece.bytes == range.bytes && piece.backing == range.backingSerial; };
+    const auto& pieces = outline.ranges;
+    while (at < pieces.size() && pieces[at].address < now[index]->address) ++at;
+    if (at >= pieces.size()) return false;
+    if (index == 0 ? at != 0 : at == 0 || !same(pieces[at - 1], *now[index - 1])) return false;
+    auto leased = index;
+    auto kept = at;
+    std::uint64_t cursor = 0;
+    do {
+        if (leased >= now.size() || kept >= pieces.size() || !same(pieces[kept], *now[leased])) return false;
+        cursor = now[leased]->address + now[leased]->bytes;
+        ++leased;
+        ++kept;
+    } while (cursor < end);
+    if (cursor != end) return false;
+    return leased == now.size() ? kept == pieces.size() : kept < pieces.size() && same(pieces[kept], *now[leased]);
+}
+
 static bool importsUnchangedRange(const GuestAllocations::Lease& before, const GuestAllocations::Lease& now, std::size_t index, std::size_t& at) {
     const auto& range = now[index];
     while (at < before.size() && before[at]->address < range->address) ++at;
@@ -4834,6 +4882,33 @@ void GuestBufferMemory::AcquireRegistered() {
     // Read before the lease below is acquired: a mutation ending in between leaves the space
     // stale by its generation, never newer than it (see AddressSpace).
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto spaceUntouched = [&](const AddressSpace& held, HostImports& imports) {
+        if (!spacePatchEnabled() || effectiveBudget(context, imports) != imports.refreshedBudget) return false;
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+        std::uint64_t through = 0;
+        if (!GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(held.keptThrough.load(std::memory_order_acquire), &spans, &through)) return false;
+        for (const auto& [begin, end] : spans) {
+            const auto low = begin == 0 ? 0 : begin - 1;
+            const auto high = end == std::numeric_limits<std::uint64_t>::max() ? end : end + 1;
+            if (GuestAllocations::GuestAllocationsAnyGpuRange_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin))) return false;
+            const auto region = std::upper_bound(held.base.begin(), held.base.end(), low, [](std::uint64_t value, const Region& entry) { return value < entry.end; });
+            if (region != held.base.end() && region->begin < high) return false;
+            if (std::any_of(held.copied.begin(), held.copied.end(), [&](const CopiedRange& range) { return range.begin < high && low < range.end; })) return false;
+        }
+        if (verifySpacePatch() && generation == GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+            for (const auto& range : GuestAllocations::GuestAllocationsAcquire_nid_postfix()) {
+                if (!range->gpu || !range->readable) continue;
+                const auto end = range->address + range->bytes;
+                const auto covers = [&](std::uint64_t first, std::uint64_t last) { return first <= range->address && end <= last; };
+                const bool held_ = std::any_of(held.base.begin(), held.base.end(), [&](const Region& entry) { return covers(entry.begin, entry.end); }) || std::any_of(held.copied.begin(), held.copied.end(), [&](const CopiedRange& entry) { return covers(entry.begin, entry.end); });
+                if (held_) continue;
+                std::fprintf(stderr, "FATAL: APS5_VERIFY_SPACE_PATCH: the address space kept across a change misses the GPU range 0x%llx+0x%llx\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes));
+                std::abort();
+            }
+        }
+        held.keptThrough.store(through, std::memory_order_release);
+        return true;
+    };
     if (addressSpaceCacheEnabled()) {
         auto current = spaces.current.load();
         bool hit = false;
@@ -4844,7 +4919,7 @@ void GuestBufferMemory::AcquireRegistered() {
             const auto keeps = [&](ImageMirror* mirror) { return heapMirrorWatched(*mirror) || !importsNow(context, state, current->lease, mirror->base); };
             if (current == nullptr) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
             else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
-            else if (current->generation != generation) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
+            else if (current->keptThrough.load(std::memory_order_acquire) != generation && !spaceUntouched(*current, state)) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
             else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
             else hit = std::all_of(current->heapMirrors.begin(), current->heapMirrors.end(), keeps) && std::all_of(current->sparseMirrors.begin(), current->sparseMirrors.end(), keeps);
             importFloor = state.useCounter + 1;
@@ -4953,8 +5028,39 @@ void GuestBufferMemory::AcquireRegistered() {
         std::uint64_t coveredBegin = 0;
         std::uint64_t coveredEnd = 0;
         std::uint64_t copiedBytes = 0;
+        const auto outline = spacePatchEnabled() && importable && addressSpaceCacheEnabled() ? spaces.outline.load() : std::shared_ptr<const SpaceOutline>{};
+        std::size_t outlineRegion = 0;
+        std::size_t outlineAt = 0;
+        std::uint64_t patchedThrough = 0;
         for (const auto& range : lease) {
+            if (range->address < patchedThrough) continue;
             if (!range->readable || !range->gpu) continue;
+            if (outline != nullptr && outline->device == context.device) {
+                while (outlineRegion < outline->regions.size() && outline->regions[outlineRegion].end <= range->address) ++outlineRegion;
+                if (outlineRegion < outline->regions.size() && outline->regions[outlineRegion].begin == range->address) {
+                    const auto& kept = outline->regions[outlineRegion];
+                    if (outlineSameOver(*outline, lease, static_cast<std::size_t>(&range - &lease[0]), outlineAt, kept.end)) {
+                        auto& state = Imports();
+                        std::lock_guard lock(state.mutex);
+                        if (const auto* entry = findImport(state, kept.begin, kept.end); entry != nullptr && entry == kept.direct) {
+                            if (verifySpacePatch()) {
+                                for (auto index = static_cast<std::size_t>(&range - &lease[0]); index < lease.size() && lease[index]->address < kept.end; ++index) {
+                                    if (importAllocation(context, state, lease[index]->address, lease, ImportRequester::Build, 0, false) == entry) continue;
+                                    std::fprintf(stderr, "FATAL: APS5_VERIFY_SPACE_PATCH: the copied region 0x%llx-0x%llx differs from the import of its range at 0x%llx\n", static_cast<unsigned long long>(kept.begin), static_cast<unsigned long long>(kept.end), static_cast<unsigned long long>(lease[index]->address));
+                                    std::abort();
+                                }
+                            }
+                            Region region{kept.begin, kept.end, kept.writable, {}, nullptr};
+                            region.hostBacked = true;
+                            region.direct = entry;
+                            regions.push_back(std::move(region));
+                            imported.emplace_back(kept.begin, kept.end);
+                            patchedThrough = kept.end;
+                            continue;
+                        }
+                    }
+                }
+            }
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
             const HostImport* entry = nullptr;
@@ -5129,6 +5235,7 @@ void GuestBufferMemory::AcquireRegistered() {
             if (publish) {
                 auto built = std::make_shared<AddressSpace>();
                 built->generation = generation;
+                built->keptThrough.store(generation, std::memory_order_relaxed);
                 built->importsEpoch = importsEpoch;
                 built->device = context.device;
                 built->serial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -5146,6 +5253,16 @@ void GuestBufferMemory::AcquireRegistered() {
                 regions = std::move(extras);
                 lease.clear();
                 planSpaceMirrors(*built);
+                if (spacePatchEnabled()) {
+                    auto kept = std::make_shared<SpaceOutline>();
+                    kept->device = context.device;
+                    kept->ranges.reserve(built->lease.size());
+                    for (const auto& range : built->lease) kept->ranges.push_back({range->address, range->bytes, range->backingSerial});
+                    for (const auto& region : built->base) {
+                        if (region.direct != nullptr && region.mirror == nullptr && !region.sparse) kept->regions.push_back({region.begin, region.end, region.writable, region.direct});
+                    }
+                    spaces.outline.store(std::shared_ptr<const SpaceOutline>(std::move(kept)));
+                }
                 {
                     auto reads = std::make_shared<Recorder::ReadList>();
                     for (const auto& region : built->base) {

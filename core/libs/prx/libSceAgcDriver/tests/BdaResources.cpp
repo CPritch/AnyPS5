@@ -452,6 +452,53 @@ void failedImportRemapTests(const Context& context, const BdaTestAccess& access)
     ::operator delete(block, std::align_val_t{piece});
 }
 
+void spaceJournalTests(const Context& context) {
+    if (!AddressSpaceCounters().enabled) return;
+    constexpr std::size_t piece = 65536;
+    void* block = ::operator new(32 * piece, std::align_val_t{piece});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto change = [&](std::uint8_t* range, bool add, bool gpu) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, gpu);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto built = [&](std::uint64_t address) {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        const auto ranges = leased.AddressRanges();
+        const bool found = std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= address && address < range.end; });
+        leased.WriteBack();
+        return found;
+    };
+    const bool patched = std::getenv("APS5_NO_SPACE_PATCH") == nullptr && std::getenv("APS5_NO_ALLOCATION_JOURNAL") == nullptr;
+    change(guest, true, true);
+    change(guest + 2 * piece, true, true);
+    Require(built(first) && built(first + 2 * piece), "the mapped GPU ranges are missing from the address space");
+    auto before = AddressSpaceCounters();
+    change(guest + 16 * piece, true, false);
+    Require(built(first), "a GPU range left the address space over a change elsewhere");
+    auto after = AddressSpaceCounters();
+    Require((after.hits == before.hits + 1) == patched, patched ? "a change touching no GPU range rebuilt the address space" : "without the patch any change rebuilds the address space");
+    before = after;
+    change(guest + 8 * piece, true, true);
+    Require(built(first + 8 * piece), "a new GPU range is missing from the address space");
+    after = AddressSpaceCounters();
+    Require(after.rebuiltGeneration + after.rebuiltWaiterDrop == before.rebuiltGeneration + before.rebuiltWaiterDrop + 1, "a new GPU range did not rebuild the address space");
+    change(guest + 8 * piece, false, true);
+    Require(!built(first + 8 * piece), "an overlapping unmap left its range in the address space");
+    change(guest + 2 * piece, false, true);
+    Require(!built(first + 2 * piece) && built(first), "an unmap removed the wrong range from the address space");
+    change(guest + 16 * piece, false, false);
+    change(guest, false, true);
+    Require(!built(first), "the last unmap left its range in the address space");
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 void spaceImportRunTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     void* block = ::operator new(2 * piece, std::align_val_t{piece});
@@ -1789,7 +1836,8 @@ void importRefusalMemoryTests(const Context& context) {
         rebuild();
         after = counted(ImportRequester::Build);
         Require(tries(after) == tries(before), "rebuild " + std::to_string(round) + " tried " + std::to_string(tries(after) - tries(before)) + " refused ranges again with the budget unchanged");
-        Require(after.refused - before.refused == refused && after.remembered - before.remembered == refused && after.made == before.made, "rebuild " + std::to_string(round) + " did not count its remembered refusals as refusals");
+        const bool keptSpace = std::getenv("APS5_NO_SPACE_PATCH") == nullptr && after.refused == before.refused && after.made == before.made;
+        Require(keptSpace || (after.refused - before.refused == refused && after.remembered - before.remembered == refused && after.made == before.made), "rebuild " + std::to_string(round) + " did not count its remembered refusals as refusals");
     }
     {
         GuestAllocations::Mutation mutation;
@@ -4735,6 +4783,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     snapshotTableTests(context, access);
     importSpanTests(context);
     importJournalTests(context);
+    spaceJournalTests(context);
     importRunGrowthTests(context);
     importRunReplacedTests(context);
     failedImportRemapTests(context, access);
