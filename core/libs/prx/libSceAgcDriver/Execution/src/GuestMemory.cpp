@@ -1102,6 +1102,7 @@ struct WriteTracker {
 #endif
     };
     std::vector<std::unique_ptr<Leaf>> leaves;
+    std::unique_ptr<std::atomic<const Leaf*>[]> leafViews;
 #ifdef _WIN32
     std::uintptr_t base = 0;
     std::size_t size = 0;
@@ -1115,7 +1116,6 @@ struct WriteTracker {
     // walk of its range and re-upload at every use of the epoch.
     std::atomic<std::uint32_t> generation{1};
     std::atomic<std::uint32_t> stable{1};
-    std::atomic<std::uint64_t> changes{1};
     std::vector<void*> pages;
     // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
     // collect fully inside one skips GetWriteWatch, whose cost is proportional to the range's pages,
@@ -1148,7 +1148,10 @@ struct WriteTracker {
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
 #else
         watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
-        if (watched) leaves.resize(LeafCount);
+        if (watched) {
+            leaves.resize(LeafCount);
+            leafViews = std::make_unique<std::atomic<const Leaf*>[]>(LeafCount);
+        }
 #endif
     }
 
@@ -1342,7 +1345,12 @@ struct WriteTracker {
 
     Leaf& leafFor(std::uint64_t block) {
         auto& leaf = leaves[block / LeafBlocks];
-        if (leaf == nullptr) leaf = std::make_unique<Leaf>();
+        if (leaf == nullptr) {
+            leaf = std::make_unique<Leaf>();
+#ifndef _WIN32
+            leafViews[block / LeafBlocks].store(leaf.get(), std::memory_order_release);
+#endif
+        }
         return *leaf;
     }
 
@@ -1400,6 +1408,23 @@ struct WriteTracker {
         const auto& leaf = leaves[block / LeafBlocks];
         return leaf != nullptr ? leaf->coarseBlocks[(block % LeafBlocks) / CoarseBlocks] : 0;
     }
+
+#ifndef _WIN32
+    bool unchangedWithoutLock(std::uint64_t address, std::size_t bytes, std::uint64_t since) const {
+        auto block = blockOf(address);
+        const auto last = blockOf(address + bytes - 1);
+        for (; block <= last; ++block) {
+            const auto* leaf = leafViews[block / LeafBlocks].load(std::memory_order_acquire);
+            if (leaf == nullptr) continue;
+            if (std::atomic_ref<std::uint32_t>(const_cast<std::uint32_t&>(leaf->blocks[block % LeafBlocks])).load(std::memory_order_relaxed) > since) return false;
+        }
+        return true;
+    }
+#else
+    bool unchangedWithoutLock(std::uint64_t, std::size_t, std::uint64_t) const {
+        return false;
+    }
+#endif
 
     bool unchanged(std::uint64_t first, std::uint64_t last, std::uint64_t since) const {
         if (first == last) return stampOf(first) <= since;
@@ -1477,7 +1502,7 @@ struct WriteTracker {
         const bool stored = kind != StampKind::ImportWindow;
         auto& leaf = leafFor(block);
         if (stored) {
-            leaf.blocks[block % LeafBlocks] = stampGeneration;
+            std::atomic_ref<std::uint32_t>(leaf.blocks[block % LeafBlocks]).store(stampGeneration, std::memory_order_relaxed);
             auto& coarse = leaf.coarseBlocks[(block % LeafBlocks) / CoarseBlocks];
             coarse = std::max(coarse, stampGeneration);
         }
@@ -1496,7 +1521,6 @@ class TrackerLock {
 public:
     explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
         acquire();
-        acquiredAt = tracker.generation.load(std::memory_order_relaxed);
     }
     ~TrackerLock() {
         if (lock.owns_lock()) publish();
@@ -1510,8 +1534,6 @@ public:
     }
 
     void Suspend() {
-        tracker.changes.fetch_add(1, std::memory_order_release);
-        interrupted = true;
         lock.unlock();
     }
 
@@ -1561,13 +1583,10 @@ private:
     void publish() {
         const auto current = tracker.generation.load(std::memory_order_relaxed);
         if (tracker.stable.load(std::memory_order_relaxed) != current) tracker.stable.store(current, std::memory_order_release);
-        if (interrupted || current != acquiredAt) tracker.changes.fetch_add(1, std::memory_order_release);
     }
 
     WriteTracker& tracker;
     std::unique_lock<AgcDriver::Mutex> lock;
-    std::uint32_t acquiredAt = 0;
-    bool interrupted = false;
 };
 
 TrackerLock lockTracker(WriteTracker& tracker) {
@@ -2431,7 +2450,6 @@ struct TrackerQueryMemo {
     std::array<UnchangedQuery, Queries> queries{};
     std::uint32_t count = 0;
     std::uint32_t kind = 0;
-    std::uint64_t changes = 0;
     std::uint64_t unwatched = 0;
     std::uint64_t mapping = 0;
 };
@@ -2465,13 +2483,12 @@ bool trackerQueryMemoVerified() {
 std::atomic<std::uint64_t> trackerQueryMemoChecks{0};
 
 struct TrackerQueryState {
-    std::uint64_t changes;
     std::uint64_t unwatched;
     std::uint64_t mapping;
 };
 
 TrackerQueryState trackerQueryState(WriteTracker& tracker) {
-    return {tracker.changes.load(std::memory_order_acquire), unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
+    return {unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
 }
 
 TrackerQueryMemo& trackerQuerySlot(TrackerQueryKind kind, std::span<const UnchangedQuery> queries) {
@@ -2482,7 +2499,7 @@ TrackerQueryMemo& trackerQuerySlot(TrackerQueryKind kind, std::span<const Unchan
 }
 
 bool trackerQueryRemembered(const TrackerQueryMemo& memo, TrackerQueryKind kind, std::span<const UnchangedQuery> queries, const TrackerQueryState& state) {
-    if (memo.kind != kind || memo.count != queries.size() || memo.changes != state.changes || memo.unwatched != state.unwatched || memo.mapping != state.mapping) return false;
+    if (memo.kind != kind || memo.count != queries.size() || memo.unwatched != state.unwatched || memo.mapping != state.mapping) return false;
     for (std::size_t index = 0; index < queries.size(); ++index) {
         const auto& held = memo.queries[index];
         if (held.address != queries[index].address || held.bytes != queries[index].bytes || held.generation != queries[index].generation) return false;
@@ -2494,13 +2511,16 @@ void trackerQueryRemember(TrackerQueryMemo& memo, TrackerQueryKind kind, std::sp
     memo.kind = kind;
     memo.count = static_cast<std::uint32_t>(queries.size());
     std::copy(queries.begin(), queries.end(), memo.queries.begin());
-    memo.changes = state.changes;
     memo.unwatched = state.unwatched;
     memo.mapping = state.mapping;
 }
 
-void trackerQueryCheck(WriteTracker& tracker, const TrackerQueryState& state, bool remembered, bool answer) {
-    if (answer != remembered && tracker.changes.load(std::memory_order_acquire) == state.changes) {
+bool trackerStampsUnchanged(const WriteTracker& tracker, std::span<const UnchangedQuery> queries) {
+    return std::all_of(queries.begin(), queries.end(), [&](const UnchangedQuery& query) { return tracker.unchangedWithoutLock(query.address, query.bytes, query.generation); });
+}
+
+void trackerQueryCheck(WriteTracker& tracker, std::span<const UnchangedQuery> queries, bool remembered, bool answer) {
+    if (answer != remembered && trackerStampsUnchanged(tracker, queries)) {
         std::fprintf(stderr, "[tracker-memo] APS5_VERIFY_TRACKER_QUERY_MEMO: a remembered query answered %d and the locked query %d\n", remembered ? 1 : 0, answer ? 1 : 0);
         std::fflush(stderr);
         std::abort();
@@ -2544,8 +2564,8 @@ bool rememberedTrackerQuery(TrackerQueryKind kind, std::span<const UnchangedQuer
     if (!trackerQueryMemoEnabled() || queries.size() > TrackerQueryMemo::Queries) return query(tracker);
     const auto state = trackerQueryState(tracker);
     auto& memo = trackerQuerySlot(kind, queries);
-    if (trackerQueryRemembered(memo, kind, queries, state)) {
-        if (trackerQueryMemoVerified()) trackerQueryCheck(tracker, state, remembered, query(tracker));
+    if (trackerQueryRemembered(memo, kind, queries, state) && trackerStampsUnchanged(tracker, queries)) {
+        if (trackerQueryMemoVerified()) trackerQueryCheck(tracker, queries, remembered, query(tracker));
         return remembered;
     }
     const bool answer = query(tracker);
