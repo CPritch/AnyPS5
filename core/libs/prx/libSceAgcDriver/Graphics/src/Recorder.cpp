@@ -3805,7 +3805,7 @@ bool Recorder::AlignedUploadCopies() {
 }
 
 #if defined(__x86_64__) && defined(__GNUC__)
-__attribute__((target("avx512f"))) static void copyWholeLines(std::byte* destination, const std::byte* source, std::size_t bytes) {
+[[gnu::target("avx512f")]] static void copyWholeLines(std::byte* destination, const std::byte* source, std::size_t bytes) {
     std::size_t at = 0;
     for (; at + 64 <= bytes; at += 64) _mm512_store_si512(reinterpret_cast<__m512i*>(destination + at), _mm512_loadu_si512(source + at));
     if (at == bytes) return;
