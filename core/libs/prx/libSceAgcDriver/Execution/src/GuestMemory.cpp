@@ -1115,6 +1115,7 @@ struct WriteTracker {
     // walk of its range and re-upload at every use of the epoch.
     std::atomic<std::uint32_t> generation{1};
     std::atomic<std::uint32_t> stable{1};
+    std::atomic<std::uint64_t> changes{1};
     std::vector<void*> pages;
     // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
     // collect fully inside one skips GetWriteWatch, whose cost is proportional to the range's pages,
@@ -1494,24 +1495,8 @@ WriteTracker& Tracker() {
 class TrackerLock {
 public:
     explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
-        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
-        if (!profile && counted) {
-            if (lock.try_lock()) return;
-            const auto start = std::chrono::steady_clock::now();
-            lock.lock();
-            threadTrackerWaitNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-            return;
-        }
-        if (!profile) {
-            lock.lock();
-            return;
-        }
-        if (!lock.try_lock()) {
-            trackerWaits.fetch_add(1, std::memory_order_relaxed);
-            lock.lock();
-        }
-        trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
+        acquire();
+        acquiredAt = tracker.generation.load(std::memory_order_relaxed);
     }
     ~TrackerLock() {
         if (lock.owns_lock()) publish();
@@ -1525,6 +1510,8 @@ public:
     }
 
     void Suspend() {
+        tracker.changes.fetch_add(1, std::memory_order_release);
+        interrupted = true;
         lock.unlock();
     }
 
@@ -1550,13 +1537,37 @@ public:
     };
 
 private:
+    void acquire() {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+        if (!profile && counted) {
+            if (lock.try_lock()) return;
+            const auto start = std::chrono::steady_clock::now();
+            lock.lock();
+            threadTrackerWaitNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            return;
+        }
+        if (!profile) {
+            lock.lock();
+            return;
+        }
+        if (!lock.try_lock()) {
+            trackerWaits.fetch_add(1, std::memory_order_relaxed);
+            lock.lock();
+        }
+        trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
+    }
+
     void publish() {
         const auto current = tracker.generation.load(std::memory_order_relaxed);
         if (tracker.stable.load(std::memory_order_relaxed) != current) tracker.stable.store(current, std::memory_order_release);
+        if (interrupted || current != acquiredAt) tracker.changes.fetch_add(1, std::memory_order_release);
     }
 
     WriteTracker& tracker;
     std::unique_lock<AgcDriver::Mutex> lock;
+    std::uint32_t acquiredAt = 0;
+    bool interrupted = false;
 };
 
 TrackerLock lockTracker(WriteTracker& tracker) {
@@ -2413,17 +2424,99 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
 }
 
-bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
-    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
-    auto& tracker = Tracker();
+namespace {
+
+struct TrackerQueryMemo {
+    static constexpr std::size_t Queries = 4;
+    std::array<UnchangedQuery, Queries> queries{};
+    std::uint32_t count = 0;
+    std::uint32_t kind = 0;
+    std::uint64_t changes = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t mapping = 0;
+};
+
+enum TrackerQueryKind : std::uint32_t { QueryUnchanged = 1, QueryUnchangedAll = 2, QueryWrittenAny = 3 };
+
+struct TrackerQueryMemos {
+    std::array<TrackerQueryMemo, 64> entries{};
+};
+
+TrackerQueryMemos& trackerQueryMemos() {
+    struct Slot {};
+    auto* memos = HostThreadSlot<TrackerQueryMemos*, Slot>::Get();
+    if (memos == nullptr) {
+        ShaderRecompiler::ThreadOwned(memos);
+        HostThreadSlot<TrackerQueryMemos*, Slot>::Set(memos);
+    }
+    return *memos;
+}
+
+bool trackerQueryMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_TRACKER_QUERY_MEMO") == nullptr;
+    return enabled;
+}
+
+bool trackerQueryMemoVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_TRACKER_QUERY_MEMO") != nullptr;
+    return verified;
+}
+
+std::atomic<std::uint64_t> trackerQueryMemoChecks{0};
+
+struct TrackerQueryState {
+    std::uint64_t changes;
+    std::uint64_t unwatched;
+    std::uint64_t mapping;
+};
+
+TrackerQueryState trackerQueryState(WriteTracker& tracker) {
+    return {tracker.changes.load(std::memory_order_acquire), unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
+}
+
+TrackerQueryMemo& trackerQuerySlot(TrackerQueryKind kind, std::span<const UnchangedQuery> queries) {
+    std::uint64_t mixed = kind;
+    for (const auto& query : queries) mixed = (mixed ^ (query.address >> 6) ^ (static_cast<std::uint64_t>(query.bytes) << 20) ^ (query.generation << 40)) * 0x9e3779b97f4a7c15ull;
+    auto& memos = trackerQueryMemos();
+    return memos.entries[(mixed >> 40) % memos.entries.size()];
+}
+
+bool trackerQueryRemembered(const TrackerQueryMemo& memo, TrackerQueryKind kind, std::span<const UnchangedQuery> queries, const TrackerQueryState& state) {
+    if (memo.kind != kind || memo.count != queries.size() || memo.changes != state.changes || memo.unwatched != state.unwatched || memo.mapping != state.mapping) return false;
+    for (std::size_t index = 0; index < queries.size(); ++index) {
+        const auto& held = memo.queries[index];
+        if (held.address != queries[index].address || held.bytes != queries[index].bytes || held.generation != queries[index].generation) return false;
+    }
+    return true;
+}
+
+void trackerQueryRemember(TrackerQueryMemo& memo, TrackerQueryKind kind, std::span<const UnchangedQuery> queries, const TrackerQueryState& state) {
+    memo.kind = kind;
+    memo.count = static_cast<std::uint32_t>(queries.size());
+    std::copy(queries.begin(), queries.end(), memo.queries.begin());
+    memo.changes = state.changes;
+    memo.unwatched = state.unwatched;
+    memo.mapping = state.mapping;
+}
+
+void trackerQueryCheck(WriteTracker& tracker, const TrackerQueryState& state, bool remembered, bool answer) {
+    if (answer != remembered && tracker.changes.load(std::memory_order_acquire) == state.changes) {
+        std::fprintf(stderr, "[tracker-memo] APS5_VERIFY_TRACKER_QUERY_MEMO: a remembered query answered %d and the locked query %d\n", remembered ? 1 : 0, answer ? 1 : 0);
+        std::fflush(stderr);
+        std::abort();
+    }
+    const auto checks = trackerQueryMemoChecks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((checks & 0xfffffu) == 0) std::fprintf(stderr, "[tracker-memo] verified %llu remembered queries, none differing\n", static_cast<unsigned long long>(checks));
+}
+
+bool unchangedSinceLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
     return tracker.rangeUnchanged(address, bytes, generation);
 }
 
-bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
-    auto& tracker = Tracker();
+bool unchangedSinceAllLocked(WriteTracker& tracker, std::span<const UnchangedQuery> queries) {
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched) return false;
@@ -2432,6 +2525,44 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
         if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
     }
     return true;
+}
+
+bool writtenSinceAnyLocked(WriteTracker& tracker, std::span<const UnchangedQuery> queries) {
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return false;
+    for (const auto& query : queries) {
+        if (query.generation == 0 || query.bytes == 0 || !tracker.covers(query.address, query.bytes)) continue;
+        if (!tracker.unchanged(tracker.blockOf(query.address), tracker.blockOf(query.address + query.bytes - 1), query.generation)) return true;
+    }
+    return false;
+}
+
+template<typename TQuery>
+bool rememberedTrackerQuery(TrackerQueryKind kind, std::span<const UnchangedQuery> queries, bool remembered, const TQuery& query) {
+    auto& tracker = Tracker();
+    if (!trackerQueryMemoEnabled() || queries.size() > TrackerQueryMemo::Queries) return query(tracker);
+    const auto state = trackerQueryState(tracker);
+    auto& memo = trackerQuerySlot(kind, queries);
+    if (trackerQueryRemembered(memo, kind, queries, state)) {
+        if (trackerQueryMemoVerified()) trackerQueryCheck(tracker, state, remembered, query(tracker));
+        return remembered;
+    }
+    const bool answer = query(tracker);
+    if (answer == remembered) trackerQueryRemember(memo, kind, queries, state);
+    return answer;
+}
+
+}
+
+bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    const UnchangedQuery query{address, bytes, generation};
+    return rememberedTrackerQuery(QueryUnchanged, std::span(&query, 1), true, [&](WriteTracker& tracker) { return unchangedSinceLocked(tracker, address, bytes, generation); });
+}
+
+bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
+    return rememberedTrackerQuery(QueryUnchangedAll, queries, true, [&](WriteTracker& tracker) { return unchangedSinceAllLocked(tracker, queries); });
 }
 
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
@@ -2735,15 +2866,7 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
 }
 
 bool WrittenSinceAny(std::span<const UnchangedQuery> queries) {
-    auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
-    tracker.initialize();
-    if (!tracker.watched) return false;
-    for (const auto& query : queries) {
-        if (query.generation == 0 || query.bytes == 0 || !tracker.covers(query.address, query.bytes)) continue;
-        if (!tracker.unchanged(tracker.blockOf(query.address), tracker.blockOf(query.address + query.bytes - 1), query.generation)) return true;
-    }
-    return false;
+    return rememberedTrackerQuery(QueryWrittenAny, queries, false, [&](WriteTracker& tracker) { return writtenSinceAnyLocked(tracker, queries); });
 }
 
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu) {

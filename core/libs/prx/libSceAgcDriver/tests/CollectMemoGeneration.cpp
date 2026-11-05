@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -113,11 +114,40 @@ void CheckMemoHitDuringWalk() {
     Require(CollectWrites(Base, Block) > memoized && !UnchangedSince(Base, Block, memoized), "a later epoch trusts the write stamped by the walk in progress");
 }
 
+void CheckRememberedQueries() {
+    using namespace AgcDriver::GuestMemory;
+    BumpCollectEpoch();
+    const auto proof = CollectWrites(Base, Block);
+    Require(proof != 0, "the range was not collected");
+    const std::array<UnchangedQuery, 1> queries{UnchangedQuery{Base + Page, Page, proof}};
+    for (int round = 0; round < 3; ++round) {
+        Require(UnchangedSince(Base + Page, Page, proof), "an unchanged range read as changed");
+        Require(UnchangedSinceAll(queries), "an unchanged bulk query read as changed");
+        Require(!WrittenSinceAny(queries), "an unchanged range read as written");
+    }
+    MarkWritten(Base + Block + Page, 4);
+    Require(UnchangedSince(Base + Page, Page, proof), "a store elsewhere changed the answer");
+    MarkWritten(Base + Page, 4);
+    for (int round = 0; round < 2; ++round) {
+        Require(!UnchangedSince(Base + Page, Page, proof), "a remembered answer hid a stamp over the range");
+        Require(!UnchangedSinceAll(queries), "a remembered bulk answer hid a stamp over the range");
+        Require(WrittenSinceAny(queries), "a remembered written answer hid a stamp over the range");
+    }
+    Require(!UnchangedSince(Base + Page, Page, 0), "generation zero proved a range");
+    Require(!UnchangedSince(Base + 3 * Block, Page, proof), "an uncovered range was proved");
+    const auto later = CollectWrites(Base + Page, Page);
+    Require(UnchangedSince(Base + Page, Page, later) && UnchangedSince(Base + Page, Page, later), "a fresh generation did not prove its range");
+    BumpCollectEpoch();
+    MarkWritten(Base + Page, 4);
+    Require(!UnchangedSince(Base + Page, Page, later), "a later epoch's stamp was hidden");
+}
+
 }
 
 int main() {
     try {
         CheckMemoHitDuringWalk();
+        CheckRememberedQueries();
     } catch (const std::exception& error) {
         std::cerr << "collect memo generation test failed: " << error.what() << "\n";
         return 1;
