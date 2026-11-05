@@ -127,7 +127,52 @@ std::atomic<std::uint64_t> heldReadHits{0};
 }
 
 namespace {
+
+#if defined(__x86_64__) && defined(__linux__)
+bool MonitorWaitAvailable() {
+    static const bool available = [] {
+        if (std::getenv("APS5_NO_RESOLVER_MWAITX") != nullptr) return false;
+        unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+        return __get_cpuid(0x80000001u, &eax, &ebx, &ecx, &edx) != 0 && (ecx & (1u << 29u)) != 0;
+    }();
+    return available;
+}
+
+[[gnu::target("mwaitx")]] void MonitorArm(const void* line) {
+    _mm_monitorx(const_cast<void*>(line), 0u, 0u);
+}
+
+[[gnu::target("mwaitx")]] void MonitorWait(unsigned tscCycles) {
+    _mm_mwaitx(2u, 0u, tscCycles);
+}
+#endif
+
+template <class Ready>
+bool IdleUntil(const void* line, std::chrono::nanoseconds window, Ready ready) {
+#if defined(__x86_64__) && defined(__linux__)
+    if (MonitorWaitAvailable()) {
+        constexpr unsigned Slice = 4096;
+        const auto deadline = std::chrono::steady_clock::now() + window;
+        do {
+            for (int slice = 0; slice < 4; ++slice) {
+                MonitorArm(line);
+                if (ready()) return true;
+                MonitorWait(Slice);
+            }
+            if (ready()) return true;
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    }
+#endif
+    return SpinUntil(window, ready);
+}
+
+}
+
+namespace {
 thread_local bool finisherThread = false;
+thread_local std::uint64_t finisherSequence = 0;
+thread_local std::function<void()>* finisherOrdered = nullptr;
 thread_local bool finisherProducer = false;
 std::size_t RoomBatch(std::size_t depth);
 
@@ -335,7 +380,7 @@ void PendingIndexDisagrees(const char* query) {
 
 void DrawFinisher::addToIndex(const Pending& held) {
     if (!DrawPipeline::PendingWriteIndexed()) return;
-    const auto sequence = ++enqueuedJobs;
+    const auto sequence = enqueuedJobs;
     if (held.unknown) ++pendingUnknown;
     pendingRanges.Add(held.writes);
     if (!held.inserts && !LookupDrainsEvery()) return;
@@ -345,7 +390,7 @@ void DrawFinisher::addToIndex(const Pending& held) {
 
 void DrawFinisher::removeFromIndex(const Pending& held) {
     if (!DrawPipeline::PendingWriteIndexed()) return;
-    const auto sequence = ranJobs + 1;
+    const auto sequence = ranJobs.load(std::memory_order_relaxed) + 1;
     if (held.unknown) --pendingUnknown;
     pendingRanges.Remove(held.writes);
     if (!held.inserts && !LookupDrainsEvery()) return;
@@ -359,7 +404,7 @@ std::uint64_t DrawFinisher::scanNewestKey(std::uint64_t key, std::uint64_t shape
         const auto& held = pending[i];
         if (!(every || held.inserts) || (held.key != key && (shape == 0 || held.shape != shape))) continue;
         if (after != nullptr) *after = pending.size() - i - 1;
-        return ranJobs + i + 1;
+        return ranJobs.load(std::memory_order_relaxed) + i + 1;
     }
     return 0;
 }
@@ -548,11 +593,88 @@ std::size_t FinisherDepth() {
 }
 }
 
-void DrawFinisher::Enqueue(Job job) {
-    Enqueue(std::move(job), Pending{});
+unsigned DrawFinisher::Threads() {
+    static const unsigned threads = [] {
+        if (std::getenv("APS5_NO_FINISHER_THREADS") != nullptr) return 1u;
+        const char* text = std::getenv("APS5_FINISHER_THREADS");
+        if (text != nullptr) return static_cast<unsigned>(std::clamp<unsigned long>(std::strtoul(text, nullptr, 10), 1ul, 8ul));
+        return UsableProcessors() > 8u ? 2u : 1u;
+    }();
+    return threads;
 }
 
-void DrawFinisher::Enqueue(Job job, Pending held) {
+unsigned DrawFinisher::VerifyThreadsEvery() {
+    static const unsigned every = [] {
+        const char* text = Threads() > 1u ? std::getenv("APS5_VERIFY_FINISHER_THREADS") : nullptr;
+        return text == nullptr ? 0u : static_cast<unsigned>(std::strtoul(text, nullptr, 10));
+    }();
+    return every;
+}
+
+bool DrawFinisher::DefersOrdered() {
+    return finisherOrdered != nullptr;
+}
+
+void DrawFinisher::DeferOrdered(Job ordered) {
+    *finisherOrdered = std::move(ordered);
+}
+
+void DrawFinisher::WaitTurn() {
+    if (finisherSequence != 0) Get().waitTurn(finisherSequence);
+}
+
+void DrawFinisher::waitTurn(std::uint64_t sequence) {
+    const auto turn = [&] { return ranJobs.load(std::memory_order_acquire) + 1 >= sequence; };
+    if (IdleUntil(&ranJobs, HandoffSpinWindow(), turn)) return;
+    std::unique_lock lock(mutex);
+    ++idleWaiters;
+    idle.wait(lock, [&] { return turn() || failure != nullptr; });
+    --idleWaiters;
+}
+
+bool DrawFinisher::earlierWrites(std::uint64_t sequence, std::uint64_t address, std::size_t bytes) {
+    const auto end = address + bytes;
+    std::lock_guard index(indexLock);
+    const auto first = ranJobs.load(std::memory_order_relaxed);
+    for (auto job = first + 1; job < sequence; ++job) {
+        const auto& held = pending[static_cast<std::size_t>(job - first - 1)];
+        if (held.unknown) return true;
+        for (const auto& [begin, last] : held.writes) {
+            if (address < last && begin < end) return true;
+        }
+    }
+    return false;
+}
+
+bool DrawFinisher::EarlierWrites(std::uint64_t address, std::size_t bytes) {
+    const auto sequence = finisherSequence;
+    if (sequence == 0) return false;
+    auto& finisher = Get();
+    if (finisher.ranJobs.load(std::memory_order_acquire) + 1 >= sequence) return false;
+    return finisher.earlierWrites(sequence, address, bytes);
+}
+
+void DrawFinisher::WaitEarlierWrites(std::uint64_t address, std::size_t bytes) {
+    if (EarlierWrites(address, bytes)) Get().waitTurn(finisherSequence);
+}
+
+void DrawFinisher::Enqueue(Job ordered) {
+    Enqueue(std::move(ordered), Pending{});
+}
+
+void DrawFinisher::Enqueue(Job ordered, Pending held) {
+    Slot slot;
+    slot.ordered = std::move(ordered);
+    push(std::move(slot), std::move(held));
+}
+
+void DrawFinisher::EnqueuePrepared(Job prepare, Pending held) {
+    Slot slot;
+    slot.prepare = std::move(prepare);
+    push(std::move(slot), std::move(held));
+}
+
+void DrawFinisher::push(Slot slot, Pending held) {
     finisherProducer = true;
     const std::size_t depth = FinisherDepth();
     struct ReclaimStorage {};
@@ -571,21 +693,110 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         --roomWaiters;
         QueueWaits::Note(QueueWaits::Site::FinisherRoom, start);
     }
-    jobs.push_back(std::move(job));
+    jobs.push_back(std::move(slot));
     {
         std::lock_guard index(indexLock);
         pending.push_back(std::move(held));
+        ++enqueuedJobs;
         addToIndex(pending.back());
     }
     outstanding.fetch_add(1, std::memory_order_release);
     if (!running) {
         running = true;
-        thread = std::thread([this] {
-            finisherThread = true;
-            run();
-        });
+        const auto count = Threads();
+        for (unsigned index = 0; index < count; ++index) {
+            threads.emplace_back([this, index, count] {
+                finisherThread = true;
+                if (count == 1) run();
+                else run(index);
+            });
+        }
     }
-    if (sleeping) wake.notify_one();
+    unclaimed.fetch_add(1, std::memory_order_release);
+    if (sleepers != 0) wake.notify_one();
+}
+
+void DrawFinisher::retireHead() {
+    auto& head = jobs.front();
+    ran.push_back(std::move(head.prepare));
+    if (head.ordered) ran.push_back(std::move(head.ordered));
+    jobs.pop_front();
+    {
+        std::lock_guard index(indexLock);
+        removeFromIndex(pending.front());
+        pending.pop_front();
+        ranJobs.fetch_add(1, std::memory_order_release);
+    }
+    outstanding.fetch_sub(1, std::memory_order_release);
+    const std::size_t depth = FinisherDepth();
+    if (idleWaiters != 0) idle.notify_all();
+    if (roomWaiters != 0 && jobs.size() <= depth - std::min(RoomBatch(depth) / 2 + 1, depth)) room.notify_all();
+}
+
+void DrawFinisher::run(unsigned index) {
+    if (index == 0) PinFinisherThread("draw finisher");
+    else PinFinisherHelperThread("draw finisher 2");
+    PerformanceTrace::BindThread(index == 0 ? "draw finisher" : "draw finisher 2");
+    GuestMemory::CountGpuLockWaits(GuestMemory::HotThread::Finisher);
+    const auto wanted = [&] { return unclaimed.load(std::memory_order_acquire) > 0; };
+    const auto attempt = [](auto& body, std::exception_ptr& error, bool& shutdown) {
+        try {
+            body();
+        } catch (const ProcessShutdown&) {
+            error = std::current_exception();
+            shutdown = true;
+        } catch (...) {
+            error = std::current_exception();
+        }
+    };
+    for (;;) {
+        IdleUntil(&unclaimed, HandoffSpinWindow(), wanted);
+        Slot* slot = nullptr;
+        bool failed = false;
+        std::uint64_t sequence = 0;
+        {
+            std::unique_lock lock(mutex);
+            ++sleepers;
+            wake.wait(lock, [&] { return claimedJobs < enqueuedJobs; });
+            --sleepers;
+            sequence = ++claimedJobs;
+            slot = &jobs[static_cast<std::size_t>(sequence - ranJobs.load(std::memory_order_relaxed) - 1)];
+            unclaimed.fetch_sub(1, std::memory_order_release);
+            failed = failure != nullptr;
+        }
+        std::exception_ptr error;
+        bool shutdown = false;
+        if (!failed && slot->prepare) {
+            finisherSequence = sequence;
+            finisherOrdered = &slot->ordered;
+            attempt(slot->prepare, error, shutdown);
+            finisherOrdered = nullptr;
+            finisherSequence = 0;
+        }
+        std::unique_lock lock(mutex);
+        slot->error = std::move(error);
+        slot->shutdown = shutdown;
+        slot->prepared = true;
+        if (sequencing) continue;
+        sequencing = true;
+        while (!jobs.empty() && jobs.front().prepared) {
+            auto& head = jobs.front();
+            auto headError = std::exchange(head.error, nullptr);
+            auto headShutdown = head.shutdown;
+            const bool skip = failure != nullptr || headError != nullptr;
+            lock.unlock();
+            if (!skip && head.ordered) attempt(head.ordered, headError, headShutdown);
+            lock.lock();
+            const bool report = headError != nullptr && failure == nullptr && !headShutdown;
+            if (headError != nullptr && failure == nullptr) failure = headError;
+            retireHead();
+            if (!report) continue;
+            lock.unlock();
+            Driver::Get().ReportFailure(headError);
+            lock.lock();
+        }
+        sequencing = false;
+    }
 }
 
 void DrawFinisher::run() {
@@ -594,16 +805,16 @@ void DrawFinisher::run() {
     GuestMemory::CountGpuLockWaits(GuestMemory::HotThread::Finisher);
     const bool counted = QueueWaits::Enabled();
     for (;;) {
-        Job* job = nullptr;
+        Slot* job = nullptr;
         bool failed = false;
         const auto idleStart = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         const auto spun = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         {
             std::unique_lock lock(mutex);
-            sleeping = true;
+            ++sleepers;
             wake.wait(lock, [&] { return !jobs.empty(); });
-            sleeping = false;
+            --sleepers;
             job = &jobs.front();
             failed = failure != nullptr;
         }
@@ -614,7 +825,8 @@ void DrawFinisher::run() {
         std::exception_ptr error;
         bool shutdown = false;
         try {
-            if (!failed) (*job)();
+            if (!failed && job->prepare) job->prepare();
+            if (!failed && job->ordered) job->ordered();
         } catch (const ProcessShutdown&) {
             error = std::current_exception();
             shutdown = true;
@@ -628,18 +840,7 @@ void DrawFinisher::run() {
                 failure = error;
                 report = !shutdown;
             }
-            ran.push_back(std::move(jobs.front()));
-            jobs.pop_front();
-            {
-                std::lock_guard index(indexLock);
-                removeFromIndex(pending.front());
-                pending.pop_front();
-                ++ranJobs;
-            }
-            outstanding.fetch_sub(1, std::memory_order_release);
-            const std::size_t depth = FinisherDepth();
-            if (idleWaiters != 0) idle.notify_all();
-            if (roomWaiters != 0 && jobs.size() <= depth - std::min(RoomBatch(depth) / 2 + 1, depth)) room.notify_all();
+            retireHead();
         }
         if (report) Driver::Get().ReportFailure(error);
     }
@@ -684,7 +885,7 @@ void DrawFinisher::WaitPendingWritten(std::span<const Range> ranges) {
     for (std::size_t i = pending.size(); i-- > 0;) {
         const auto& held = pending[i];
         if (!held.unknown && std::none_of(held.writes.begin(), held.writes.end(), overlapping)) continue;
-        target = ranJobs + i + 1;
+        target = ranJobs.load(std::memory_order_relaxed) + i + 1;
         (held.unknown ? heldWaitUnknown : held.labelAddress != 0 ? heldWaitLabels : heldWaitOther).fetch_add(1, std::memory_order_relaxed);
         break;
     }
@@ -968,49 +1169,6 @@ unsigned DrawPipeline::ResolveSplit() {
     return mode;
 }
 
-namespace {
-
-#if defined(__x86_64__) && defined(__linux__)
-bool MonitorWaitAvailable() {
-    static const bool available = [] {
-        if (std::getenv("APS5_NO_RESOLVER_MWAITX") != nullptr) return false;
-        unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
-        return __get_cpuid(0x80000001u, &eax, &ebx, &ecx, &edx) != 0 && (ecx & (1u << 29u)) != 0;
-    }();
-    return available;
-}
-
-[[gnu::target("mwaitx")]] void MonitorArm(const void* line) {
-    _mm_monitorx(const_cast<void*>(line), 0u, 0u);
-}
-
-[[gnu::target("mwaitx")]] void MonitorWait(unsigned tscCycles) {
-    _mm_mwaitx(2u, 0u, tscCycles);
-}
-#endif
-
-template <class Ready>
-bool IdleUntil(const std::atomic<int>& line, std::chrono::nanoseconds window, Ready ready) {
-#if defined(__x86_64__) && defined(__linux__)
-    if (MonitorWaitAvailable()) {
-        constexpr unsigned Slice = 4096;
-        const auto deadline = std::chrono::steady_clock::now() + window;
-        do {
-            for (int slice = 0; slice < 4; ++slice) {
-                MonitorArm(&line);
-                if (ready()) return true;
-                MonitorWait(Slice);
-            }
-            if (ready()) return true;
-        } while (std::chrono::steady_clock::now() < deadline);
-        return false;
-    }
-#endif
-    return SpinUntil(window, ready);
-}
-
-}
-
 void DrawPipeline::wakeLane(ResolveLane& lane) {
     lane.wake.fetch_add(1, std::memory_order_seq_cst);
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -1194,7 +1352,7 @@ void DrawPipeline::resolveAhead(unsigned laneIndex) {
             std::this_thread::sleep_for(idleNap);
             continue;
         }
-        if (!spins && !IdleUntil(lane.state, window, posted)) {
+        if (!spins && !IdleUntil(&lane.state, window, posted)) {
             const auto wake = lane.wake.load(std::memory_order_acquire);
             lane.sleeping.fetch_add(1, std::memory_order_seq_cst);
             std::atomic_thread_fence(std::memory_order_seq_cst);

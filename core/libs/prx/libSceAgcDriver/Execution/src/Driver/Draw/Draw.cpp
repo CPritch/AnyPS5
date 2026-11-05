@@ -845,7 +845,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         noteFinisherHandOff(true);
         DrawFinisher::Pending held;
         if (DrawFinisher::Overlap()) held = heldWrites(tail);
-        DrawFinisher::Get().Enqueue([this, tailHolder] {
+        DrawFinisher::Get().EnqueuePrepared([this, tailHolder] {
             auto& job = *tailHolder;
             DrawPipeline::FollowEpoch(job.epoch);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
@@ -1019,6 +1019,17 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     std::size_t completedSubdraws = 0;
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
+    const bool verifyThreads = [] {
+        const auto every = DrawFinisher::DefersOrdered() ? DrawFinisher::VerifyThreadsEvery() : 0u;
+        static std::atomic<std::uint64_t> seen{0};
+        return every != 0 && seen.fetch_add(1, std::memory_order_relaxed) % every == 0;
+    }();
+    std::vector<ShaderRecompiler::MemoryRegion> memoryBefore;
+    Pm4::DrawParameters drawBefore{};
+    if (verifyThreads) {
+        memoryBefore = memory;
+        drawBefore = drawParameters;
+    }
     std::optional<ShaderRecompiler::MeshBarycentricLayout> meshBarycentrics;
     std::vector<std::size_t> resultIndex(programs.size(), 0);
     for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -1040,7 +1051,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
                 memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
             } else {
-                if (!dataCandidates[i].empty() && !verifyDrawDataHits()) decodeVertexInfo(i);
+                if (!dataCandidates[i].empty() && !verifyDrawDataHits()) {
+                    DrawFinisher::WaitTurn();
+                    decodeVertexInfo(i);
+                }
                 if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) {
                     for (auto previous = i; previous-- > 0;) {
                         if (programResults[previous] == nullptr) continue;
@@ -1075,6 +1089,35 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
     }
 
+    if (verifyThreads && rejected.empty()) {
+        DrawFinisher::WaitTurn();
+        ShaderMemory ordered(memoryBefore, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
+        auto orderedMemory = memoryBefore;
+        auto orderedCaptures = stageCaptures;
+        auto orderedRecompiled = recompiled;
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            if (roles[i] == Role::GeometryBack) continue;
+            if (recompiled[i]) {
+                const auto again = materializeDrawStage(i, pushOffsets[i], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, orderedMemory, linked, drawBefore, localDevice, ordered, orderedCaptures, orderedRecompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
+                const auto& parallel = *stageCaptures[i].compiled;
+                const auto sameBindingWords = [&] {
+                    for (std::size_t b = 0; b < parallel.bindings.size(); ++b) {
+                        if (parallel.bindings[b].guestDescriptor != again->bindings[b].guestDescriptor) return false;
+                    }
+                    return true;
+                };
+                const char* what = again == stageCaptures[i].compiled ? nullptr : parallel.variantId != again->variantId ? "variant" : parallel.specializationId != again->specializationId ? "specialization" : parallel.pushConstants != again->pushConstants ? "push constants" : parallel.poisonedSrtReads != again->poisonedSrtReads ? "poisoned reads" : parallel.bindings.size() != again->bindings.size() ? "binding count" : !sameBindingWords() ? "binding words" : nullptr;
+                if (what != nullptr) {
+                    std::fprintf(stderr, "[finisher-threads] APS5_VERIFY_FINISHER_THREADS: stage %zu (program 0x%llx, key 0x%llx) captured out of order differs from a capture at its turn in its %s\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), static_cast<unsigned long long>(drawKey), what);
+                    std::fflush(stderr);
+                    std::abort();
+                }
+            } else if (programResults[i] != nullptr) {
+                orderedMemory.insert(orderedMemory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
+            }
+            if (i == 0) fold(*programResults[0], drawBefore);
+        }
+    }
     if (stageDataVerified != 0) {
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.stageDataVerified += stageDataVerified;
@@ -1424,7 +1467,20 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         if (ahead != nullptr) prepare = [held, ahead] { ahead->Prepare(); };
         DrawPipeline::Early earlyHook;
         if (DrawPipeline::ResolveSplit() != 0) earlyHook = [held](const DrawPipeline::EarlyOffer& offer) { return (*held)(&offer); };
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(prepare), std::move(earlyHook));
+        if (DrawFinisher::DefersOrdered()) {
+            struct Deferred {
+                DrawPipeline::Commit commit;
+                std::vector<DrawPipeline::Range> writes;
+                std::vector<DrawPipeline::Range> reads;
+                DrawPipeline::Prepare prepare;
+                DrawPipeline::Early early;
+            };
+            DrawFinisher::DeferOrdered([deferred = std::make_shared<Deferred>(Deferred{[held] { (*held)(nullptr); }, std::move(writes), std::move(reads), std::move(prepare), std::move(earlyHook)})] {
+                DrawPipeline::Queue0().Enqueue(std::move(deferred->commit), std::move(deferred->writes), 0, {}, std::move(deferred->reads), true, DrawPipeline::ItemKind::Draw, std::move(deferred->prepare), std::move(deferred->early));
+            });
+        } else {
+            DrawPipeline::Queue0().Enqueue([held] { (*held)(nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(prepare), std::move(earlyHook));
+        }
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();

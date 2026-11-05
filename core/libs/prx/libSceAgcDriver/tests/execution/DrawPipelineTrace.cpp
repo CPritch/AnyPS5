@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             const auto snapshot = trace->Collect();
-            if (snapshot.name != worker || snapshot.dropped) { failure = "draw worker trace identity or capacity is incorrect"; return; }
+            if (!snapshot.name.starts_with(worker) || snapshot.dropped) { failure = "draw worker trace identity or capacity is incorrect"; return; }
             const auto found = [](const auto& event) { return event.scope != nullptr && std::string_view(event.scope) == "DrawPipeline.TraceRegression" && event.stage == nullptr && event.length > std::chrono::steady_clock::duration::zero(); };
             if (std::none_of(snapshot.slices.begin(), snapshot.slices.end(), found) || std::none_of(snapshot.totals.begin(), snapshot.totals.end(), found))
                 { failure = "draw work was missing from trace slices or totals"; return; }

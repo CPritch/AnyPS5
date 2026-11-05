@@ -344,16 +344,36 @@ public:
     static bool Enabled();
     static bool OnFinisherThread();
     static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
-    void Enqueue(Job job);
-    void Enqueue(Job job, Pending held);
+    void Enqueue(Job ordered);
+    void Enqueue(Job ordered, Pending held);
+    void EnqueuePrepared(Job prepare, Pending held);
+    static unsigned Threads();
+    static unsigned VerifyThreadsEvery();
+    static bool DefersOrdered();
+    static void DeferOrdered(Job ordered);
+    static void WaitTurn();
+    static bool EarlierWrites(std::uint64_t address, std::size_t bytes);
+    static void WaitEarlierWrites(std::uint64_t address, std::size_t bytes);
     void Drain(QueueWaits::Site site = QueueWaits::Site::FinisherOther);
     void WaitPendingWritten(std::span<const Range> ranges);
     void Settle();
     void ReleaseRan();
 
 private:
+    struct Slot {
+        Job prepare;
+        Job ordered;
+        std::exception_ptr error;
+        bool shutdown = false;
+        bool prepared = false;
+    };
     DrawFinisher() = default;
+    void push(Slot slot, Pending held);
     void run();
+    void run(unsigned index);
+    void retireHead();
+    void waitTurn(std::uint64_t sequence);
+    bool earlierWrites(std::uint64_t sequence, std::uint64_t address, std::size_t bytes);
     inline static std::atomic<std::size_t> outstanding{0};
     std::mutex mutex;
     std::condition_variable wake;
@@ -361,7 +381,7 @@ private:
     std::condition_variable room;
     std::uint32_t idleWaiters = 0;
     std::uint32_t roomWaiters = 0;
-    std::deque<Job> jobs;
+    std::deque<Slot> jobs;
     std::deque<Pending> pending;
     AgcDriver::Mutex indexLock;
     CountedRanges pendingRanges;
@@ -374,10 +394,13 @@ private:
     std::uint64_t scanNewestKey(std::uint64_t key, std::uint64_t shape, std::size_t* after) const;
     std::vector<Job> ran;
     std::exception_ptr failure;
-    std::uint64_t ranJobs = 0;
+    alignas(64) std::atomic<std::uint64_t> ranJobs{0};
+    alignas(64) std::atomic<int> unclaimed{0};
+    alignas(64) std::uint64_t claimedJobs = 0;
+    bool sequencing = false;
     bool running = false;
-    bool sleeping = false;
-    std::thread thread;
+    std::uint32_t sleepers = 0;
+    std::vector<std::thread> threads;
 };
 
 }

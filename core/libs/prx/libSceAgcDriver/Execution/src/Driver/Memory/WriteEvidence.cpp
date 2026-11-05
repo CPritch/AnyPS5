@@ -227,6 +227,7 @@ bool overQueuedWrite(std::uint64_t address, std::size_t bytes) {
 
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (checksQueuedWrites()) {
+        if (DrawFinisher::OnFinisherThread()) DrawFinisher::WaitEarlierWrites(address, bytes);
         if (overQueuedWrite(address, bytes)) {
             if (queuedLabelReads() && !known.empty() && known.size() == bytes && bytes <= 8) {
                 if (const auto value = DrawPipeline::Queue0().PendingLabel(address, bytes)) {
@@ -249,7 +250,7 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
 
 ShaderMemory::PendingWrite Driver::QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (checksQueuedWrites()) {
-        if (overQueuedWrite(address, bytes)) return ShaderMemory::PendingWrite::Sync;
+        if (DrawFinisher::EarlierWrites(address, bytes) || overQueuedWrite(address, bytes)) return ShaderMemory::PendingWrite::Sync;
     } else if (QueueWaits::Enabled() && DrawFinisher::OnFinisherThread()) {
         overQueuedWrite(address, bytes);
     }

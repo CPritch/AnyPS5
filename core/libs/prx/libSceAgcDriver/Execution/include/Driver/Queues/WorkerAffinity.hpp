@@ -12,6 +12,7 @@ std::uint64_t PreparerAffinityMask();
 void PinWorkerThread(const char* role);
 void PinDrawWorkerThread(const char* role);
 void PinFinisherThread(const char* role);
+void PinFinisherHelperThread(const char* role);
 void PinCommitterThread(const char* role);
 void PinPreparerThread(const char* role);
 void PinResolverThread(const char* role);

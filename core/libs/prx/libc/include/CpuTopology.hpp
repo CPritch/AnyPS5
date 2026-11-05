@@ -243,6 +243,7 @@ inline std::uint64_t PinTraced(const char* role, void* handle, std::uint64_t mas
 struct Placement {
     std::uint64_t worker = 0;
     std::uint64_t finisher = 0;
+    std::uint64_t finisherHelper = 0;
     std::uint64_t committer = 0;
     std::uint64_t resolver = 0;
     std::uint64_t resolverSecond = 0;
@@ -252,7 +253,7 @@ struct Placement {
     }
 };
 
-inline Placement PlacementFor(const Layout& layout, const std::vector<std::uint64_t>& performantCores, bool resolver = false, bool resolverWholeCore = false, bool resolverOwnCore = false, bool resolverLanes = false) {
+inline Placement PlacementFor(const Layout& layout, const std::vector<std::uint64_t>& performantCores, bool resolver = false, bool resolverWholeCore = false, bool resolverOwnCore = false, bool resolverLanes = false, bool finisherHelper = false) {
     constexpr std::size_t dedicated = 3;
     if (!layout.hybrid || performantCores.size() <= dedicated) return {};
     Placement result{};
@@ -260,6 +261,10 @@ inline Placement PlacementFor(const Layout& layout, const std::vector<std::uint6
     result.finisher = performantCores[1];
     result.committer = performantCores[2];
     std::uint64_t reserved = result.worker | result.finisher | result.committer;
+    if (finisherHelper && std::popcount(result.finisher) > 1) {
+        result.finisherHelper = std::uint64_t{1} << (63 - std::countl_zero(result.finisher));
+        result.finisher &= ~result.finisherHelper;
+    }
     if (resolver && performantCores.size() > dedicated) {
         const auto core = performantCores[dedicated];
         const bool siblings = std::popcount(core) > 1;
@@ -297,6 +302,12 @@ inline bool PlacementRequested() {
     return MaskFromEnvironment("APS5_WORKER_AFFINITY_MASK") == 0 && MaskFromEnvironment("APS5_COMMITTER_AFFINITY_MASK") == 0;
 }
 
+inline bool FinisherHelperRequested() {
+    if (std::getenv("APS5_NO_FINISHER_THREADS") != nullptr || MaskFromEnvironment("APS5_FINISHER_HELPER_AFFINITY_MASK") != 0) return false;
+    const char* threads = std::getenv("APS5_FINISHER_THREADS");
+    return threads == nullptr || std::strtoul(threads, nullptr, 10) > 1;
+}
+
 inline const Placement& GetPlacement() {
     static const Placement placement = [] {
         if (!PlacementRequested()) return Placement{};
@@ -304,7 +315,7 @@ inline const Placement& GetPlacement() {
         const auto& layout = Get();
         const char* split = std::getenv("APS5_RESOLVE_SPLIT");
         const bool resolver = (split == nullptr || std::strtoul(split, nullptr, 10) >= 2) && MaskFromEnvironment("APS5_RESOLVER_AFFINITY_MASK") == 0;
-        return PlacementFor(layout, CoresFromSysfs("/sys/devices/system/cpu", layout.performant & layout.process), resolver, std::getenv("APS5_RESOLVER_WHOLE_CORE") != nullptr, std::getenv("APS5_RESOLVER_OWN_CORE") != nullptr, std::getenv("APS5_RESOLVE_LANES") != nullptr && std::getenv("APS5_NO_CARRY_RESOLVE_HOLD") == nullptr && (split == nullptr || std::strtoul(split, nullptr, 10) == 2));
+        return PlacementFor(layout, CoresFromSysfs("/sys/devices/system/cpu", layout.performant & layout.process), resolver, std::getenv("APS5_RESOLVER_WHOLE_CORE") != nullptr, std::getenv("APS5_RESOLVER_OWN_CORE") != nullptr, std::getenv("APS5_RESOLVE_LANES") != nullptr && std::getenv("APS5_NO_CARRY_RESOLVE_HOLD") == nullptr && (split == nullptr || std::strtoul(split, nullptr, 10) == 2), FinisherHelperRequested());
 #else
         return Placement{};
 #endif
