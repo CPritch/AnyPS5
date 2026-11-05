@@ -173,6 +173,9 @@ public:
     static void ReleaseCarriedHold() noexcept;
     static void SetCarryRelease(void (*release)());
     static void NoteOwnResolve(OwnCause cause, std::uint64_t resolveNs, std::uint64_t emitNs);
+    static void NoteCommittedDraw(bool ownResolve);
+    static std::uint64_t CommittedDraws();
+    static std::uint64_t OwnResolves();
     static std::uint64_t FollowedEpoch();
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void WaitWritten(std::uint64_t address, std::size_t bytes, DrainReason reason, std::uint32_t opcode = 0x100);

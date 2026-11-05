@@ -52,6 +52,8 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
+std::atomic<std::uint64_t> templateBuildsTotal{0};
+
 struct PixelFunctionLdsPool {
     Context context{};
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -2246,6 +2248,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
+        templateBuildsTotal.fetch_add(1, std::memory_order_relaxed);
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
     }
     timer.phase(PhaseResources);
@@ -4925,6 +4928,10 @@ void SetRedoHook(void (*hook)()) {
 
 namespace {
 std::atomic<std::uint64_t> drawRedoSerial{0};
+}
+
+std::uint64_t DrawTemplateBuilds() {
+    return templateBuildsTotal.load(std::memory_order_relaxed);
 }
 
 std::uint64_t DrawRedoSerial() {

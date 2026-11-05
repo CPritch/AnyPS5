@@ -2052,6 +2052,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
             }
         }
         std::uint64_t ownResolveNs = 0;
+        const bool resolvedOwn = packet == nullptr;
         if (packet == nullptr) {
             DrawPipeline::QuiescePreProof();
             const DrawPipeline::ResolvePhaseScope ownResolve;
@@ -2099,6 +2100,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         const auto emitting = clock();
         localDevice->EmitDraw(*packet);
         lastEmittedTemplate = Graphics::DrawPacketTemplate(*packet);
+        DrawPipeline::NoteCommittedDraw(resolvedOwn);
         if (timed) {
             DrawPipeline::NoteCommitterPart(fromEarly ? DrawPipeline::CommitterPart::EmitEarly : DrawPipeline::CommitterPart::EmitWhole, emitting);
             if (!fromEarly && ownResolveNs != 0) DrawPipeline::NoteOwnResolve(OwnResolveCause(early, staleCause), ownResolveNs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - emitting).count()));
