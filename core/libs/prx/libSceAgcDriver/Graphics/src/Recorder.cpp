@@ -3840,7 +3840,7 @@ bool Recorder::DrawUploadBatchKept(const Buffer* buffer) const {
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (stamp == unwrittenStamp) return;
-    static const bool survive = std::getenv("APS5_NO_SNAPSHOT_SURVIVAL") == nullptr;
+    static const bool survive = std::getenv("APS5_SNAPSHOT_SURVIVAL") != nullptr;
     if (survive && stamp[1] != 0 && stamp[1] == unwrittenStamp[1] && stamp[2] == unwrittenStamp[2]) {
         unwrittenStamp = stamp;
         return;

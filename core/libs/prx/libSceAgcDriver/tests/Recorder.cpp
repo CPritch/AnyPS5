@@ -5416,7 +5416,7 @@ void snapshotSurvivalTests(const Device& device) {
     cache.NoteUnwrittenDrawSnapshot(address, 64, stamp, buffer);
     cache.NoteUnwrittenDrawSnapshot(address + 65536, 64, stamp, buffer);
     MarkWritten(address + 4096, 4);
-    const bool survive = std::getenv("APS5_NO_SNAPSHOT_SURVIVAL") == nullptr;
+    const bool survive = std::getenv("APS5_SNAPSHOT_SURVIVAL") != nullptr;
     stamp = stampNow();
     Require(stamp[0] != 0, "the tracker has no generation");
     Require((cache.UnwrittenDrawSnapshot(address, 64, stamp) == buffer) == survive, "a store elsewhere in the block decided a snapshot's survival against its switch");
