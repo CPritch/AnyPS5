@@ -5394,6 +5394,42 @@ void containingSnapshotTests(const Device& device) {
     Require(cache.ReusableDrawSnapshot(inner + 4096, 4096, Recorder::SnapshotUse::Storage, nullptr, 0, &offset) == nullptr, "a containing snapshot outlived a CPU store into the range");
 }
 
+void snapshotSurvivalTests(const Device& device) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t bytes = 131072;
+    void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "write watching unavailable: surviving draw snapshots not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    Recorder cache(device.GetContext());
+    const auto buffer = std::make_shared<Buffer>(device.GetContext(), 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    BumpCollectEpoch();
+    const auto stampNow = [] { return std::array<std::uint64_t, 3>{PublishedTrackerGeneration(), CollectEpoch(), 1}; };
+    CollectWrites(address, bytes);
+    auto stamp = stampNow();
+    cache.NoteUnwrittenDrawSnapshot(address, 64, stamp, buffer);
+    cache.NoteUnwrittenDrawSnapshot(address + 65536, 64, stamp, buffer);
+    MarkWritten(address + 4096, 4);
+    const bool survive = std::getenv("APS5_NO_SNAPSHOT_SURVIVAL") == nullptr;
+    stamp = stampNow();
+    Require(stamp[0] != 0, "the tracker has no generation");
+    Require((cache.UnwrittenDrawSnapshot(address, 64, stamp) == buffer) == survive, "a store elsewhere in the block decided a snapshot's survival against its switch");
+    MarkWritten(address + 16, 4);
+    stamp = stampNow();
+    Require(cache.UnwrittenDrawSnapshot(address, 64, stamp) == nullptr, "a snapshot survived a store over its range");
+    Require(cache.UnwrittenDrawSnapshot(address, 64, stamp) == nullptr, "a snapshot that a store ended came back");
+    Require((cache.UnwrittenDrawSnapshot(address + 65536, 64, stamp) == buffer) == survive, "a store in another block ended a snapshot");
+    BumpCollectEpoch();
+    stamp = stampNow();
+    Require(cache.UnwrittenDrawSnapshot(address + 65536, 64, stamp) == nullptr, "a snapshot survived its collect epoch");
+}
+
 void unwrittenSnapshotTests(const Device& device) {
     Recorder cache(device.GetContext());
     const auto buffer = std::make_shared<Buffer>(device.GetContext(), 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -14368,6 +14404,8 @@ int main(int argc, char** argv) {
             drawSnapshotCapTests(device, recorder);
             containingSnapshotTests(device);
             unwrittenSnapshotTests(device);
+        snapshotSurvivalTests(device);
+            snapshotSurvivalTests(device);
             drawSnapshotUploadTests(device, recorder);
             std::cout << "Draw snapshot cap tests passed\n";
             return 0;

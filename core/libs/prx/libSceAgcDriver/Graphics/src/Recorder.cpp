@@ -3840,6 +3840,11 @@ bool Recorder::DrawUploadBatchKept(const Buffer* buffer) const {
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     if (stamp == unwrittenStamp) return;
+    static const bool survive = std::getenv("APS5_NO_SNAPSHOT_SURVIVAL") == nullptr;
+    if (survive && stamp[1] != 0 && stamp[1] == unwrittenStamp[1] && stamp[2] == unwrittenStamp[2]) {
+        unwrittenStamp = stamp;
+        return;
+    }
     unwrittenSnapshots.clear();
     unwrittenBytes = 0;
     unwrittenStamp = stamp;
@@ -3862,6 +3867,24 @@ std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, s
     retireUnwrittenSnapshots(stamp);
     const auto found = unwrittenSnapshots.find(address);
     if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return {};
+    const bool survived = found->second.generation != stamp[0];
+    if (survived) {
+        if (!GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+            unwrittenBytes -= found->second.bytes;
+            unwrittenSnapshots.erase(found);
+            return {};
+        }
+        found->second.generation = stamp[0];
+    }
+    static const bool verified = std::getenv("APS5_VERIFY_SNAPSHOT_SURVIVAL") != nullptr;
+    if (verified) {
+        static std::array<std::atomic<std::uint64_t>, 2> checked{}, differing{};
+        const auto bytesHeld = found->second.buffer->Bytes().subspan(static_cast<std::size_t>(found->second.offset), bytes);
+        const auto kind = survived ? 1u : 0u;
+        if (std::memcmp(bytesHeld.data(), reinterpret_cast<const void*>(address), bytes) != 0) differing[kind].fetch_add(1, std::memory_order_relaxed);
+        const auto total = checked[0].fetch_add(kind == 0 ? 1 : 0, std::memory_order_relaxed) + checked[1].fetch_add(kind, std::memory_order_relaxed) + 1;
+        if ((total & 0x3ffffu) == 0) std::fprintf(stderr, "[snapshot-survival] same stamp %llu reused, %llu differing from guest memory; survived a tracker bump %llu reused, %llu differing\n", static_cast<unsigned long long>(checked[0].load()), static_cast<unsigned long long>(differing[0].load()), static_cast<unsigned long long>(checked[1].load()), static_cast<unsigned long long>(differing[1].load()));
+    }
     if (offset != nullptr) *offset = found->second.offset;
     return found->second.buffer;
 }
@@ -3890,7 +3913,7 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
         unwrittenSnapshots.erase(found);
     }
     if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) return;
-    unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset});
+    unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset, stamp[0]});
     unwrittenBytes += bytes;
 }
 
