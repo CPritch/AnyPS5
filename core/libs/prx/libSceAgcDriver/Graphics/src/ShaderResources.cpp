@@ -6832,6 +6832,26 @@ const ShaderResources::DrawBindings* ShaderResources::BindingsForEmit(Recorder& 
     return item;
 }
 
+void ShaderResources::PrefetchBindings(std::span<const MovedBuffer> moved) const {
+    static const bool enabled = std::getenv("APS5_NO_BINDING_PREFETCH") == nullptr;
+    if (!enabled) return;
+    const auto lines = [](const void* begin, std::size_t bytes, std::size_t most) {
+        const auto* at = static_cast<const char*>(begin);
+        for (std::size_t line = 0; line * 64 < bytes && line < most; ++line) __builtin_prefetch(at + line * 64);
+    };
+    lines(moved.data(), moved.size_bytes(), 2);
+    lines(allocations.data(), allocations.size() * sizeof(allocations[0]), 6);
+    lines(descriptorWrites.data(), descriptorWrites.size() * sizeof(VkWriteDescriptorSet), 4);
+    lines(descriptorBuffers.data(), descriptorBuffers.size() * sizeof(VkDescriptorBufferInfo), 2);
+    lines(drawWritePlan.allocationSlots.data(), drawWritePlan.allocationSlots.size() * sizeof(drawWritePlan.allocationSlots[0]), 2);
+    if (auto* own = ownBindingsSlot; own != nullptr && !own->empty()) {
+        __builtin_prefetch(own->back(), 1);
+        __builtin_prefetch(reinterpret_cast<const char*>(own->back()) + 64, 1);
+        __builtin_prefetch(reinterpret_cast<const char*>(own->back()) + 128, 1);
+        __builtin_prefetch(own->back()->snapshots.data(), 1);
+    }
+}
+
 bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
     auto* const result = &bound;
     const bool onLane = GuestMemory::OnResolverThread();

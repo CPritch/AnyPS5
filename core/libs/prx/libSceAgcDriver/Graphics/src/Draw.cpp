@@ -5054,6 +5054,7 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
             if (!RefreshCachedStorage(context, binding.resident)) {
                 redo = true;
                 break;
+    if (packet.ready && prepared.resolved.resources != nullptr) prepared.resolved.resources->PrefetchBindings(prepared.resolved.moved);
             }
             materializeRegisterClear(context, binding.color, *binding.resident);
         } catch (const std::exception&) {

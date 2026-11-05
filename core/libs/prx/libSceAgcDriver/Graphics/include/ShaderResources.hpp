@@ -245,6 +245,7 @@ public:
     static std::uint64_t JobBindingsVerified();
     static std::string JobBindingsText();
     void PrepareAheadDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, AheadDrawBindings& ahead) const;
+    void PrefetchBindings(std::span<const MovedBuffer> moved) const;
     const DrawBindings* BindingsForEmit(Recorder& recorder, std::span<const MovedBuffer> moved, AheadDrawBindings* ahead, bool disturbed) const;
     struct MovedPlan {
         std::vector<MovedBuffer> moved;
