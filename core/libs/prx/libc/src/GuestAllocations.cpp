@@ -782,6 +782,7 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     auto* state = static_cast<MutationState*>(mutation);
     const auto deadline = std::chrono::steady_clock::now() + pinWait();
     int syncedRounds = 0;
+    int fruitlessRounds = 0;
     bool marked = false;
     const auto unmark = [&] {
         if (!marked) return;
@@ -853,7 +854,14 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
             // and the re-lock a driver worker took a new lease (every address-based build pins every
             // registered range). Rare per round, but each round is a GPU wait, so a repeat is reported.
             if (++syncedRounds == 8) std::fprintf(stderr, "[gpu] leased allocation 0x%llx+0x%llx still pinned after %d recorder syncs\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), syncedRounds);
+            fruitlessRounds = 0;
             continue;
+        }
+        static const bool backsOff = std::getenv("APS5_NO_LEASE_WAIT_UNLOCKED") == nullptr;
+        if (backsOff && ++fruitlessRounds > 8 && state != nullptr && state->lock.owns_lock()) {
+            state->lock.unlock();
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            state->lock.lock();
         }
     }
 }

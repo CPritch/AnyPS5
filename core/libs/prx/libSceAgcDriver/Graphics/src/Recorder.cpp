@@ -5399,6 +5399,29 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     return true;
 }
 
+bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
+    GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    static const bool enabled = std::getenv("APS5_NO_LEASE_WAIT_UNLOCKED") == nullptr;
+    auto& mutex = GuestMemory::GpuMutex();
+    if (!enabled || timeline == VK_NULL_HANDLE || completionDepth != 0 || mutex.DepthOnThisThread() != 1) return false;
+    if (serial == 0) return true;
+    const auto myId = id;
+    const auto device = context.device;
+    const auto semaphore = timeline;
+    const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+    VkResult result = VK_SUCCESS;
+    {
+        const UnlockedWaiter waiter{myId};
+        mutex.unlock();
+        result = WaitTimeline(device, semaphore, waitSemaphores, serial);
+    }
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+    mutex.lock();
+    Check(result, "vkWaitSemaphoresKHR recorder");
+    if (RecorderAlive(myId)) FinishUpTo(serial);
+    return true;
+}
+
 bool Recorder::Reap() {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     PerformanceTimer frameTiming("Recorder.Reap");

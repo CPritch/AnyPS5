@@ -3870,23 +3870,38 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         }
         if (retiredImport && recorder != nullptr) recorder->FlushDeferredReleases();
     } else {
-        std::lock_guard lock(GuestMemory::GpuMutex());
+        std::unique_lock lock(GuestMemory::GpuMutex());
         auto& state = Leases();
         auto* recorder = Recorder::Active();
         const auto target = state.newestLeaseSerial;
+        const auto drainRecorder = [&] {
+            Recorder::CountSync(4);
+            recorder->Submit();
+            if (!recorder->FinishUpToUnlocked(recorder->Submissions())) recorder->Sync();
+            recorder = Recorder::Active();
+            synced = true;
+            drained = true;
+        };
         if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
             Recorder::CountSync(4);
             recorder->Submit();
-            recorder->FinishUpTo(target);
-            state.finishedLeaseSerial = target;
+            const auto* leasing = recorder;
+            if (!recorder->FinishUpToUnlocked(target)) recorder->FinishUpTo(target);
+            recorder = Recorder::Active();
+            if (recorder == leasing) state.finishedLeaseSerial = target;
             synced = true;
         } else if (recorder != nullptr && !recorder->Idle()) {
-            Recorder::CountSync(4);
-            recorder->Sync();
-            synced = true;
-            drained = true;
+            drainRecorder();
         } else {
-            std::this_thread::yield();
+            static const bool locked = std::getenv("APS5_NO_LEASE_WAIT_UNLOCKED") != nullptr;
+            if (!locked && GuestMemory::GpuMutex().DepthOnThisThread() == 1) {
+                lock.unlock();
+                std::this_thread::yield();
+                lock.lock();
+                recorder = Recorder::Active();
+            } else {
+                std::this_thread::yield();
+            }
         }
         if (recorder != nullptr) recorder->FlushDeferredReleases();
 
@@ -3904,12 +3919,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
             }
         }
         if (overlapsImport) {
-            if (recorder != nullptr && !recorder->Idle()) {
-                Recorder::CountSync(4);
-                recorder->Sync();
-                synced = true;
-                drained = true;
-            }
+            if (recorder != nullptr && !recorder->Idle()) drainRecorder();
             const auto lease = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
             {
                 std::lock_guard importsLock(imports.mutex);
@@ -3924,12 +3934,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
                     retiredImport = true;
                 }
             }
-            if (retiredImport && recorder != nullptr && !recorder->Idle()) {
-                Recorder::CountSync(4);
-                recorder->Sync();
-                synced = true;
-                drained = true;
-            }
+            if (retiredImport && recorder != nullptr && !recorder->Idle()) drainRecorder();
         }
 #ifdef _WIN32
         if (releaseSettleRetired(imports, address, end)) retiredImport = true;

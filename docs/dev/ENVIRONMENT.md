@@ -841,4 +841,5 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_VERIFY_IMPORT_JOURNAL` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | re-derives each import kept by the journal from a fresh lease and aborts if the full reconcile would have dropped it |
 | `APS5_NO_SPACE_PATCH` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | turns off what is on by default: keeping the cached address space across changes that touch none of its regions and no GPU range, and copying unchanged import regions into a rebuilt space |
 | `APS5_VERIFY_SPACE_PATCH` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | re-derives a kept address space and each copied region from the registry and the imports, and aborts on a difference |
+| `APS5_NO_LEASE_WAIT_UNLOCKED` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | turns off what is on by default: a guest thread waiting for leased work releases the GPU mutex around the GPU wait and around its idle retries, and backs off after eight fruitless rounds |
 

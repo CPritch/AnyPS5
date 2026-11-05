@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -85,7 +86,6 @@ void Reconcile(AgcDriver::VulkanDevice& device, const GuestAllocation& probe) {
     const std::array<std::uint32_t, 4> pattern{5u, 6u, 7u, 8u};
     Require(device.FillBuffer(probe.Address(), BlockBytes, pattern), "host import at map: the probe fill was not imported");
     device.WaitIdle();
-    static_cast<void>(device.ImportsIdentity());
 }
 
 void Import(AgcDriver::VulkanDevice& device, const GuestAllocations::Mapped& ranges, std::uint64_t generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
@@ -166,7 +166,7 @@ int main() {
         const auto lateRanges = late.Ranges();
         const auto lateAt = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         GuestAllocation newer;
-        Reconcile(*device, probe);
+        Reconcile(*device, newer);
         Import(*device, lateRanges, lateAt);
         Require(!Imported(handle, late.Address(), AllocationBytes), "host import at map: an import older than the last reconcile was made");
 
@@ -183,6 +183,36 @@ int main() {
         release = true;
         holder.join();
         Require(unlocked && Imported(handle, contended.Address(), AllocationBytes), "host import at map: a mapping on a device that already imports needed the GPU lock");
+        {
+            std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+            const std::array<std::uint32_t, 4> pattern{13u, 14u, 15u, 16u};
+            Require(device->FillBuffer(probe.Address(), BlockBytes, pattern), "host import at map: the lease wait fill was not imported");
+            auto* recorder = AgcDriver::Graphics::Recorder::Active();
+            Require(recorder != nullptr, "host import at map: no active recorder for the lease wait");
+            recorder->Submit();
+            const auto serial = recorder->Submissions();
+            {
+                std::lock_guard nested(AgcDriver::GuestMemory::GpuMutex());
+                Require(!recorder->FinishUpToUnlocked(serial), "host import at map: a nested GPU lock was given up around a lease wait");
+            }
+            std::atomic<bool> taken{false};
+            std::thread other([&] {
+                std::lock_guard otherLock(AgcDriver::GuestMemory::GpuMutex());
+                taken = true;
+            });
+            const bool unlocked = recorder->FinishUpToUnlocked(serial);
+            if (std::getenv("APS5_NO_LEASE_WAIT_UNLOCKED") != nullptr) {
+                Require(!unlocked, "host import at map: APS5_NO_LEASE_WAIT_UNLOCKED left the wait unlocked");
+                recorder->FinishUpTo(serial);
+                gpu.unlock();
+            } else {
+                Require(unlocked && AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "host import at map: the unlocked lease wait did not retake the GPU lock");
+                Require(recorder->CompletedThrough() >= serial, "host import at map: the unlocked lease wait did not finish its batch");
+                gpu.unlock();
+            }
+            other.join();
+            Require(taken.load(), "host import at map: another thread never took the GPU lock around the lease wait");
+        }
         std::puts("host import at map tests passed");
         return 0;
     } catch (const std::exception& error) {
