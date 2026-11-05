@@ -31,6 +31,10 @@
 #include <unistd.h>
 #endif
 #include <stdexcept>
+#if defined(__x86_64__) && defined(__linux__)
+#include <cpuid.h>
+#include <x86intrin.h>
+#endif
 #include <string>
 
 namespace AgcDriver::DriverDetail {
@@ -58,8 +62,9 @@ struct PendingSecond {
 thread_local PendingSecond pendingSecond;
 thread_local std::vector<DrawPipeline::Range> secondWrites;
 thread_local std::vector<DrawPipeline::Range> secondDepth;
-thread_local std::uint64_t laneJobSequence = 0;
 thread_local bool laneHoldsPhase = false;
+thread_local unsigned laneSerialDepth = 0;
+constexpr std::uint32_t ResolveGateWriter = 0x80000000u;
 thread_local unsigned committerPhaseDepth = 0;
 thread_local DrawPipeline* committingPipeline = nullptr;
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> kindNames{"other", "draw", "indirect draw", "dispatch", "dispatch miss", "dispatch without recipe", "label", "fill", "copy", "store", "pass", "seal", "completion", "occlusion dump"};
@@ -739,21 +744,43 @@ DrawPipeline::ResolvePhaseScope::ResolvePhaseScope() {
     if (!ResolveLanes() || committingPipeline == nullptr) return;
     held = true;
     if (committerPhaseDepth++ != 0) return;
-    auto& phase = committingPipeline->resolvePhaseHeld;
-    while (phase.exchange(true, std::memory_order_acquire)) SpinPause();
+    auto& gate = committingPipeline->resolveGate;
+    gate.fetch_or(ResolveGateWriter, std::memory_order_acquire);
+    while (gate.load(std::memory_order_acquire) != ResolveGateWriter) SpinPause();
 }
 
 DrawPipeline::ResolvePhaseScope::~ResolvePhaseScope() {
     if (!held) return;
-    if (--committerPhaseDepth == 0) committingPipeline->resolvePhaseHeld.store(false, std::memory_order_release);
+    if (--committerPhaseDepth == 0) committingPipeline->resolveGate.fetch_and(~ResolveGateWriter, std::memory_order_release);
+}
+
+bool DrawPipeline::ParallelResolve() {
+    static const bool enabled = std::getenv("APS5_NO_PARALLEL_RESOLVE") == nullptr;
+    return enabled;
+}
+
+DrawPipeline::LaneSerial::LaneSerial() {
+    if (!laneHoldsPhase) return;
+    held = true;
+    if (laneSerialDepth++ != 0) return;
+    auto& flag = Queue0().laneSerial;
+    while (flag.exchange(true, std::memory_order_acquire)) SpinPause();
+}
+
+DrawPipeline::LaneSerial::~LaneSerial() {
+    if (!held) return;
+    if (--laneSerialDepth == 0) Queue0().laneSerial.store(false, std::memory_order_release);
 }
 
 void DrawPipeline::EndResolvePhase() {
     if (!laneHoldsPhase) return;
     laneHoldsPhase = false;
     auto& pipeline = Queue0();
-    pipeline.resolvedThrough.store(laneJobSequence, std::memory_order_release);
-    pipeline.resolvePhaseHeld.store(false, std::memory_order_release);
+    if (laneSerialDepth != 0) {
+        laneSerialDepth = 0;
+        pipeline.laneSerial.store(false, std::memory_order_release);
+    }
+    pipeline.resolveGate.fetch_sub(1, std::memory_order_release);
 }
 
 void DrawPipeline::JoinCarriedJob() {
@@ -837,6 +864,49 @@ unsigned DrawPipeline::ResolveSplit() {
     return mode;
 }
 
+namespace {
+
+#if defined(__x86_64__) && defined(__linux__)
+bool MonitorWaitAvailable() {
+    static const bool available = [] {
+        if (std::getenv("APS5_NO_RESOLVER_MWAITX") != nullptr) return false;
+        unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+        return __get_cpuid(0x80000001u, &eax, &ebx, &ecx, &edx) != 0 && (ecx & (1u << 29u)) != 0;
+    }();
+    return available;
+}
+
+__attribute__((target("mwaitx"))) void MonitorArm(const void* line) {
+    _mm_monitorx(const_cast<void*>(line), 0u, 0u);
+}
+
+__attribute__((target("mwaitx"))) void MonitorWait(unsigned tscCycles) {
+    _mm_mwaitx(2u, 0u, tscCycles);
+}
+#endif
+
+template <class Ready>
+bool IdleUntil(const std::atomic<int>& line, std::chrono::nanoseconds window, Ready ready) {
+#if defined(__x86_64__) && defined(__linux__)
+    if (MonitorWaitAvailable()) {
+        constexpr unsigned Slice = 4096;
+        const auto deadline = std::chrono::steady_clock::now() + window;
+        do {
+            for (int slice = 0; slice < 4; ++slice) {
+                MonitorArm(&line);
+                if (ready()) return true;
+                MonitorWait(Slice);
+            }
+            if (ready()) return true;
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    }
+#endif
+    return SpinUntil(window, ready);
+}
+
+}
+
 void DrawPipeline::wakeLane(ResolveLane& lane) {
     lane.wake.fetch_add(1, std::memory_order_seq_cst);
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -902,8 +972,6 @@ void DrawPipeline::joinLane(DrawPipeline& pipeline, ResolveLane& lane, bool revo
     if (revoke && lane.state.compare_exchange_strong(expected, ResolveIdle, std::memory_order_acq_rel)) {
         ran = false;
         resolvesRevoked.fetch_add(1, std::memory_order_relaxed);
-        auto through = pipeline.resolvedThrough.load(std::memory_order_relaxed);
-        while (through < lane.sequence && !pipeline.resolvedThrough.compare_exchange_weak(through, lane.sequence, std::memory_order_acq_rel)) {}
     } else {
         if (!revoke) expected = lane.state.load(std::memory_order_acquire);
         if (expected == ResolveDone) {
@@ -1022,7 +1090,7 @@ void DrawPipeline::resolveAhead(unsigned laneIndex) {
             std::this_thread::sleep_for(idleNap);
             continue;
         }
-        if (!spins && !SpinUntil(window, posted)) {
+        if (!spins && !IdleUntil(lane.state, window, posted)) {
             const auto wake = lane.wake.load(std::memory_order_acquire);
             lane.sleeping.fetch_add(1, std::memory_order_seq_cst);
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -1038,23 +1106,26 @@ void DrawPipeline::resolveAhead(unsigned laneIndex) {
         }
         bool holdsPhase = false;
         if (twoLanes) {
-            const auto sequence = lane.sequence;
             while (lane.state.load(std::memory_order_acquire) == ResolvePosted) {
-                if (resolvedThrough.load(std::memory_order_acquire) + 1 >= sequence && !resolvePhaseHeld.exchange(true, std::memory_order_acquire)) {
+                auto gate = resolveGate.load(std::memory_order_relaxed);
+                if ((gate & ResolveGateWriter) == 0 && resolveGate.compare_exchange_weak(gate, gate + 1, std::memory_order_acquire)) {
                     holdsPhase = true;
                     break;
                 }
                 SpinPause();
             }
             if (!holdsPhase) continue;
-            laneJobSequence = sequence;
         }
         int expected = ResolvePosted;
         if (!lane.state.compare_exchange_strong(expected, ResolveRunning, std::memory_order_acq_rel)) {
-            if (holdsPhase) resolvePhaseHeld.store(false, std::memory_order_release);
+            if (holdsPhase) resolveGate.fetch_sub(1, std::memory_order_release);
             continue;
         }
         laneHoldsPhase = holdsPhase;
+        if (holdsPhase && !ParallelResolve()) {
+            while (laneSerial.exchange(true, std::memory_order_acquire)) SpinPause();
+            laneSerialDepth = 1;
+        }
         static const bool timed = std::getenv("APS5_COMMIT_STATS") != nullptr;
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (timed) resolveStartNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - lane.posted).count()), std::memory_order_relaxed);

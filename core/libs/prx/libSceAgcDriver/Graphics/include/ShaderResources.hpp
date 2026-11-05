@@ -423,6 +423,7 @@ private:
     friend class AgcDriver::VulkanDevice;
     friend class ResourceCache;
     std::atomic<bool> inResourceCache{false};
+    std::atomic<bool> provingOnLane{false};
     bool refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder);
     std::optional<std::size_t> shaderDataAllocation(const CompiledShader& shader) const;
     VkBuffer shaderDataBuffer(const CompiledShader& shader) const;

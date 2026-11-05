@@ -3629,6 +3629,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
     static const bool deferInputReads = std::getenv("APS5_NO_DEFERRED_INPUT_READS") == nullptr;
+    std::optional<AgcDriver::DriverDetail::DrawPipeline::LaneSerial> laneSerial;
+    laneSerial.emplace();
     inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared.ahead, deferInputReads && !redoingWhole ? &prepared.deferredReads : nullptr);
     if (inputs.nothing) return false;
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
@@ -3796,7 +3798,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
+    laneSerial.reset();
     resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.ahead);
+    laneSerial.emplace();
     auto& resources = resolved.resources;
     for (std::size_t index = 0; index < targets.size(); ++index) {
         auto& binding = targets[index];

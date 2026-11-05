@@ -134,6 +134,17 @@ public:
     private:
         bool held = false;
     };
+    class LaneSerial {
+    public:
+        LaneSerial();
+        ~LaneSerial();
+        LaneSerial(const LaneSerial&) = delete;
+        LaneSerial& operator=(const LaneSerial&) = delete;
+
+    private:
+        bool held = false;
+    };
+    static bool ParallelResolve();
     static bool EarlyStopped();
     static void StopEarly();
     static void NoteEarlyAbort(std::uint8_t kind);
@@ -288,8 +299,8 @@ private:
     PreProofRequest preProofRequest;
     std::array<ResolveLane, 2> lanes;
     std::atomic<bool> resolverClosing{false};
-    alignas(64) std::atomic<bool> resolvePhaseHeld{false};
-    alignas(64) std::atomic<std::uint64_t> resolvedThrough{0};
+    alignas(64) std::atomic<std::uint32_t> resolveGate{0};
+    alignas(64) std::atomic<bool> laneSerial{false};
     alignas(64) std::uint64_t nextJob = 0;
     unsigned postLane = 0;
     unsigned oldestLane = 0;

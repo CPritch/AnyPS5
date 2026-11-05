@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -4117,6 +4118,18 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    struct ProvingOnLane {
+        std::atomic<bool>& flag;
+        bool held = false;
+        explicit ProvingOnLane(std::atomic<bool>& flag) : flag(flag) {
+            if (!GuestMemory::OnResolverThread()) return;
+            if (flag.exchange(true, std::memory_order_acquire)) GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverPath);
+            held = true;
+        }
+        ~ProvingOnLane() {
+            if (held) flag.store(false, std::memory_order_release);
+        }
+    } provingScope(provingOnLane);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CommitterProofTimer committerTimer;
@@ -4155,6 +4168,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // they must hand back the very objects the set's views belong to. The build appended them stage
     // by stage, binding by binding, so the walk repeats that order.
     const auto fullWalk = [&] {
+        const AgcDriver::DriverDetail::DrawPipeline::LaneSerial walkAlone;
         lastFullWalk = std::chrono::steady_clock::now();
         lookupLog().clear();
         BuildLookups lookups;
