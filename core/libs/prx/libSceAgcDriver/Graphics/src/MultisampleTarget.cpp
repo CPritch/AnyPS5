@@ -1718,6 +1718,12 @@ void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const 
     RequireNoMultisampleColorTarget(address, bytes, access);
 }
 
+bool MultisampleGuardsClearOver(std::uint64_t begin, std::uint64_t end) {
+    if (!anyGuarded().load(std::memory_order_acquire)) return true;
+    std::shared_lock lock(guardedMutex());
+    return std::none_of(guarded().begin(), guarded().end(), [&](const GuardedRange& range) { return begin < range.address + range.bytes && range.address < end; });
+}
+
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access) {
     if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire)) return;
     const auto overlaps = [&](const GuardedRange& range) { return address < range.address + range.bytes && range.address < address + bytes; };

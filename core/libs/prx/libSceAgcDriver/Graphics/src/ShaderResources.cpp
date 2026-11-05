@@ -7130,6 +7130,42 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     return true;
 }
 
+namespace {
+
+bool guardRegionsClear(std::uint64_t address, std::size_t bytes, std::uint64_t depthGeneration, std::uint64_t colorGeneration) {
+    static const bool enabled = std::getenv("APS5_NO_GUARD_REGION_MEMO") == nullptr;
+    if (!enabled || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    constexpr unsigned RegionShift = 21;
+    struct Regions {
+        std::uint64_t depth = 0;
+        std::uint64_t color = 0;
+        std::array<std::uint64_t, 32> clear{};
+    };
+    thread_local Regions regions;
+    if (regions.depth != depthGeneration || regions.color != colorGeneration) {
+        regions.clear.fill(0);
+        regions.depth = depthGeneration;
+        regions.color = colorGeneration;
+    }
+    for (auto region = address >> RegionShift; region <= (address + bytes - 1) >> RegionShift; ++region) {
+        auto& held = regions.clear[region % regions.clear.size()];
+        if (held == region + 1) continue;
+        const auto begin = region << RegionShift;
+        const auto end = begin + (std::uint64_t{1} << RegionShift);
+        if (!DepthGuardsClearOver(begin, end) || !MultisampleGuardsClearOver(begin, end)) return false;
+        held = region + 1;
+    }
+    static const bool verified = std::getenv("APS5_VERIFY_GUARD_REGION_MEMO") != nullptr;
+    if (verified && (!DepthGuardsClearOver(address, address + bytes) || !MultisampleGuardsClearOver(address, address + bytes)) && DepthGuardGeneration() == depthGeneration && MultisampleGuardGeneration() == colorGeneration) {
+        std::fprintf(stderr, "[guard-regions] APS5_VERIFY_GUARD_REGION_MEMO: a region memo cleared 0x%llx+0x%zx over a guarded range\n", static_cast<unsigned long long>(address), bytes);
+        std::fflush(stderr);
+        std::abort();
+    }
+    return true;
+}
+
+}
+
 void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
     static const bool memo = std::getenv("APS5_NO_GUARD_CHECK_MEMO") == nullptr;
     static const bool movedMemo = std::getenv("APS5_NO_MOVED_GUARD_MEMO") == nullptr;
@@ -7149,7 +7185,7 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
     };
     if (remembered && guardsCheckedDepth.load(std::memory_order_acquire) == depthGeneration && guardsCheckedColor.load(std::memory_order_acquire) == colorGeneration && guardsCheckedMoved.load(std::memory_order_acquire) == movedSignature) {
         for (const auto& entry : moved) {
-            if (entry.allocation < allocations.size() && allocations[entry.allocation].guest) check(entry.address, entry.size);
+            if (entry.allocation < allocations.size() && allocations[entry.allocation].guest && !guardRegionsClear(entry.address, entry.size, depthGeneration, colorGeneration)) check(entry.address, entry.size);
         }
         return;
     }

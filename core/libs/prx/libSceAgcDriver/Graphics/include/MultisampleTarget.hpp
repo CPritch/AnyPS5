@@ -115,6 +115,7 @@ void ClaimMultisampleTargetMemory(std::uint64_t address, std::uint64_t bytes);
 void GuardOneFragmentFmask(const Context& context, const ColorTarget& target);
 void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access);
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access);
+bool MultisampleGuardsClearOver(std::uint64_t begin, std::uint64_t end);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> HostOnlySampleRanges(std::uint64_t address, std::size_t bytes);
 
 }

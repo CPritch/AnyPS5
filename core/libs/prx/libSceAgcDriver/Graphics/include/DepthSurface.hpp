@@ -48,6 +48,7 @@ void SetDirectDepthCopy(bool enabled);
 std::uint64_t DirectDepthCopyCount();
 std::uint64_t MultisampledDepthBytes_nid_no_patch(VkExtent2D extent, std::uint32_t bytesPerTexel, std::uint32_t samples);
 void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t bytes, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
+bool DepthGuardsClearOver(std::uint64_t begin, std::uint64_t end);
 std::uint64_t DepthGuardGeneration();
 void AppendHostWrittenDepthRanges(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 bool HasResidentDepthGuards_nid_no_patch();

@@ -2649,6 +2649,12 @@ void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t 
     anyDepthGuard().store(!depthGuards().empty(), std::memory_order_release);
 }
 
+bool DepthGuardsClearOver(std::uint64_t begin, std::uint64_t end) {
+    if (!anyDepthGuard().load(std::memory_order_acquire)) return true;
+    std::shared_lock lock(depthGuardMutex());
+    return std::ranges::none_of(depthGuards(), [&](const DepthGuard& range) { return begin < range.address + range.bytes && range.address < end; });
+}
+
 void AppendHostWrittenDepthRanges(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
     if (bytes == 0u || !anyDepthGuard().load(std::memory_order_acquire)) return;
     std::shared_lock lock(depthGuardMutex());
