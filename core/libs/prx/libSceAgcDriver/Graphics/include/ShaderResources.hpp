@@ -693,8 +693,6 @@ private:
     mutable std::once_flag drawWritePlanOnce;
     mutable DrawWritePlan drawWritePlan;
     mutable std::once_flag drawPoolSizesOnce;
-    mutable std::once_flag drawSnapshotPlanOnce;
-    mutable std::vector<std::uint8_t> drawSnapshotPlan;
     mutable std::array<std::vector<VkDescriptorPoolSize>, 2> drawPoolSizes;
     mutable std::array<bool, 2> drawPoolDescribed{};
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
