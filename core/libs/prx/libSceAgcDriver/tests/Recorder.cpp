@@ -5628,7 +5628,11 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
         GuestAllocations::Mutation mutation;
         mutation.Remove(other);
     }
-    Require(!CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused, "a draw input outlived a registry mutation");
+    const auto unrelated = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
+    Require(equalsGuest(unrelated), "a draw input kept across an unrelated registry mutation differs from guest memory");
+    if (!unrelated.reused) KeepDrawInput(&recorder, address, unrelated, Use::Index32, 1);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(address) + 128, 4);
+    Require(!CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused, "a draw input outlived a registry mutation over it");
     const auto pool = address + 8192;
     const auto whole = CopyDrawInput(context, &recorder, pool, 12288, 1, Use::Vertex);
     Require(!whole.reused && std::memcmp(whole.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "the vertex pool copy is wrong");

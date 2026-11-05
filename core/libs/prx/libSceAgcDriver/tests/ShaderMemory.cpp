@@ -3649,7 +3649,10 @@ void verifyTableSnapshotReuse() {
         mutation.Remove(unrelated);
     }
     ::operator delete(unrelated, std::align_val_t{UnrelatedBytes});
-    require(remapped.reuse.unwritten == 0u && remapped.reuse.compared == 1u && heldRecords(remapped, heap, Records), "table snapshot reuse: a table was reused without a read after a guest mapping changed");
+    require(heldRecords(remapped, heap, Records), "table snapshot reuse: a table kept across an unrelated mapping lost its records");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(heap), Bytes);
+    const auto invalidated = capture(request, heap, Bytes, nullptr);
+    require(invalidated.reuse.unwritten == 0u && invalidated.reuse.compared == 1u && heldRecords(invalidated, heap, Records), "table snapshot reuse: a table was reused without a read after a guest mapping over it changed");
 
     auto& flipped = heap[100u * 8u + 1u];
     const auto keptWord = flipped;
@@ -4036,7 +4039,8 @@ void verifyTableVouch() {
         GuestAllocations::Mutation mutation;
         mutation.Add(unrelated, UnrelatedBytes, true, true, false);
     }
-    refused("a changed guest mapping", nullptr);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(address), Bytes);
+    refused("a changed guest mapping over the table", nullptr);
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(unrelated);

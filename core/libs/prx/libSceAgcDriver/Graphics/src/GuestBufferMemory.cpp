@@ -4888,7 +4888,7 @@ void GuestBufferMemory::AcquireRegistered() {
     // stale by its generation, never newer than it (see AddressSpace).
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto spaceUntouched = [&](const AddressSpace& held, HostImports& imports) {
-        if (!spacePatchEnabled() || effectiveBudget(context, imports) != imports.refreshedBudget) return false;
+        if (!spacePatchEnabled() || !held.copied.empty() || held.mirrored || effectiveBudget(context, imports) != imports.refreshedBudget) return false;
         thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
         std::uint64_t through = 0;
         if (!GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(held.keptThrough.load(std::memory_order_acquire), &spans, &through)) return false;
