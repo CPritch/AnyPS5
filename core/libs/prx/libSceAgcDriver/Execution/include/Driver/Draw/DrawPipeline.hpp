@@ -1,6 +1,8 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PendingWriteIndex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -89,6 +91,8 @@ public:
         std::size_t items = 0;
         std::vector<Range> writes;
     };
+    static bool PendingWriteIndexed();
+    static bool VerifyPendingWriteIndex();
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class ItemKind : std::uint8_t { Other, Draw, IndirectDraw, Dispatch, DispatchMiss, DispatchNoRecipe, Label, Fill, Copy, Store, Pass, Seal, Completion, Dump, Count };
 
@@ -224,6 +228,8 @@ private:
     static bool OnlyRunBehind(const std::deque<Item>& items);
     static std::size_t EarlyIndex(const std::deque<Item>& items);
     std::vector<std::pair<Range, std::uint32_t>> queuedWrites;
+    AgcDriver::Mutex queuedWritesLock;
+    RetiredWrites retiredWrites;
     std::vector<Item> retired;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
@@ -357,6 +363,15 @@ private:
     std::uint32_t roomWaiters = 0;
     std::deque<Job> jobs;
     std::deque<Pending> pending;
+    AgcDriver::Mutex indexLock;
+    CountedRanges pendingRanges;
+    std::uint32_t pendingUnknown = 0;
+    NewestSequenceMap pendingKeys;
+    NewestSequenceMap pendingShapes;
+    std::uint64_t enqueuedJobs = 0;
+    void addToIndex(const Pending& held);
+    void removeFromIndex(const Pending& held);
+    std::uint64_t scanNewestKey(std::uint64_t key, std::uint64_t shape, std::size_t* after) const;
     std::vector<Job> ran;
     std::exception_ptr failure;
     std::uint64_t ranJobs = 0;

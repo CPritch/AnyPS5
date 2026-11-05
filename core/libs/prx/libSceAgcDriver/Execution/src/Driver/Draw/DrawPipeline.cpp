@@ -315,16 +315,79 @@ bool DrawFinisher::Overlap() {
     return Graphics::DrawPipelineEnabled();
 }
 
+bool DrawPipeline::PendingWriteIndexed() {
+    static const bool indexed = std::getenv("APS5_NO_PENDING_WRITE_INDEX") == nullptr;
+    return indexed;
+}
+
+bool DrawPipeline::VerifyPendingWriteIndex() {
+    static const bool verify = PendingWriteIndexed() && std::getenv("APS5_VERIFY_PENDING_WRITE_INDEX") != nullptr;
+    return verify;
+}
+
+namespace {
+void PendingIndexDisagrees(const char* query) {
+    std::fprintf(stderr, "[pending-write-index] APS5_VERIFY_PENDING_WRITE_INDEX: %s differs from the scan\n", query);
+    std::fflush(stderr);
+    std::abort();
+}
+}
+
+void DrawFinisher::addToIndex(const Pending& held) {
+    if (!DrawPipeline::PendingWriteIndexed()) return;
+    const auto sequence = ++enqueuedJobs;
+    if (held.unknown) ++pendingUnknown;
+    pendingRanges.Add(held.writes);
+    if (!held.inserts && !LookupDrainsEvery()) return;
+    pendingKeys.Set(held.key, sequence);
+    if (held.shape != 0) pendingShapes.Set(held.shape, sequence);
+}
+
+void DrawFinisher::removeFromIndex(const Pending& held) {
+    if (!DrawPipeline::PendingWriteIndexed()) return;
+    const auto sequence = ranJobs + 1;
+    if (held.unknown) --pendingUnknown;
+    pendingRanges.Remove(held.writes);
+    if (!held.inserts && !LookupDrainsEvery()) return;
+    pendingKeys.Erase(held.key, sequence);
+    if (held.shape != 0) pendingShapes.Erase(held.shape, sequence);
+}
+
+std::uint64_t DrawFinisher::scanNewestKey(std::uint64_t key, std::uint64_t shape, std::size_t* after) const {
+    const bool every = LookupDrainsEvery();
+    for (std::size_t i = pending.size(); i-- > 0;) {
+        const auto& held = pending[i];
+        if (!(every || held.inserts) || (held.key != key && (shape == 0 || held.shape != shape))) continue;
+        if (after != nullptr) *after = pending.size() - i - 1;
+        return ranJobs + i + 1;
+    }
+    return 0;
+}
+
 bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
     if (!Busy() || !finisherProducer) return false;
-    std::lock_guard lock(mutex);
-    for (const auto& held : pending) {
-        if (held.unknown) return true;
-        for (const auto& [first, last] : held.writes) {
-            if (begin < last && first < end) return true;
+    const auto scan = [&] {
+        for (const auto& held : pending) {
+            if (held.unknown) return true;
+            for (const auto& [first, last] : held.writes) {
+                if (begin < last && first < end) return true;
+            }
         }
+        return false;
+    };
+    if (!DrawPipeline::PendingWriteIndexed()) {
+        std::lock_guard lock(mutex);
+        return scan();
     }
-    return false;
+    if (DrawPipeline::VerifyPendingWriteIndex()) {
+        std::lock_guard lock(mutex);
+        std::lock_guard index(indexLock);
+        const bool indexed = pendingUnknown != 0 || pendingRanges.Overlaps(begin, end);
+        if (indexed != scan()) PendingIndexDisagrees("PendingOverlaps");
+        return indexed;
+    }
+    std::lock_guard index(indexLock);
+    return pendingUnknown != 0 || pendingRanges.Overlaps(begin, end);
 }
 
 DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value) {
@@ -345,16 +408,30 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
 
 bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
     if (!Busy() || !finisherProducer) return false;
-    std::lock_guard lock(mutex);
-    for (const auto& held : pending) {
-        if (held.unknown) return true;
-        for (const auto& [first, last] : held.writes) {
-            for (const auto& [begin, end] : ranges) {
-                if (begin < last && first < end) return true;
+    const auto scan = [&] {
+        for (const auto& held : pending) {
+            if (held.unknown) return true;
+            for (const auto& [first, last] : held.writes) {
+                for (const auto& [begin, end] : ranges) {
+                    if (begin < last && first < end) return true;
+                }
             }
         }
+        return false;
+    };
+    if (!DrawPipeline::PendingWriteIndexed()) {
+        std::lock_guard lock(mutex);
+        return scan();
     }
-    return false;
+    if (DrawPipeline::VerifyPendingWriteIndex()) {
+        std::lock_guard lock(mutex);
+        std::lock_guard index(indexLock);
+        const bool indexed = pendingUnknown != 0 || pendingRanges.OverlapsAny(ranges);
+        if (indexed != scan()) PendingIndexDisagrees("PendingOverlapsAny");
+        return indexed;
+    }
+    std::lock_guard index(indexLock);
+    return pendingUnknown != 0 || pendingRanges.OverlapsAny(ranges);
 }
 
 bool DrawFinisher::LookupDrainsEvery() {
@@ -364,31 +441,50 @@ bool DrawFinisher::LookupDrainsEvery() {
 
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
     if (!Busy() || !finisherProducer) return false;
-    const bool every = LookupDrainsEvery();
-    std::lock_guard lock(mutex);
-    return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return (every || held.inserts) && (held.key == key || (shape != 0 && held.shape == shape)); });
+    const auto indexed = [&] { return pendingKeys.Find(key) != 0 || (shape != 0 && pendingShapes.Find(shape) != 0); };
+    if (!DrawPipeline::PendingWriteIndexed()) {
+        std::lock_guard lock(mutex);
+        return scanNewestKey(key, shape, nullptr) != 0;
+    }
+    if (DrawPipeline::VerifyPendingWriteIndex()) {
+        std::lock_guard lock(mutex);
+        std::lock_guard index(indexLock);
+        const bool found = indexed();
+        if (found != (scanNewestKey(key, shape, nullptr) != 0)) PendingIndexDisagrees("PendingKey");
+        return found;
+    }
+    std::lock_guard index(indexLock);
+    return indexed();
 }
 
 bool DrawFinisher::WaitPendingKey(std::uint64_t key, std::uint64_t shape) {
     if (!Busy() || !finisherProducer || OnFinisherThread()) return false;
-    const bool every = LookupDrainsEvery();
-    std::unique_lock lock(mutex);
     std::uint64_t target = 0;
     std::size_t after = 0;
-    for (std::size_t i = pending.size(); i-- > 0;) {
-        const auto& held = pending[i];
-        if (!(every || held.inserts) || (held.key != key && (shape == 0 || held.shape != shape))) continue;
-        target = ranJobs + i + 1;
-        after = pending.size() - i - 1;
-        break;
+    const auto indexed = [&] {
+        target = std::max(pendingKeys.Find(key), shape != 0 ? pendingShapes.Find(shape) : std::uint64_t{0});
+        after = target != 0 ? static_cast<std::size_t>(enqueuedJobs - target) : 0;
+    };
+    if (!DrawPipeline::PendingWriteIndexed()) {
+        std::lock_guard lock(mutex);
+        target = scanNewestKey(key, shape, &after);
+    } else if (DrawPipeline::VerifyPendingWriteIndex()) {
+        std::lock_guard lock(mutex);
+        std::lock_guard index(indexLock);
+        indexed();
+        std::size_t scannedAfter = 0;
+        const auto scanned = scanNewestKey(key, shape, &scannedAfter);
+        if (scanned != target || scannedAfter != after) PendingIndexDisagrees("WaitPendingKey");
+    } else {
+        std::lock_guard index(indexLock);
+        indexed();
     }
     if (target == 0) return false;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher wait under the GPU lock");
     PerformanceTimer timing("DrawFinisher.WaitKey");
     const auto start = std::chrono::steady_clock::now();
-    lock.unlock();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) <= after; });
-    lock.lock();
+    std::unique_lock lock(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return ranJobs >= target || failure != nullptr; });
     --idleWaiters;
@@ -476,7 +572,11 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         QueueWaits::Note(QueueWaits::Site::FinisherRoom, start);
     }
     jobs.push_back(std::move(job));
-    pending.push_back(std::move(held));
+    {
+        std::lock_guard index(indexLock);
+        pending.push_back(std::move(held));
+        addToIndex(pending.back());
+    }
     outstanding.fetch_add(1, std::memory_order_release);
     if (!running) {
         running = true;
@@ -530,8 +630,12 @@ void DrawFinisher::run() {
             }
             ran.push_back(std::move(jobs.front()));
             jobs.pop_front();
-            pending.pop_front();
-            ++ranJobs;
+            {
+                std::lock_guard index(indexLock);
+                removeFromIndex(pending.front());
+                pending.pop_front();
+                ++ranJobs;
+            }
             outstanding.fetch_sub(1, std::memory_order_release);
             const std::size_t depth = FinisherDepth();
             if (idleWaiters != 0) idle.notify_all();
@@ -876,11 +980,11 @@ bool MonitorWaitAvailable() {
     return available;
 }
 
-__attribute__((target("mwaitx"))) void MonitorArm(const void* line) {
+[[gnu::target("mwaitx")]] void MonitorArm(const void* line) {
     _mm_monitorx(const_cast<void*>(line), 0u, 0u);
 }
 
-__attribute__((target("mwaitx"))) void MonitorWait(unsigned tscCycles) {
+[[gnu::target("mwaitx")]] void MonitorWait(unsigned tscCycles) {
     _mm_mwaitx(2u, 0u, tscCycles);
 }
 #endif
@@ -1813,9 +1917,11 @@ void DrawPipeline::run() {
         {
             std::lock_guard lock(mutex);
             countWrites(items.front().writes, false);
+            const auto retiredNow = retiredItems.load(std::memory_order_relaxed) + 1;
+            if (PendingWriteIndexed()) retiredWrites.Note(retiredNow, items.front().writes);
             retired.push_back(std::move(items.front()));
             items.pop_front();
-            const auto retiredNow = retiredItems.fetch_add(1, std::memory_order_release) + 1;
+            retiredItems.store(retiredNow, std::memory_order_release);
             ++commits;
             commitNs += spent;
             ++kindCommits[kind];
@@ -2048,6 +2154,7 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 }
 
 void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
+    std::lock_guard counted(queuedWritesLock);
     for (const auto& range : writes) {
         const auto found = std::find_if(queuedWrites.begin(), queuedWrites.end(), [&](const auto& entry) { return entry.first == range; });
         if (added) {
@@ -2064,6 +2171,7 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
     if (!Busy()) return {Retired(), 0, {}};
     std::lock_guard lock(mutex);
     Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
+    if (PendingWriteIndexed() && !VerifyPendingWriteIndex()) return watch;
     for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
     return watch;
 }
@@ -2076,10 +2184,33 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
     };
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
     std::lock_guard lock(mutex);
-    if (std::any_of(items.begin(), items.end(), [&](const Item& item) { return overlaps(item.writes); })) return true;
-    const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
-    if (retiredNow == watch.retired) return false;
-    return retiredNow - watch.retired > watch.items || overlaps(watch.writes);
+    const auto scan = [&] {
+        if (std::any_of(items.begin(), items.end(), [&](const Item& item) { return overlaps(item.writes); })) return true;
+        const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
+        if (retiredNow == watch.retired) return false;
+        return retiredNow - watch.retired > watch.items || overlaps(watch.writes);
+    };
+    if (!PendingWriteIndexed()) return scan();
+    bool overflowed = false;
+    const auto indexed = [&] {
+        {
+            std::lock_guard counted(queuedWritesLock);
+            for (const auto& [range, count] : queuedWrites) {
+                for (const auto& [begin, end] : reads) {
+                    if (begin < range.second && range.first < end) return true;
+                }
+            }
+        }
+        const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
+        if (retiredNow == watch.retired) return false;
+        if (retiredNow - watch.retired > watch.items) return true;
+        const auto answer = retiredWrites.Since(watch.retired, reads);
+        overflowed = answer == RetiredWrites::Answer::Overflow;
+        return answer != RetiredWrites::Answer::Clear;
+    };
+    const bool answer = indexed();
+    if (VerifyPendingWriteIndex() && answer != scan() && !overflowed) PendingIndexDisagrees("WrittenSince");
+    return answer;
 }
 
 bool DrawPipeline::Busy() const {
@@ -2088,7 +2219,7 @@ bool DrawPipeline::Busy() const {
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(ranges)) return true;
-    std::lock_guard lock(mutex);
+    std::lock_guard counted(queuedWritesLock);
     for (const auto& [range, count] : queuedWrites) {
         for (const auto& [address, end] : ranges) {
             if (address < range.second && range.first < end) return true;
@@ -2100,7 +2231,7 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return true;
-    std::lock_guard lock(mutex);
+    std::lock_guard counted(queuedWritesLock);
     for (const auto& [range, count] : queuedWrites) {
         if (address < range.second && range.first < end) return true;
     }
