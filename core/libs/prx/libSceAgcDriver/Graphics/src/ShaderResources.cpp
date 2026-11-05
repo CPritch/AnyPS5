@@ -6872,7 +6872,36 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return false;
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
-    guestMemory.InPlaceReads(reads);
+    static const bool snapshotPlan = std::getenv("APS5_NO_DRAW_SNAPSHOT_PLAN") == nullptr;
+    static const bool verifySnapshotPlan = std::getenv("APS5_VERIFY_DRAW_SNAPSHOT_PLAN") != nullptr;
+    if (!snapshotPlan || verifySnapshotPlan) guestMemory.InPlaceReads(reads);
+    const auto eligibleNow = [&](const auto& item, std::span<const std::pair<std::uint64_t, std::uint64_t>> over) {
+        if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) return false;
+        return std::any_of(over.begin(), over.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+    };
+    if (snapshotPlan) {
+        std::call_once(drawSnapshotPlanOnce, [&] {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> over;
+            guestMemory.InPlaceReads(over);
+            drawSnapshotPlan.resize(allocations.size());
+            for (std::size_t index = 0; index < allocations.size(); ++index) drawSnapshotPlan[index] = eligibleNow(allocations[index], over) ? 1u : 0u;
+        });
+    }
+    thread_local std::vector<std::int32_t>* movedAtSlot = nullptr;
+    auto& movedAt = ShaderRecompiler::ThreadOwned(movedAtSlot);
+    if (movedAt.size() < allocations.size()) movedAt.resize(allocations.size(), -1);
+    struct MovedAtReset {
+        std::vector<std::int32_t>& slots;
+        std::span<const MovedBuffer> entries;
+        ~MovedAtReset() {
+            for (const auto& entry : entries) {
+                if (entry.allocation < slots.size()) slots[entry.allocation] = -1;
+            }
+        }
+    } movedAtReset{movedAt, moved};
+    for (std::size_t position = moved.size(); position-- > 0;) {
+        if (moved[position].allocation < movedAt.size()) movedAt[moved[position].allocation] = static_cast<std::int32_t>(position);
+    }
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
@@ -6925,7 +6954,8 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
-        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        const auto override = movedAt[index] >= 0 ? moved.begin() + movedAt[index] : moved.end();
+        if (override == moved.end() && snapshotPlan && !verifySnapshotPlan && (movedOnly || drawSnapshotPlan[index] == 0u)) continue;
         if (override != moved.end() && !override->words.empty()) {
             auto slice = recorder.DrawUpload(override->size);
             upload({slice.bytes, reinterpret_cast<const std::byte*>(override->words.data()), override->size, index});
@@ -6939,9 +6969,10 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             address = override->address;
             size = override->size;
         } else {
-            if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
-            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+            if (verifySnapshotPlan && snapshotPlan) Require(eligibleNow(item, reads) == (drawSnapshotPlan[index] != 0u), "a template's draw snapshot plan went stale");
+            if (movedOnly) continue;
+            if (snapshotPlan && !verifySnapshotPlan ? false : !eligibleNow(item, reads)) continue;
+            if (recorder.PendingWriteOverlaps(item.address, item.size)) continue;
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
