@@ -79,6 +79,7 @@ DrawPacketPtr ResolveDraw(const Context& context, const State& state, const Pm4:
 void EmitDraw(const Context& context, DrawPacket& packet);
 void DiscardDrawPacket(const Context& context, DrawPacket& packet);
 std::uint64_t DrawRedoSerial();
+std::uint64_t DrawTemplateBuilds();
 bool DrawPacketReadsOverlap(const DrawPacket& packet, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 bool DrawPacketTemplateGone(const DrawPacket& packet);
 bool RevalidateDrawPacketTemplate(const DrawPacket& packet, std::span<const CompiledShader> shaders);

@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -75,7 +77,14 @@ void Driver::AttachWindow(const PresentationWindow& window) {
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, const DisplayBuffer* plane, bool opaque, void (*gpuReady)(void*), void* context) {
     if (PerformanceTrace::Configured()) PerformanceTrace::Present(window.width, window.height, device.Load().get());
     static const bool logged = std::getenv("APS5_LONG_WAIT_LOG") != nullptr;
-    if (logged) std::fprintf(stderr, "[present] %lld\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
+    if (logged) {
+        static std::uint64_t previousDraws = 0, previousResolves = 0, previousBuilds = 0;
+        const auto draws = DrawPipeline::CommittedDraws(), resolves = DrawPipeline::OwnResolves(), builds = Graphics::DrawTemplateBuilds();
+        std::fprintf(stderr, "[present] %lld draws %llu own_resolves %llu template_builds %llu\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), static_cast<unsigned long long>(draws - previousDraws), static_cast<unsigned long long>(resolves - previousResolves), static_cast<unsigned long long>(builds - previousBuilds));
+        previousDraws = draws;
+        previousResolves = resolves;
+        previousBuilds = builds;
+    }
     PerformanceContext timingContext(window.timing.get());
     PerformanceTimer timing("Driver.Present");
     static thread_local bool pinned = false;

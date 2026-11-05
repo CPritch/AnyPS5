@@ -122,6 +122,7 @@ void (*carryRelease)() = nullptr;
 std::atomic<std::uint64_t> carriedHolds{0}, carriesReleasedEarly{0}, heldReadsTargetMissing{0};
 thread_local DrawPipeline::OwnCause takenOwnCause = DrawPipeline::OwnCause::Unknown;
 thread_local DrawPipeline::OwnCause nextOwnCause = DrawPipeline::OwnCause::Unknown;
+std::atomic<std::uint64_t> committedDrawsTotal{0}, ownResolvesTotal{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::OwnCause::Count)> ownCauseCount{}, ownCauseResolveNs{}, ownCauseEmitNs{};
 
 bool OwnCausesCounted() {
@@ -1167,6 +1168,19 @@ void DrawPipeline::ReleaseCarriedHold() noexcept {
 
 void DrawPipeline::SetCarryRelease(void (*release)()) {
     carryRelease = release;
+}
+
+void DrawPipeline::NoteCommittedDraw(bool ownResolve) {
+    committedDrawsTotal.fetch_add(1, std::memory_order_relaxed);
+    if (ownResolve) ownResolvesTotal.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t DrawPipeline::CommittedDraws() {
+    return committedDrawsTotal.load(std::memory_order_relaxed);
+}
+
+std::uint64_t DrawPipeline::OwnResolves() {
+    return ownResolvesTotal.load(std::memory_order_relaxed);
 }
 
 void DrawPipeline::NoteOwnResolve(OwnCause cause, std::uint64_t resolveNs, std::uint64_t emitNs) {
