@@ -6351,6 +6351,9 @@ void ShaderResources::DrawBindings::Release() {
     fragmentAllocation = {};
     snapshots.clear();
     owners.clear();
+    stamp = {};
+    stamped = false;
+    declined = false;
 }
 
 ShaderResources::DrawBindings::~DrawBindings() {
@@ -6641,8 +6644,171 @@ ShaderResources::DrawBindings* ShaderResources::PrepareBatchDrawBindings(Recorde
     return item;
 }
 
+ShaderResources::AheadDrawBindings::~AheadDrawBindings() {
+    Drop();
+}
+
+void ShaderResources::AheadDrawBindings::Drop() {
+    made = false;
+    stamped = false;
+    if (bindings != nullptr) GiveBindingStorage(std::exchange(bindings, nullptr));
+}
+
+ShaderResources::JobBindings ShaderResources::JobBindingsMode() {
+    static const JobBindings mode = !Recorder::BatchKeeps() || std::getenv("APS5_NO_JOB_BINDINGS") != nullptr ? JobBindings::Off : std::getenv("APS5_JOB_BINDINGS_SHADOW") != nullptr ? JobBindings::Shadow : JobBindings::On;
+    return mode;
+}
+
+namespace {
+
+enum JobBindingCount : std::size_t { JobEmits, JobOwn, JobDeclined, JobMatched, JobStampTracker, JobStampEpoch, JobStampRegistry, JobDisturbed, JobSelection, JobFewer, JobBytes, JobTaken, JobRedone, JobVerified, JobVerifyFewer, JobVerifyDiffers, JobWithSnapshots, JobCountTotal };
+std::array<std::atomic<std::uint64_t>, JobCountTotal> jobBindingCounts{};
+
+void CountJobBindings(JobBindingCount count) {
+    jobBindingCounts[count].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string JobBindingsLine() {
+    const auto at = [](JobBindingCount count) { return static_cast<unsigned long long>(jobBindingCounts[count].load(std::memory_order_relaxed)); };
+    const auto compared = at(JobEmits) - at(JobDeclined);
+    char text[640];
+    std::snprintf(text, sizeof(text), "[job-bindings] draws %llu, without a job's bindings %llu, job declined %llu, compared %llu: matched %llu (%.1f %% of compared, %.1f %% of draws); differing: stamp tracker %llu, epoch %llu, registry %llu, disturbed at the emit %llu, selection %llu, job selected fewer %llu, bytes %llu; taken %llu, redone %llu, verified %llu (job selected fewer %llu, differing %llu), made with snapshots %llu", at(JobEmits) + at(JobOwn), at(JobOwn), at(JobDeclined), compared, at(JobMatched), compared == 0 ? 0.0 : 100.0 * static_cast<double>(at(JobMatched)) / static_cast<double>(compared), at(JobEmits) + at(JobOwn) == 0 ? 0.0 : 100.0 * static_cast<double>(at(JobMatched)) / static_cast<double>(at(JobEmits) + at(JobOwn)), at(JobStampTracker), at(JobStampEpoch), at(JobStampRegistry), at(JobDisturbed), at(JobSelection), at(JobFewer), at(JobBytes), at(JobTaken), at(JobRedone), at(JobVerified), at(JobVerifyFewer), at(JobVerifyDiffers), at(JobWithSnapshots));
+    return text;
+}
+
+void ReportJobBindings() {
+    static std::atomic<std::uint64_t> seen{0};
+    if ((seen.fetch_add(1, std::memory_order_relaxed) & 0x3ffffu) != 0x3ffffu) return;
+    std::fprintf(stderr, "%s\n", JobBindingsLine().c_str());
+}
+
+enum class BindingsCompare : std::uint8_t { Same, JobFewer, Selection, Bytes };
+
+BindingsCompare CompareBindings(const ShaderResources::DrawBindings* job, const ShaderResources::DrawBindings* own) {
+    if (job == nullptr) return own == nullptr ? BindingsCompare::Same : BindingsCompare::JobFewer;
+    if (own == nullptr) return BindingsCompare::Selection;
+    std::size_t at = 0;
+    for (const auto& snapshot : job->snapshots) {
+        while (at < own->snapshots.size() && (own->snapshots[at].address != snapshot.address || own->snapshots[at].bytes != snapshot.bytes)) ++at;
+        if (at == own->snapshots.size()) return BindingsCompare::Selection;
+        const auto mine = own->snapshots[at++].Bytes();
+        if (std::memcmp(mine.data(), snapshot.Bytes().data(), mine.size()) != 0) return BindingsCompare::Bytes;
+    }
+    return job->snapshots.size() == own->snapshots.size() ? BindingsCompare::Same : BindingsCompare::JobFewer;
+}
+
+}
+
+std::uint64_t ShaderResources::JobBindingsVerifyDiffers() {
+    return jobBindingCounts[JobVerifyDiffers].load(std::memory_order_relaxed);
+}
+
+std::uint64_t ShaderResources::JobBindingsWithSnapshots() {
+    return jobBindingCounts[JobWithSnapshots].load(std::memory_order_relaxed);
+}
+
+std::uint64_t ShaderResources::JobBindingsVerified() {
+    return jobBindingCounts[JobVerified].load(std::memory_order_relaxed);
+}
+
+std::string ShaderResources::JobBindingsText() {
+    return JobBindingsLine();
+}
+
+std::uint64_t ShaderResources::JobBindingsTaken() {
+    return jobBindingCounts[JobTaken].load(std::memory_order_relaxed);
+}
+
+void ShaderResources::PrepareAheadDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, AheadDrawBindings& ahead) const {
+    ahead.Drop();
+    auto* item = TakeBindingStorage();
+    bool made = false;
+    try {
+        made = prepareDrawBindings(*item, recorder, moved, false);
+    } catch (...) {
+        GiveBindingStorage(item);
+        throw;
+    }
+    if (item->declined) {
+        GiveBindingStorage(item);
+        return;
+    }
+    ahead.stamp = item->stamp;
+    ahead.stamped = item->stamped;
+    ahead.made = true;
+    if (made) {
+        ahead.bindings = item;
+        CountJobBindings(JobWithSnapshots);
+    } else {
+        GiveBindingStorage(item);
+    }
+}
+
+const ShaderResources::DrawBindings* ShaderResources::BindingsForEmit(Recorder& recorder, std::span<const MovedBuffer> moved, AheadDrawBindings* ahead, bool disturbed) const {
+    const auto mode = JobBindingsMode();
+    if (mode == JobBindings::Off || ahead == nullptr) {
+        if (mode != JobBindings::Off) {
+            CountJobBindings(JobOwn);
+            ReportJobBindings();
+        }
+        return PrepareBatchDrawBindings(recorder, moved);
+    }
+    CountJobBindings(JobEmits);
+    ReportJobBindings();
+    if (!ahead->made) {
+        CountJobBindings(JobDeclined);
+        return PrepareBatchDrawBindings(recorder, moved);
+    }
+    static const bool lockedStamp = std::getenv("APS5_LOCKED_SNAPSHOT_STAMP") != nullptr;
+    const std::array<std::uint64_t, 3> stamp{lockedStamp ? GuestMemory::TrackerGeneration() : GuestMemory::PublishedTrackerGeneration(), GuestMemory::CollectEpoch(), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
+    const auto stampCause = !ahead->stamped ? JobCountTotal : ahead->stamp[0] != stamp[0] ? JobStampTracker : ahead->stamp[1] != stamp[1] ? JobStampEpoch : ahead->stamp[2] != stamp[2] ? JobStampRegistry : JobCountTotal;
+    if (mode == JobBindings::Shadow) {
+        const auto* own = PrepareBatchDrawBindings(recorder, moved);
+        const auto compared = CompareBindings(ahead->bindings, own);
+        if (stampCause != JobCountTotal) CountJobBindings(stampCause);
+        else if (disturbed) CountJobBindings(JobDisturbed);
+        else if (compared == BindingsCompare::Selection) CountJobBindings(JobSelection);
+        else if (compared == BindingsCompare::JobFewer) CountJobBindings(JobFewer);
+        else if (compared == BindingsCompare::Bytes) CountJobBindings(JobBytes);
+        else CountJobBindings(JobMatched);
+        ahead->Drop();
+        return own;
+    }
+    if (stampCause != JobCountTotal || disturbed) {
+        CountJobBindings(JobRedone);
+        CountJobBindings(stampCause != JobCountTotal ? stampCause : JobDisturbed);
+        ahead->Drop();
+        return PrepareBatchDrawBindings(recorder, moved);
+    }
+    static const unsigned verifyEvery = [] {
+        const char* text = std::getenv("APS5_VERIFY_JOB_BINDINGS");
+        return text == nullptr ? 0u : static_cast<unsigned>(std::strtoul(text, nullptr, 10));
+    }();
+    thread_local unsigned verifyCount = 0;
+    if (verifyEvery != 0 && ++verifyCount % verifyEvery == 0) {
+        const auto* own = PrepareBatchDrawBindings(recorder, moved);
+        const auto compared = CompareBindings(ahead->bindings, own);
+        CountJobBindings(JobVerified);
+        if (compared == BindingsCompare::JobFewer) CountJobBindings(JobVerifyFewer);
+        if (compared == BindingsCompare::Selection || compared == BindingsCompare::Bytes) {
+            const auto differs = jobBindingCounts[JobVerifyDiffers].fetch_add(1, std::memory_order_relaxed);
+            if (differs < 32) std::fprintf(stderr, "[job-bindings] APS5_VERIFY_JOB_BINDINGS: the job's bindings differ from the emit's in their %s: %zu snapshots in the job, %zu at the emit\n", compared == BindingsCompare::Selection ? "selection" : "uploaded bytes", ahead->bindings != nullptr ? ahead->bindings->snapshots.size() : 0, own != nullptr ? own->snapshots.size() : 0);
+        }
+        ahead->Drop();
+        return own;
+    }
+    CountJobBindings(JobTaken);
+    ahead->made = false;
+    auto* item = std::exchange(ahead->bindings, nullptr);
+    if (item == nullptr) return nullptr;
+    OpenBatchBindings(recorder).items.push_back(item);
+    for (const auto& snapshot : item->snapshots) recorder.KeepBytes(snapshot.buffer, snapshot.buffer->Bytes().size());
+    return item;
+}
+
 bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
     auto* const result = &bound;
+    const bool onLane = GuestMemory::OnResolverThread();
     const bool timed = BindingsCounted();
     auto partMark = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto part = [&](BindingPart which) {
@@ -6735,6 +6901,11 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             stamp = {snapshotStamp(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
         }
+        if (!result->stamped) {
+            result->stamp = stamp;
+            result->stamped = true;
+        }
+        GuestMemory::NoteEarlyRead(begin, bytes);
         VkDeviceSize offset = 0;
         if (deferCopies) {
             const auto pending = std::find_if(pendingNotes.begin(), pendingNotes.end(), [&](const PendingNote& note) { return note.address == begin && note.bytes == bytes && note.stamp == stamp; });
@@ -6755,7 +6926,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
         CountBinding(CountSnapshots);
         if (buffer != nullptr) CountBinding(CountReused);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
-        if (verifySnapshots && buffer != nullptr) {
+        if (verifySnapshots && buffer != nullptr && !onLane) {
             static std::atomic<std::uint64_t> checked{0}, differing{0};
             const auto fast = buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes);
             VkDeviceSize slowOffset = 0;
@@ -6775,6 +6946,10 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
                 raw = slice.buffer;
                 offset = slice.offset;
             } else {
+                if (onLane) {
+                    result->declined = true;
+                    return false;
+                }
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
                 CountBinding(buffer != nullptr ? CountLargeReused : CountLargeNew);

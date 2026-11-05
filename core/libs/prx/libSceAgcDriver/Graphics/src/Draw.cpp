@@ -2598,6 +2598,7 @@ struct RecordedDraw {
     bool waited = false;
     const std::array<std::byte, PipelinePushConstantBytes>* pushBytes = nullptr;
     VkShaderStageFlags pushStages = 0;
+    ShaderResources::AheadDrawBindings* aheadBindings = nullptr;
     std::vector<std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> stencilReplay;
     std::vector<SampleOrderTarget> reordered;
     SampleOrderPass reorderPass;
@@ -2986,12 +2987,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     for (const auto image : record.multisampleImages) passAttachments.emplace_back(image, true);
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
-    static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
+    const auto storedLinear = StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory);
     part(0);
     std::shared_ptr<ShaderResources::DrawBindings> perDrawBindings;
     const ShaderResources::DrawBindings* drawBindings = nullptr;
     if (Recorder::BatchKeeps()) {
-        drawBindings = resources.PrepareBatchDrawBindings(*recorder, record.moved);
+        drawBindings = resources.BindingsForEmit(*recorder, record.moved, record.aheadBindings, storedLinear != 0 || outcome.keyStoresFlushed || outcome.storesFlushed);
     } else {
         perDrawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
         drawBindings = perDrawBindings.get();
@@ -3368,6 +3369,8 @@ struct PreparedDraw {
     std::vector<SampleOrderTarget> reordered;
     SampleOrderPass reorderPass;
     std::optional<DepthSampleLocations> depthLocations;
+    ShaderResources::AheadDrawBindings aheadBindings;
+    bool aheadOffered = false;
 };
 
 bool ShapeMemoEnabled() {
@@ -4140,6 +4143,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.reordered = reordered;
         record.reorderPass = reorderPass;
         record.depthLocations = depthLocations;
+        record.aheadBindings = prepared.aheadOffered ? &prepared.aheadBindings : nullptr;
         {
             Borrow borrow(record, prepared);
             recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace);
@@ -4741,7 +4745,6 @@ struct SpentRing {
 };
 std::array<SpentRing, SpentPacketLanes> spentRings;
 std::atomic<void (*)(unsigned)> spentWake{nullptr};
-thread_local unsigned packetLane = 0;
 
 bool GiveSpentPacket(DrawPacket* packet) {
     if (!Recorder::BatchKeeps() || !packet->prepared.lean || GuestMemory::CurrentHotThread() != GuestMemory::HotThread::Committer) return false;
@@ -4774,7 +4777,7 @@ void SetSpentPacketWake(void (*wake)(unsigned lane)) {
 }
 
 void StartSpentPacketLane(unsigned lane) {
-    packetLane = lane;
+    Recorder::SetThreadLane(lane);
     spentRings[lane].running.store(true, std::memory_order_release);
 }
 
@@ -4841,6 +4844,18 @@ void ApplyDrawMemoKeeps(const Context& context, DrawPacket& packet) {
     if (keeps.empty() || context.recorder == nullptr) return;
     for (auto& keep : keeps) keep(*context.recorder);
     keeps.clear();
+}
+
+void PrepareDrawBindingsAhead(DrawPacket& packet) {
+    auto& prepared = packet.prepared;
+    if (ShaderResources::JobBindingsMode() == ShaderResources::JobBindings::Off || !packet.ready || !prepared.lean || prepared.recorder == nullptr || prepared.resolved.resources == nullptr || CaptureTrace::Enabled() || CaptureInputsEnabled()) return;
+    const Recorder::DeferScope defer(&prepared.deferred);
+    prepared.aheadOffered = true;
+    prepared.resolved.resources->PrepareAheadDrawBindings(*prepared.recorder, prepared.resolved.moved, prepared.aheadBindings);
+}
+
+bool DrawPacketHasMemoKeeps(const DrawPacket& packet) {
+    return !packet.prepared.memoKeeps.empty();
 }
 
 void BuryPackets(std::vector<DrawPacket*>& packets) {
@@ -4939,7 +4954,7 @@ DrawPacketPtr ResolveDraw(const Context& context, const State& state, const Pm4:
     Require(!NeedsMeshLayerWindows(context, state, draw), "a draw that needs mesh layer windows reached ResolveDraw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawPacketPtr packet(new DrawPacket(profile));
-    packet->lane = packetLane;
+    packet->lane = Recorder::ThreadLane();
     auto& prepared = packet->prepared;
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;

@@ -137,6 +137,8 @@ public:
     void ApplyDeferred(DeferredEffects& effects);
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
+    static void SetThreadLane(unsigned lane);
+    static unsigned ThreadLane();
     static bool BatchKeeps();
     static bool VerifyBatchKeeps();
     template <class T>
@@ -1042,6 +1044,14 @@ private:
     std::array<std::uint64_t, 3> unwrittenStamp{};
     std::size_t unwrittenBytes = 0;
     void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
+    struct alignas(64) LaneDraws {
+        std::shared_ptr<Buffer> upload;
+        VkDeviceSize used = 0;
+        std::array<std::uint64_t, 3> stamp{};
+        std::unordered_map<std::uint64_t, UnwrittenSnapshot> snapshots;
+        std::size_t bytes = 0;
+    };
+    std::array<LaneDraws, 2> laneDraws;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     struct IndexRange {

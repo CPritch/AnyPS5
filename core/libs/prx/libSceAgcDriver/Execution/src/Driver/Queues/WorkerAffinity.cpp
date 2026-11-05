@@ -114,6 +114,18 @@ void PinResolverThread(const char* role) {
     PinThread(role, PreparerAffinityMask(), summary, "draw resolver");
 }
 
+void PinResolverLaneThread(const char* role) {
+    NameThread(role);
+    static std::once_flag summary;
+    const auto requested = CpuTopology::MaskFromEnvironment("APS5_RESOLVER_LANE_AFFINITY_MASK");
+    if (requested != 0) {
+        PinThread(role, requested, summary, "draw resolver lane");
+        return;
+    }
+    if (PinPlaced(role, &CpuTopology::Placement::resolverSecond)) return;
+    PinThread(role, PreparerAffinityMask(), summary, "draw resolver lane");
+}
+
 void PinPreparerThread(const char* role) {
     NameThread(role);
     static std::once_flag summary;

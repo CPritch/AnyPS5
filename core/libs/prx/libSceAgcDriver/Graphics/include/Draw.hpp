@@ -101,6 +101,8 @@ public:
     ResolverScope& operator=(const ResolverScope&) = delete;
 };
 void BuryPackets(std::vector<DrawPacket*>& packets);
+void PrepareDrawBindingsAhead(DrawPacket& packet);
+bool DrawPacketHasMemoKeeps(const DrawPacket& packet);
 constexpr unsigned SpentPacketLanes = 2;
 void SetSpentPacketWake(void (*wake)(unsigned lane));
 void StartSpentPacketLane(unsigned lane);

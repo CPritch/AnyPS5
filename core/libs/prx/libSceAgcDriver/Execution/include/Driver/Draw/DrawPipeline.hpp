@@ -70,11 +70,18 @@ public:
     using Prepare = std::function<void()>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     using PreProofRequest = DriverDetail::PreProofRequest;
+    struct EarlyProbe {
+        std::vector<Range>* depth = nullptr;
+        const void* hintTemplate = nullptr;
+    };
     struct EarlyOffer {
         const std::vector<Range>* writes = nullptr;
         std::span<const Range> depth;
         const void* currentTemplate = nullptr;
         PreProofRequest* preProof = nullptr;
+        EarlyProbe* probe = nullptr;
+        const void* nextTemplate = nullptr;
+        bool twoAhead = false;
     };
     using Early = std::function<bool(const EarlyOffer&)>;
     struct Watch {
@@ -99,7 +106,7 @@ public:
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {});
     static unsigned ResolveSplit();
-    enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, DeclinedWriters, MultisampleFound, MultisampleMissed, VerifyMatched, VerifyDiffered, Unoffered, KeptRecipe, KeptTessellation, KeptEpoch, KeptReadsWritten, KeptDepthColour, KeptPredictor, KeptCurrentTemplate, KeptDescribed, IdleSubmitAfterEmit, NextMissing, NextNotDraw, NextNoHook, LateOffered, AcrossSeal, AcrossLabels, UsedAcrossLabels, StaleScoped, StaleScopedTemplate, Count };
+    enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, DeclinedWriters, MultisampleFound, MultisampleMissed, VerifyMatched, VerifyDiffered, Unoffered, KeptRecipe, KeptTessellation, KeptEpoch, KeptReadsWritten, KeptDepthColour, KeptPredictor, KeptCurrentTemplate, KeptDescribed, IdleSubmitAfterEmit, NextMissing, NextNotDraw, NextNoHook, LateOffered, AcrossSeal, AcrossLabels, UsedAcrossLabels, StaleScoped, StaleScopedTemplate, PostedTwoAhead, Count };
     static void NoteEarly(EarlyEvent event);
     static std::uint64_t EarlyEventCount(EarlyEvent event);
     static bool OfferAcrossLabels();
@@ -112,9 +119,25 @@ public:
     static void PostResolve(void (*body)(void*), void (*finish)(void*, bool), void* context);
     static void JoinResolve();
     static void WaitResolve();
+    static bool ResolveLanes();
+    static bool LaneJobsInFlight();
+    static void JoinCarriedJob();
+    static void SettleCarriedBoundary();
+    static void EndResolvePhase();
+    class ResolvePhaseScope {
+    public:
+        ResolvePhaseScope();
+        ~ResolvePhaseScope();
+        ResolvePhaseScope(const ResolvePhaseScope&) = delete;
+        ResolvePhaseScope& operator=(const ResolvePhaseScope&) = delete;
+
+    private:
+        bool held = false;
+    };
     static bool EarlyStopped();
     static void StopEarly();
     static void NoteEarlyAbort(std::uint8_t kind);
+    static std::uint64_t EarlyAbortCount(std::uint8_t kind);
     static void NoteEarlyResolveNs(std::uint64_t ns);
     enum class CommitterPart : std::uint8_t { Check, ResolveWhole, Offer, EmitEarly, EmitWhole, Join, Prologue, MemoKeeps, Count };
     static void NoteCommitterPart(CommitterPart part, std::chrono::steady_clock::time_point since);
@@ -235,9 +258,26 @@ private:
     std::atomic<bool> preparersClosing{false};
     std::atomic<std::uint32_t> prepareWake{0};
     std::atomic<std::uint32_t> preparersSleeping{0};
-    void resolveAhead();
+    struct ResolveLane {
+        std::thread thread;
+        alignas(64) std::atomic<int> state{0};
+        std::atomic<std::uint32_t> wake{0};
+        std::atomic<std::uint32_t> sleeping{0};
+        void (*body)(void*) = nullptr;
+        void (*finish)(void*, bool) = nullptr;
+        void* context = nullptr;
+        const void* target = nullptr;
+        std::uint64_t sequence = 0;
+        std::size_t distance = 0;
+        std::chrono::steady_clock::time_point posted;
+    };
+    void resolveAhead(unsigned laneIndex);
     static void WakeResolverForSpent(unsigned lane);
+    static void offerSecondEarly(std::span<const Range> depth, const void* currentTemplate);
     static void joinResolve(bool revoke);
+    static void joinLane(DrawPipeline& pipeline, ResolveLane& lane, bool revoke);
+    void wakeLane(ResolveLane& lane);
+    bool laneTargets(const void* item) const;
     void postPreProof(const void* currentTemplate, std::span<const Range> depth, const std::vector<Range>* writes);
     void runPreProof();
     void settlePreProof(const void* taken);
@@ -246,16 +286,15 @@ private:
     Item* preProofTarget = nullptr;
     std::atomic<const void*> preProofAfter{nullptr};
     PreProofRequest preProofRequest;
-    std::thread resolver;
-    alignas(64) std::atomic<int> resolveState{0};
-    std::atomic<std::uint32_t> resolverWake{0};
-    std::atomic<std::uint32_t> resolverSleeping{0};
+    std::array<ResolveLane, 2> lanes;
     std::atomic<bool> resolverClosing{false};
-    void (*resolveBody)(void*) = nullptr;
-    void (*resolveFinish)(void*, bool) = nullptr;
-    void* resolveContext = nullptr;
-    const void* resolveTarget = nullptr;
-    std::chrono::steady_clock::time_point resolvePosted;
+    alignas(64) std::atomic<bool> resolvePhaseHeld{false};
+    alignas(64) std::atomic<std::uint64_t> resolvedThrough{0};
+    alignas(64) std::uint64_t nextJob = 0;
+    unsigned postLane = 0;
+    unsigned oldestLane = 0;
+    unsigned lanesInFlight = 0;
+    std::uint32_t carriedBoundaries = 0;
     alignas(64) std::uint64_t resolveLineEnd = 0;
 };
 

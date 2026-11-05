@@ -151,6 +151,11 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
     }
 }
 
+bool Driver::labelsDueForPacket() {
+    static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
+    return !deferredLabels().labels.empty() || (packetFlush && Graphics::Recorder::PendingLabelSince().has_value());
+}
+
 bool Driver::recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queue) {
     static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
 

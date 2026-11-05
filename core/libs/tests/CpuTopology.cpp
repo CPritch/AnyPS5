@@ -161,6 +161,9 @@ int main() {
         Require(whole.resolver == 0x2008ull && whole.shared == 0xfe3f8ull, "a whole-core resolver shares its core with every other thread");
         const auto own = CpuTopology::PlacementFor(zen5, cores, true, false, true);
         Require(own.resolver == 0x2008ull && own.shared == 0xfc3f0ull, "an own-core resolver takes the whole fourth performant core from every other thread");
+        const auto lanes = CpuTopology::PlacementFor(zen5, cores, true, false, false, true);
+        Require(lanes.resolver == 0x2000ull && lanes.resolverSecond == 0x8ull && lanes.shared == 0xfc3f0ull, "two resolver lanes take the fourth performant core's two siblings from every other thread");
+        Require(CpuTopology::PlacementFor(zen5, {0x401ull, 0x802ull, 0x1004ull, 0x8ull}, true, false, false, true).resolverSecond == 0, "a resolver core without a second sibling has no second lane core");
         const auto single = CpuTopology::PlacementFor(zen5, {0x401ull, 0x802ull, 0x1004ull, 0x8ull}, true);
         Require(single.resolver == 0x8ull && (single.shared & 0x8ull) != 0, "a resolver core without a second sibling stays shared");
         const auto pins = CpuTopology::ParseNamedPins("RenderThread:2008,bad,:4,Other:0,Main Thread:30");

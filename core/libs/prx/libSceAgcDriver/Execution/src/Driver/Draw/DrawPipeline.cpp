@@ -49,6 +49,18 @@ struct PendingEarly {
     std::size_t next = 0;
 };
 thread_local PendingEarly pendingEarly;
+struct PendingSecond {
+    const DrawPipeline::Early* hook = nullptr;
+    const DrawPipeline::Early* after = nullptr;
+    const void* afterTarget = nullptr;
+    const void* target = nullptr;
+};
+thread_local PendingSecond pendingSecond;
+thread_local std::vector<DrawPipeline::Range> secondWrites;
+thread_local std::vector<DrawPipeline::Range> secondDepth;
+thread_local std::uint64_t laneJobSequence = 0;
+thread_local bool laneHoldsPhase = false;
+thread_local unsigned committerPhaseDepth = 0;
 thread_local DrawPipeline* committingPipeline = nullptr;
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> kindNames{"other", "draw", "indirect draw", "dispatch", "dispatch miss", "dispatch without recipe", "label", "fill", "copy", "store", "pass", "seal", "completion", "occlusion dump"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> nextNotDrawKinds{};
@@ -707,15 +719,74 @@ void DrawPipeline::NoteJobClass(std::size_t jobClass, std::uint64_t jobNs, std::
     jobClassWaitNs[index].fetch_add(waitNs, std::memory_order_relaxed);
 }
 
+bool DrawPipeline::ResolveLanes() {
+    static const bool enabled = std::getenv("APS5_NO_RESOLVE_LANES") == nullptr && std::getenv("APS5_NO_CARRY_RESOLVE_HOLD") == nullptr && ResolveSplit() == 2;
+    return enabled;
+}
+
+bool DrawPipeline::LaneJobsInFlight() {
+    return ResolveLanes() && Queue0().lanesInFlight != 0;
+}
+
+bool DrawPipeline::laneTargets(const void* item) const {
+    for (unsigned index = 0; index < lanesInFlight; ++index) {
+        if (lanes[(oldestLane + index) % lanes.size()].target == item) return true;
+    }
+    return false;
+}
+
+DrawPipeline::ResolvePhaseScope::ResolvePhaseScope() {
+    if (!ResolveLanes() || committingPipeline == nullptr) return;
+    held = true;
+    if (committerPhaseDepth++ != 0) return;
+    auto& phase = committingPipeline->resolvePhaseHeld;
+    while (phase.exchange(true, std::memory_order_acquire)) SpinPause();
+}
+
+DrawPipeline::ResolvePhaseScope::~ResolvePhaseScope() {
+    if (!held) return;
+    if (--committerPhaseDepth == 0) committingPipeline->resolvePhaseHeld.store(false, std::memory_order_release);
+}
+
+void DrawPipeline::EndResolvePhase() {
+    if (!laneHoldsPhase) return;
+    laneHoldsPhase = false;
+    auto& pipeline = Queue0();
+    pipeline.resolvedThrough.store(laneJobSequence, std::memory_order_release);
+    pipeline.resolvePhaseHeld.store(false, std::memory_order_release);
+}
+
+void DrawPipeline::JoinCarriedJob() {
+    auto& pipeline = Queue0();
+    lastJoinWaitNs = 0;
+    while (pipeline.lanesInFlight != 0 && pipeline.lanes[pipeline.oldestLane].target == takenItem) joinLane(pipeline, pipeline.lanes[pipeline.oldestLane], true);
+}
+
+void DrawPipeline::SettleCarriedBoundary() {
+    auto& pipeline = Queue0();
+    constexpr std::uint32_t BoundaryBound = 32;
+    if (pipeline.lanesInFlight != 0 && GuestMemory::GpuLockWaiters() == 0 && ++pipeline.carriedBoundaries < BoundaryBound) return;
+    pipeline.carriedBoundaries = 0;
+    joinResolve(true);
+    ReleaseCarriedHold();
+}
+
 bool DrawPipeline::CarryHold() {
     static const bool enabled = std::getenv("APS5_NO_CARRY_RESOLVE_HOLD") == nullptr;
     const auto next = std::exchange(postedNext, 0);
+    if (ResolveLanes()) {
+        if (committingPipeline == nullptr || std::uncaught_exceptions() != 0) return false;
+        auto& pipeline = *committingPipeline;
+        if (pipeline.lanesInFlight == 0 || pipeline.lanes[pipeline.oldestLane].distance != 1 || !carriedHold) return false;
+        carriedTarget = pipeline.lanes[pipeline.oldestLane].target;
+        return true;
+    }
     if (!enabled || next != 1 || committingPipeline == nullptr || carriedHold || std::uncaught_exceptions() != 0) return false;
     auto& pipeline = Queue0();
-    if (pipeline.resolveState.load(std::memory_order_acquire) == ResolveIdle || pipeline.resolveTarget == nullptr) return false;
+    if (pipeline.lanes[0].state.load(std::memory_order_acquire) == ResolveIdle || pipeline.lanes[0].target == nullptr) return false;
     GuestMemory::GpuMutex().lock();
     carriedHold = true;
-    carriedTarget = pipeline.resolveTarget;
+    carriedTarget = pipeline.lanes[0].target;
     carriedHolds.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -750,6 +821,10 @@ void DrawPipeline::NoteEarlyResolveNs(std::uint64_t ns) {
     earlyResolveCount.fetch_add(1, std::memory_order_relaxed);
 }
 
+std::uint64_t DrawPipeline::EarlyAbortCount(std::uint8_t kind) {
+    return earlyAborts[std::min<std::size_t>(kind, earlyAborts.size() - 1)].load(std::memory_order_relaxed);
+}
+
 void DrawPipeline::NoteEarlyAbort(std::uint8_t kind) {
     earlyAborts[std::min<std::size_t>(kind, earlyAborts.size() - 1)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -762,24 +837,47 @@ unsigned DrawPipeline::ResolveSplit() {
     return mode;
 }
 
+void DrawPipeline::wakeLane(ResolveLane& lane) {
+    lane.wake.fetch_add(1, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (lane.sleeping.load(std::memory_order_seq_cst) != 0) lane.wake.notify_one();
+}
+
 void DrawPipeline::PostResolve(void (*body)(void*), void (*finish)(void*, bool), void* context) {
     auto& pipeline = Queue0();
-    if (!pipeline.resolver.joinable()) {
+    const bool twoLanes = ResolveLanes();
+    const auto laneIndex = twoLanes ? pipeline.postLane : 0u;
+    auto& lane = pipeline.lanes[laneIndex];
+    if (!lane.thread.joinable()) {
         std::lock_guard lock(pipeline.prepareMutex);
-        if (!pipeline.resolverClosing.load(std::memory_order_relaxed) && !pipeline.resolver.joinable()) pipeline.resolver = std::thread([&pipeline] { pipeline.resolveAhead(); });
+        if (!pipeline.resolverClosing.load(std::memory_order_relaxed) && !lane.thread.joinable()) lane.thread = std::thread([&pipeline, laneIndex] { pipeline.resolveAhead(laneIndex); });
     }
-    pipeline.resolveBody = body;
-    pipeline.resolveFinish = finish;
-    pipeline.resolveContext = context;
-    pipeline.resolveTarget = std::exchange(offerTarget, nullptr);
+    lane.body = body;
+    lane.finish = finish;
+    lane.context = context;
+    lane.target = std::exchange(offerTarget, nullptr);
     postedNext = std::exchange(offerNext, 0);
+    lane.distance = postedNext;
+    lane.sequence = ++pipeline.nextJob;
     static const bool timed = std::getenv("APS5_COMMIT_STATS") != nullptr;
-    if (timed) pipeline.resolvePosted = std::chrono::steady_clock::now();
+    if (timed) lane.posted = std::chrono::steady_clock::now();
     resolvesPosted.fetch_add(1, std::memory_order_relaxed);
-    pipeline.resolveState.store(ResolvePosted, std::memory_order_release);
-    pipeline.resolverWake.fetch_add(1, std::memory_order_seq_cst);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (pipeline.resolverSleeping.load(std::memory_order_seq_cst) != 0) pipeline.resolverWake.notify_one();
+    if (twoLanes) {
+        if (!carriedHold) {
+            GuestMemory::GpuMutex().lock();
+            carriedHold = true;
+            carriedHolds.fetch_add(1, std::memory_order_relaxed);
+        }
+        carriedTarget = pipeline.lanes[pipeline.lanesInFlight == 0 ? laneIndex : pipeline.oldestLane].target;
+        if (pipeline.lanesInFlight == 0) pipeline.oldestLane = laneIndex;
+        ++pipeline.lanesInFlight;
+        pipeline.postLane = (laneIndex + 1) % pipeline.lanes.size();
+    } else {
+        pipeline.oldestLane = 0;
+        pipeline.lanesInFlight = 1;
+    }
+    lane.state.store(ResolvePosted, std::memory_order_release);
+    pipeline.wakeLane(lane);
 }
 
 void DrawPipeline::JoinResolve() {
@@ -794,28 +892,37 @@ void DrawPipeline::joinResolve(bool revoke) {
     auto& pipeline = Queue0();
     postedNext = 0;
     lastJoinWaitNs = 0;
-    if (pipeline.resolveState.load(std::memory_order_acquire) == ResolveIdle) return;
+    if (pipeline.lanesInFlight == 0 && pipeline.lanes[0].state.load(std::memory_order_acquire) == ResolveIdle) return;
+    while (pipeline.lanesInFlight != 0) joinLane(pipeline, pipeline.lanes[pipeline.oldestLane], revoke);
+}
+
+void DrawPipeline::joinLane(DrawPipeline& pipeline, ResolveLane& lane, bool revoke) {
     bool ran = true;
     int expected = ResolvePosted;
-    if (revoke && pipeline.resolveState.compare_exchange_strong(expected, ResolveIdle, std::memory_order_acq_rel)) {
+    if (revoke && lane.state.compare_exchange_strong(expected, ResolveIdle, std::memory_order_acq_rel)) {
         ran = false;
         resolvesRevoked.fetch_add(1, std::memory_order_relaxed);
+        auto through = pipeline.resolvedThrough.load(std::memory_order_relaxed);
+        while (through < lane.sequence && !pipeline.resolvedThrough.compare_exchange_weak(through, lane.sequence, std::memory_order_acq_rel)) {}
     } else {
-        if (!revoke) expected = pipeline.resolveState.load(std::memory_order_acquire);
+        if (!revoke) expected = lane.state.load(std::memory_order_acquire);
         if (expected == ResolveDone) {
             resolvesDoneBeforeJoin.fetch_add(1, std::memory_order_relaxed);
         } else {
             const auto start = std::chrono::steady_clock::now();
-            while (pipeline.resolveState.load(std::memory_order_acquire) != ResolveDone) SpinPause();
+            while (lane.state.load(std::memory_order_acquire) != ResolveDone) SpinPause();
             resolvesWaited.fetch_add(1, std::memory_order_relaxed);
-            lastJoinWaitNs = elapsedNs(start);
-            resolveWaitNs.fetch_add(lastJoinWaitNs, std::memory_order_relaxed);
+            lastJoinWaitNs += elapsedNs(start);
+            resolveWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
         }
-        pipeline.resolveState.store(ResolveIdle, std::memory_order_relaxed);
+        lane.state.store(ResolveIdle, std::memory_order_relaxed);
     }
-    const auto finish = std::exchange(pipeline.resolveFinish, nullptr);
-    auto* context = std::exchange(pipeline.resolveContext, nullptr);
-    pipeline.resolveBody = nullptr;
+    --pipeline.lanesInFlight;
+    if (pipeline.lanesInFlight != 0) pipeline.oldestLane = (pipeline.oldestLane + 1) % pipeline.lanes.size();
+    const auto finish = std::exchange(lane.finish, nullptr);
+    auto* context = std::exchange(lane.context, nullptr);
+    lane.body = nullptr;
+    lane.target = nullptr;
     if (finish == nullptr) return;
     if (std::uncaught_exceptions() == 0) {
         finish(context, ran);
@@ -881,74 +988,94 @@ void installFaultReport() {
 }
 #endif
 
-void DrawPipeline::WakeResolverForSpent(unsigned) {
+void DrawPipeline::WakeResolverForSpent(unsigned lane) {
     auto& pipeline = Queue0();
-    pipeline.resolverWake.fetch_add(1, std::memory_order_seq_cst);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (pipeline.resolverSleeping.load(std::memory_order_seq_cst) != 0) pipeline.resolverWake.notify_one();
+    pipeline.wakeLane(pipeline.lanes[std::min<std::size_t>(lane, pipeline.lanes.size() - 1)]);
 }
 
-void DrawPipeline::resolveAhead() {
+void DrawPipeline::resolveAhead(unsigned laneIndex) {
 #ifdef __linux__
     installFaultReport();
 #endif
     GuestMemory::MarkResolverThread();
-    PinResolverThread("draw resolver");
+    if (laneIndex == 0) PinResolverThread("draw resolver");
+    else PinResolverLaneThread("draw resolver 2");
     PerformanceTimer::UntraceThisThread();
     Graphics::SetSpentPacketWake(&WakeResolverForSpent);
-    Graphics::StartSpentPacketLane(0);
+    Graphics::StartSpentPacketLane(laneIndex);
     struct StopSpent {
-        ~StopSpent() { Graphics::StopSpentPacketLane(0); }
-    } stopSpent;
+        unsigned lane;
+        ~StopSpent() { Graphics::StopSpentPacketLane(lane); }
+    } stopSpent{laneIndex};
     constexpr std::chrono::microseconds idleNap{20};
     static const bool spins = std::getenv("APS5_RESOLVER_SPINS") != nullptr;
     static const auto window = [] {
         const char* text = std::getenv("APS5_RESOLVER_SPIN_US");
         return std::chrono::nanoseconds(std::chrono::microseconds(text != nullptr ? std::strtoll(text, nullptr, 10) : 20));
     }();
+    auto& lane = lanes[laneIndex];
+    const bool twoLanes = ResolveLanes();
     for (;;) {
-        const auto preProofDue = [&] { return preProofState.load(std::memory_order_acquire) == PreProofPosted && preProofAfter.load(std::memory_order_acquire) == lastJobTarget && lastJobTemplate != nullptr; };
-        const auto posted = [&] { return resolveState.load(std::memory_order_acquire) == ResolvePosted || resolverClosing.load(std::memory_order_relaxed) || preProofDue() || Graphics::SpentDrawPacketsWaiting(0); };
+        const auto preProofDue = [&] { return laneIndex == 0 && preProofState.load(std::memory_order_acquire) == PreProofPosted && preProofAfter.load(std::memory_order_acquire) == lastJobTarget && lastJobTemplate != nullptr; };
+        const auto posted = [&] { return lane.state.load(std::memory_order_acquire) == ResolvePosted || resolverClosing.load(std::memory_order_relaxed) || preProofDue() || Graphics::SpentDrawPacketsWaiting(laneIndex); };
         if (spins && !SpinUntil(HandoffSpinWindow(), posted)) {
             std::this_thread::sleep_for(idleNap);
             continue;
         }
         if (!spins && !SpinUntil(window, posted)) {
-            const auto wake = resolverWake.load(std::memory_order_acquire);
-            resolverSleeping.fetch_add(1, std::memory_order_seq_cst);
+            const auto wake = lane.wake.load(std::memory_order_acquire);
+            lane.sleeping.fetch_add(1, std::memory_order_seq_cst);
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            if (!posted()) resolverWake.wait(wake, std::memory_order_acquire);
-            resolverSleeping.fetch_sub(1, std::memory_order_relaxed);
+            if (!posted()) lane.wake.wait(wake, std::memory_order_acquire);
+            lane.sleeping.fetch_sub(1, std::memory_order_relaxed);
             continue;
         }
         if (resolverClosing.load(std::memory_order_acquire)) return;
-        if (resolveState.load(std::memory_order_acquire) != ResolvePosted) {
+        if (lane.state.load(std::memory_order_acquire) != ResolvePosted) {
             if (preProofDue()) runPreProof();
-            else Graphics::ReapSpentDrawPacket(0);
+            else Graphics::ReapSpentDrawPacket(laneIndex);
             continue;
         }
+        bool holdsPhase = false;
+        if (twoLanes) {
+            const auto sequence = lane.sequence;
+            while (lane.state.load(std::memory_order_acquire) == ResolvePosted) {
+                if (resolvedThrough.load(std::memory_order_acquire) + 1 >= sequence && !resolvePhaseHeld.exchange(true, std::memory_order_acquire)) {
+                    holdsPhase = true;
+                    break;
+                }
+                SpinPause();
+            }
+            if (!holdsPhase) continue;
+            laneJobSequence = sequence;
+        }
         int expected = ResolvePosted;
-        if (!resolveState.compare_exchange_strong(expected, ResolveRunning, std::memory_order_acq_rel)) continue;
+        if (!lane.state.compare_exchange_strong(expected, ResolveRunning, std::memory_order_acq_rel)) {
+            if (holdsPhase) resolvePhaseHeld.store(false, std::memory_order_release);
+            continue;
+        }
+        laneHoldsPhase = holdsPhase;
         static const bool timed = std::getenv("APS5_COMMIT_STATS") != nullptr;
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (timed) resolveStartNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - resolvePosted).count()), std::memory_order_relaxed);
-        heldReadsFrom = resolveTarget;
+        if (timed) resolveStartNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - lane.posted).count()), std::memory_order_relaxed);
+        heldReadsFrom = lane.target;
         resolvedTemplate = nullptr;
-        const auto* jobTarget = resolveTarget;
+        const auto* jobTarget = lane.target;
         try {
-            resolveBody(resolveContext);
+            lane.body(lane.context);
         } catch (...) {
         }
+        EndResolvePhase();
         heldReadsFrom = nullptr;
         lastJobTarget = jobTarget;
         lastJobTemplate = std::exchange(resolvedTemplate, nullptr);
         if (timed) resolveBusyNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
-        resolveState.store(ResolveDone, std::memory_order_release);
+        lane.state.store(ResolveDone, std::memory_order_release);
     }
 }
 
 bool DrawPipeline::PreProofEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_RESOLVER_PRE_PROOF") == nullptr;
+    static const bool enabled = std::getenv("APS5_NO_RESOLVER_PRE_PROOF") == nullptr && !ResolveLanes();
     return enabled;
 }
 
@@ -1001,7 +1128,7 @@ void DrawPipeline::postPreProof(const void* currentTemplate, std::span<const Ran
     if (state != PreProofIdle) return;
     {
         std::lock_guard lock(mutex);
-        const auto* after = static_cast<const Item*>(resolveTarget);
+        const auto* after = static_cast<const Item*>(lanes[0].target);
         auto it = std::find_if(items.begin(), items.end(), [&](const Item& item) { return &item == after; });
         if (it == items.end()) return;
         const auto& offered = *it;
@@ -1016,9 +1143,7 @@ void DrawPipeline::postPreProof(const void* currentTemplate, std::span<const Ran
     }
     preProofsPosted.fetch_add(1, std::memory_order_relaxed);
     preProofState.store(PreProofPosted, std::memory_order_release);
-    resolverWake.fetch_add(1, std::memory_order_seq_cst);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (resolverSleeping.load(std::memory_order_seq_cst) != 0) resolverWake.notify_one();
+    wakeLane(lanes[0]);
 }
 
 void DrawPipeline::consumePreProof() {
@@ -1127,6 +1252,7 @@ void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentT
     }
     if (!pendingEarly.hook) {
         pendingEarly = {};
+        offerSecondEarly(depth, currentTemplate);
         return;
     }
     auto hook = std::move(pendingEarly.hook);
@@ -1143,6 +1269,38 @@ void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentT
     } catch (...) {
         earlyFailed.fetch_add(1, std::memory_order_relaxed);
     }
+    offerSecondEarly(depth, currentTemplate);
+}
+
+void DrawPipeline::offerSecondEarly(std::span<const Range> depth, const void* currentTemplate) {
+    const auto second = std::exchange(pendingSecond, PendingSecond{});
+    if (second.hook == nullptr || committingPipeline == nullptr) return;
+    auto& pipeline = *committingPipeline;
+    if (pipeline.lanesInFlight != 1 || pipeline.lanes[pipeline.oldestLane].target != second.afterTarget) return;
+    secondDepth.assign(depth.begin(), depth.end());
+    EarlyProbe probe{&secondDepth, nullptr};
+    EarlyOffer probing;
+    probing.probe = &probe;
+    offerTarget = second.target;
+    offerNext = 2;
+    try {
+        (*second.after)(probing);
+        EarlyOffer offer;
+        offer.writes = &secondWrites;
+        offer.depth = secondDepth;
+        offer.currentTemplate = currentTemplate;
+        offer.nextTemplate = probe.hintTemplate;
+        offer.twoAhead = true;
+        const bool resolved = (*second.hook)(offer);
+        if (resolved) NoteEarly(EarlyEvent::PostedTwoAhead);
+        (resolved ? earlyResolved : earlyDeclined).fetch_add(1, std::memory_order_relaxed);
+    } catch (const ProcessShutdown&) {
+        throw;
+    } catch (...) {
+        earlyFailed.fetch_add(1, std::memory_order_relaxed);
+    }
+    offerTarget = nullptr;
+    offerNext = 0;
 }
 
 std::uint64_t DrawPipeline::FollowedEpoch() {
@@ -1468,7 +1626,21 @@ void DrawPipeline::run() {
             takenOwnCause = nextOwnCause;
             nextOwnCause = OwnCause::Unknown;
         }
+        const auto arrangeSecond = [&] {
+            if (!ResolveLanes() || items.size() < 3 || !items[1].draw || !items[1].early || !items[2].draw || !items[2].early) return;
+            pendingSecond.hook = &items[2].early;
+            pendingSecond.after = &items[1].early;
+            pendingSecond.afterTarget = &items[1];
+            pendingSecond.target = &items[2];
+            secondWrites.assign(items[0].writes.begin(), items[0].writes.end());
+            secondWrites.insert(secondWrites.end(), items[1].writes.begin(), items[1].writes.end());
+        };
+        if (ResolveLanes() && items.size() >= 2 && laneTargets(&items[1])) {
+            arrangeSecond();
+            return;
+        }
         if (const auto next = EarlyIndex(items); next != 0) {
+            if (next == 1) arrangeSecond();
             pendingEarly.hook = items[next].early;
             pendingEarly.writes = OfferWrites(items, next);
             pendingEarly.target = &items[next];
@@ -1521,7 +1693,7 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
-            if (carriedHold && (commit == nullptr || takenItem != carriedTarget)) {
+            if ((carriedHold && (commit == nullptr || takenItem != carriedTarget)) || (commit == nullptr && lanesInFlight != 0)) {
                 carriesReleasedEarly.fetch_add(1, std::memory_order_relaxed);
                 releaseCarriedForRun();
             }
@@ -1562,6 +1734,11 @@ void DrawPipeline::run() {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
+        pendingSecond = {};
+        for (unsigned index = 0; index < lanesInFlight; ++index) {
+            auto& lane = lanes[(oldestLane + index) % lanes.size()];
+            if (lane.distance != 0) --lane.distance;
+        }
         {
             std::lock_guard lock(mutex);
             countWrites(items.front().writes, false);
@@ -1599,7 +1776,7 @@ void DrawPipeline::run() {
         idleStart = clock();
         if (counted) QueueWaits::Note(QueueWaits::Site::CommitterRetire, committed, idleStart);
     }
-    if (carriedHold) {
+    if (carriedHold || lanesInFlight != 0) {
         try {
             releaseCarriedForRun();
         } catch (...) {
@@ -1622,17 +1799,20 @@ void DrawPipeline::Stop() {
         if (preparer.get_id() == std::this_thread::get_id()) preparer.detach();
         else preparer.join();
     }
-    std::thread resolving;
+    std::array<std::thread, 2> resolving;
     {
         std::lock_guard lock(prepareMutex);
         resolverClosing.store(true, std::memory_order_release);
-        resolverWake.fetch_add(1, std::memory_order_release);
-        resolverWake.notify_all();
-        resolving = std::move(resolver);
+        for (std::size_t index = 0; index < lanes.size(); ++index) {
+            lanes[index].wake.fetch_add(1, std::memory_order_release);
+            lanes[index].wake.notify_all();
+            resolving[index] = std::move(lanes[index].thread);
+        }
     }
-    if (resolving.joinable()) {
-        if (resolving.get_id() == std::this_thread::get_id()) resolving.detach();
-        else resolving.join();
+    for (auto& lane : resolving) {
+        if (!lane.joinable()) continue;
+        if (lane.get_id() == std::this_thread::get_id()) lane.detach();
+        else lane.join();
     }
     {
         std::lock_guard lock(mutex);

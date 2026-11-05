@@ -212,6 +212,9 @@ public:
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
         std::vector<std::shared_ptr<Buffer>> owners;
+        std::array<std::uint64_t, 3> stamp{};
+        bool stamped = false;
+        bool declined = false;
         void Release();
         ~DrawBindings();
     };
@@ -223,6 +226,26 @@ public:
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     DrawBindings* PrepareBatchDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    struct AheadDrawBindings {
+        DrawBindings* bindings = nullptr;
+        std::array<std::uint64_t, 3> stamp{};
+        bool stamped = false;
+        bool made = false;
+        AheadDrawBindings() = default;
+        AheadDrawBindings(const AheadDrawBindings&) = delete;
+        AheadDrawBindings& operator=(const AheadDrawBindings&) = delete;
+        ~AheadDrawBindings();
+        void Drop();
+    };
+    enum class JobBindings : std::uint8_t { Off, On, Shadow };
+    static JobBindings JobBindingsMode();
+    static std::uint64_t JobBindingsVerifyDiffers();
+    static std::uint64_t JobBindingsTaken();
+    static std::uint64_t JobBindingsWithSnapshots();
+    static std::uint64_t JobBindingsVerified();
+    static std::string JobBindingsText();
+    void PrepareAheadDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, AheadDrawBindings& ahead) const;
+    const DrawBindings* BindingsForEmit(Recorder& recorder, std::span<const MovedBuffer> moved, AheadDrawBindings* ahead, bool disturbed) const;
     struct MovedPlan {
         std::vector<MovedBuffer> moved;
         std::vector<std::pair<std::uint64_t, std::size_t>> checks;

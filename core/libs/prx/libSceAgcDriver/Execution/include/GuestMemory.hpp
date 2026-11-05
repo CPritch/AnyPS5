@@ -218,6 +218,7 @@ private:
     std::uint32_t depth = 0;
 };
 GpuMutexType& GpuMutex();
+std::uint32_t GpuLockWaiters();
 struct ResolveLockTrace {
     std::uint32_t touches = 0;
     std::uint32_t commands = 0;

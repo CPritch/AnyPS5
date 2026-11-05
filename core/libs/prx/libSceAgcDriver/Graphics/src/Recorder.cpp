@@ -3784,8 +3784,30 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshotMaps[SnapshotPool(std::get<1>(entry->first))].erase(entry);
 }
 
+namespace {
+thread_local unsigned threadLane = 0;
+}
+
+void Recorder::SetThreadLane(unsigned lane) {
+    threadLane = lane;
+}
+
+unsigned Recorder::ThreadLane() {
+    return threadLane;
+}
+
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+    if (GuestMemory::OnResolverThread()) {
+        auto& lane = laneDraws[threadLane];
+        auto at = (lane.used + alignment - 1) & ~(alignment - 1);
+        if (lane.upload == nullptr || at + bytes > lane.upload->Bytes().size()) {
+            lane.upload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, context.UploadProperties());
+            at = 0;
+        }
+        lane.used = at + bytes;
+        return {lane.upload.get(), at, lane.upload->Bytes().data() + at};
+    }
     auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
     if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
         drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, context.UploadProperties());
@@ -3807,11 +3829,12 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
 
 const std::shared_ptr<Buffer>& Recorder::DrawUploadOwner(const Buffer* buffer) const {
     static const std::shared_ptr<Buffer> none;
+    if (GuestMemory::OnResolverThread()) return buffer == laneDraws[threadLane].upload.get() ? laneDraws[threadLane].upload : none;
     return buffer == drawUpload.get() ? drawUpload : none;
 }
 
 bool Recorder::DrawUploadBatchKept(const Buffer* buffer) const {
-    return buffer != nullptr && buffer == drawUploadKept && drawUploadKeptSerial == submissions + 1 && deferringEffects == nullptr;
+    return deferringEffects == nullptr && buffer != nullptr && buffer == drawUploadKept && drawUploadKeptSerial == submissions + 1;
 }
 
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
@@ -3823,6 +3846,18 @@ void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stam
 }
 
 std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset) {
+    if (GuestMemory::OnResolverThread()) {
+        auto& lane = laneDraws[threadLane];
+        if (lane.stamp != stamp) {
+            lane.snapshots.clear();
+            lane.bytes = 0;
+            lane.stamp = stamp;
+        }
+        const auto found = lane.snapshots.find(address);
+        if (found == lane.snapshots.end() || found->second.bytes != bytes) return {};
+        if (offset != nullptr) *offset = found->second.offset;
+        return found->second.buffer;
+    }
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     retireUnwrittenSnapshots(stamp);
     const auto found = unwrittenSnapshots.find(address);
@@ -3832,6 +3867,22 @@ std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, s
 }
 
 void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset) {
+    if (GuestMemory::OnResolverThread()) {
+        auto& lane = laneDraws[threadLane];
+        if (lane.stamp != stamp) {
+            lane.snapshots.clear();
+            lane.bytes = 0;
+            lane.stamp = stamp;
+        }
+        if (const auto found = lane.snapshots.find(address); found != lane.snapshots.end()) {
+            lane.bytes -= found->second.bytes;
+            lane.snapshots.erase(found);
+        }
+        if (lane.snapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - lane.bytes) return;
+        lane.snapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset});
+        lane.bytes += bytes;
+        return;
+    }
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     retireUnwrittenSnapshots(stamp);
     if (const auto found = unwrittenSnapshots.find(address); found != unwrittenSnapshots.end()) {

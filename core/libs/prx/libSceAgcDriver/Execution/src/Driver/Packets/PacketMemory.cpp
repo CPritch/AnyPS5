@@ -585,6 +585,7 @@ bool Driver::submitDueAfterCommit(VulkanDevice* localDevice, bool deferIdle) {
     if (!due && !cap && !idle) return false;
     if (deferIdle && !due && !cap) return true;
     DrawPipeline::QuiescePreProof();
+    const DrawPipeline::ResolvePhaseScope submitAlone;
     Graphics::Recorder::TagSubmitCause(due ? Graphics::Recorder::SubmitCause::LabelDeadline : cap ? Graphics::Recorder::SubmitCause::BatchCap : Graphics::Recorder::SubmitCause::Idle);
     localDevice->SubmitRecorded(true);
     return false;
