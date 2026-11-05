@@ -1152,13 +1152,32 @@ void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std:
     if (const auto observer = unmapObserver.load(std::memory_order_acquire)) observer(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
+static void verifyCachedLease(const Lease::Ranges& cached, bool readableOnly) {
+    if (!verifyLeasePatch()) return;
+    std::size_t at = 0;
+    for (const auto& [address, range] : registry().ranges) {
+        if (range->bytes == 0 || (readableOnly && !range->readable)) continue;
+        if (at >= cached.size() || cached[at] != range) {
+            std::fprintf(stderr, "FATAL: APS5_VERIFY_LEASE_PATCH: the cached lease differs from the registry at 0x%llx+0x%llx\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes));
+            std::abort();
+        }
+        ++at;
+    }
+    if (at == cached.size()) return;
+    std::fprintf(stderr, "FATAL: APS5_VERIFY_LEASE_PATCH: the cached lease holds %zu ranges past the registry's %zu\n", cached.size() - at, at);
+    std::abort();
+}
+
 void GuestAllocationsSetUnmapObserver_nid_postfix(void (*callback)(std::uintptr_t, std::size_t)) {
     unmapObserver.store(callback, std::memory_order_release);
 }
 
 Lease GuestAllocationsAcquire_nid_postfix() {
     std::lock_guard lock(registry().mutex);
-    if (auto shared = registry().readableLease) return Lease(std::move(shared));
+    if (auto shared = registry().readableLease) {
+        verifyCachedLease(*shared, true);
+        return Lease(std::move(shared));
+    }
     const bool retiring = !registry().retiring.empty();
     const auto& index = currentLeaseIndex();
     auto ranges = std::make_shared<Lease::Ranges>();
@@ -1209,7 +1228,10 @@ Lease GuestAllocationsAcquireMapped_nid_no_patch(const Mapped& mapped) {
 Lease GuestAllocationsAcquireRegistered_nid_postfix() {
     std::lock_guard lock(registry().mutex);
     if (registry().retiring.empty()) {
-        if (auto shared = registry().readableLease) return Lease(std::move(shared));
+        if (auto shared = registry().readableLease) {
+            verifyCachedLease(*shared, true);
+            return Lease(std::move(shared));
+        }
     }
     const auto& index = currentLeaseIndex();
     auto ranges = std::make_shared<Lease::Ranges>();
@@ -1239,7 +1261,10 @@ std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t a
 
 Lease GuestAllocationsAcquireAll_nid_postfix() {
     std::lock_guard lock(registry().mutex);
-    if (auto shared = registry().allLease) return Lease(std::move(shared));
+    if (auto shared = registry().allLease) {
+        verifyCachedLease(*shared, false);
+        return Lease(std::move(shared));
+    }
     const bool retiring = !registry().retiring.empty();
     const auto& index = currentLeaseIndex();
     auto ranges = std::make_shared<Lease::Ranges>();
