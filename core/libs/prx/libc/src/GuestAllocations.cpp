@@ -68,6 +68,7 @@ struct Registry {
     std::shared_ptr<const Lease::Ranges> allLease;
     std::uint64_t backingSerials = 0;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> retiring;
+    std::size_t unlockedMutations = 0;
 };
 
 Registry& registry() {
@@ -520,7 +521,7 @@ bool GuestAllocationsChangesSince_nid_no_patch(std::uint64_t since, std::vector<
 
 bool GuestAllocationsMutationWaiting_nid_postfix() {
     std::lock_guard lock(registry().mutex);
-    return !registry().retiring.empty();
+    return !registry().retiring.empty() || registry().unlockedMutations != 0;
 }
 
 bool GuestAllocationsAnyGpuRange_nid_postfix(std::uintptr_t address, std::size_t bytes) {
@@ -803,15 +804,23 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         ~Unmark() { release(); }
     } unmarkOnExit{unmark};
     int cacheDrops = 0;
+    const auto release = [&] {
+        ++registry().unlockedMutations;
+        state->lock.unlock();
+    };
+    const auto retake = [&] {
+        state->lock.lock();
+        --registry().unlockedMutations;
+    };
     for (;;) {
         if (registry().readableLease != nullptr || registry().allLease != nullptr) {
             auto droppedReadable = std::move(registry().readableLease);
             auto droppedAll = std::move(registry().allLease);
             if (leasePatchEnabled() && cacheDrops++ < 2 && state != nullptr && state->lock.owns_lock()) {
-                state->lock.unlock();
+                release();
                 droppedReadable.reset();
                 droppedAll.reset();
-                state->lock.lock();
+                retake();
                 continue;
             }
         }
@@ -842,15 +851,15 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         const auto waiter = pinWaiter.load(std::memory_order_acquire);
         bool progressed = false;
         if (state != nullptr && state->lock.owns_lock()) {
-            state->lock.unlock();
+            release();
             try {
                 if (waiter != nullptr) progressed = waiter(address, bytes);
                 else std::this_thread::yield();
             } catch (...) {
-                state->lock.lock();
+                retake();
                 throw;
             }
-            state->lock.lock();
+            retake();
         } else {
             std::this_thread::yield();
         }
@@ -864,9 +873,9 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         }
         static const bool backsOff = std::getenv("APS5_NO_LEASE_WAIT_UNLOCKED") == nullptr;
         if (backsOff && ++fruitlessRounds > 8 && state != nullptr && state->lock.owns_lock()) {
-            state->lock.unlock();
+            release();
             std::this_thread::sleep_for(std::chrono::microseconds(50));
-            state->lock.lock();
+            retake();
         }
     }
 }
@@ -1225,8 +1234,7 @@ Lease GuestAllocationsAcquireMapped_nid_no_patch(const Mapped& mapped) {
     return Lease(std::move(ranges));
 }
 
-Lease GuestAllocationsAcquireRegistered_nid_postfix() {
-    std::lock_guard lock(registry().mutex);
+static Lease acquireRegisteredLocked() {
     if (registry().retiring.empty()) {
         if (auto shared = registry().readableLease) {
             verifyCachedLease(*shared, true);
@@ -1241,6 +1249,19 @@ Lease GuestAllocationsAcquireRegistered_nid_postfix() {
     }
     if (registry().retiring.empty()) registry().readableLease = ranges;
     return Lease(std::move(ranges));
+}
+
+Lease GuestAllocationsAcquireRegistered_nid_postfix() {
+    std::lock_guard lock(registry().mutex);
+    return acquireRegisteredLocked();
+}
+
+bool GuestAllocationsAcquireSettled_nid_no_patch(Lease* lease, std::uint64_t* published) {
+    std::lock_guard lock(registry().mutex);
+    if (!registry().retiring.empty() || registry().unlockedMutations != 0) return false;
+    *published = generation.load(std::memory_order_acquire);
+    *lease = acquireRegisteredLocked();
+    return true;
 }
 
 std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t address, bool next) {

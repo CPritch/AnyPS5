@@ -2,7 +2,9 @@
 #include "prx/libc/include/GuestHeap.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <memory>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -348,6 +350,50 @@ void heapFreeDropsSnapshots() {
     check(rangeAt(GuestAllocationsAcquire_nid_postfix(), pointer).expired(), "a freed heap block is still leased");
 }
 
+
+void settledLeaseNeverShowsHalfAMutation() {
+    auto* first = arena() + 4 * Granule;
+    auto* second = first + 4096;
+    {
+        Mutation mutation;
+        mutation.Add(first, 4096, true, true, true);
+        mutation.Add(second, 4096, true, true, true);
+    }
+    const auto halfDone = [&](const Lease& lease) {
+        const auto low = rangeAt(lease, first).lock();
+        const auto high = rangeAt(lease, second).lock();
+        return low != nullptr && high != nullptr && low->writable != high->writable;
+    };
+    std::atomic<bool> stop{false};
+    std::uint64_t half = 0;
+    std::uint64_t settledHalf = 0;
+    std::uint64_t settled = 0;
+    std::thread reader([&] {
+        while (!stop.load()) {
+            half += halfDone(GuestAllocationsAcquireRegistered_nid_postfix()) ? 1 : 0;
+            Lease lease;
+            std::uint64_t published = 0;
+            if (!GuestAllocationsAcquireSettled_nid_no_patch(&lease, &published)) continue;
+            ++settled;
+            settledHalf += halfDone(lease) ? 1 : 0;
+        }
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (bool writable = false; std::chrono::steady_clock::now() < deadline; writable = !writable) {
+        Mutation mutation;
+        mutation.Protect(first, 4096, true, writable, true, [] {});
+        mutation.Protect(second, 4096, true, writable, true, [] {});
+    }
+    stop.store(true);
+    reader.join();
+    std::printf("half-done mutations seen by plain leases: %llu; settled leases taken: %llu\n", static_cast<unsigned long long>(half), static_cast<unsigned long long>(settled));
+    check(settled != 0, "no settled lease was ever available");
+    check(settledHalf == 0, "a settled lease showed a mutation half done");
+    Mutation mutation;
+    mutation.Remove(first);
+    mutation.Remove(second);
+}
+
 }
 
 int main() {
@@ -361,6 +407,7 @@ int main() {
     cachedSnapshotsFollowRemovals();
     aHeldLeaseBlocksRemoval();
     heapFreeDropsSnapshots();
+    settledLeaseNeverShowsHalfAMutation();
     std::puts("guest allocation journal tests passed");
     return 0;
 }
