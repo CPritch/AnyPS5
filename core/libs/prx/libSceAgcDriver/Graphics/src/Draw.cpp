@@ -3173,8 +3173,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (drawBindings != nullptr) {
             const auto set = drawBindings->allocation.set;
             const auto fragmentSet = drawBindings->fragmentAllocation.set;
-            if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
-            if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+            static const bool jointBind = std::getenv("APS5_NO_JOINT_SET_BIND") == nullptr && ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet == 1u;
+            if (jointBind && set != VK_NULL_HANDLE && fragmentSet != VK_NULL_HANDLE) {
+                const std::array<VkDescriptorSet, 2> sets{set, fragmentSet};
+                context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 2, sets.data(), 0, nullptr);
+            } else {
+                if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
+                if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+            }
         } else {
             resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
         }
