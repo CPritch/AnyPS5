@@ -1491,6 +1491,7 @@ struct alignas(64) DrawAheadCounter {
 };
 std::array<DrawAheadCounter, DrawAheadEvents> drawAheadTotals{};
 std::atomic<bool> drawAheadDisabled{false};
+std::atomic<std::uint64_t> committerTemplateBuilds{0};
 std::atomic<bool> drawAheadThrows{false};
 std::atomic<std::uint64_t> drawAheadNs{0};
 thread_local bool redoingWhole = false;
@@ -2221,11 +2222,40 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         if (timer.counted && DrawSplitCounted()) DrawSplit().uncacheable.fetch_add(1, std::memory_order_relaxed);
     }
     timer.phase(PhaseLookup);
+    std::shared_ptr<ShaderResources> builtAhead;
+    if (ahead.ahead != nullptr && ahead.ahead->built != nullptr) {
+        builtAhead = std::move(ahead.ahead->built);
+        if (resolved.resources != nullptr) {
+            ShaderResources::CountAhead(ShaderResources::AheadEvent::Dropped);
+            builtAhead.reset();
+        }
+    }
     if (resolved.resources == nullptr) {
-        GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverPath);
+        static const bool verifyAhead = std::getenv("APS5_VERIFY_AHEAD_TEMPLATE_BUILD") != nullptr;
+        static const bool aheadOnLanes = std::getenv("APS5_NO_AHEAD_TEMPLATE_LANE") == nullptr;
+        if (builtAhead == nullptr || verifyAhead || !aheadOnLanes) GuestMemory::ResolverBarrier(GuestMemory::BarrierKind::ResolverPath);
         const bool buildCounted = timer.counted && DrawSplitCounted();
         const auto building = buildCounted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        if (builtAhead != nullptr && !verifyAhead && builtAhead->CompleteAhead()) {
+            resolved.resources = std::move(builtAhead);
+        } else {
+            resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+            committerTemplateBuilds.fetch_add(1, std::memory_order_relaxed);
+            if (builtAhead != nullptr && verifyAhead) {
+                if (builtAhead->CompleteAhead()) {
+                    const auto difference = resolved.resources->DifferenceFrom(*builtAhead);
+                    if (!difference.empty()) {
+                        std::fprintf(stderr, "[draw] APS5_VERIFY_AHEAD_TEMPLATE_BUILD: a template built ahead differs from the committer's build in its %s\n", difference.c_str());
+                        std::fflush(stderr);
+                        std::abort();
+                    }
+                    ShaderResources::CountAhead(ShaderResources::AheadEvent::Verified);
+                }
+            } else if (builtAhead != nullptr) {
+                ShaderResources::CountAhead(ShaderResources::AheadEvent::Dropped);
+            }
+            builtAhead.reset();
+        }
         if (buildCounted) {
             auto& split = DrawSplit();
             const std::size_t kind = resolved.cacheable ? 0u : 1u;
@@ -5261,6 +5291,16 @@ void PrepareDrawAhead(const Context& context, const State& state, const Pm4::Dra
             }
         }
     }
+    if (AheadTemplateBuilds() && (keyed ? ahead.looked && ahead.found == nullptr : true) && !draw.indirect && draw.indexCount != 0 && draw.instanceCount != 0 && ShaderResources::BuildableAhead(shaders)) {
+        try {
+            const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+            ahead.built = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), ShaderResources::AheadBuild{});
+            ShaderResources::CountAhead(ShaderResources::AheadEvent::Made);
+        } catch (const std::exception&) {
+            ahead.built.reset();
+            ShaderResources::CountAhead(ShaderResources::AheadEvent::Failed);
+        }
+    }
     static const bool precollect = std::getenv("APS5_NO_PREPARE_AHEAD_PRECOLLECT") == nullptr;
     if (precollect) {
         for (const auto& color : state.colors) {
@@ -5339,6 +5379,15 @@ std::string DrawAheadReport() {
     char line[1024];
     std::snprintf(line, sizeof(line), "[prepare-ahead] (10 s): %llu offered, %llu prepared, %llu used; not used: %llu not started, %llu unfinished, %llu exception, %llu device; pipeline redone: %llu not lean, %llu pipeline inputs; %llu pipelines left to the shape memo; templates: %llu hinted, %llu gone; %llu draws on precollected walks, %llu walks written since; moved-buffer plans: %llu made, %llu taken; preparation %.1f ms, of it moved-buffer plans %.1f ms; %llu verified, %llu mismatches%s", at(DrawAheadEvent::Offered), at(DrawAheadEvent::Prepared), at(DrawAheadEvent::Used), at(DrawAheadEvent::NotStarted), at(DrawAheadEvent::Unfinished), at(DrawAheadEvent::Thrown), at(DrawAheadEvent::Device), at(DrawAheadEvent::NotLean), at(DrawAheadEvent::PipelineInputs), at(DrawAheadEvent::ShapeMemo), at(DrawAheadEvent::TemplateHinted), at(DrawAheadEvent::TemplateGone), at(DrawAheadEvent::Precollected), at(DrawAheadEvent::PrecollectStale), at(DrawAheadEvent::MovedPlanned), at(DrawAheadEvent::MovedTaken), static_cast<double>(drawAheadNs.exchange(0, std::memory_order_relaxed)) / 1e6, static_cast<double>(movedPlanNs.exchange(0, std::memory_order_relaxed)) / 1e6, at(DrawAheadEvent::Verified), at(DrawAheadEvent::Mismatch), DrawAheadDisabled() ? " (off after a mismatch)" : "");
     return line;
+}
+
+bool AheadTemplateBuilds() {
+    static const bool enabled = std::getenv("APS5_NO_AHEAD_TEMPLATE_BUILD") == nullptr;
+    return enabled;
+}
+
+std::uint64_t CommitterTemplateBuilds() {
+    return committerTemplateBuilds.load(std::memory_order_relaxed);
 }
 
 bool DrawAheadDisabled() {
