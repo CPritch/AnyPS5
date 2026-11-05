@@ -5430,7 +5430,25 @@ void snapshotSurvivalTests(const Device& device) {
     Require(cache.UnwrittenDrawSnapshot(address + 65536, 64, stamp) == nullptr, "a snapshot survived its collect epoch");
 }
 
+void uploadCopyTests() {
+    alignas(64) std::array<std::byte, 512> destination{};
+    std::array<std::byte, 700> source{};
+    for (std::size_t index = 0; index < source.size(); ++index) source[index] = static_cast<std::byte>(index * 7 + 3);
+    for (std::size_t bytes = 1; bytes <= 400; ++bytes) {
+        for (const std::size_t offset : {std::size_t{0}, std::size_t{1}, std::size_t{13}}) {
+            destination.fill(std::byte{0});
+            Recorder::CopyToDrawUpload(destination.data(), source.data() + offset, bytes);
+            Require(std::memcmp(destination.data(), source.data() + offset, bytes) == 0, "a whole-line upload copy changed the snapshot's bytes");
+            const auto roundedEnd = (bytes + 63) / 64 * 64;
+            Require(std::all_of(destination.begin() + static_cast<std::ptrdiff_t>(roundedEnd), destination.end(), [](std::byte value) { return value == std::byte{0}; }), "a whole-line upload copy wrote past its last line");
+        }
+    }
+    Recorder::CopyToDrawUpload(destination.data() + 16, source.data(), 32);
+    Require(std::memcmp(destination.data() + 16, source.data(), 32) == 0, "an upload copy to a misaligned slice changed its bytes");
+}
+
 void unwrittenSnapshotTests(const Device& device) {
+    uploadCopyTests();
     Recorder cache(device.GetContext());
     const auto buffer = std::make_shared<Buffer>(device.GetContext(), 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     constexpr std::uint64_t address = 0x10000000;

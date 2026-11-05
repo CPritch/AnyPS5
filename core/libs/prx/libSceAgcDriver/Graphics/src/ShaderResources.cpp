@@ -6881,7 +6881,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     auto& pendingNotes = ShaderRecompiler::ThreadOwned(notesSlot);
     pendingNotes.clear();
     const auto copy = [&](const PendingCopy& pending) {
-        std::memcpy(pending.destination, pending.source, pending.bytes);
+        Recorder::CopyToDrawUpload(pending.destination, pending.source, pending.bytes);
         if (pending.patched == Unpatched) return;
         for (const auto& patch : dataPatches) {
             if (patch.allocation == pending.patched && patch.byte < pending.bytes) pending.destination[patch.byte] = static_cast<std::byte>(patch.adjustment);

@@ -174,6 +174,8 @@ public:
         std::byte* bytes = nullptr;
     };
     UploadSlice DrawUpload(std::size_t bytes);
+    static bool AlignedUploadCopies();
+    static void CopyToDrawUpload(std::byte* destination, const std::byte* source, std::size_t bytes);
     const std::shared_ptr<Buffer>& DrawUploadOwner(const Buffer* buffer) const;
     bool DrawUploadBatchKept(const Buffer* buffer) const;
     static constexpr std::size_t IndexRangeEntries = 16384;

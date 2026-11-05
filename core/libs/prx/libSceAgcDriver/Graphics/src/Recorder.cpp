@@ -24,6 +24,9 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/DispatchArguments_spv.h"
+#if defined(__x86_64__) && defined(__GNUC__)
+#include <immintrin.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3796,8 +3799,35 @@ unsigned Recorder::ThreadLane() {
     return threadLane;
 }
 
+bool Recorder::AlignedUploadCopies() {
+    static const bool enabled = std::getenv("APS5_NO_ALIGNED_UPLOAD_COPIES") == nullptr;
+    return enabled;
+}
+
+#if defined(__x86_64__) && defined(__GNUC__)
+__attribute__((target("avx512f"))) static void copyWholeLines(std::byte* destination, const std::byte* source, std::size_t bytes) {
+    std::size_t at = 0;
+    for (; at + 64 <= bytes; at += 64) _mm512_store_si512(reinterpret_cast<__m512i*>(destination + at), _mm512_loadu_si512(source + at));
+    if (at == bytes) return;
+    alignas(64) std::array<std::byte, 64> tail{};
+    std::memcpy(tail.data(), source + at, bytes - at);
+    _mm512_store_si512(reinterpret_cast<__m512i*>(destination + at), _mm512_load_si512(tail.data()));
+}
+#endif
+
+void Recorder::CopyToDrawUpload(std::byte* destination, const std::byte* source, std::size_t bytes) {
+#if defined(__x86_64__) && defined(__GNUC__)
+    static const bool wide = AlignedUploadCopies() && __builtin_cpu_supports("avx512f");
+    if (wide && reinterpret_cast<std::uintptr_t>(destination) % 64 == 0) {
+        copyWholeLines(destination, source, bytes);
+        return;
+    }
+#endif
+    std::memcpy(destination, source, bytes);
+}
+
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
-    const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+    const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, AlignedUploadCopies() ? 64 : 16);
     if (GuestMemory::OnResolverThread()) {
         auto& lane = laneDraws[threadLane];
         auto at = (lane.used + alignment - 1) & ~(alignment - 1);
