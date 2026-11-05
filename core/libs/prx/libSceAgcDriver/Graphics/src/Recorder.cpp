@@ -3826,6 +3826,31 @@ void Recorder::CopyToDrawUpload(std::byte* destination, const std::byte* source,
     std::memcpy(destination, source, bytes);
 }
 
+bool Recorder::StagedDrawUploads() {
+    static const bool enabled = std::getenv("APS5_NO_STAGED_DRAW_UPLOADS") == nullptr;
+    return enabled;
+}
+
+void Recorder::FlushDrawUploads() {
+    if (drawUpload == nullptr || drawUploadShadow == nullptr || drawUploadFlushed >= drawUploadUsed) return;
+    const auto mapped = drawUpload->Bytes();
+    const auto begin = static_cast<std::size_t>(drawUploadFlushed) & ~std::size_t{63};
+    const auto end = std::min((static_cast<std::size_t>(drawUploadUsed) + 63) & ~std::size_t{63}, mapped.size());
+    CopyToDrawUpload(mapped.data() + begin, drawUploadShadow + begin, end - begin);
+    drawUploadFlushed = drawUploadUsed;
+#if defined(__x86_64__) && defined(__GNUC__)
+    _mm_sfence();
+#endif
+    static const bool verified = std::getenv("APS5_VERIFY_STAGED_UPLOADS") != nullptr;
+    if (verified) {
+        const auto from = static_cast<std::size_t>(drawUploadVerified);
+        Require(std::memcmp(mapped.data() + from, drawUploadShadow + from, static_cast<std::size_t>(drawUploadUsed) - from) == 0, "a staged draw upload differs from the bytes the GPU reads");
+        drawUploadVerified = drawUploadUsed;
+        static std::atomic<std::uint64_t> flushes{0};
+        if ((flushes.fetch_add(1, std::memory_order_relaxed) & 0xfffu) == 0xfffu) std::fprintf(stderr, "[staged-uploads] APS5_VERIFY_STAGED_UPLOADS: %llu flushes compared, none differing\n", static_cast<unsigned long long>(flushes.load(std::memory_order_relaxed)));
+    }
+}
+
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, AlignedUploadCopies() ? 64 : 16);
     if (GuestMemory::OnResolverThread()) {
@@ -3840,8 +3865,17 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     }
     auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
     if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
+        FlushDrawUploads();
         drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, context.UploadProperties());
         offset = 0;
+        drawUploadUsed = 0;
+        drawUploadFlushed = 0;
+        drawUploadVerified = 0;
+        if (StagedDrawUploads() && drawUploadShadowBytes < drawUpload->Bytes().size()) {
+            drawUploadShadowBytes = drawUpload->Bytes().size();
+            drawUploadShadowStore.assign(drawUploadShadowBytes + 64, std::byte{0});
+            drawUploadShadow = drawUploadShadowStore.data() + (64 - reinterpret_cast<std::uintptr_t>(drawUploadShadowStore.data()) % 64) % 64;
+        }
     }
     drawUploadUsed = offset + bytes;
     static const bool batchKept = std::getenv("APS5_NO_BATCH_KEPT_UPLOADS") == nullptr;
@@ -3854,7 +3888,7 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
             drawUploadKeptSerial = submissions + 1;
         }
     }
-    return {drawUpload.get(), offset, drawUpload->Bytes().data() + offset};
+    return {drawUpload.get(), offset, (drawUploadShadow != nullptr ? drawUploadShadow : drawUpload->Bytes().data()) + offset};
 }
 
 const std::shared_ptr<Buffer>& Recorder::DrawUploadOwner(const Buffer* buffer) const {
@@ -3908,6 +3942,7 @@ std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, s
     }
     static const bool verified = std::getenv("APS5_VERIFY_SNAPSHOT_SURVIVAL") != nullptr;
     if (verified) {
+        FlushDrawUploads();
         static std::array<std::atomic<std::uint64_t>, 2> checked{}, differing{};
         const auto bytesHeld = found->second.buffer->Bytes().subspan(static_cast<std::size_t>(found->second.offset), bytes);
         const auto kind = survived ? 1u : 0u;
@@ -4961,6 +4996,7 @@ void Recorder::Submit() {
     }
     if (hold != VK_NULL_HANDLE || timeline != VK_NULL_HANDLE) submission.pNext = &timelineInfo;
     DestroyDeferredAtIdle(context);
+    FlushDrawUploads();
     const auto submitStart = std::chrono::steady_clock::now();
     const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
     if (result == VK_ERROR_DEVICE_LOST) {

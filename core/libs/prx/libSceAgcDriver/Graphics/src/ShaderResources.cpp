@@ -6631,10 +6631,12 @@ std::string TakeDrawBindingsText() {
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
     if (Recorder::BatchKeeps() && !movedOnly) {
         auto* item = PrepareBatchDrawBindings(recorder, moved);
+        recorder.FlushDrawUploads();
         return item != nullptr ? std::shared_ptr<DrawBindings>(recorder.OpenBindingsBlock(), item) : std::shared_ptr<DrawBindings>{};
     }
     auto result = std::make_shared<DrawBindings>();
     if (!prepareDrawBindings(*result, recorder, moved, movedOnly)) return {};
+    if (!GuestMemory::OnResolverThread()) recorder.FlushDrawUploads();
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer, snapshot.buffer->Bytes().size());
     return result;
@@ -6790,6 +6792,7 @@ const ShaderResources::DrawBindings* ShaderResources::BindingsForEmit(Recorder& 
     }
     if (mode == JobBindings::Shadow) {
         const auto* own = PrepareBatchDrawBindings(recorder, moved);
+        recorder.FlushDrawUploads();
         const auto compared = CompareBindings(ahead->bindings, own);
         if (stampCause != JobCountTotal) CountJobBindings(stampCause);
         else if (disturbed) CountJobBindings(JobDisturbed);
@@ -6813,6 +6816,7 @@ const ShaderResources::DrawBindings* ShaderResources::BindingsForEmit(Recorder& 
     thread_local unsigned verifyCount = 0;
     if (verifyEvery != 0 && ++verifyCount % verifyEvery == 0) {
         const auto* own = PrepareBatchDrawBindings(recorder, moved);
+        recorder.FlushDrawUploads();
         const auto compared = CompareBindings(ahead->bindings, own);
         CountJobBindings(JobVerified);
         if (compared == BindingsCompare::JobFewer) CountJobBindings(JobVerifyFewer);
@@ -6908,7 +6912,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
         }
     };
     const auto upload = [&](const PendingCopy& pending) {
-        if (deferCopies) pendingCopies.push_back(pending);
+        if (deferCopies && (onLane || !Recorder::StagedDrawUploads())) pendingCopies.push_back(pending);
         else copy(pending);
     };
     const auto keep = [&](DrawBindings::Snapshot snapshot, const std::shared_ptr<Buffer>& owner) {
@@ -6973,6 +6977,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
         if (buffer != nullptr) CountBinding(CountReused);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
         if (verifySnapshots && buffer != nullptr && !onLane) {
+            recorder.FlushDrawUploads();
             static std::atomic<std::uint64_t> checked{0}, differing{0};
             const auto fast = buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes);
             VkDeviceSize slowOffset = 0;
