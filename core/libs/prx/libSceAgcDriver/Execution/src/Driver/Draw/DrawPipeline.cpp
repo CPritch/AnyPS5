@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StageDelay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -38,6 +39,25 @@
 #include <string>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+StageDelays ReadStageDelays() {
+    const char* text = std::getenv("APS5_STAGE_DELAY_NS");
+    if (text == nullptr) return {};
+    const auto delays = ParseStageDelays(text);
+    for (std::size_t stage = 0; stage < delays.size(); ++stage) std::fprintf(stderr, "[stage-delay] %s %llu ns per draw\n", DelayedStageNames[stage].data(), static_cast<unsigned long long>(delays[stage]));
+    return delays;
+}
+
+}
+
+const StageDelays stageDelays = ReadStageDelays();
+
+void SpinStageDelay(std::uint64_t ns) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(ns);
+    while (std::chrono::steady_clock::now() < deadline) SpinPause();
+}
 
 namespace {
 std::string TakeStaleSubmitText();
@@ -1391,6 +1411,7 @@ void DrawPipeline::resolveAhead(unsigned laneIndex) {
         static const bool timed = std::getenv("APS5_COMMIT_STATS") != nullptr;
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (timed) resolveStartNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - lane.posted).count()), std::memory_order_relaxed);
+        DelayStage(DelayedStage::Resolver);
         heldReadsFrom = lane.target;
         resolvedTemplate = nullptr;
         const auto* jobTarget = lane.target;
@@ -1738,6 +1759,7 @@ void DrawPipeline::prepareAhead() {
             prepares.pop_front();
             queuedPrepares.fetch_sub(1, std::memory_order_release);
         }
+        DelayStage(DelayedStage::Preparer);
         try {
             prepare();
         } catch (...) {
