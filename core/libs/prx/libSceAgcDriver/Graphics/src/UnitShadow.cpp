@@ -59,7 +59,7 @@ struct Statistics {
     std::atomic<std::uint64_t> retiled{0}, retiledBytes{0}, refused{0}, refusedBytes{0}, seeds{0}, seedBytes{0};
     std::atomic<std::uint64_t> detiledShadow{0}, detiledShadowBytes{0}, detiledImport{0}, detiledImportBytes{0}, tailPublishes{0};
     std::array<std::atomic<std::uint64_t>, ReasonCount> published{}, publishedBytes{};
-    std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0};
+    std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0}, lazyVerified{0};
 };
 
 Statistics& Stats() {
@@ -447,6 +447,91 @@ std::size_t publishRange(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     return any ? publishUnits(shadow, first, last, selected, reason) : 0;
 }
 
+struct LazyEntry {
+    std::weak_ptr<UnitShadow> shadow;
+    std::uint64_t unit;
+    std::uint64_t generation;
+};
+
+struct LazyLedger {
+    SlimMutex mutex;
+    std::vector<LazyEntry> entries;
+};
+
+LazyLedger& Ledger() {
+    static LazyLedger ledger;
+    return ledger;
+}
+
+constexpr std::size_t LazyLedgerCapacity = 4096;
+
+void verifyLazyAt(std::uint64_t address, std::uint64_t end) {
+    struct Check {
+        std::shared_ptr<UnitShadow> shadow;
+        std::uint64_t unit;
+        std::uint64_t generation;
+    };
+    std::vector<Check> checks;
+    {
+        auto& ledger = Ledger();
+        std::lock_guard lock(ledger.mutex);
+        if (ledger.entries.empty()) return;
+        std::erase_if(ledger.entries, [&](const LazyEntry& entry) {
+            auto shadow = entry.shadow.lock();
+            if (shadow == nullptr) return true;
+            const auto [begin, stop] = shadow->UnitRange(entry.unit);
+            if (stop <= address || begin >= end) return false;
+            checks.push_back({std::move(shadow), entry.unit, entry.generation});
+            return true;
+        });
+    }
+    if (checks.empty()) return;
+    bool synced = false;
+    for (const auto& check : checks) {
+        const auto& shadow = *check.shadow;
+        const auto [begin, stop] = shadow.UnitRange(check.unit);
+        if (stop <= begin) continue;
+        GuestMemory::CollectWritesUncached(begin, static_cast<std::size_t>(stop - begin));
+        std::shared_ptr<ShadowSlab> slab;
+        {
+            std::lock_guard lock(Registry().mutex);
+            if (shadow.generation[check.unit] != check.generation) continue;
+            std::vector<std::uint8_t> changed, cpu;
+            changedUnits(shadow, check.unit, check.unit, changed, cpu);
+            if (changed[0] != 0) continue;
+            slab = shadow.slabs[static_cast<std::size_t>(check.unit / SlabUnits())];
+        }
+        if (slab == nullptr) continue;
+        if (!synced) {
+            if (auto* recorder = Recorder::Active()) {
+                Recorder::CountSync(4);
+                recorder->Sync();
+            }
+            synced = true;
+        }
+        const auto& context = shadow.context;
+        const auto bytes = static_cast<std::size_t>(stop - begin);
+        Buffer host(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        CopyBuffer(context, batch.Handle(), slab->buffer, (check.unit - slab->firstUnit) * UnitBytes + (begin - shadow.UnitBegin(check.unit)), host.Handle(), 0, bytes);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        host.Invalidate();
+        Stats().lazyVerified.fetch_add(1, std::memory_order_relaxed);
+        if (GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) && std::memcmp(reinterpret_cast<const void*>(begin), host.Bytes().data(), bytes) == 0) continue;
+        GuestMemory::CollectWritesUncached(begin, bytes);
+        {
+            std::lock_guard lock(Registry().mutex);
+            std::vector<std::uint8_t> changed, cpu;
+            changedUnits(shadow, check.unit, check.unit, changed, cpu);
+            if (changed[0] != 0 || shadow.generation[check.unit] != check.generation) continue;
+        }
+        std::fprintf(stderr, "[shadow] APS5_VERIFY_LAZY_WRITEBACK: unit 0x%llx+0x%zx of import 0x%llx holds bytes other than its shadow at a demand point after an eager publish: a lazy publish there would overwrite them\n", static_cast<unsigned long long>(begin), bytes, static_cast<unsigned long long>(shadow.importBase));
+        std::fflush(stderr);
+        std::abort();
+    }
+}
+
 // Frees the least recently used unpinned slab of any shadow after publishing its fresh units; false
 // when nothing can be freed (a pinned slab is a destination of the write-back in progress: its
 // copies are recorded into it after this decision).
@@ -498,6 +583,44 @@ bool UnitShadowEnabled() {
 bool ShadowVerify() {
     static const bool verify = std::getenv("APS5_SHADOW_VERIFY") != nullptr;
     return verify;
+}
+
+bool LazyWriteBack() {
+    static const bool lazy = std::getenv("APS5_NO_LAZY_WRITEBACK") == nullptr;
+    return lazy;
+}
+
+bool VerifyLazyWriteBack() {
+    static const bool verify = std::getenv("APS5_VERIFY_LAZY_WRITEBACK") != nullptr;
+    return verify;
+}
+
+void NoteLazyPublish(std::uint64_t address, std::size_t bytes) {
+    if (!UnitShadowEnabled() || !VerifyLazyWriteBack() || bytes == 0) return;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    std::vector<LazyEntry> noted;
+    {
+        auto& registry = Registry();
+        std::lock_guard lock(registry.mutex);
+        for (const auto& shadow : overlapping(registry, address, end)) {
+            const auto begin = std::max(address, shadow->importBase);
+            const auto stop = std::min(end, shadow->ImportEnd());
+            if (stop <= begin) continue;
+            for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(stop - 1); ++unit) {
+                if (shadow->generation[unit] == 0 || shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())] == nullptr) continue;
+                noted.push_back({shadow, unit, shadow->generation[unit]});
+            }
+        }
+    }
+    if (noted.empty()) return;
+    auto& ledger = Ledger();
+    std::lock_guard lock(ledger.mutex);
+    for (auto& entry : noted) {
+        const auto shadow = entry.shadow.lock();
+        std::erase_if(ledger.entries, [&](const LazyEntry& old) { return old.unit == entry.unit && old.shadow.lock() == shadow; });
+        ledger.entries.push_back(std::move(entry));
+    }
+    if (ledger.entries.size() > LazyLedgerCapacity) ledger.entries.erase(ledger.entries.begin(), ledger.entries.begin() + static_cast<std::ptrdiff_t>(ledger.entries.size() - LazyLedgerCapacity));
 }
 
 void NoteShadowSeed(std::uint64_t begin, std::uint64_t end) {
@@ -556,6 +679,7 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
         return 0;
     }
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    if (VerifyLazyWriteBack() && !Recorder::InCompletion()) verifyLazyAt(address, end);
     std::vector<std::shared_ptr<UnitShadow>> shadows;
     {
         auto& registry = Registry();
@@ -963,6 +1087,10 @@ std::string ShadowReport() {
     line += text;
     if (ShadowVerify()) {
         std::snprintf(text, sizeof(text), ", verified %llu, mismatches %llu", take(statistics.verified), take(statistics.mismatches));
+        line += text;
+    }
+    if (VerifyLazyWriteBack()) {
+        std::snprintf(text, sizeof(text), ", lazy publishes verified %llu", take(statistics.lazyVerified));
         line += text;
     }
     return line;
