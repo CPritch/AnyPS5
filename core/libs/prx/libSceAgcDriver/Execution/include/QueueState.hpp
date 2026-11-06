@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_QUEUESTATE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_QUEUESTATE_HPP
 
+#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,8 @@
 #include <vector>
 
 namespace AgcDriver {
+
+std::uint64_t NextRegistersLineage();
 
 class Registers {
 public:
@@ -81,16 +84,31 @@ public:
     using iterator = const_iterator;
 
     Registers() = default;
-    Registers(const Registers&) = default;
-    Registers& operator=(const Registers&) = default;
-    Registers(Registers&& other) noexcept : values(std::move(other.values)), present(std::move(other.present)), entries(std::exchange(other.entries, 0)), mask(std::move(other.mask)), fingerprint(std::exchange(other.fingerprint, 0)) {}
+    Registers(const Registers& other) : values(other.values), present(other.present), groupWrites(other.groupWrites), entries(other.entries), mask(other.mask), fingerprint(other.fingerprint) {}
+    Registers& operator=(const Registers& other) {
+        if (this == &other) return *this;
+        values = other.values;
+        present = other.present;
+        groupWrites = other.groupWrites;
+        entries = other.entries;
+        mask = other.mask;
+        fingerprint = other.fingerprint;
+        lineage = NextRegistersLineage();
+        return *this;
+    }
+    Registers(Registers&& other) noexcept : values(std::move(other.values)), present(std::move(other.present)), groupWrites(std::move(other.groupWrites)), entries(std::exchange(other.entries, 0)), mask(std::move(other.mask)), fingerprint(std::exchange(other.fingerprint, 0)) {
+        other.lineage = NextRegistersLineage();
+    }
     Registers& operator=(Registers&& other) noexcept {
         if (this == &other) return *this;
         values = std::move(other.values);
         present = std::move(other.present);
+        groupWrites = std::move(other.groupWrites);
         entries = std::exchange(other.entries, 0);
         mask = std::move(other.mask);
         fingerprint = std::exchange(other.fingerprint, 0);
+        lineage = NextRegistersLineage();
+        other.lineage = NextRegistersLineage();
         return *this;
     }
     Registers(std::initializer_list<std::pair<std::uint32_t, std::uint32_t>> entries) {
@@ -118,8 +136,10 @@ public:
     void clear() {
         values.clear();
         present.clear();
+        groupWrites.clear();
         entries = 0;
         fingerprint = 0;
+        lineage = NextRegistersLineage();
     }
     std::pair<const_iterator, bool> emplace(std::uint32_t offset, std::uint32_t value) {
         if (contains(offset)) return {const_iterator{this, offset}, false};
@@ -131,6 +151,7 @@ public:
         if (contains(offset)) {
             if (values[offset] == value) return {const_iterator{this, offset}, false};
             changeFingerprint(offset, values[offset]);
+            ++groupWrites[offset / 64];
             values[offset] = value;
             changeFingerprint(offset, value);
             return {const_iterator{this, offset}, false};
@@ -155,6 +176,7 @@ public:
         if (!contains(offset)) return 0;
         changeFingerprint(offset, values[offset]);
         present[offset / 64] &= ~(std::uint64_t{1} << (offset % 64));
+        ++groupWrites[offset / 64];
         --entries;
         return 1;
     }
@@ -172,6 +194,22 @@ public:
             mask = selected;
         }
         return fingerprint;
+    }
+    std::uint64_t Lineage() const { return lineage; }
+    std::uint32_t GroupWrites(std::uint32_t group) const { return group < groupWrites.size() ? groupWrites[group] : 0u; }
+    template <class TVisit>
+    void ForEachIn(std::uint32_t first, std::uint32_t end, TVisit&& visit) const {
+        const auto limit = std::min<std::size_t>(end, values.size());
+        for (std::size_t word = first / 64; word * 64 < limit; ++word) {
+            auto bits = present[word];
+            if (word == first / 64) bits &= ~std::uint64_t{0} << (first % 64);
+            const auto top = limit - word * 64;
+            if (top < 64) bits &= (std::uint64_t{1} << top) - 1;
+            for (; bits != 0; bits &= bits - 1) {
+                const auto offset = word * 64 + static_cast<std::size_t>(std::countr_zero(bits));
+                visit(static_cast<std::uint32_t>(offset), values[offset]);
+            }
+        }
     }
     std::uint64_t RecomputeFingerprint(const Mask& selected) const {
         std::uint64_t result = 0;
@@ -197,8 +235,10 @@ private:
             const auto words = static_cast<std::size_t>(offset) / 64 + 1;
             values.resize(words * 64, 0);
             present.resize(words, 0);
+            groupWrites.resize(words, 0);
         }
         present[offset / 64] |= std::uint64_t{1} << (offset % 64);
+        ++groupWrites[offset / 64];
         ++entries;
         return values[offset];
     }
@@ -212,9 +252,11 @@ private:
     }
     std::vector<std::uint32_t> values;
     std::vector<std::uint64_t> present;
+    std::vector<std::uint32_t> groupWrites;
     std::size_t entries = 0;
     mutable std::shared_ptr<const Mask> mask;
     mutable std::uint64_t fingerprint = 0;
+    std::uint64_t lineage = NextRegistersLineage();
 };
 
 inline Registers BuildInitialContextRegisters() {

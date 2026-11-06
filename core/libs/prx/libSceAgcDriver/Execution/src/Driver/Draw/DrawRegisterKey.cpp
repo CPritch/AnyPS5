@@ -93,9 +93,51 @@ void forEachKeyedUserWord(const QueueState& queue, bool allUserWords, TVisit&& v
     words(0x102u, 2);
 }
 
+bool incrementalRegisterKey() {
+    static const bool enabled = std::getenv("APS5_NO_INCREMENTAL_REGISTER_KEY") == nullptr;
+    return enabled;
 }
 
-std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, std::uint64_t* shapeKey, RegisterStateKeyParts* parts) {
+bool verifyRegisterKey() {
+    static const bool enabled = std::getenv("APS5_VERIFY_REGISTER_KEY") != nullptr;
+    return enabled;
+}
+
+struct UserBlock {
+    std::uint32_t base;
+    std::uint32_t limit;
+    bool counted;
+};
+
+constexpr std::array<UserBlock, 4> UserBlocks{{{0x00cu, 32u, true}, {0x04cu, 16u, true}, {0x08cu, 32u, true}, {0x10cu, 32u, true}}};
+constexpr std::array<UserBlock, 2> AuxiliaryBlocks{{{0x082u, 2u, false}, {0x102u, 2u, false}}};
+
+struct UserWordMemo {
+    std::uint64_t lineage = 0;
+    bool allUserWords = false;
+    std::array<std::uint32_t, UserBlocks.size() + AuxiliaryBlocks.size()> writes{};
+    std::array<std::uint64_t, UserBlocks.size() + AuxiliaryBlocks.size()> hashes{};
+};
+
+std::uint64_t wordHash(std::uint32_t offset, std::uint32_t value) {
+    auto hash = ((static_cast<std::uint64_t>(offset) << 32u) | value) + 0x9e3779b97f4a7c15ull;
+    hash = (hash ^ (hash >> 30u)) * 0xbf58476d1ce4e5b9ull;
+    hash = (hash ^ (hash >> 27u)) * 0x94d049bb133111ebull;
+    return hash ^ (hash >> 31u);
+}
+
+std::uint64_t blockHash(const Registers& shader, const UserBlock& block, bool allUserWords) {
+    auto count = block.limit;
+    if (block.counted && !allUserWords) {
+        const auto resources = shader.find(block.base - 1);
+        count = resources == shader.end() ? 0u : std::min(((resources->second >> 1u) & 0x1fu) | (((resources->second >> 27u) & 1u) << 5u), block.limit);
+    }
+    std::uint64_t hash = 0xcbf29ce484222325ull ^ block.base;
+    shader.ForEachIn(block.base, block.base + count, [&](std::uint32_t offset, std::uint32_t value) { hash = (hash ^ wordHash(offset, value)) * 0x100000001b3ull; });
+    return hash;
+}
+
+std::uint64_t legacyRegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, std::uint64_t* shapeKey, RegisterStateKeyParts* parts) {
     const auto& masks = registerMasks();
     const auto fingerprint = [&](const Registers& registers, Graphics::RegisterBank bank) {
         const auto& mask = masks[static_cast<std::size_t>(bank)];
@@ -129,6 +171,60 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
     return exact;
 }
 
+}
+
+std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, std::uint64_t* shapeKey, RegisterStateKeyParts* parts) {
+    if (!incrementalRegisterKey()) return legacyRegisterStateKey(queue, allUserWords, incremental, shapeKey, parts);
+    const auto& masks = registerMasks();
+    const auto fingerprint = [&](const Registers& registers, Graphics::RegisterBank bank) {
+        const auto& mask = masks[static_cast<std::size_t>(bank)];
+        return incremental ? registers.Fingerprint(mask) : registers.RecomputeFingerprint(*mask);
+    };
+    auto shape = (0xcbf29ce484222325ull ^ fingerprint(queue.context, Graphics::RegisterBank::Context)) * 0x100000001b3ull;
+    shape = (shape ^ fingerprint(queue.shader, Graphics::RegisterBank::Shader)) * 0x100000001b3ull;
+    shape = (shape ^ fingerprint(queue.userConfig, Graphics::RegisterBank::UserConfig)) * 0x100000001b3ull;
+    if (shapeKey != nullptr) *shapeKey = shape;
+    const auto& shader = queue.shader;
+    thread_local UserWordMemo memo;
+    const bool reuse = incremental && memo.lineage == shader.Lineage() && memo.allUserWords == allUserWords;
+    bool reused = false;
+    std::array<std::uint64_t, UserBlocks.size() + AuxiliaryBlocks.size()> hashes{};
+    for (std::size_t i = 0; i < hashes.size(); ++i) {
+        const auto& block = i < UserBlocks.size() ? UserBlocks[i] : AuxiliaryBlocks[i - UserBlocks.size()];
+        const auto writes = shader.GroupWrites(block.base / 64);
+        if (reuse && memo.writes[i] == writes) {
+            hashes[i] = memo.hashes[i];
+            reused = true;
+            continue;
+        }
+        hashes[i] = blockHash(shader, block, allUserWords);
+        if (incremental) {
+            memo.writes[i] = writes;
+            memo.hashes[i] = hashes[i];
+        }
+    }
+    if (incremental) {
+        memo.lineage = shader.Lineage();
+        memo.allUserWords = allUserWords;
+    }
+    if (reused && verifyRegisterKey()) {
+        for (std::size_t i = 0; i < hashes.size(); ++i) {
+            const auto& block = i < UserBlocks.size() ? UserBlocks[i] : AuxiliaryBlocks[i - UserBlocks.size()];
+            if (hashes[i] == blockHash(shader, block, allUserWords)) continue;
+            std::fprintf(stderr, "APS5_VERIFY_REGISTER_KEY: the kept hash of the user words at 0x%x disagrees with the registers\n", block.base);
+            std::abort();
+        }
+    }
+    std::uint64_t userData = 0xcbf29ce484222325ull;
+    std::uint64_t auxiliary = 0xcbf29ce484222325ull;
+    for (std::size_t i = 0; i < hashes.size(); ++i) {
+        auto& part = i < UserBlocks.size() ? userData : auxiliary;
+        part = (part ^ hashes[i]) * 0x100000001b3ull;
+    }
+    const auto exact = (((shape ^ userData) * 0x100000001b3ull) ^ auxiliary) * 0x100000001b3ull;
+    if (parts != nullptr) *parts = {shape, userData, auxiliary};
+    return exact;
+}
 
 std::uint64_t DrawShaderSetKey(const QueueState& queue, const ShaderRegistry& registry) {
     std::uint64_t key = 0xcbf29ce484222325ull;

@@ -15,6 +15,15 @@
 #include <stdexcept>
 #include <string>
 
+namespace AgcDriver {
+
+std::uint64_t NextRegistersLineage() {
+    static std::atomic<std::uint64_t> next{0};
+    return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+}
+
 namespace AgcDriver::Pm4 {
 
 namespace {
