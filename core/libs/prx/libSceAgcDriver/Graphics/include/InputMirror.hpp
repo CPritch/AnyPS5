@@ -31,6 +31,9 @@ struct InputMirrorCounts {
     std::uint64_t stagedFills = 0;
     std::uint64_t filledBytes = 0;
     std::uint64_t verified = 0;
+    std::uint64_t preludes = 0;
+    std::uint64_t preludeFills = 0;
+    std::uint64_t inBatchFills = 0;
     std::uint64_t liveEntries = 0;
     std::uint64_t liveBytes = 0;
 };

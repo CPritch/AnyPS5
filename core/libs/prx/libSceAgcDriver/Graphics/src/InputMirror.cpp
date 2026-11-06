@@ -13,11 +13,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <list>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <unordered_map>
 #include <utility>
 
@@ -39,6 +42,7 @@ struct Entry {
     HostImport view{};
     bool dirty = true;
     std::uint32_t hitsSinceCopy = 0;
+    std::uint64_t verifiedInBatch = 0;
     std::list<std::pair<std::uint64_t, std::size_t>>::iterator recent;
 };
 
@@ -61,6 +65,7 @@ struct Cache {
     std::unordered_map<std::pair<std::uint64_t, std::size_t>, Candidate, PairHash> candidates;
     std::uint64_t liveBytes = 0;
     std::vector<std::shared_ptr<Entry>> abandoned;
+    std::vector<std::shared_ptr<Entry>> pendingFills;
 };
 
 Cache& Mirrors() {
@@ -69,7 +74,7 @@ Cache& Mirrors() {
 }
 
 struct Counters {
-    std::atomic<std::uint64_t> candidates{0}, created{0}, hits{0}, recopies{0}, demoted{0}, evicted{0}, refusedBudget{0}, refusedAllocation{0}, fills{0}, stagedFills{0}, filledBytes{0}, verified{0};
+    std::atomic<std::uint64_t> candidates{0}, created{0}, hits{0}, recopies{0}, demoted{0}, evicted{0}, refusedBudget{0}, refusedAllocation{0}, fills{0}, stagedFills{0}, filledBytes{0}, verified{0}, preludes{0}, preludeFills{0}, inBatchFills{0};
 };
 
 Counters& Counts() {
@@ -104,6 +109,7 @@ void adoptDevice(Cache& cache, const Context& context) {
     cache.entries.clear();
     cache.recency.clear();
     cache.candidates.clear();
+    cache.pendingFills.clear();
     cache.liveBytes = 0;
     cache.device = context.device;
 }
@@ -143,13 +149,14 @@ void reportMaybe() {
     auto previous = last.load(std::memory_order_relaxed);
     if (now - previous < 10 || !last.compare_exchange_strong(previous, now, std::memory_order_relaxed)) return;
     const auto counts = InputMirrorCounters();
-    std::fprintf(stderr, "[mirrors] input mirrors: %llu live (%.0f MiB of %llu MiB), %llu hits, %llu created, %llu recopied, %llu demoted, %llu evicted, %llu candidates, %llu refused by budget, %llu fills (%llu staged, %.0f MiB)\n", static_cast<unsigned long long>(counts.liveEntries), static_cast<double>(counts.liveBytes) / 1048576.0, static_cast<unsigned long long>(mirrorBudget() >> 20u), static_cast<unsigned long long>(counts.hits), static_cast<unsigned long long>(counts.created), static_cast<unsigned long long>(counts.recopies), static_cast<unsigned long long>(counts.demoted), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.candidates), static_cast<unsigned long long>(counts.refusedBudget), static_cast<unsigned long long>(counts.fills), static_cast<unsigned long long>(counts.stagedFills), static_cast<double>(counts.filledBytes) / 1048576.0);
+    std::fprintf(stderr, "[mirrors] input mirrors: %llu live (%.0f MiB of %llu MiB), %llu hits, %llu created, %llu recopied, %llu demoted, %llu evicted, %llu candidates, %llu refused by budget, %llu fills (%llu staged, %.0f MiB) in %llu prelude submissions, %llu recorded in the batch\n", static_cast<unsigned long long>(counts.liveEntries), static_cast<double>(counts.liveBytes) / 1048576.0, static_cast<unsigned long long>(mirrorBudget() >> 20u), static_cast<unsigned long long>(counts.hits), static_cast<unsigned long long>(counts.created), static_cast<unsigned long long>(counts.recopies), static_cast<unsigned long long>(counts.demoted), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.candidates), static_cast<unsigned long long>(counts.refusedBudget), static_cast<unsigned long long>(counts.fills), static_cast<unsigned long long>(counts.stagedFills), static_cast<double>(counts.filledBytes) / 1048576.0, static_cast<unsigned long long>(counts.preludes), static_cast<unsigned long long>(counts.inBatchFills));
 }
 
-void verifyMirror(const Context& context, Recorder& recorder, VkCommandBuffer commands, const std::shared_ptr<Entry>& entry) {
+void verifyMirror(const Context& context, Recorder& recorder, const std::shared_ptr<Entry>& entry) {
     const auto readback = std::make_shared<Buffer>(context, entry->bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     auto expected = std::make_shared<std::vector<std::byte>>(entry->bytes);
     GuestMemory::Read(entry->address, *expected);
+    const auto commands = recorder.Commands();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     CopyBuffer(context, commands, entry->buffer->Handle(), 0, readback->Handle(), 0, entry->bytes);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT);
@@ -168,37 +175,205 @@ void verifyMirror(const Context& context, Recorder& recorder, VkCommandBuffer co
     });
 }
 
-void fill(const Context& context, Recorder& recorder, const std::shared_ptr<Entry>& entry) {
-    bool dirty = false;
-    std::uint64_t generation = 0;
-    {
-        auto& cache = Mirrors();
-        std::lock_guard lock(cache.mutex);
-        dirty = entry->dirty;
-        entry->dirty = false;
-        generation = entry->generation;
+struct FillSource {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    std::shared_ptr<Buffer> staged;
+};
+
+FillSource fillSource(const Context& context, const Entry& entry) {
+    FillSource source;
+    if (const auto* import = ExistingHostImportFor(context, entry.address, entry.bytes)) {
+        source.buffer = import->buffer;
+        source.offset = HostImportOffset(*import, entry.address);
+        return source;
     }
-    recorder.Keep(entry->buffer, entry->bytes);
-    const bool verify = InputMirrorsVerified() && !recorder.PendingWriteOverlaps(entry->address, entry->bytes) && GuestMemory::CollectWrites(entry->address, entry->bytes) != 0 && GuestMemory::UnchangedSince(entry->address, entry->bytes, generation);
-    if (!dirty && !verify) return;
+    source.staged = std::make_shared<Buffer>(context, entry.bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    GuestMemory::Read(entry.address, source.staged->Bytes());
+    source.buffer = source.staged->Handle();
+    Counts().stagedFills.fetch_add(1, std::memory_order_relaxed);
+    return source;
+}
+
+void recordCopy(const Context& context, VkCommandBuffer commands, const Entry& entry, FillSource& source, std::vector<std::shared_ptr<void>>& kept) {
+    CopyBuffer(context, commands, source.buffer, source.offset, entry.buffer->Handle(), 0, entry.bytes);
+    if (source.staged != nullptr) kept.push_back(std::move(source.staged));
+    kept.push_back(entry.buffer);
+    Counts().fills.fetch_add(1, std::memory_order_relaxed);
+    Counts().filledBytes.fetch_add(entry.bytes, std::memory_order_relaxed);
+}
+
+constexpr VkAccessFlags FillSourceWrites = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+constexpr VkAccessFlags FillReaders = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+
+struct PreludeBatch {
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    std::vector<std::shared_ptr<void>> kept;
+};
+
+struct Preludes {
+    std::optional<Context> context;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    std::deque<PreludeBatch> inFlight;
+    std::vector<PreludeBatch> spare;
+};
+
+Preludes& PreludeState() {
+    static auto* state = new Preludes;
+    return *state;
+}
+
+void resetPreludes(Preludes& state) {
+    for (auto& batch : state.inFlight) static_cast<void>(new std::vector<std::shared_ptr<void>>(std::move(batch.kept)));
+    state.context.reset();
+    state.pool = VK_NULL_HANDLE;
+    state.inFlight.clear();
+    state.spare.clear();
+}
+
+bool preludesEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_INPUT_MIRROR_PRELUDE") != nullptr;
+    return !disabled;
+}
+
+void reclaimPreludes(Preludes& state, bool wait) {
+    if (!state.context) return;
+    const auto& context = *state.context;
+    while (!state.inFlight.empty()) {
+        auto& front = state.inFlight.front();
+        if (wait) Check(context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &front.fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences input mirror prelude");
+        else if (context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, front.fence) != VK_SUCCESS) break;
+        Check(context.Function<PFN_vkResetFences>("vkResetFences")(context.device, 1, &front.fence), "vkResetFences input mirror prelude");
+        Check(context.Function<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(front.commands, 0), "vkResetCommandBuffer input mirror prelude");
+        front.kept.clear();
+        state.spare.push_back(std::move(front));
+        state.inFlight.pop_front();
+    }
+}
+
+PreludeBatch beginPrelude(const Context& context) {
+    auto& state = PreludeState();
+    if (!state.context || state.context->device != context.device) {
+        resetPreludes(state);
+        state.context.emplace(context);
+        VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        info.queueFamilyIndex = context.queueFamily;
+        Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &info, nullptr, &state.pool), "vkCreateCommandPool input mirror prelude");
+    }
+    reclaimPreludes(state, false);
+    PreludeBatch batch;
+    if (!state.spare.empty()) {
+        batch = std::move(state.spare.back());
+        state.spare.pop_back();
+    } else {
+        VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, state.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, &batch.commands), "vkAllocateCommandBuffers input mirror prelude");
+        VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fence, nullptr, &batch.fence), "vkCreateFence input mirror prelude");
+    }
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(batch.commands, &begin), "vkBeginCommandBuffer input mirror prelude");
+    return batch;
+}
+
+void submitPrelude(const Context& context, PreludeBatch batch) {
+    Check(context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(batch.commands), "vkEndCommandBuffer input mirror prelude");
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &batch.commands;
+    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, batch.fence), "vkQueueSubmit input mirror prelude");
+    PreludeState().inFlight.push_back(std::move(batch));
+    Counts().preludes.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool writtenInBatch(Recorder& recorder, const Entry& entry) {
+    return recorder.PendingWriteOverlaps(entry.address, entry.bytes) || recorder.QueuedStoreOverlaps(entry.address, entry.bytes) || recorder.QueuedKeyStoreOverlaps(entry.address, entry.bytes) || recorder.PendingLabelIn(entry.address, entry.bytes);
+}
+
+void fillInBatch(const Context& context, Recorder& recorder, const std::shared_ptr<Entry>& entry) {
+    recorder.FlushStoresOverlapping(entry->address, entry->bytes);
+    recorder.FlushKeyStoresOverlapping(entry->address, entry->bytes);
+    auto source = fillSource(context, *entry);
+    const bool imported = source.staged == nullptr;
     const auto commands = recorder.Commands();
-    if (dirty) {
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        if (const auto* import = ExistingHostImportFor(context, entry->address, entry->bytes)) {
-            CopyBuffer(context, commands, import->buffer, HostImportOffset(*import, entry->address), entry->buffer->Handle(), 0, entry->bytes);
-            recorder.NotePendingRead(entry->address, entry->bytes, Recorder::ReadKind::GpuCopy);
-        } else {
-            auto staged = std::make_shared<Buffer>(context, entry->bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            GuestMemory::Read(entry->address, staged->Bytes());
-            CopyBuffer(context, commands, staged->Handle(), 0, entry->buffer->Handle(), 0, entry->bytes);
-            recorder.Keep(staged, entry->bytes);
-            Counts().stagedFills.fetch_add(1, std::memory_order_relaxed);
-        }
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
-        Counts().fills.fetch_add(1, std::memory_order_relaxed);
-        Counts().filledBytes.fetch_add(entry->bytes, std::memory_order_relaxed);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, FillSourceWrites, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    std::vector<std::shared_ptr<void>> kept;
+    recordCopy(context, commands, *entry, source, kept);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, FillReaders);
+    for (auto& object : kept) recorder.Keep(std::move(object), entry->bytes);
+    if (imported) recorder.NotePendingRead(entry->address, entry->bytes, Recorder::ReadKind::GpuCopy);
+    Counts().inBatchFills.fetch_add(1, std::memory_order_relaxed);
+}
+
+void fillInPrelude(const Context& context, Recorder& recorder, std::span<const std::shared_ptr<Entry>> entries) {
+    std::vector<FillSource> sources;
+    sources.reserve(entries.size());
+    for (const auto& entry : entries) sources.push_back(fillSource(context, *entry));
+    auto batch = beginPrelude(context);
+    RecordMemoryBarrier(context, batch.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, FillSourceWrites, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    std::vector<std::pair<std::uint64_t, std::size_t>> reads;
+    for (std::size_t at = 0; at < entries.size(); ++at) {
+        const auto& entry = entries[at];
+        if (sources[at].staged == nullptr) reads.emplace_back(entry->address, entry->bytes);
+        recordCopy(context, batch.commands, *entry, sources[at], batch.kept);
+        Counts().preludeFills.fetch_add(1, std::memory_order_relaxed);
     }
-    if (verify) verifyMirror(context, recorder, commands, entry);
+    RecordMemoryBarrier(context, batch.commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, FillReaders);
+    submitPrelude(context, std::move(batch));
+    for (const auto& [address, bytes] : reads) recorder.NotePendingRead(address, bytes, Recorder::ReadKind::GpuCopy);
+}
+
+void fill(const Context& context, Recorder& recorder, const std::shared_ptr<Entry>& entry) {
+    const bool prelude = preludesEnabled() && context.queue != VK_NULL_HANDLE && GuestMemory::GpuMutex().HeldByThisThread() && !Recorder::OnSecondaryRecorder();
+    std::vector<std::shared_ptr<Entry>> dirty;
+    std::uint64_t generation = 0;
+    auto& cache = Mirrors();
+    {
+        std::lock_guard lock(cache.mutex);
+        generation = entry->generation;
+        if (prelude) {
+            for (auto& pending : cache.pendingFills) {
+                if (pending->dirty && pending != entry) {
+                    pending->dirty = false;
+                    dirty.push_back(std::move(pending));
+                }
+            }
+            cache.pendingFills.clear();
+        }
+        if (entry->dirty) {
+            entry->dirty = false;
+            dirty.push_back(entry);
+        }
+    }
+    std::vector<std::shared_ptr<Entry>> early;
+    std::vector<std::shared_ptr<Entry>> later;
+    bool selfInBatch = false;
+    const auto openBatch = recorder.Submissions() + 1;
+    for (auto& candidate : dirty) {
+        if (!prelude || writtenInBatch(recorder, *candidate) || candidate->verifiedInBatch == openBatch) {
+            if (candidate == entry) selfInBatch = true;
+            else later.push_back(std::move(candidate));
+        } else {
+            early.push_back(std::move(candidate));
+        }
+    }
+    if (!later.empty()) {
+        std::lock_guard lock(cache.mutex);
+        for (auto& pending : later) {
+            pending->dirty = true;
+            cache.pendingFills.push_back(std::move(pending));
+        }
+    }
+    if (!early.empty()) fillInPrelude(context, recorder, early);
+    if (selfInBatch) fillInBatch(context, recorder, entry);
+    recorder.Keep(entry->buffer, entry->bytes);
+    if (InputMirrorsVerified() && !writtenInBatch(recorder, *entry) && GuestMemory::CollectWrites(entry->address, entry->bytes) != 0 && GuestMemory::UnchangedSince(entry->address, entry->bytes, generation)) {
+        entry->verifiedInBatch = openBatch;
+        verifyMirror(context, recorder, entry);
+    }
 }
 
 const HostImport* use(const Context& context, std::shared_ptr<Entry> entry, std::vector<std::function<void(Recorder&)>>* deferred) {
@@ -212,7 +387,7 @@ const HostImport* use(const Context& context, std::shared_ptr<Entry> entry, std:
 }
 
 std::shared_ptr<Entry> create(const Context& context, std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration) {
-    if (StorageTextureCacheBudget(context) < StorageImageFloor + bytes) {
+    if (context.memoryProperties2 != nullptr && context.physical != VK_NULL_HANDLE && StorageTextureCacheBudget(context) < StorageImageFloor + bytes) {
         auto& cache = Mirrors();
         std::lock_guard lock(cache.mutex);
         evictTo(cache, cache.liveBytes / 2);
@@ -248,6 +423,7 @@ std::shared_ptr<Entry> create(const Context& context, std::uint64_t address, std
     cache.entries.emplace(key, entry);
     cache.liveBytes += bytes;
     cache.candidates.erase(key);
+    cache.pendingFills.push_back(entry);
     Counts().created.fetch_add(1, std::memory_order_relaxed);
     return entry;
 }
@@ -294,6 +470,7 @@ const HostImport* MirrorDrawInput(const Context& context, std::uint64_t address,
             } else {
                 entry->generation = GuestMemory::CollectWrites(entry->address, entry->bytes);
                 entry->registryGeneration = registry;
+                if (!entry->dirty) cache.pendingFills.push_back(entry);
                 entry->dirty = true;
                 entry->hitsSinceCopy = 0;
                 cache.recency.splice(cache.recency.end(), cache.recency, entry->recent);
@@ -338,6 +515,9 @@ InputMirrorCounts InputMirrorCounters() {
     result.stagedFills = counts.stagedFills.load(std::memory_order_relaxed);
     result.filledBytes = counts.filledBytes.load(std::memory_order_relaxed);
     result.verified = counts.verified.load(std::memory_order_relaxed);
+    result.preludes = counts.preludes.load(std::memory_order_relaxed);
+    result.preludeFills = counts.preludeFills.load(std::memory_order_relaxed);
+    result.inBatchFills = counts.inBatchFills.load(std::memory_order_relaxed);
     auto& cache = Mirrors();
     std::lock_guard lock(cache.mutex);
     result.liveEntries = cache.entries.size();
@@ -346,12 +526,24 @@ InputMirrorCounts InputMirrorCounters() {
 }
 
 void ClearInputMirrors() {
+    auto& state = PreludeState();
+    if (state.context) {
+        reclaimPreludes(state, true);
+        const auto& context = *state.context;
+        for (auto& batch : state.spare) {
+            context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, batch.fence, nullptr);
+            context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, state.pool, 1, &batch.commands);
+        }
+        context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, state.pool, nullptr);
+        resetPreludes(state);
+    }
     auto& cache = Mirrors();
     std::lock_guard lock(cache.mutex);
     cache.entries.clear();
     cache.recency.clear();
     cache.candidates.clear();
     cache.liveBytes = 0;
+    cache.pendingFills.clear();
     ThreadPins() = Pins{};
 }
 

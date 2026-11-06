@@ -12626,6 +12626,7 @@ bool inputMirrorLifecycleTests(const Device& device, Recorder& recorder) {
             ClearInputMirrors();
         }
     } cleanup{recorder};
+    std::lock_guard gpu(GpuMutex());
     const auto fillPattern = [&](std::uint32_t seed) {
         auto* words = static_cast<std::uint32_t*>(watched);
         for (std::size_t at = 0; at < bytes / 4; ++at) words[at] = seed * 2654435761u + static_cast<std::uint32_t>(at);
@@ -12648,7 +12649,7 @@ bool inputMirrorLifecycleTests(const Device& device, Recorder& recorder) {
     Require(MirrorDrawInput(context, address, unit, 4, nullptr) == nullptr, "a range was mirrored at its first sighting");
     Require(MirrorDrawInput(context, address, unit - 4, 4, nullptr) == nullptr, "a range of another size was mirrored at its first sighting");
     const auto* created = MirrorDrawInput(context, address, unit, 4, nullptr);
-    Require(created != nullptr && created->base == address && created->bytes == unit && created->lead == 0, "an unchanged range was not mirrored at its second sighting");
+    Require(created != nullptr && created->base == address && created->bytes == unit && created->lead == 0, "an unchanged range was not mirrored at its second sighting (" + std::to_string(InputMirrorCounters().refusedBudget - start.refusedBudget) + " refused by the storage image budget, " + std::to_string(InputMirrorCounters().refusedAllocation - start.refusedAllocation) + " by allocation)");
     mirrored(created, address, unit, "the new mirror");
     const auto made = InputMirrorCounters();
     Require(made.created == start.created + 1 && made.fills == start.fills + 1 && made.stagedFills == start.stagedFills + 1, "the new mirror was not filled once from guest memory");
@@ -12681,13 +12682,22 @@ bool inputMirrorLifecycleTests(const Device& device, Recorder& recorder) {
     for (auto& keep : deferred) keep(recorder);
     Require(InputMirrorCounters().fills == beforeApply + 1, "the queued fill did not record the recopy");
     mirrored(deferredView, address, unit, "the mirror filled at emit");
+    const auto preluded = InputMirrorCounters();
+    Require(InputMirrorsVerified() || std::getenv("APS5_NO_INPUT_MIRROR_PRELUDE") != nullptr || preluded.inBatchFills == start.inBatchFills && preluded.preludeFills == preluded.fills - start.fills + start.preludeFills, "a mirror fill without a GPU write pending in the batch ended the open render pass instead of going to a prelude");
+    Require(MirrorDrawInput(context, address, unit, 4, nullptr) != nullptr, "the mirror filled at emit was not reused");
+    static_cast<std::uint32_t*>(watched)[300] = 7u;
+    recorder.NotePendingWrite(address + 1024, 16);
+    const auto* ordered = MirrorDrawInput(context, address, unit, 4, nullptr);
+    const auto behind = InputMirrorCounters();
+    Require(ordered != nullptr && behind.inBatchFills == preluded.inBatchFills + 1, "a recopy over a GPU write pending in the batch was not recorded in the batch behind it");
+    mirrored(ordered, address, unit, "the mirror recopied behind a pending GPU write");
     Require(MirrorDrawInput(context, address + unit, 4096, 4, nullptr) == nullptr, "a range below the mirror threshold was mirrored");
     auto unrecorded = context;
     unrecorded.recorder = nullptr;
     Require(MirrorDrawInput(unrecorded, address, unit, 4, nullptr) == nullptr, "a draw without a recorder bound a mirror");
     const auto done = InputMirrorCounters();
     if (InputMirrorsVerified()) Require(done.verified > start.verified, "APS5_VERIFY_INPUT_MIRRORS compared no mirror");
-    std::cout << "Input mirror lifecycle: " << done.created - start.created << " created, " << done.hits - start.hits << " hits, " << done.recopies - start.recopies << " recopies, " << done.demoted - start.demoted << " demoted, " << done.fills - start.fills << " fills, " << done.verified - start.verified << " verified\n";
+    std::cout << "Input mirror lifecycle: " << done.created - start.created << " created, " << done.hits - start.hits << " hits, " << done.recopies - start.recopies << " recopies, " << done.demoted - start.demoted << " demoted, " << done.fills - start.fills << " fills (" << done.preludeFills - start.preludeFills << " in " << done.preludes - start.preludes << " prelude submissions, " << done.inBatchFills - start.inBatchFills << " in the batch, each ending any open render pass), " << done.verified - start.verified << " verified\n";
     return true;
 }
 
@@ -12800,7 +12810,7 @@ bool vertexInputMirrorTests(const Device& device, Recorder& recorder) {
     const auto first = frame(16, "the first frame");
     Require(first.created == start.created && first.candidates >= start.candidates + 2, "a draw input was mirrored at its first sighting");
     const auto second = frame(16, "the frame that mirrors the inputs");
-    Require(second.created == first.created + 2 && second.fills == first.fills + 2 && second.liveEntries == 2, "the unchanged vertex and index ranges were not mirrored at their second sighting");
+    Require(second.created == first.created + 2 && second.fills == first.fills + 2 && second.liveEntries == 2, "the unchanged vertex and index ranges were not mirrored at their second sighting (" + std::to_string(second.created - first.created) + " created, " + std::to_string(second.refusedBudget - first.refusedBudget) + " refused by the storage image budget, " + std::to_string(second.candidates - first.candidates) + " new candidates)");
     const auto third = frame(16, "the frame drawn from the mirrors");
     Require(third.hits >= second.hits + 2 && third.fills == second.fills && third.created == second.created, "unchanged mirrors were not reused without a copy");
     writeVertices(0.75f);
@@ -12811,7 +12821,9 @@ bool vertexInputMirrorTests(const Device& device, Recorder& recorder) {
     Require(fifth.recopies == fourth.recopies + 1 && fifth.fills == fourth.fills + 1, "a written index range was not recopied into its mirror");
     writeIndices(true);
     const auto sixth = frame(24, "the frame after the indices were restored");
-    Require(sixth.recopies == fifth.recopies + 1 && sixth.hits >= fifth.hits + 1, "the restored index range was not recopied, or the vertex mirror was not reused");
+    Require(sixth.demoted == fifth.demoted + 1 && sixth.hits >= fifth.hits + 1, "an index range written in two frames running kept its mirror, or the vertex mirror was not reused");
+    const auto seventh = frame(24, "the frame after the index range settled");
+    Require(seventh.hits >= sixth.hits + 1, "the vertex mirror was not reused once the index range settled");
     for (std::uint32_t round = 0; round < 3; ++round) {
         writeVertices(round % 2 == 0 ? 0.5f : 0.75f);
         static_cast<void>(frame(round % 2 == 0 ? 16 : 24, "a frame of a vertex range written every frame"));
@@ -12819,7 +12831,7 @@ bool vertexInputMirrorTests(const Device& device, Recorder& recorder) {
     const auto churned = InputMirrorCounters();
     Require(churned.demoted >= sixth.demoted + 1, "a vertex range written before every use kept its mirror");
     if (InputMirrorsVerified()) Require(churned.verified > start.verified, "APS5_VERIFY_INPUT_MIRRORS compared no mirror");
-    std::cout << "Vertex input mirrors: " << churned.created - start.created << " created, " << churned.hits - start.hits << " hits, " << churned.recopies - start.recopies << " recopies, " << churned.demoted - start.demoted << " demoted, " << churned.fills - start.fills << " fills, " << churned.verified - start.verified << " verified\n";
+    std::cout << "Vertex input mirrors: " << churned.created - start.created << " created, " << churned.hits - start.hits << " hits, " << churned.recopies - start.recopies << " recopies, " << churned.demoted - start.demoted << " demoted, " << churned.fills - start.fills << " fills (" << churned.preludeFills - start.preludeFills << " in " << churned.preludes - start.preludes << " prelude submissions, " << churned.inBatchFills - start.inBatchFills << " in the batch), " << churned.verified - start.verified << " verified\n";
     return true;
 }
 
