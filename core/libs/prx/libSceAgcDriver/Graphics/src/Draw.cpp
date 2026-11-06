@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InputMirror.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -1426,6 +1427,9 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     }
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
+    if (!behind) {
+        if (const auto* mirror = MirrorDrawInput(context, address, bytes, alignment, memoKeeps)) return mirror;
+    }
     if (deferredReads != nullptr) deferredReads->emplace_back(address, bytes);
     else recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
     if (behindGpuWrite != nullptr && behind) *behindGpuWrite = true;
