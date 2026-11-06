@@ -31,6 +31,7 @@
 #include <atomic>
 #include <exception>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <string_view>
@@ -198,6 +199,97 @@ struct DrawStorageReturn {
 
 using DrawStorageHandle = std::unique_ptr<DrawTailStorage, DrawStorageReturn>;
 
+bool WorkerPools() {
+    static const bool enabled = std::getenv("APS5_NO_WORKER_POOLS") == nullptr;
+    return enabled;
+}
+
+template <typename T>
+class BlockPool {
+public:
+    static BlockPool& Get() {
+        static auto* pool = new BlockPool();
+        return *pool;
+    }
+
+    void* Take() {
+        if (WorkerPools()) {
+            std::lock_guard lock(mutex);
+            if (!free.empty()) {
+                void* block = free.back();
+                free.pop_back();
+                return block;
+            }
+        }
+        return ::operator new(sizeof(T), std::align_val_t{alignof(T)});
+    }
+
+    void Give(void* block) noexcept {
+        if (WorkerPools()) {
+            std::lock_guard lock(mutex);
+            if (free.size() < MostFree) {
+                free.push_back(block);
+                return;
+            }
+        }
+        ::operator delete(block, std::align_val_t{alignof(T)});
+    }
+
+private:
+    static constexpr std::size_t MostFree = 1024;
+
+    BlockPool() { free.reserve(MostFree); }
+
+    AgcDriver::Mutex mutex;
+    std::vector<void*> free;
+};
+
+template <typename T>
+struct PoolAllocator {
+    using value_type = T;
+
+    PoolAllocator() = default;
+    template <typename U>
+    PoolAllocator(const PoolAllocator<U>&) noexcept {}
+
+    T* allocate(std::size_t count) {
+        if (count != 1) return static_cast<T*>(::operator new(count * sizeof(T), std::align_val_t{alignof(T)}));
+        return static_cast<T*>(BlockPool<T>::Get().Take());
+    }
+
+    void deallocate(T* block, std::size_t count) noexcept {
+        if (count != 1) {
+            ::operator delete(block, std::align_val_t{alignof(T)});
+            return;
+        }
+        BlockPool<T>::Get().Give(block);
+    }
+
+    template <typename U>
+    bool operator==(const PoolAllocator<U>&) const noexcept { return true; }
+};
+
+struct ShaderMemoryRelease {
+    void operator()(ShaderMemory* memory) const noexcept {
+        memory->~ShaderMemory();
+        BlockPool<ShaderMemory>::Get().Give(memory);
+    }
+};
+
+using ShaderMemoryHandle = std::unique_ptr<ShaderMemory, ShaderMemoryRelease>;
+
+template <typename... TArgs>
+ShaderMemoryHandle MakeShaderMemory(TArgs&&... args) {
+    auto& pool = BlockPool<ShaderMemory>::Get();
+    void* block = pool.Take();
+    try {
+        return ShaderMemoryHandle(new (block) ShaderMemory(std::forward<TArgs>(args)...));
+    } catch (...) {
+        pool.Give(block);
+        throw;
+    }
+}
+
 DrawStorageHandle AcquireDrawStorage() {
     if (DrawStoragePooled()) {
         auto& pool = drawStoragePool();
@@ -242,7 +334,8 @@ struct DrawTail {
     decltype(DrawTailStorage::linked)& linked = storage->linked;
     decltype(DrawTailStorage::vertexInfos)& vertexInfos = storage->vertexInfos;
     decltype(DrawTailStorage::decodeReads)& decodeReads = storage->decodeReads;
-    std::unique_ptr<ShaderMemory> shaderMemory;
+    ShaderMemoryHandle shaderMemory;
+    std::shared_ptr<DrawTail> self;
     decltype(DrawTailStorage::snapshots)& snapshots = storage->snapshots;
     decltype(DrawTailStorage::recipeStages)& recipeStages = storage->recipeStages;
     decltype(DrawTailStorage::results)& results = storage->results;
@@ -412,6 +505,36 @@ std::optional<HeldReason> writesBeyondTargets(const ShaderRecompiler::RecompileR
     return std::nullopt;
 }
 
+struct HeldWritesEntry {
+    std::shared_ptr<const DrawDecode> decode;
+    bool stored = false;
+    decltype(DrawFinisher::Pending::writes) writes;
+};
+
+struct HeldWritesMemo {
+    static constexpr std::size_t Entries = 16;
+    std::array<HeldWritesEntry, Entries> entries;
+};
+
+struct HeldWritesStorage {};
+
+decltype(DrawFinisher::Pending::writes) heldDrawWrites(const std::shared_ptr<const DrawDecode>& decode) {
+    if (!WorkerPools()) return DrawWriteRanges(decode->state, {}, ExactDrawWrites());
+    auto& memo = HostThreadLocal<HeldWritesMemo, HeldWritesStorage>();
+    auto& entry = memo.entries[(reinterpret_cast<std::uintptr_t>(decode.get()) >> 6u) % HeldWritesMemo::Entries];
+    if (entry.decode != decode) {
+        entry.decode = decode;
+        entry.stored = false;
+        entry.writes.clear();
+        return DrawWriteRanges(decode->state, {}, ExactDrawWrites());
+    }
+    if (!entry.stored) {
+        entry.writes = DrawWriteRanges(decode->state, {}, ExactDrawWrites());
+        entry.stored = true;
+    }
+    return entry.writes;
+}
+
 DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     DrawFinisher::Pending held;
     held.key = tail.drawKey;
@@ -462,7 +585,7 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
         }
     }
     noteHeld(HeldReason::Known);
-    held.writes = DrawWriteRanges(tail.decode->state, {}, ExactDrawWrites());
+    held.writes = heldDrawWrites(tail.decode);
     held.unknown = false;
     return held;
 }
@@ -471,6 +594,8 @@ bool EmptyIndirectSkip() {
     static const bool enabled = std::getenv("APS5_NO_EMPTY_INDIRECT_SKIP") == nullptr;
     return enabled;
 }
+
+struct UserPatchStorage {};
 
 struct CpuIndirectProgramsStorage {};
 
@@ -484,7 +609,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     DelayStage(DelayedStage::Worker);
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    auto tailHolder = std::make_shared<DrawTail>();
+    auto tailHolder = std::allocate_shared<DrawTail>(PoolAllocator<DrawTail>());
     auto& tail = *tailHolder;
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
@@ -578,7 +703,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& dataEntry = tail.dataEntry;
     auto& shapeKey = tail.shapeKey;
     std::uint64_t drawIdentity = 0, drawAlias = 0;
-    std::vector<DrawUserPatch> userPatches;
+    std::vector<DrawUserPatch> ownUserPatches;
+    auto& userPatches = WorkerPools() ? HostThreadLocal<std::vector<DrawUserPatch>, UserPatchStorage>() : ownUserPatches;
+    userPatches.clear();
+    DrawRelocationTrial* relocationTrial = nullptr;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::shared_ptr<const DrawRelocation> relocation;
@@ -591,6 +719,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             const auto known = drawRelocations.find(drawIdentity);
             if (known != drawRelocations.end()) {
                 auto& trial = drawRelocationTrials[drawIdentity];
+                relocationTrial = &trial;
                 if (trial.idle != 0) --trial.idle;
                 else relocation = known->second;
                 aliasFirst = relocation != nullptr && trial.productive;
@@ -602,10 +731,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             bool cached = false;
             if (DrawFinisher::Overlap()) {
                 std::lock_guard peekLock(drawCacheMutex);
-                cached = !DrawFinisher::LookupDrainsEvery() && drawCache.contains(drawKey);
+                std::optional<bool> keyPresent;
+                const auto present = [&] {
+                    if (!WorkerPools()) return drawCache.contains(drawKey);
+                    if (!keyPresent) keyPresent = drawCache.contains(drawKey);
+                    return *keyPresent;
+                };
+                cached = !DrawFinisher::LookupDrainsEvery() && present();
                 if (drawDataHits()) {
                     const auto shape = drawShapes.find(shapeKey);
-                    shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
+                    shapeMatters = !present() && (shape == drawShapes.end() || !drawCache.contains(shape->second));
                 }
             }
             static const bool targeted = std::getenv("APS5_NO_TARGETED_LOOKUP_WAIT") == nullptr;
@@ -639,7 +774,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
             if (relocation != nullptr) {
-                auto& trial = drawRelocationTrials[drawIdentity];
+                auto& trial = WorkerPools() && relocationTrial != nullptr ? *relocationTrial : drawRelocationTrials[drawIdentity];
                 const auto flips = flipsCounted.load(std::memory_order_relaxed);
                 if (trial.lookups++ == 0) trial.windowFlip = flips;
                 if (trial.lookups >= DrawRelocationTrial::Window && (!poolRelocationEnabled() || flips - trial.windowFlip >= DrawRelocationTrial::WindowFlips)) {
@@ -813,7 +948,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowDecode);
     }
     auto& shaderMemory = tail.shaderMemory;
-    shaderMemory = std::make_unique<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
+    shaderMemory = MakeShaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
     auto& results = tail.results;
     auto& compiledStages = tail.compiledStages;
     compiledStages.reserve(programs.size());
@@ -866,7 +1001,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (drawHit || verifyHit) {
             ++drawRelocationCounters.hits;
             if (rebasedStages) ++drawRelocationCounters.rebasedHits;
-            ++drawRelocationTrials[drawIdentity].hits;
+            ++(WorkerPools() && relocationTrial != nullptr ? *relocationTrial : drawRelocationTrials[drawIdentity]).hits;
             if (const auto alias = drawAliases.find(drawAlias); alias != drawAliases.end()) {
                 const auto donor = drawCache.find(alias->second);
                 if (donor != drawCache.end() && drawCacheHits - donor->second->touched > drawCacheEntries() / 8) {
@@ -940,9 +1075,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         noteFinisherHandOff(true);
         DrawFinisher::Pending held;
         if (DrawFinisher::Overlap()) held = heldWrites(tail);
-        DrawFinisher::Get().EnqueuePrepared([this, tailHolder] {
+        const auto finishOnFinisher = [this](DrawTail& job) {
             DelayStage(DelayedStage::Finisher);
-            auto& job = *tailHolder;
             DrawPipeline::FollowEpoch(job.epoch);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
             PerformanceTimer finishTiming("Driver.DrawFinish");
@@ -952,7 +1086,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
                 throw std::runtime_error("draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + " (finished on the draw finisher): " + error.what());
             }
-        }, std::move(held));
+        };
+        DrawFinisher::Job work;
+        if (WorkerPools()) {
+            tail.self = tailHolder;
+            work = [finishOnFinisher, raw = &tail] {
+                const auto owner = std::move(raw->self);
+                finishOnFinisher(*raw);
+            };
+        } else {
+            work = [finishOnFinisher, tailHolder] { finishOnFinisher(*tailHolder); };
+        }
+        DrawFinisher::Get().EnqueuePrepared(std::move(work), std::move(held));
         timing.Mark("draw_handed_off");
         return drawn();
     }
