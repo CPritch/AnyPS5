@@ -225,13 +225,36 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
     return false;
 }
 
+ListedRegisters Submission::FindRegisterList(std::size_t cursor) const {
+    if (!FlatRegisterLists()) {
+        const auto found = registerLists.find(cursor);
+        if (found == registerLists.end()) return {};
+        return {found->second, true, Pm4::IndirectRegistersValid(found->second)};
+    }
+    const auto found = std::lower_bound(registerListIndex.begin(), registerListIndex.end(), cursor, [](const RegisterListEntry& entry, std::size_t at) { return entry.cursor < at; });
+    if (found == registerListIndex.end() || found->cursor != cursor) return {};
+    return RegisterListOf(*found);
+}
+
 void Driver::readRegisterLists(Submission& submission) {
     submission.registerLists.clear();
+    submission.registerListIndex.clear();
+    submission.registerListWords.clear();
+    const bool flat = FlatRegisterLists();
     for (std::size_t cursor = 0; cursor < submission.commands.size(); cursor += Pm4::PacketWords(submission.commands[cursor])) {
         const auto header = submission.commands[cursor];
         if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
         try {
-            submission.registerLists.emplace(cursor, Pm4::ReadIndirectRegisters(std::span<const std::uint32_t>(submission.commands).subspan(cursor, Pm4::PacketWords(header))));
+            const auto packet = std::span<const std::uint32_t>(submission.commands).subspan(cursor, Pm4::PacketWords(header));
+            if (flat) {
+                auto& words = submission.registerListWords;
+                const auto first = words.size();
+                Pm4::AppendIndirectRegisters(packet, words);
+                const auto listed = words.size() - first;
+                submission.registerListIndex.push_back({cursor, first, listed, Pm4::IndirectRegistersValid(std::span<const std::uint32_t>(words).subspan(first, listed))});
+            } else {
+                submission.registerLists.emplace(cursor, Pm4::ReadIndirectRegisters(packet));
+            }
         } catch (const std::exception& error) {
             throw std::runtime_error("AGC driver: " + Pm4::Name(header) + " at DWORD " + std::to_string(cursor) + ": " + error.what());
         }
@@ -356,8 +379,8 @@ std::vector<std::uint64_t> BoundGraphicsPrograms(const Submission& submission) {
         if (!Pm4::FillerPacket(header) && opcode == 0x76 && count > 2 && !Pm4::IsTagMarker(packet)) {
             for (std::size_t index = 2; index < count; ++index) note((packet[1] & ~0x70000000u) + static_cast<std::uint32_t>(index - 2), packet[index]);
         } else if (!Pm4::FillerPacket(header) && opcode == 0x63) {
-            if (const auto found = submission.registerLists.find(cursor); found != submission.registerLists.end()) {
-                for (std::size_t index = 0; index + 1 < found->second.size(); index += 2) note(found->second[index] & ~0x70000000u, found->second[index + 1]);
+            if (const auto found = submission.FindRegisterList(cursor); found.found) {
+                for (std::size_t index = 0; index + 1 < found.pairs.size(); index += 2) note(found.pairs[index] & ~0x70000000u, found.pairs[index + 1]);
             }
         }
         flush();

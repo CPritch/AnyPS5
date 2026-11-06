@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <utility>
 
 namespace AgcDriver::DriverDetail {
@@ -156,6 +157,26 @@ private:
     decltype(Submission::flips)::const_iterator at;
 };
 
+class RegisterListCursor {
+public:
+    explicit RegisterListCursor(const Submission& submission) : submission(submission) {}
+
+    ListedRegisters At(std::size_t cursor) {
+        const auto& index = submission.registerListIndex;
+        if (FlatRegisterLists()) {
+            while (at < index.size() && index[at].cursor < cursor) ++at;
+            if (at < index.size() && index[at].cursor == cursor) return submission.RegisterListOf(index[at]);
+        }
+        const auto found = submission.FindRegisterList(cursor);
+        if (!found.found) throw std::out_of_range("indirect register packet has no register list read at submission");
+        return found;
+    }
+
+private:
+    const Submission& submission;
+    std::size_t at = 0;
+};
+
 bool& drawnSinceSeal() {
     static thread_local bool drawn = false;
     return drawn;
@@ -288,6 +309,7 @@ void Driver::execute(const Submission& submission) {
     }
     PacketHistory recent{submission.commands};
     FlipCursor flipAt{submission};
+    RegisterListCursor registerListAt{submission};
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
@@ -620,9 +642,11 @@ void Driver::execute(const Submission& submission) {
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
                 if (Pm4::IndirectRegisterOpcode(opcode)) {
-                    const auto& listed = submission.registerLists.at(cursor);
-                    if (Pm4::IndirectRegistersValid(listed)) {
-                        Pm4::ExecuteIndirectRegisters(packet, listed, queue);
+                    const auto registerList = registerListAt.At(cursor);
+                    const auto listed = registerList.pairs;
+                    if (registerList.valid) {
+                        if (FlatRegisterLists()) Pm4::ExecuteValidatedIndirectRegisters(packet, listed, queue);
+                        else Pm4::ExecuteIndirectRegisters(packet, listed, queue);
                     } else {
                         landPendingWaits(submission.queue);
                         recordQueuedLabelsBeforeRead(submission.queue);
