@@ -19,6 +19,8 @@
 #include <atomic>
 #include <array>
 #include <utility>
+#include <stdexcept>
+#include <memory>
 
 namespace AgcDriver::DriverDetail {
 
@@ -34,21 +36,41 @@ std::uint64_t AlignedWord(std::uint32_t word) {
 // A relocated copy's V# base words read again at their runs' new addresses, and the result fields they and the
 // moved user words feed (VariantRebase). False when a base is unmapped, null or moved off its 4-byte alignment:
 // then the bound address could not be what a capture at the new address binds.
-bool RebaseMovedFields(DispatchVariant& copy, const DispatchVariant& variant, std::uint64_t moved, std::span<const std::pair<std::uint32_t, std::uint32_t>> movedValues) {
+bool RebaseMovedFields(DispatchVariant& copy, const DispatchVariant& variant, std::uint64_t moved, std::span<const std::pair<std::uint32_t, std::uint32_t>> movedValues, bool batch) {
+    constexpr std::size_t WindowWords = 1024;
+    thread_local std::array<std::uint32_t, WindowWords> window;
     std::size_t offset = 0;
     auto next = variant.movableWords.begin();
+    const auto rebaseWord = [&](std::uint32_t position, std::uint32_t live) {
+        const auto kept = variant.words[position];
+        if (live == 0 || kept == 0 || ((live ^ kept) & 3u) != 0) return false;
+        copy.words[position] = live;
+        return true;
+    };
     for (std::size_t run = 0; run < copy.runs.size() && next != variant.movableWords.end(); ++run) {
         const auto count = static_cast<std::size_t>((copy.runs[run].second - copy.runs[run].first) / sizeof(std::uint32_t));
         const auto base = run < copy.runBases.size() ? copy.runBases[run] : std::int8_t {-1};
         const bool shifted = base >= 0 && (moved >> base & 1u) != 0;
-        for (; next != variant.movableWords.end() && *next < offset + count; ++next) {
-            if (*next < offset || !shifted) continue;
-            std::uint32_t live = 0;
-            const auto address = copy.runs[run].first + (*next - offset) * sizeof(std::uint32_t);
-            if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(&live, 1))) != GuestMemory::Compare::Equal) return false;
-            const auto kept = variant.words[*next];
-            if (live == 0 || kept == 0 || ((live ^ kept) & 3u) != 0) return false;
-            copy.words[*next] = live;
+        auto first = next;
+        while (next != variant.movableWords.end() && *next < offset + count) ++next;
+        if (shifted) {
+            while (first != next && *first < offset) ++first;
+            if (batch && next - first >= 2 && static_cast<std::size_t>(*(next - 1) - *first) < WindowWords) {
+                const auto span = static_cast<std::size_t>(*(next - 1) - *first) + 1u;
+                const auto address = copy.runs[run].first + (*first - offset) * sizeof(std::uint32_t);
+                if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(window).first(span))) == GuestMemory::Compare::Equal) {
+                    for (auto at = first; at != next; ++at) {
+                        if (!rebaseWord(*at, window[*at - *first])) return false;
+                    }
+                    first = next;
+                }
+            }
+            for (; first != next; ++first) {
+                std::uint32_t live = 0;
+                const auto address = copy.runs[run].first + (*first - offset) * sizeof(std::uint32_t);
+                if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(&live, 1))) != GuestMemory::Compare::Equal) return false;
+                if (!rebaseWord(*first, live)) return false;
+            }
         }
         offset += count;
     }
@@ -488,6 +510,141 @@ void Driver::learnPendingRelocation(const DrawRelocationPending& pending) {
     drawAliases[pending.alias] = pending.key;
 }
 
+namespace {
+
+struct RelocationMove {
+    std::size_t program;
+    std::uint32_t index, from, to;
+};
+
+struct RelocationMoveSet {
+    std::uint64_t words = 0;
+    std::array<std::uint64_t, 64> delta;
+    std::array<std::uint32_t, 64> to;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> values;
+};
+
+bool inPlaceRelocation() {
+    static const bool enabled = std::getenv("APS5_NO_INPLACE_RELOCATION") == nullptr;
+    return enabled;
+}
+
+constexpr std::size_t MaxRecycledVariants = 4096;
+constexpr std::size_t MaxRecycledEntries = 1024;
+constexpr std::size_t RecycleProbes = 32;
+
+template <typename T, typename Tag>
+class RecyclingRing {
+public:
+    struct Slot {
+        std::shared_ptr<T> object;
+        Tag tag;
+    };
+
+    Slot* Acquire(std::size_t capacity) {
+        const auto probes = std::min(slots.size(), RecycleProbes);
+        for (std::size_t probe = 0; probe < probes; ++probe) {
+            auto& slot = slots[cursor];
+            cursor = cursor + 1 == slots.size() ? 0 : cursor + 1;
+            if (slot.object.use_count() == 1) return &slot;
+        }
+        if (slots.size() >= capacity) return nullptr;
+        slots.push_back({std::make_shared<T>(), Tag{}});
+        return &slots.back();
+    }
+
+private:
+    std::vector<Slot> slots;
+    std::size_t cursor = 0;
+};
+
+struct NoTag {};
+
+using RecycledVariants = RecyclingRing<DispatchVariant, std::weak_ptr<const DispatchVariant>>;
+using RecycledEntries = RecyclingRing<DrawEntry, NoTag>;
+
+bool SameOwner(const std::weak_ptr<const DispatchVariant>& from, const std::shared_ptr<DispatchVariant>& donor) {
+    return !from.owner_before(donor) && !donor.owner_before(from) && !from.expired();
+}
+
+void SeedFromDonor(DispatchVariant& copy, const DispatchVariant& variant, bool sameDonor) {
+    copy.runs.assign(variant.runs.begin(), variant.runs.end());
+    copy.runBases.assign(variant.runBases.begin(), variant.runBases.end());
+    copy.relocatableWords = variant.relocatableWords;
+    copy.valueWords = variant.valueWords;
+    copy.valueSlots.assign(variant.valueSlots.begin(), variant.valueSlots.end());
+    copy.calleeWords = variant.calleeWords;
+    copy.calleeReads.assign(variant.calleeReads.begin(), variant.calleeReads.end());
+    if (sameDonor && copy.words.size() == variant.words.size()) {
+        for (const auto position : variant.movableWords) copy.words[position] = variant.words[position];
+    } else {
+        copy.words.assign(variant.words.begin(), variant.words.end());
+    }
+    copy.forgetSerial = variant.forgetSerial;
+    copy.compiled = variant.compiled;
+    copy.meshIndexDescriptor = variant.meshIndexDescriptor;
+    copy.shader = variant.shader;
+    copy.dataPositions.assign(variant.dataPositions.begin(), variant.dataPositions.end());
+    copy.dataSlots.assign(variant.dataSlots.begin(), variant.dataSlots.end());
+    copy.flatBinding = variant.flatBinding;
+    copy.pushOffset = variant.pushOffset;
+    copy.vertexInfo = variant.vertexInfo;
+    copy.shared.clear();
+    copy.registeredViews.reset();
+    copy.recipe.store(nullptr);
+    copy.userDataMask = ~std::uint64_t {0};
+    copy.memory.reset();
+    copy.captured.clear();
+    copy.spans.clear();
+    copy.generation.store(0);
+    copy.shaderDataPatches.clear();
+    copy.descriptorPatches.clear();
+    copy.movableWords.clear();
+    copy.rebases.clear();
+    copy.rebasedWords.clear();
+}
+
+void ApplyIndexedMoves(DispatchVariant& copy, const DispatchVariant& variant, const RelocationMoveSet& set) {
+    for (std::size_t run = 0; run < copy.runs.size() && run < copy.runBases.size(); ++run) {
+        const auto base = copy.runBases[run];
+        if (base < 0 || base >= 64 || (set.words >> base & 1u) == 0) continue;
+        copy.runs[run].first += set.delta[static_cast<std::size_t>(base)];
+        copy.runs[run].second += set.delta[static_cast<std::size_t>(base)];
+    }
+    const auto& forwarded = variant.compiled->shaderDataUserWords;
+    const auto patchesBefore = copy.shaderDataPatches.size();
+    for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
+        const auto word = forwarded[slot];
+        if (word < 64 && (set.words >> word & 1u) != 0) copy.shaderDataPatches.emplace_back(slot, set.to[word]);
+    }
+    std::stable_sort(copy.shaderDataPatches.begin() + static_cast<std::ptrdiff_t>(patchesBefore), copy.shaderDataPatches.end(), [&](const auto& left, const auto& right) { return forwarded[left.first] < forwarded[right.first]; });
+    for (const auto& [index, binding, word] : variant.valueSlots) {
+        if (index < 64 && (set.words >> index & 1u) != 0) copy.descriptorPatches.push_back({binding, word, set.to[index]});
+    }
+}
+
+const char* DifferingField(const DispatchVariant& a, const DispatchVariant& b) {
+    const auto sameRebased = [](const RebasedWord& x, const RebasedWord& y) { return x.kind == y.kind && x.target == y.target && x.word == y.word && x.value == y.value; };
+    if (a.runs != b.runs) return "runs";
+    if (a.runBases != b.runBases) return "run bases";
+    if (a.words != b.words) return "words";
+    if (a.relocatableWords != b.relocatableWords || a.valueWords != b.valueWords || a.calleeWords != b.calleeWords) return "tagged words";
+    if (a.valueSlots != b.valueSlots) return "value slots";
+    if (a.calleeReads != b.calleeReads) return "callee reads";
+    if (a.forgetSerial != b.forgetSerial || a.pushOffset != b.pushOffset || a.flatBinding != b.flatBinding || a.userDataMask != b.userDataMask) return "scalars";
+    if (a.compiled != b.compiled || a.shader != b.shader || a.vertexInfo != b.vertexInfo || a.registeredViews != b.registeredViews || a.memory != b.memory) return "shared state";
+    if (a.meshIndexDescriptor != b.meshIndexDescriptor) return "mesh index descriptor";
+    if (a.dataPositions != b.dataPositions || a.dataSlots != b.dataSlots) return "data positions";
+    if (a.shaderDataPatches != b.shaderDataPatches) return "shader data patches";
+    if (a.descriptorPatches != b.descriptorPatches) return "descriptor patches";
+    if (a.movableWords != b.movableWords || !a.rebases.empty() != !b.rebases.empty()) return "movable words";
+    if (!std::equal(a.rebasedWords.begin(), a.rebasedWords.end(), b.rebasedWords.begin(), b.rebasedWords.end(), sameRebased)) return "rebased words";
+    if (!a.shared.empty() || !b.shared.empty() || !a.captured.empty() || !b.captured.empty() || !a.spans.empty() || !b.spans.empty() || a.recipe.load() != b.recipe.load() || a.generation.load() != b.generation.load()) return "leftover state";
+    return nullptr;
+}
+
+}
+
 void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches) {
     static const bool indexedMoves = std::getenv("APS5_NO_RELOCATE_INDEX") == nullptr;
     auto& counters = drawRelocationCounters;
@@ -503,11 +660,9 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
     const auto donor = cached->second;
     const auto& programs = donor->decode->programs;
     if (donor->stages.size() != programs.size()) return;
-    struct Move {
-        std::size_t program;
-        std::uint32_t index, from, to;
-    };
-    std::vector<Move> moves;
+    using Move = RelocationMove;
+    thread_local std::vector<Move> moves;
+    moves.clear();
     for (std::size_t i = 0; i < programs.size(); ++i) {
         const auto& program = programs[i];
         for (std::uint32_t index = program.hiddenUserWords; index < program.userData.size(); ++index) {
@@ -517,33 +672,46 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
     }
     if (moves.empty()) return;
     ++counters.donors;
-    auto relocated = std::make_shared<DrawEntry>();
-    relocated->decode = donor->decode;
+    const bool inPlace = indexedMoves && inPlaceRelocation();
+    const bool verify = inPlace && verifyDrawDataHits();
+    thread_local RecycledVariants recycledVariants;
+    thread_local RecycledEntries recycledEntries;
+    std::shared_ptr<DrawEntry> relocated;
+    if (inPlace) {
+        if (auto* slot = recycledEntries.Acquire(MaxRecycledEntries)) {
+            relocated = slot->object;
+            for (auto& stage : relocated->stages) stage.clear();
+            relocated->decode = donor->decode;
+            relocated->recipes.store(nullptr);
+            relocated->touched = 0;
+            relocated->shape = 0;
+            relocated->order = {};
+        }
+    }
+    if (relocated == nullptr) {
+        relocated = std::make_shared<DrawEntry>();
+        relocated->decode = donor->decode;
+    }
     relocated->stages.resize(donor->stages.size());
+    thread_local RelocationMoveSet set;
     for (std::size_t i = 0; i < donor->stages.size(); ++i) {
         const bool moved = std::any_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program == i; });
         if (!moved) {
             relocated->stages[i] = donor->stages[i];
             continue;
         }
-        std::uint64_t movedWords = 0;
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> movedValues;
-        std::array<std::uint64_t, 64> movedDelta{};
-        std::array<std::uint32_t, 64> movedTo{};
+        set.words = 0;
+        set.values.clear();
         for (const auto& move : moves) {
             if (move.program != i || move.index >= 64) continue;
-            movedWords |= std::uint64_t {1} << move.index;
-            movedValues.emplace_back(move.index, move.to);
-            movedDelta[move.index] = AlignedWord(move.to) - AlignedWord(move.from);
-            movedTo[move.index] = move.to;
+            set.words |= std::uint64_t {1} << move.index;
+            set.values.emplace_back(move.index, move.to);
+            set.delta[move.index] = AlignedWord(move.to) - AlignedWord(move.from);
+            set.to[move.index] = move.to;
         }
-        for (const auto& variant : donor->stages[i]) {
-            if (variant == nullptr || variant->compiled == nullptr) continue;
-            const bool allowed = std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program != i || (move.index < 64 && move.from != 0 && move.to != 0 && ((((variant->relocatableWords | variant->calleeWords) >> move.index & 1u) != 0 && ((move.from ^ move.to) & 3u) == 0) || (variant->valueWords >> move.index & 1u) != 0)); });
-            if (!allowed) {
-                ++counters.refused;
-                continue;
-            }
+        const auto movedWords = set.words;
+        const auto& movedValues = set.values;
+        const auto buildFresh = [&](const std::shared_ptr<DispatchVariant>& variant) {
             auto copy = std::make_shared<DispatchVariant>();
             copy->runs = variant->runs;
             copy->runBases = variant->runBases;
@@ -563,22 +731,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->pushOffset = variant->pushOffset;
             copy->vertexInfo = variant->vertexInfo;
             if (indexedMoves) {
-                for (std::size_t run = 0; run < copy->runs.size() && run < copy->runBases.size(); ++run) {
-                    const auto base = copy->runBases[run];
-                    if (base < 0 || base >= 64 || (movedWords >> base & 1u) == 0) continue;
-                    copy->runs[run].first += movedDelta[static_cast<std::size_t>(base)];
-                    copy->runs[run].second += movedDelta[static_cast<std::size_t>(base)];
-                }
-                const auto& forwarded = variant->compiled->shaderDataUserWords;
-                const auto patchesBefore = copy->shaderDataPatches.size();
-                for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
-                    const auto word = forwarded[slot];
-                    if (word < 64 && (movedWords >> word & 1u) != 0) copy->shaderDataPatches.emplace_back(slot, movedTo[word]);
-                }
-                std::stable_sort(copy->shaderDataPatches.begin() + static_cast<std::ptrdiff_t>(patchesBefore), copy->shaderDataPatches.end(), [&](const auto& left, const auto& right) { return forwarded[left.first] < forwarded[right.first]; });
-                for (const auto& [index, binding, word] : variant->valueSlots) {
-                    if (index < 64 && (movedWords >> index & 1u) != 0) copy->descriptorPatches.push_back({binding, word, movedTo[index]});
-                }
+                ApplyIndexedMoves(*copy, *variant, set);
             } else {
                 for (const auto& move : moves) {
                     if (move.program != i) continue;
@@ -597,7 +750,36 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
                     }
                 }
             }
-            if ((!variant->movableWords.empty() || !variant->rebases.empty()) && !RebaseMovedFields(*copy, *variant, movedWords, movedValues)) {
+            return copy;
+        };
+        for (const auto& variant : donor->stages[i]) {
+            if (variant == nullptr || variant->compiled == nullptr) continue;
+            const bool allowed = std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program != i || (move.index < 64 && move.from != 0 && move.to != 0 && ((((variant->relocatableWords | variant->calleeWords) >> move.index & 1u) != 0 && ((move.from ^ move.to) & 3u) == 0) || (variant->valueWords >> move.index & 1u) != 0)); });
+            if (!allowed) {
+                ++counters.refused;
+                continue;
+            }
+            std::shared_ptr<DispatchVariant> copy;
+            if (inPlace) {
+                if (auto* slot = recycledVariants.Acquire(MaxRecycledVariants)) {
+                    const bool sameDonor = SameOwner(slot->tag, variant);
+                    slot->tag.reset();
+                    SeedFromDonor(*slot->object, *variant, sameDonor);
+                    ApplyIndexedMoves(*slot->object, *variant, set);
+                    slot->tag = variant;
+                    copy = slot->object;
+                }
+            }
+            const bool recycled = copy != nullptr;
+            if (!recycled) copy = buildFresh(variant);
+            const bool rebased = !((!variant->movableWords.empty() || !variant->rebases.empty()) && !RebaseMovedFields(*copy, *variant, movedWords, movedValues, recycled));
+            if (verify && recycled) {
+                auto check = buildFresh(variant);
+                const bool checked = !((!variant->movableWords.empty() || !variant->rebases.empty()) && !RebaseMovedFields(*check, *variant, movedWords, movedValues, false));
+                const char* differing = checked != rebased ? "rebase outcome" : rebased ? DifferingField(*copy, *check) : nullptr;
+                if (differing != nullptr) throw std::runtime_error(std::string("APS5_VERIFY_DRAW_DATA_HITS: an in-place relocated variant differs from a fresh copy in its ") + differing);
+            }
+            if (!rebased) {
                 ++counters.unreadBases;
                 continue;
             }
