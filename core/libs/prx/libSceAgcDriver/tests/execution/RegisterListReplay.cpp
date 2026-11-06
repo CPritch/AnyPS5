@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
@@ -227,6 +228,24 @@ void MeasureKeyWaits(InstructionCounter& counter) {
     std::printf("draw key waits: %llu of %d waited, %.1f us and %.0f instructions a wait\n", static_cast<unsigned long long>(waited), Rounds, static_cast<double>(ns) / Rounds / 1000.0, static_cast<double>(instructions) / Rounds);
 }
 
+void MeasureDecodeCopies(InstructionCounter& counter) {
+    DrawDecode source;
+    source.programs.resize(2);
+    for (auto& program : source.programs) program.userData.assign(40, 7u);
+    source.roles.resize(2);
+    source.state.colors.resize(2);
+    source.state.blends.resize(2);
+    constexpr int Copies = 20000;
+    std::array<std::shared_ptr<DrawDecode>, 64> held;
+    counter.Start();
+    for (int copy = 0; copy < Copies; ++copy) held[static_cast<std::size_t>(copy) % held.size()] = std::make_shared<DrawDecode>(source);
+    const auto fresh = counter.Stop();
+    counter.Start();
+    for (int copy = 0; copy < Copies; ++copy) *held[static_cast<std::size_t>(copy) % held.size()] = source;
+    const auto assigned = counter.Stop();
+    std::printf("decode copies: %.0f instructions a new copy, %.0f a copy into a kept decode\n", static_cast<double>(fresh) / Copies, static_cast<double>(assigned) / Copies);
+}
+
 }
 
 int main() {
@@ -253,6 +272,7 @@ int main() {
         if (counter.Available()) std::printf(", %.1f instructions a draw", static_cast<double>(instructions) / static_cast<double>(measured) / draws);
         std::printf(" (key 0x%016llx)\n", static_cast<unsigned long long>(key));
         MeasureKeyWaits(counter);
+        MeasureDecodeCopies(counter);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

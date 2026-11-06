@@ -603,6 +603,36 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
     return HostThreadLocal<std::unordered_map<std::uint64_t, bool>, CpuIndirectProgramsStorage>();
 }
 
+bool RecycledDecodes() {
+    static const bool enabled = std::getenv("APS5_NO_RECYCLED_DECODES") == nullptr;
+    return enabled;
+}
+
+struct RecycledDecodeSlots {
+    static constexpr std::size_t Slots = 128;
+    std::array<std::shared_ptr<DrawDecode>, Slots> slots;
+    std::size_t next = 0;
+};
+
+struct RecycledDecodeStorage {};
+
+std::shared_ptr<DrawDecode> CopyDecode(const DrawDecode& source) {
+    if (!RecycledDecodes()) return std::make_shared<DrawDecode>(source);
+    auto& recycled = HostThreadLocal<RecycledDecodeSlots, RecycledDecodeStorage>();
+    for (std::size_t probe = 0; probe < RecycledDecodeSlots::Slots; ++probe) {
+        auto& slot = recycled.slots[(recycled.next + probe) % RecycledDecodeSlots::Slots];
+        if (slot == nullptr || slot.use_count() != 1) continue;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        recycled.next = (recycled.next + probe + 1) % RecycledDecodeSlots::Slots;
+        *slot = source;
+        return slot;
+    }
+    auto& slot = recycled.slots[recycled.next];
+    recycled.next = (recycled.next + 1) % RecycledDecodeSlots::Slots;
+    slot = std::make_shared<DrawDecode>(source);
+    return slot;
+}
+
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
@@ -817,7 +847,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     phaseTiming.Phase(DrawRowKeyLookupValidate);
 
     if (dataEntry != nullptr) {
-        auto refreshed = std::make_shared<DrawDecode>(*dataEntry->decode);
+        auto refreshed = CopyDecode(*dataEntry->decode);
         for (auto& program : refreshed->programs) {
             ReadUserWords(queue, program, false);
             if (program.merged) InitializeMerged(queue, program, program.mergedPointer, program.mergedPointerRequired, false);
@@ -835,7 +865,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decode = std::move(refreshed);
     }
     if (decode != nullptr && !userPatches.empty() && verifyDrawRecipe()) {
-        auto patched = std::make_shared<DrawDecode>(*decode);
+        auto patched = CopyDecode(*decode);
         for (const auto& patch : userPatches) patched->programs.at(patch.program).userData.at(patch.index) = patch.value;
         decode = std::move(patched);
     }
@@ -1013,7 +1043,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
     }
     if (!userPatches.empty() && !drawHit) {
-        auto current = std::make_shared<DrawDecode>(*decode);
+        auto current = CopyDecode(*decode);
         for (const auto& patch : userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
         decode = std::move(current);
     }
