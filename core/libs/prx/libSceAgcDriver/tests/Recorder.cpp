@@ -12735,7 +12735,10 @@ bool vertexInputMirrorTests(const Device& device, Recorder& recorder) {
             HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
         }
     } cleanup{context, recorder, block};
-    if (HostImportFor(context, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) return false;
+    if (HostImportFor(context, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "skipped, the device's host imports are not write-watched, so no mirror can be validated by write stamps\n";
+        return false;
+    }
     const auto shader = [](auto& words, std::uint64_t variant) {
         ShaderRecompiler::RecompileResult program;
         program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
