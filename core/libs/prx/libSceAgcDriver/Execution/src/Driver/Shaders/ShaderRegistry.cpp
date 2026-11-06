@@ -693,6 +693,11 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     return std::memcmp(&used, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) == 0 || RelocatedRegisters(snapshot, used, registered) || RelocatedCopy(snapshot, used, registered) || FusedHullHeader(snapshot, used, registered);
 }
 
+std::uint64_t ShaderRegistry::NextSerial() {
+    static std::atomic<std::uint64_t> next{0};
+    return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 std::size_t ShaderRegistry::chunkFor(std::uint64_t address) const {
     const auto above = std::upper_bound(chunks.begin(), chunks.end(), address, [](std::uint64_t key, const std::shared_ptr<Chunk>& chunk) { return key < chunk->begin()->first; });
     return above == chunks.begin() ? 0u : static_cast<std::size_t>(above - chunks.begin()) - 1u;
@@ -728,6 +733,7 @@ const ShaderRegistry::mapped_type& ShaderRegistry::at(std::uint64_t address) con
 }
 
 ShaderRegistry::mapped_type& ShaderRegistry::operator[](std::uint64_t address) {
+    serial = NextSerial();
     if (chunks.empty()) chunks.push_back(std::make_shared<Chunk>());
     const auto index = chunks.front()->empty() ? 0u : chunkFor(address);
     auto& chunk = writable(index);
@@ -751,6 +757,7 @@ std::pair<ShaderRegistry::const_iterator, bool> ShaderRegistry::emplace(std::uin
 
 std::size_t ShaderRegistry::erase(std::uint64_t address) {
     if (!contains(address)) return 0;
+    serial = NextSerial();
     const auto index = chunkFor(address);
     auto& chunk = writable(index);
     chunk.erase(address);

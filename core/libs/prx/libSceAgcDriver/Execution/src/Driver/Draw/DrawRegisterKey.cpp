@@ -3,6 +3,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
@@ -31,6 +32,51 @@ const auto& registerMasks() {
         return result;
     }();
     return masks;
+}
+
+bool registryLookupMemo() {
+    static const bool enabled = std::getenv("APS5_NO_REGISTRY_LOOKUP_MEMO") == nullptr;
+    return enabled;
+}
+
+struct StageEntry {
+    const ShaderRegistry::mapped_type* snapshots = nullptr;
+    std::uint64_t offset = 0;
+};
+
+StageEntry lookupStage(const ShaderRegistry& registry, std::uint64_t address) {
+    auto it = registry.upper_bound(address);
+    if (it == registry.begin()) return {};
+    --it;
+    return {&it->second, address - it->first};
+}
+
+struct StageMemoSlot {
+    std::uint64_t serial = 0;
+    std::uint64_t address = 0;
+    StageEntry entry;
+};
+
+StageEntry resolveStage(const ShaderRegistry& registry, std::uint64_t address) {
+    if (!registryLookupMemo()) return lookupStage(registry, address);
+    constexpr std::size_t Slots = 256;
+    thread_local std::array<StageMemoSlot, Slots> memo{};
+    const auto serial = registry.Serial();
+    auto hash = (address ^ (serial * 0x9e3779b97f4a7c15ull)) * 0xbf58476d1ce4e5b9ull;
+    auto& slot = memo[static_cast<std::size_t>(hash >> 56u) % Slots];
+    if (slot.serial == serial && slot.address == address) {
+        static const bool verify = std::getenv("APS5_VERIFY_REGISTER_KEY") != nullptr;
+        if (verify) {
+            const auto fresh = lookupStage(registry, address);
+            if (fresh.snapshots != slot.entry.snapshots || fresh.offset != slot.entry.offset) {
+                std::fprintf(stderr, "APS5_VERIFY_REGISTER_KEY: the shader registry lookup memo for 0x%llx disagrees with the registry\n", static_cast<unsigned long long>(address));
+                std::abort();
+            }
+        }
+        return slot.entry;
+    }
+    slot = {serial, address, lookupStage(registry, address)};
+    return slot.entry;
 }
 
 template <typename TVisit>
@@ -92,11 +138,10 @@ std::uint64_t DrawShaderSetKey(const QueueState& queue, const ShaderRegistry& re
         const auto high = queue.shader.find(base + 1);
         if (low == queue.shader.end() || high == queue.shader.end()) { mix(0); continue; }
         const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
-        auto it = registry.upper_bound(address);
-        if (it == registry.begin()) { mix(1); continue; }
-        --it;
-        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
-        mix(address - it->first);
+        const auto stage = resolveStage(registry, address);
+        if (stage.snapshots == nullptr) { mix(1); continue; }
+        for (const auto& snapshot : *stage.snapshots) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        mix(stage.offset);
     }
     return key;
 }
@@ -119,14 +164,13 @@ std::uint64_t Driver::drawIdentityKey(const QueueState& queue, const ShaderRegis
         const auto resources = queue.shader.find(base + 3);
         mix(resources != queue.shader.end() ? resources->second : 0);
         const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
-        auto it = registry.upper_bound(address);
-        if (it == registry.begin()) {
+        const auto stage = resolveStage(registry, address);
+        if (stage.snapshots == nullptr) {
             mix(1);
             continue;
         }
-        --it;
-        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
-        mix(address - it->first);
+        for (const auto& snapshot : *stage.snapshots) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        mix(stage.offset);
     }
     return key == 0 ? 1 : key;
 }
@@ -176,17 +220,16 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
             continue;
         }
         const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
-        auto it = registry.upper_bound(address);
-        if (it == registry.begin()) {
+        const auto stage = resolveStage(registry, address);
+        if (stage.snapshots == nullptr) {
             mix(1);
             continue;
         }
-        --it;
-        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
-        mix(address - it->first);
+        for (const auto& snapshot : *stage.snapshots) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        mix(stage.offset);
         if (aliased) {
-            for (const auto& snapshot : it->second) mixOther(reinterpret_cast<std::uintptr_t>(snapshot.get()));
-            mixOther(address - it->first);
+            for (const auto& snapshot : *stage.snapshots) mixOther(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+            mixOther(stage.offset);
         }
     }
     if (shape != nullptr) *shape = shapeKey;
