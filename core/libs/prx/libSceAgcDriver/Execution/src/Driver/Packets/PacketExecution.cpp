@@ -136,6 +136,26 @@ bool sealsWriteOnly(std::span<const std::uint32_t> packet, std::uint32_t opcode)
     }
 }
 
+bool WorkerPools() {
+    static const bool enabled = std::getenv("APS5_NO_WORKER_POOLS") == nullptr;
+    return enabled;
+}
+
+class FlipCursor {
+public:
+    explicit FlipCursor(const Submission& submission) : flips(submission.flips), at(submission.flips.begin()) {}
+
+    bool Contains(std::size_t cursor) {
+        if (!WorkerPools()) return flips.contains(cursor);
+        while (at != flips.end() && at->first < cursor) ++at;
+        return at != flips.end() && at->first == cursor;
+    }
+
+private:
+    const decltype(Submission::flips)& flips;
+    decltype(Submission::flips)::const_iterator at;
+};
+
 bool& drawnSinceSeal() {
     static thread_local bool drawn = false;
     return drawn;
@@ -267,6 +287,7 @@ void Driver::execute(const Submission& submission) {
         }
     }
     PacketHistory recent{submission.commands};
+    FlipCursor flipAt{submission};
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
@@ -307,7 +328,7 @@ void Driver::execute(const Submission& submission) {
             if (DrawPipeline::Queue0().Overlaps(read.first, static_cast<std::size_t>(read.second - read.first))) DrawPipeline::Queue0().WaitWrittenAny(std::span(&read, 1), DrawPipeline::DrainReason::Packet, opcode);
         }
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
-            const bool queuesItem = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor);
+            const bool queuesItem = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !flipAt.Contains(cursor);
             const bool queuesLabel = queuesItem && labelPacketQueues(packet, opcode);
             const bool queuesDump = queuesItem && sampleDumpQueues(packet, opcode, submission.queue);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
@@ -323,7 +344,7 @@ void Driver::execute(const Submission& submission) {
         if (submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled()) noteRingPacket(submission.queue, submission.serial, opcode, header);
         PerformanceTimer timing("Driver.Packet");
         if (!predicated) noteLabelIssue(packet, submission.queue);
-        if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueSampleDumpPacket(packet, opcode, submission.queue))) {
+        if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !flipAt.Contains(cursor) && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueSampleDumpPacket(packet, opcode, submission.queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
             cursor = nextCursor;
@@ -438,7 +459,7 @@ void Driver::execute(const Submission& submission) {
         recent.Record(cursor);
         if (header == RenderingWaitPacketHeader) {
             timed(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
-        } else if (submission.flips.contains(cursor)) {
+        } else if (flipAt.Contains(cursor)) {
             if (opcode == 0x49) {
                 if (!wroteOnGpu) {
                     Pm4::Execute(packet, queue);
