@@ -1818,9 +1818,7 @@ bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, 
         using R = Graphics::PredictReason;
         const auto reason = Graphics::PredictPureReason(graphics, drawParameters, stages, result, multisampleFound);
         static const bool offerUnhinted = std::getenv("APS5_RESOLVE_OFFER_UNHINTED") != nullptr;
-        static const bool offerBuiltAhead = std::getenv("APS5_NO_AHEAD_TEMPLATE_LANE") == nullptr && Graphics::AheadTemplateBuilds();
-        const bool builtAhead = offerBuiltAhead && reason == R::NoHint && result != nullptr && result->built != nullptr;
-        const bool proofOnly = reason == R::ProofNotCurrent || reason == R::NoSlot || builtAhead || (offerUnhinted && (reason == R::NotLooked || reason == R::NoHint));
+        const bool proofOnly = reason == R::ProofNotCurrent || reason == R::NoSlot || (offerUnhinted && (reason == R::NotLooked || reason == R::NoHint));
         if (reason != R::Accepted && !proofOnly) return keep(E::KeptPredictor);
         if (proofOnly && result != nullptr && result->found != nullptr && (result->found.get() == currentTemplate || (nextTemplate != nullptr && result->found.get() == nextTemplate))) return keep(E::KeptCurrentTemplate);
     }

@@ -42,7 +42,6 @@ struct DrawAhead {
     std::uint64_t storeHash = 0;
     bool looked = false;
     std::shared_ptr<ShaderResources> found;
-    std::shared_ptr<ShaderResources> built;
     std::uint64_t proofAtLookup = 0;
     std::uint64_t pendingAtLookup = 0;
     bool movedPlanned = false;
@@ -61,8 +60,6 @@ std::string DrawAheadReport();
 bool DrawAheadDisabled();
 std::optional<CompileWait> DrawCompileWait(const State& state, std::span<const CompiledShader> shaders, const Recorder* recorder, bool lean);
 void ThrowInDrawAheadForTest(bool enabled);
-bool AheadTemplateBuilds();
-std::uint64_t CommitterTemplateBuilds();
 
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
