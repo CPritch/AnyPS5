@@ -3,9 +3,111 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+bool pooledDataHits() {
+    static const bool enabled = std::getenv("APS5_NO_POOLED_DATA_HITS") == nullptr;
+    return enabled;
+}
+
+constexpr std::size_t PooledDataSlots = 8192;
+constexpr std::size_t PooledDataBucket = 4;
+constexpr std::size_t PooledDataWays = 3;
+
+struct PooledDataWay {
+    std::vector<std::uint32_t> values;
+    std::shared_ptr<ShaderRecompiler::RecompileResult> result;
+};
+
+struct PooledDataSlot {
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> base;
+    std::uint32_t flatBinding = 0;
+    std::vector<std::uint32_t> slots;
+    std::array<PooledDataWay, PooledDataWays> ways;
+    std::size_t next = 0;
+    std::uint64_t stamp = 0;
+};
+
+bool PoolableDataHit(const DispatchVariant& variant) {
+    return !variant.dataPositions.empty() && variant.dataPositions.size() == variant.dataSlots.size() && variant.compiled != nullptr && variant.flatBinding < variant.compiled->bindings.size();
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> PooledDataResult(const DispatchVariant& variant, const std::vector<std::uint32_t>& words) {
+    thread_local std::vector<PooledDataSlot> table(PooledDataSlots);
+    thread_local std::vector<std::uint32_t> values;
+    values.clear();
+    for (const auto position : variant.dataPositions) values.push_back(words[position]);
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    hash = (hash ^ reinterpret_cast<std::uintptr_t>(variant.compiled.get())) * 0x100000001b3ull;
+    hash = (hash ^ variant.flatBinding) * 0x100000001b3ull;
+    for (const auto slot : variant.dataSlots) hash = (hash ^ slot) * 0x100000001b3ull;
+    thread_local std::uint64_t clock = 0;
+    auto* bucket = &table[static_cast<std::size_t>((hash ^ (hash >> 29u)) % (PooledDataSlots / PooledDataBucket)) * PooledDataBucket];
+    PooledDataSlot* chosen = nullptr;
+    for (std::size_t i = 0; i < PooledDataBucket && chosen == nullptr; ++i) {
+        if (bucket[i].base == variant.compiled && bucket[i].flatBinding == variant.flatBinding && bucket[i].slots == variant.dataSlots) chosen = &bucket[i];
+    }
+    if (chosen == nullptr) {
+        chosen = &bucket[0];
+        for (std::size_t i = 1; i < PooledDataBucket; ++i) {
+            if (bucket[i].stamp < chosen->stamp) chosen = &bucket[i];
+        }
+        *chosen = {};
+        chosen->base = variant.compiled;
+        chosen->flatBinding = variant.flatBinding;
+        chosen->slots = variant.dataSlots;
+    }
+    chosen->stamp = ++clock;
+    auto& pooled = *chosen;
+    for (auto& way : pooled.ways) {
+        if (way.result != nullptr && way.values == values) return way.result;
+    }
+    PooledDataWay* target = nullptr;
+    std::size_t index = pooled.next;
+    for (std::size_t probe = 0; probe < PooledDataWays && target == nullptr; ++probe) {
+        index = (pooled.next + probe) % PooledDataWays;
+        auto& way = pooled.ways[index];
+        if (way.result == nullptr || way.result.use_count() == 1) target = &way;
+    }
+    if (target == nullptr) {
+        index = pooled.next;
+        target = &pooled.ways[index];
+    }
+    pooled.next = index;
+    if (target->result == nullptr || target->result.use_count() != 1) {
+        target->result = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+        target->result->bindings.Patch(variant.flatBinding);
+    }
+    target->result->drawKeyMemo = ShaderRecompiler::ResultKeyMemo{};
+    auto& descriptor = target->result->bindings.Patch(variant.flatBinding).guestDescriptor;
+    for (std::size_t k = 0; k < variant.dataSlots.size(); ++k) {
+        if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = values[k];
+    }
+    target->values = values;
+    return target->result;
+}
+
+const char* DifferingResult(const ShaderRecompiler::RecompileResult& pooled, const ShaderRecompiler::RecompileResult& fresh) {
+    if (pooled.variantId != fresh.variantId) return "variant";
+    if (pooled.pushConstants != fresh.pushConstants) return "push constants";
+    if (pooled.bindings.size() != fresh.bindings.size()) return "bindings";
+    for (std::size_t index = 0; index < pooled.bindings.size(); ++index) {
+        const auto& a = pooled.bindings[index];
+        const auto& b = fresh.bindings[index];
+        if (a.kind != b.kind || a.role != b.role || a.binding != b.binding || a.count != b.count || a.guestDescriptor != b.guestDescriptor) return "bindings";
+    }
+    return nullptr;
+}
+
+}
 
 void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData) {
     using Role = ShaderRecompiler::ProgramRole;
@@ -164,7 +266,19 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             for (const auto& [position, value] : liveData) hit.words[position] = value;
                             regions.clear();
                             appendEntryRegions(*variant, regions, &hit.words);
-                            hit.compiled = patchDataWords(*variant, hit.words);
+                            const bool poolable = pooledDataHits() && PoolableDataHit(*variant);
+                            const bool relocatedPatches = !variant->shaderDataPatches.empty() || !variant->descriptorPatches.empty() || !variant->rebasedWords.empty();
+                            if (!poolable) {
+                                hit.compiled = patchDataWords(*variant, hit.words);
+                            } else if (relocatedPatches && !verifyDrawDataHits()) {
+                                hit.compiled = variant->compiled;
+                            } else {
+                                hit.compiled = PooledDataResult(*variant, hit.words);
+                                if (verifyDrawDataHits()) {
+                                    const auto fresh = patchDataWords(*variant, hit.words);
+                                    if (const char* differing = DifferingResult(*hit.compiled, *fresh)) throw std::runtime_error(std::string("APS5_VERIFY_DRAW_DATA_HITS: a pooled data hit differs from a fresh patch in its ") + differing);
+                                }
+                            }
                             ++dataStages;
                             dataWords += liveData.size();
                         }
