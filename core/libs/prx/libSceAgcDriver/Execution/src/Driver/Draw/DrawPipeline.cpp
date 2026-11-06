@@ -549,7 +549,9 @@ bool DrawFinisher::WaitPendingKey(std::uint64_t key, std::uint64_t shape) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher wait under the GPU lock");
     PerformanceTimer timing("DrawFinisher.WaitKey");
     const auto start = std::chrono::steady_clock::now();
-    SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) <= after; });
+    static const bool monitored = std::getenv("APS5_NO_KEY_WAIT_MONITOR") == nullptr;
+    if (monitored) IdleUntil(&ranJobs, HandoffSpinWindow(), [&] { return ranJobs.load(std::memory_order_acquire) >= target; });
+    else SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) <= after; });
     std::unique_lock lock(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return ranJobs >= target || failure != nullptr; });
