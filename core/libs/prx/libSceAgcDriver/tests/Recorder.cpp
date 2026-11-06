@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InputMirror.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -12605,6 +12606,220 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
     return true;
 }
 
+bool inputMirrorLifecycleTests(const Device& device, Recorder& recorder) {
+    if (!InputMirrorsEnabled(device.GetContext())) return false;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 2;
+    void* watched = AllocateWatched(bytes, unit);
+    if (watched == nullptr) return false;
+    struct Release {
+        void* watched;
+        ~Release() { ReleaseWatched(watched, bytes); }
+    } release{watched};
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    const auto address = reinterpret_cast<std::uint64_t>(watched);
+    struct Cleanup {
+        Recorder& recorder;
+        ~Cleanup() {
+            recorder.Sync();
+            ClearInputMirrors();
+        }
+    } cleanup{recorder};
+    const auto fillPattern = [&](std::uint32_t seed) {
+        auto* words = static_cast<std::uint32_t*>(watched);
+        for (std::size_t at = 0; at < bytes / 4; ++at) words[at] = seed * 2654435761u + static_cast<std::uint32_t>(at);
+    };
+    const auto mirrored = [&](const HostImport* view, std::uint64_t at, std::size_t length, const char* what) {
+        Require(view != nullptr, std::string(what) + ": no mirror was bound");
+        auto readback = std::make_shared<Buffer>(context, length, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, view->buffer, HostImportOffset(*view, at), readback->Handle(), 0, length);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(readback);
+        recorder.Sync();
+        readback->Invalidate();
+        Require(std::memcmp(readback->Bytes().data(), reinterpret_cast<const void*>(at), length) == 0, std::string(what) + ": the mirror's bytes differ from guest memory");
+    };
+    ClearInputMirrors();
+    fillPattern(1);
+    const auto start = InputMirrorCounters();
+    Require(MirrorDrawInput(context, address, unit, 4, nullptr) == nullptr, "a range was mirrored at its first sighting");
+    Require(MirrorDrawInput(context, address, unit - 4, 4, nullptr) == nullptr, "a range of another size was mirrored at its first sighting");
+    const auto* created = MirrorDrawInput(context, address, unit, 4, nullptr);
+    Require(created != nullptr && created->base == address && created->bytes == unit && created->lead == 0, "an unchanged range was not mirrored at its second sighting");
+    mirrored(created, address, unit, "the new mirror");
+    const auto made = InputMirrorCounters();
+    Require(made.created == start.created + 1 && made.fills == start.fills + 1 && made.stagedFills == start.stagedFills + 1, "the new mirror was not filled once from guest memory");
+    const auto* inner = MirrorDrawInput(context, address + 256, 4096, 4, nullptr);
+    Require(inner != nullptr && inner->buffer == created->buffer && HostImportOffset(*inner, address + 256) == 256, "a range inside a mirror did not bind the containing mirror");
+    Require(MirrorDrawInput(context, address + 2, 4096, 4, nullptr) == nullptr, "a misaligned range inside a mirror bound it");
+    const auto* again = MirrorDrawInput(context, address, unit, 4, nullptr);
+    Require(again != nullptr && again->buffer == created->buffer, "an unchanged mirror was not reused");
+    const auto reused = InputMirrorCounters();
+    Require(reused.hits >= made.hits + 2 && reused.fills == made.fills, "a mirror hit copied the range again");
+    mirrored(again, address, unit, "the reused mirror");
+    static_cast<std::uint32_t*>(watched)[100] = 0xdeadbeefu;
+    const auto* recopied = MirrorDrawInput(context, address, unit, 4, nullptr);
+    Require(recopied != nullptr && recopied->buffer == created->buffer, "a written mirror was not recopied in place");
+    const auto after = InputMirrorCounters();
+    Require(after.recopies == reused.recopies + 1 && after.fills == reused.fills + 1, "a CPU write did not recopy its mirror");
+    mirrored(recopied, address, unit, "the recopied mirror");
+    Require(MirrorDrawInput(context, address, unit, 4, nullptr) != nullptr, "the recopied mirror was not reused");
+    AgcDriver::GuestMemory::MarkWritten(address + 512, 4);
+    Require(MirrorDrawInput(context, address, unit, 4, nullptr) != nullptr && InputMirrorCounters().recopies == after.recopies + 1, "a stamped GPU write did not recopy the mirror");
+    static_cast<std::uint32_t*>(watched)[200] = 1u;
+    Require(MirrorDrawInput(context, address, unit, 4, nullptr) == nullptr && InputMirrorCounters().demoted == start.demoted + 1, "a range written before every use kept its mirror");
+    Require(MirrorDrawInput(context, address, unit, 4, nullptr) != nullptr, "the demoted range was not mirrored again once it stayed unchanged");
+    Require(MirrorDrawInput(context, address, unit, 4, nullptr) != nullptr, "the mirror made again was not reused");
+    std::vector<std::function<void(Recorder&)>> deferred;
+    fillPattern(2);
+    const auto* deferredView = MirrorDrawInput(context, address, unit, 4, &deferred);
+    Require(deferredView != nullptr && deferred.size() == 1, "a deferred use did not queue its fill");
+    const auto beforeApply = InputMirrorCounters().fills;
+    for (auto& keep : deferred) keep(recorder);
+    Require(InputMirrorCounters().fills == beforeApply + 1, "the queued fill did not record the recopy");
+    mirrored(deferredView, address, unit, "the mirror filled at emit");
+    Require(MirrorDrawInput(context, address + unit, 4096, 4, nullptr) == nullptr, "a range below the mirror threshold was mirrored");
+    auto unrecorded = context;
+    unrecorded.recorder = nullptr;
+    Require(MirrorDrawInput(unrecorded, address, unit, 4, nullptr) == nullptr, "a draw without a recorder bound a mirror");
+    const auto done = InputMirrorCounters();
+    if (InputMirrorsVerified()) Require(done.verified > start.verified, "APS5_VERIFY_INPUT_MIRRORS compared no mirror");
+    std::cout << "Input mirror lifecycle: " << done.created - start.created << " created, " << done.hits - start.hits << " hits, " << done.recopies - start.recopies << " recopies, " << done.demoted - start.demoted << " demoted, " << done.fills - start.fills << " fills, " << done.verified - start.verified << " verified\n";
+    return true;
+}
+
+bool vertexInputMirrorTests(const Device& device, Recorder& recorder) {
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0 || !InputMirrorsEnabled(device.GetContext())) return false;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 5;
+    constexpr std::uint32_t vertexCount = 4098;
+    constexpr std::uint32_t indexCount = 32772;
+    void* watched = AllocateWatched(bytes, unit);
+    if (watched == nullptr) return false;
+    struct Release {
+        void* watched;
+        ~Release() { ReleaseWatched(watched, bytes); }
+    } release{watched};
+    auto* block = static_cast<std::byte*>(watched);
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const auto vertices = address + unit;
+    const auto indices = address + 3 * unit;
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            ClearInputMirrors();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (HostImportFor(context, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) return false;
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program.variantId = variant;
+        return program;
+    };
+    auto vertex = shader(VERTEXRANGE_VERT_SPV, 203);
+    auto pixel = shader(COVER_FRAG_SPV, 204);
+    vertex.vertexAttributes = {ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(vertices), static_cast<std::uint32_t>(vertices >> 32u) | (16u << 16u), vertexCount, 77u << 12u}}, 0}};
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.color = {address, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {64, 64};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    AgcDriver::Pm4::DrawParameters draw{indices, indexCount, 2, 1, 0, true};
+    const auto writeVertices = [&](float offset) {
+        std::vector<float> data(vertexCount * 4, 0.0f);
+        for (std::uint32_t at = 0; at < vertexCount; ++at) data[at * 4] = offset;
+        std::memcpy(reinterpret_cast<void*>(vertices), data.data(), data.size() * sizeof(float));
+    };
+    const auto writeIndices = [&](bool triangle) {
+        std::vector<std::uint16_t> data(indexCount, 0);
+        const std::array<std::uint16_t, 3> pattern{0, 1, vertexCount - 1};
+        if (triangle) {
+            for (std::uint32_t at = 0; at < indexCount; ++at) data[at] = pattern[at % 3];
+        }
+        std::memcpy(reinterpret_cast<void*>(indices), data.data(), data.size() * sizeof(std::uint16_t));
+    };
+    const auto frame = [&](std::uint32_t edge, const char* what) {
+        std::vector<std::byte> cleared(64 * 64 * 4);
+        AgcDriver::GuestMemory::Write(address, cleared);
+        Draw(context, state, draw, shaders);
+        WaitForOptimizedPipelines(context.device);
+        std::vector<std::byte> texels(64 * 64 * 4);
+        ReadColorTarget(state.color, texels);
+        for (std::size_t y = 0; y < 64; ++y) {
+            for (std::size_t x = 0; x < 64; ++x) {
+                const auto expected = x < edge ? std::byte{0} : std::byte{255};
+                for (std::size_t channel = 0; channel < 4; ++channel) {
+                    if (texels[(y * 64 + x) * 4 + channel] != expected) throw std::runtime_error(std::string(what) + ": pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") is not the expected " + std::to_string(std::to_integer<unsigned>(expected)));
+                }
+            }
+        }
+        recorder.Sync();
+        return InputMirrorCounters();
+    };
+    ClearInputMirrors();
+    writeVertices(0.5f);
+    writeIndices(true);
+    const auto start = InputMirrorCounters();
+    const auto first = frame(16, "the first frame");
+    Require(first.created == start.created && first.candidates >= start.candidates + 2, "a draw input was mirrored at its first sighting");
+    const auto second = frame(16, "the frame that mirrors the inputs");
+    Require(second.created == first.created + 2 && second.fills == first.fills + 2 && second.liveEntries == 2, "the unchanged vertex and index ranges were not mirrored at their second sighting");
+    const auto third = frame(16, "the frame drawn from the mirrors");
+    Require(third.hits >= second.hits + 2 && third.fills == second.fills && third.created == second.created, "unchanged mirrors were not reused without a copy");
+    writeVertices(0.75f);
+    const auto fourth = frame(24, "the frame after a vertex write");
+    Require(fourth.recopies == third.recopies + 1 && fourth.fills == third.fills + 1 && fourth.hits >= third.hits + 1, "a written vertex range was not recopied into its mirror");
+    writeIndices(false);
+    const auto fifth = frame(64, "the frame after an index write");
+    Require(fifth.recopies == fourth.recopies + 1 && fifth.fills == fourth.fills + 1, "a written index range was not recopied into its mirror");
+    writeIndices(true);
+    const auto sixth = frame(24, "the frame after the indices were restored");
+    Require(sixth.recopies == fifth.recopies + 1 && sixth.hits >= fifth.hits + 1, "the restored index range was not recopied, or the vertex mirror was not reused");
+    for (std::uint32_t round = 0; round < 3; ++round) {
+        writeVertices(round % 2 == 0 ? 0.5f : 0.75f);
+        static_cast<void>(frame(round % 2 == 0 ? 16 : 24, "a frame of a vertex range written every frame"));
+    }
+    const auto churned = InputMirrorCounters();
+    Require(churned.demoted >= sixth.demoted + 1, "a vertex range written before every use kept its mirror");
+    if (InputMirrorsVerified()) Require(churned.verified > start.verified, "APS5_VERIFY_INPUT_MIRRORS compared no mirror");
+    std::cout << "Vertex input mirrors: " << churned.created - start.created << " created, " << churned.hits - start.hits << " hits, " << churned.recopies - start.recopies << " recopies, " << churned.demoted - start.demoted << " demoted, " << churned.fills - start.fills << " fills, " << churned.verified - start.verified << " verified\n";
+    return true;
+}
+
 std::uint64_t processPrivateBytes() {
 #ifdef _WIN32
     PROCESS_MEMORY_COUNTERS_EX counters{};
@@ -14454,6 +14669,12 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (argc == 2 && std::string_view(argv[1]) == "--input-mirror-lifecycle") {
+            return inputMirrorLifecycleTests(device, recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--vertex-input-mirror") {
+            return vertexInputMirrorTests(device, recorder) ? 0 : 77;
+        }
         if (argc == 2 && (std::string_view(argv[1]) == "--vertex-target-range-copied" || std::string_view(argv[1]) == "--vertex-target-range-imported")) {
             return vertexTargetRangeTests(device, recorder, std::string_view(argv[1]) == "--vertex-target-range-imported") ? 0 : 77;
         }
