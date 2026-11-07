@@ -650,6 +650,7 @@ if(WIN32 OR APPLE)
     endif()
 endif()
 
+include(cmake/FastBuild.cmake)
 add_subdirectory(core/shader/recompiler)
 add_subdirectory(core/Decoder/Jpeg)
 add_subdirectory(core/Decoder/Png)
