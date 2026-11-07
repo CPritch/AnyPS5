@@ -656,3 +656,7 @@ add_subdirectory(core/Decoder/Jpeg)
 add_subdirectory(core/Decoder/Png)
 add_subdirectory(core/libs)
 add_subdirectory(core/relinker)
+
+if(ANYPS5_LTO_ACTIVE)
+    anyps5_exclude_targets_from_lto("${CMAKE_SOURCE_DIR}")
+endif()
