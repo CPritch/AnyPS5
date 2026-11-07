@@ -132,6 +132,7 @@ Project switches accept `ON` or `OFF`:
 | `-DANYPS5_USE_SYSTEM_DEPS=ON`    | `OFF`   | Resolve SDL2, freetype, Vulkan-Headers, SPIRV-Headers, glslang and SPIRV-Tools from the system instead of the submodules. |
 | `-DANYPS5_RELINKER_CLI=OFF`     | `ON`    | Skip the native relinker command line (`ANYPS5_BUILD_WASM` turns it off). |
 | `-DANYPS5_NO_SEMANTIC_INTERPOSITION=OFF` | `ON` | Linux: compile the project's own targets with `-fno-semantic-interposition`, so a shared library's calls to its own exported functions are direct and inlinable instead of going through the PLT. Turn it off if something must override a library's exported function from outside at load time. |
+| `-DANYPS5_MARCH=<value>`          | `native` | Linux: compile the project's own targets with `-march=<value>` and `-ffp-contract=off`, which keeps floating-point results identical to a build without `-march` (no fused multiply-add). The binaries then run only on CPUs with the build machine's instruction sets. Set `-DANYPS5_MARCH=` (empty) for a portable build, or a fixed value such as `x86-64-v3`. |
 | `-DAPS5_ENABLE_TIMING_LOG=ON`    | `OFF`   | Compile frame timing logging.                    |
 | `-DAPS5_ENABLE_TRACY=ON`         | `OFF`   | Build the [Tracy](#tracy) profiler client into the agc driver. |
 | `-DAGC_BUILD_VISUAL_TEST=ON`     | `OFF`   | Build the standalone AGC SPIR-V visual test.     |

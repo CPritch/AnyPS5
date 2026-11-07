@@ -1,7 +1,11 @@
 option(ANYPS5_NO_SEMANTIC_INTERPOSITION "Compile the project's own targets with -fno-semantic-interposition on Linux" ON)
+set(ANYPS5_MARCH "native" CACHE STRING "Value of -march for the project's own targets on Linux; empty leaves the compiler default")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
     if(ANYPS5_NO_SEMANTIC_INTERPOSITION)
         add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fno-semantic-interposition>)
+    endif()
+    if(ANYPS5_MARCH)
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-march=${ANYPS5_MARCH}> $<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off>)
     endif()
 endif()
