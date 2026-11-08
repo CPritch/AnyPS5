@@ -1,0 +1,13 @@
+if(BUILD_TESTING)
+    agc_add_draw_pipeline_test(agc_driver_bda_templates)
+    foreach(agcBdaTemplatesMode IN ITEMS off verify)
+        add_test(NAME agc_driver_bda_templates_${agcBdaTemplatesMode} COMMAND agc_driver_bda_templates_tests)
+    endforeach()
+    set_tests_properties(agc_driver_bda_templates_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FAST_F16=0;APS5_FAST_F32=0;APS5_A2C_FALLBACK=0;APS5_DRAW_PIPELINE=0;APS5_PIPELINE_DISPATCH=0;APS5_NO_BDA_TEMPLATES=1")
+    set_tests_properties(agc_driver_bda_templates_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FAST_F16=0;APS5_FAST_F32=0;APS5_A2C_FALLBACK=0;APS5_DRAW_PIPELINE=0;APS5_PIPELINE_DISPATCH=0;APS5_VERIFY_BDA_TEMPLATES=1")
+    set_tests_properties(agc_driver_bda_templates agc_driver_bda_templates_draw_pipeline agc_driver_bda_templates_off agc_driver_bda_templates_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FATAL:" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_bda_templates_draw_pipeline agc_driver_bda_templates_off agc_driver_bda_templates_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
