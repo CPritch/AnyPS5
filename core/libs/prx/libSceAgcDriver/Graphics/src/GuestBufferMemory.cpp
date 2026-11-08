@@ -4955,6 +4955,61 @@ static bool importsUnchangedRange(const GuestAllocations::Lease& before, const G
     return low && high;
 }
 
+template<typename TSpace>
+static bool spaceUnchangedSince(const Context& context, const TSpace& held, HostImports& imports, std::uint64_t generation) {
+    if (!spacePatchEnabled() || !held.copied.empty() || held.mirrored || effectiveBudget(context, imports) != imports.refreshedBudget) return false;
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::uint64_t through = 0;
+    if (!GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(held.keptThrough.load(std::memory_order_acquire), &spans, &through)) return false;
+    for (const auto& [begin, end] : spans) {
+        const auto low = begin == 0 ? 0 : begin - 1;
+        const auto high = end == std::numeric_limits<std::uint64_t>::max() ? end : end + 1;
+        if (GuestAllocations::GuestAllocationsAnyGpuRange_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin))) return false;
+        const auto region = std::upper_bound(held.base.begin(), held.base.end(), low, [](std::uint64_t value, const auto& entry) { return value < entry.end; });
+        if (region != held.base.end() && region->begin < high) return false;
+        if (std::any_of(held.copied.begin(), held.copied.end(), [&](const auto& range) { return range.begin < high && low < range.end; })) return false;
+    }
+    GuestAllocations::Lease settled;
+    std::uint64_t settledAt = 0;
+    if (verifySpacePatch() && GuestAllocations::GuestAllocationsAcquireSettled_nid_no_patch(&settled, &settledAt) && settledAt == generation) {
+        for (const auto& range : settled) {
+            if (!range->gpu || !range->readable) continue;
+            const auto end = range->address + range->bytes;
+            const auto covers = [&](std::uint64_t first, std::uint64_t last) { return first <= range->address && end <= last; };
+            const bool held_ = std::any_of(held.base.begin(), held.base.end(), [&](const auto& entry) { return covers(entry.begin, entry.end); }) || std::any_of(held.copied.begin(), held.copied.end(), [&](const auto& entry) { return covers(entry.begin, entry.end); });
+            if (held_) continue;
+            std::fprintf(stderr, "FATAL: APS5_VERIFY_SPACE_PATCH: the address space kept across a change misses the GPU range 0x%llx+0x%llx\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes));
+            std::abort();
+        }
+    }
+    held.keptThrough.store(through, std::memory_order_release);
+    return true;
+}
+
+template<typename TSpace>
+static void stampSpaceUse(HostImports& state, const TSpace& current) {
+    const auto stamp = ++state.useCounter;
+    static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
+    auto& spaceUse = state.spaceUses[current.serial];
+    if (!stampOnce || spaceUse == 0) {
+        for (const auto& region : current.base) {
+            if (region.direct == nullptr) continue;
+            region.direct->lastUse = stamp;
+            if (stampOnce) region.direct->spaceSerial = current.serial;
+        }
+    }
+    spaceUse = stamp;
+    if (state.spaceUses.size() > 64) {
+        const auto oldest = std::min_element(state.spaceUses.begin(), state.spaceUses.end(), [](const auto& left, const auto& right) { return left.second < right.second; });
+        for (auto& [base, entry] : state.imports) {
+            if (entry.spaceSerial != oldest->first) continue;
+            entry.lastUse = std::max(entry.lastUse, oldest->second);
+            entry.spaceSerial = 0;
+        }
+        state.spaceUses.erase(oldest);
+    }
+}
+
 void GuestBufferMemory::AcquireRegistered() {
     struct BuildingScope {
         explicit BuildingScope(GuestBufferMemory* self) { buildingBufferMemory = self; }
@@ -4988,35 +5043,7 @@ void GuestBufferMemory::AcquireRegistered() {
     // Read before the lease below is acquired: a mutation ending in between leaves the space
     // stale by its generation, never newer than it (see AddressSpace).
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const auto spaceUntouched = [&](const AddressSpace& held, HostImports& imports) {
-        if (!spacePatchEnabled() || !held.copied.empty() || held.mirrored || effectiveBudget(context, imports) != imports.refreshedBudget) return false;
-        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
-        std::uint64_t through = 0;
-        if (!GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(held.keptThrough.load(std::memory_order_acquire), &spans, &through)) return false;
-        for (const auto& [begin, end] : spans) {
-            const auto low = begin == 0 ? 0 : begin - 1;
-            const auto high = end == std::numeric_limits<std::uint64_t>::max() ? end : end + 1;
-            if (GuestAllocations::GuestAllocationsAnyGpuRange_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin))) return false;
-            const auto region = std::upper_bound(held.base.begin(), held.base.end(), low, [](std::uint64_t value, const Region& entry) { return value < entry.end; });
-            if (region != held.base.end() && region->begin < high) return false;
-            if (std::any_of(held.copied.begin(), held.copied.end(), [&](const CopiedRange& range) { return range.begin < high && low < range.end; })) return false;
-        }
-        GuestAllocations::Lease settled;
-        std::uint64_t settledAt = 0;
-        if (verifySpacePatch() && GuestAllocations::GuestAllocationsAcquireSettled_nid_no_patch(&settled, &settledAt) && settledAt == generation) {
-            for (const auto& range : settled) {
-                if (!range->gpu || !range->readable) continue;
-                const auto end = range->address + range->bytes;
-                const auto covers = [&](std::uint64_t first, std::uint64_t last) { return first <= range->address && end <= last; };
-                const bool held_ = std::any_of(held.base.begin(), held.base.end(), [&](const Region& entry) { return covers(entry.begin, entry.end); }) || std::any_of(held.copied.begin(), held.copied.end(), [&](const CopiedRange& entry) { return covers(entry.begin, entry.end); });
-                if (held_) continue;
-                std::fprintf(stderr, "FATAL: APS5_VERIFY_SPACE_PATCH: the address space kept across a change misses the GPU range 0x%llx+0x%llx\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes));
-                std::abort();
-            }
-        }
-        held.keptThrough.store(through, std::memory_order_release);
-        return true;
-    };
+    const auto spaceUntouched = [&](const AddressSpace& held, HostImports& imports) { return spaceUnchangedSince(context, held, imports, generation); };
     if (addressSpaceCacheEnabled()) {
         auto current = spaces.current.load();
         bool hit = false;
@@ -5031,28 +5058,7 @@ void GuestBufferMemory::AcquireRegistered() {
             else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
             else hit = std::all_of(current->heapMirrors.begin(), current->heapMirrors.end(), keeps) && std::all_of(current->sparseMirrors.begin(), current->sparseMirrors.end(), keeps);
             importFloor = state.useCounter + 1;
-            if (hit) {
-                const auto stamp = ++state.useCounter;
-                static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
-                auto& spaceUse = state.spaceUses[current->serial];
-                if (!stampOnce || spaceUse == 0) {
-                    for (const auto& region : current->base) {
-                        if (region.direct == nullptr) continue;
-                        region.direct->lastUse = stamp;
-                        if (stampOnce) region.direct->spaceSerial = current->serial;
-                    }
-                }
-                spaceUse = stamp;
-                if (state.spaceUses.size() > 64) {
-                    const auto oldest = std::min_element(state.spaceUses.begin(), state.spaceUses.end(), [](const auto& left, const auto& right) { return left.second < right.second; });
-                    for (auto& [base, entry] : state.imports) {
-                        if (entry.spaceSerial != oldest->first) continue;
-                        entry.lastUse = std::max(entry.lastUse, oldest->second);
-                        entry.spaceSerial = 0;
-                    }
-                    state.spaceUses.erase(oldest);
-                }
-            }
+            if (hit) stampSpaceUse(state, *current);
         }
         if (hit) {
             for (auto* mirror : current->sparseMirrors) {
