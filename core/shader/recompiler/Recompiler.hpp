@@ -993,6 +993,21 @@ void SetResultMemoBudget(std::uint64_t bytes);
 [[nodiscard]] std::uint64_t ResultMemoBytes();
 void SetResultMemoTrimHook(std::function<void()> hook);
 
+struct SpecializationTotals {
+    std::uint64_t first = 0;
+    std::uint64_t firstNs = 0;
+    std::uint64_t respecialized = 0;
+    std::uint64_t respecializedNs = 0;
+    std::uint64_t served = 0;
+    std::uint64_t keptEntries = 0;
+    std::uint64_t keptBytes = 0;
+    std::uint64_t keptEvictions = 0;
+};
+
+[[nodiscard]] SpecializationTotals SpecializationCounts();
+void SetSpirvKeepBytes(std::uint64_t bytes);
+[[nodiscard]] std::uint64_t SpirvKeepBytes();
+
 // Debug aid (see DebugProbe in Translation/TranslationContext.hpp): the APS5_PROBE register probe is
 // only applied while a driver has it active, so it can be limited to one dispatch; the recompile
 // cache keys on it.

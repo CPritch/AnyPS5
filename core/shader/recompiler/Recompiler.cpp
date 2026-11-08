@@ -934,12 +934,116 @@ SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, 
     return {std::move(module), std::move(spirv)};
 }
 
+struct SpecializationCounters {
+    std::atomic<std::uint64_t> first{0};
+    std::atomic<std::uint64_t> firstNs{0};
+    std::atomic<std::uint64_t> respecialized{0};
+    std::atomic<std::uint64_t> respecializedNs{0};
+    std::atomic<std::uint64_t> served{0};
+};
+
+SpecializationCounters& specializationCounters() {
+    static SpecializationCounters counters;
+    return counters;
+}
+
+std::uint64_t elapsedNs(std::chrono::steady_clock::time_point started) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+}
+
+std::atomic<std::uint64_t>& spirvKeepBudgetBytes() {
+    static std::atomic<std::uint64_t> budget{[] {
+        if (std::getenv("APS5_NO_SPIRV_KEEP") != nullptr) return std::uint64_t{0};
+        const char* value = std::getenv("APS5_SPIRV_KEEP_MB");
+        const std::uint64_t megabytes = value == nullptr || *value == '\0' ? 128u : std::strtoull(value, nullptr, 10);
+        return megabytes << 20u;
+    }()};
+    return budget;
+}
+
+class SpirvKeep {
+public:
+    void Touch(const SpecializedModule* key, const SharedSpirv& spirv) {
+        const auto budget = spirvKeepBudgetBytes().load(std::memory_order_relaxed);
+        if (budget == 0u || spirv.empty()) return;
+        std::vector<SharedSpirv> released;
+        {
+            std::lock_guard lock(mutex);
+            const auto found = index.find(key);
+            if (found != index.end()) {
+                order.splice(order.begin(), order, found->second);
+                return;
+            }
+            const auto bytes = spirv.size() * sizeof(std::uint32_t);
+            order.push_front({key, spirv, bytes});
+            index.emplace(key, order.begin());
+            held += bytes;
+            while (held > budget && !order.empty()) {
+                auto& oldest = order.back();
+                held -= oldest.bytes;
+                index.erase(oldest.key);
+                released.push_back(std::move(oldest.spirv));
+                order.pop_back();
+                ++evictions;
+            }
+        }
+    }
+
+    void Trim() {
+        const auto budget = spirvKeepBudgetBytes().load(std::memory_order_relaxed);
+        std::vector<SharedSpirv> released;
+        std::lock_guard lock(mutex);
+        while (held > budget && !order.empty()) {
+            auto& oldest = order.back();
+            held -= oldest.bytes;
+            index.erase(oldest.key);
+            released.push_back(std::move(oldest.spirv));
+            order.pop_back();
+            ++evictions;
+        }
+    }
+
+    void Totals(SpecializationTotals& totals) {
+        std::lock_guard lock(mutex);
+        totals.keptEntries = order.size();
+        totals.keptBytes = held;
+        totals.keptEvictions = evictions;
+    }
+
+private:
+    struct Entry {
+        const SpecializedModule* key;
+        SharedSpirv spirv;
+        std::uint64_t bytes;
+    };
+
+    std::mutex mutex;
+    std::list<Entry> order;
+    std::unordered_map<const SpecializedModule*, std::list<Entry>::iterator> index;
+    std::uint64_t held = 0;
+    std::uint64_t evictions = 0;
+};
+
+SpirvKeep& spirvKeep() {
+    static SpirvKeep keep;
+    return keep;
+}
+
 SharedSpirv specializedWords(const SpecializedModule& module, const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     std::lock_guard lock(module.mutex);
-    if (auto spirv = module.spirv.Lock(); !spirv.empty()) return spirv;
+    auto& counters = specializationCounters();
+    if (auto spirv = module.spirv.Lock(); !spirv.empty()) {
+        counters.served.fetch_add(1, std::memory_order_relaxed);
+        spirvKeep().Touch(&module, spirv);
+        return spirv;
+    }
+    const auto started = std::chrono::steady_clock::now();
     auto spirv = InternSpirv(specializeWords(artifact, classes, constants, target));
     if (spirv.ContentHash() != module.hash) throw std::runtime_error("ShaderRecompiler: a specialized module built again from its key differs from its first build");
     module.spirv = spirv.Weaken();
+    counters.respecialized.fetch_add(1, std::memory_order_relaxed);
+    counters.respecializedNs.fetch_add(elapsedNs(started), std::memory_order_relaxed);
+    spirvKeep().Touch(&module, spirv);
     return spirv;
 }
 
@@ -972,7 +1076,12 @@ struct RegistrationModuleEntry {
 
 SharedSpirv lockedWords(const SpecializedModule& module) {
     std::lock_guard lock(module.mutex);
-    return module.spirv.Lock();
+    auto spirv = module.spirv.Lock();
+    if (!spirv.empty()) {
+        specializationCounters().served.fetch_add(1, std::memory_order_relaxed);
+        spirvKeep().Touch(&module, spirv);
+    }
+    return spirv;
 }
 
 SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<SpecializedSpirv()>& specialize) {
@@ -1086,7 +1195,12 @@ SpecializedSpirv specializeModule(const CompiledShaderArtifact& artifact, std::s
     SharedSpirv built;
     std::call_once(entry->ready, [&] {
         try {
+            const auto started = std::chrono::steady_clock::now();
             auto specialized = buildSpecializedModule(artifact, classes, constants, target);
+            auto& counters = specializationCounters();
+            counters.first.fetch_add(1, std::memory_order_relaxed);
+            counters.firstNs.fetch_add(elapsedNs(started), std::memory_order_relaxed);
+            spirvKeep().Touch(specialized.module.get(), specialized.spirv);
             entry->module = std::move(specialized.module);
             built = std::move(specialized.spirv);
         } catch (...) {
@@ -2237,6 +2351,27 @@ std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request
 void SetResultMemoBudget(std::uint64_t bytes) {
     resultMemoBudgetBytes().store(bytes, std::memory_order_relaxed);
     if (bytes != 0 && resultMemoCounters().heldBytes.load(std::memory_order_relaxed) > bytes) trimResultMemo(bytes);
+}
+
+SpecializationTotals SpecializationCounts() {
+    const auto& counters = specializationCounters();
+    SpecializationTotals totals;
+    totals.first = counters.first.load(std::memory_order_relaxed);
+    totals.firstNs = counters.firstNs.load(std::memory_order_relaxed);
+    totals.respecialized = counters.respecialized.load(std::memory_order_relaxed);
+    totals.respecializedNs = counters.respecializedNs.load(std::memory_order_relaxed);
+    totals.served = counters.served.load(std::memory_order_relaxed);
+    spirvKeep().Totals(totals);
+    return totals;
+}
+
+void SetSpirvKeepBytes(std::uint64_t bytes) {
+    spirvKeepBudgetBytes().store(bytes, std::memory_order_relaxed);
+    spirvKeep().Trim();
+}
+
+std::uint64_t SpirvKeepBytes() {
+    return spirvKeepBudgetBytes().load(std::memory_order_relaxed);
 }
 
 void SetResultMemoTrimHook(std::function<void()> hook) {

@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
+#include "Recompiler.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -106,11 +107,12 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         static VerifyCounts previousVerify{};
         static std::uint64_t previousDraws = 0, previousResolves = 0, previousBuilds = 0;
         static Graphics::ImportChurnCounts previousChurn = Graphics::ImportChurnTotals();
+        static ShaderRecompiler::SpecializationTotals previousSpecialization{};
         const auto draws = DrawPipeline::CommittedDraws(), resolves = DrawPipeline::OwnResolves(), builds = Graphics::DrawTemplateBuilds();
         const auto churn = Graphics::ImportChurnTotals();
         const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
         const auto micros = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>((now - before) / 1000u); };
-        char line[2048];
+        char line[4096];
         std::size_t used = static_cast<std::size_t>(std::snprintf(line, sizeof(line), "[present] %lld draws %llu own_resolves %llu template_builds %llu", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), static_cast<unsigned long long>(draws - previousDraws), static_cast<unsigned long long>(resolves - previousResolves), static_cast<unsigned long long>(builds - previousBuilds)));
         const auto field = [&](const char* name, unsigned long long value) {
             if (used < sizeof(line)) used += static_cast<std::size_t>(std::snprintf(line + used, sizeof(line) - used, " %s %llu", name, value));
@@ -151,6 +153,15 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         field("import_proofs_survived", delta(churn.proofsSurvived, previousChurn.proofsSurvived));
         field("import_map_unlocked", delta(churn.mapUnlocked, previousChurn.mapUnlocked));
         field("import_map_discarded", delta(churn.mapDiscarded, previousChurn.mapDiscarded));
+        const auto specialization = ShaderRecompiler::SpecializationCounts();
+        field("spec_first", delta(specialization.first, previousSpecialization.first));
+        field("spec_first_us", micros(specialization.firstNs, previousSpecialization.firstNs));
+        field("spec_respecialized", delta(specialization.respecialized, previousSpecialization.respecialized));
+        field("spec_respecialized_us", micros(specialization.respecializedNs, previousSpecialization.respecializedNs));
+        field("spec_served", delta(specialization.served, previousSpecialization.served));
+        field("spirv_kept_entries", specialization.keptEntries);
+        field("spirv_kept_bytes", specialization.keptBytes);
+        field("spirv_kept_evictions", delta(specialization.keptEvictions, previousSpecialization.keptEvictions));
         const auto verifyTotals = VerifyTotals();
         for (std::size_t index = 0; index < verifyTotals.size(); ++index) {
             if (VerifyRequested(static_cast<VerifyCount>(index))) field(VerifyFieldName(static_cast<VerifyCount>(index)), delta(verifyTotals[index], previousVerify[index]));
@@ -161,6 +172,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         previousResolves = resolves;
         previousBuilds = builds;
         previousChurn = churn;
+        previousSpecialization = specialization;
     }
     PerformanceContext timingContext(window.timing.get());
     PerformanceTimer timing("Driver.Present");
