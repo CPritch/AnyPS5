@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -78,7 +79,31 @@ void Driver::AttachWindow(const PresentationWindow& window) {
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, const DisplayBuffer* plane, bool opaque, void (*gpuReady)(void*), void* context) {
     if (PerformanceTrace::Configured()) PerformanceTrace::Present(window.width, window.height, device.Load().get());
     static const bool logged = std::getenv("APS5_LONG_WAIT_LOG") != nullptr;
+    if (AnyVerifyRequested()) {
+        static auto lastSummary = std::chrono::steady_clock::now();
+        static VerifyCounts previousSummary{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastSummary >= std::chrono::seconds(10)) {
+            lastSummary = now;
+            const auto totals = VerifyTotals();
+            char summary[1024];
+            std::size_t length = static_cast<std::size_t>(std::snprintf(summary, sizeof(summary), "[verify] 10 s:"));
+            for (std::size_t index = 0; index < totals.size() && length < sizeof(summary); ++index) {
+                if (!VerifyRequested(static_cast<VerifyCount>(index))) continue;
+                length += static_cast<std::size_t>(std::snprintf(summary + length, sizeof(summary) - length, " %s %llu", VerifyFieldName(static_cast<VerifyCount>(index)), static_cast<unsigned long long>(totals[index] - previousSummary[index])));
+            }
+            if (length < sizeof(summary)) length += static_cast<std::size_t>(std::snprintf(summary + length, sizeof(summary) - length, "; total:"));
+            for (std::size_t index = 0; index < totals.size() && length < sizeof(summary); ++index) {
+                if (!VerifyRequested(static_cast<VerifyCount>(index))) continue;
+                length += static_cast<std::size_t>(std::snprintf(summary + length, sizeof(summary) - length, " %s %llu", VerifyFieldName(static_cast<VerifyCount>(index)), static_cast<unsigned long long>(totals[index])));
+            }
+            std::fprintf(stderr, "%s\n", summary);
+            std::fflush(stderr);
+            previousSummary = totals;
+        }
+    }
     if (logged) {
+        static VerifyCounts previousVerify{};
         static std::uint64_t previousDraws = 0, previousResolves = 0, previousBuilds = 0;
         static Graphics::ImportChurnCounts previousChurn = Graphics::ImportChurnTotals();
         const auto draws = DrawPipeline::CommittedDraws(), resolves = DrawPipeline::OwnResolves(), builds = Graphics::DrawTemplateBuilds();
@@ -126,6 +151,11 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         field("import_proofs_survived", delta(churn.proofsSurvived, previousChurn.proofsSurvived));
         field("import_map_unlocked", delta(churn.mapUnlocked, previousChurn.mapUnlocked));
         field("import_map_discarded", delta(churn.mapDiscarded, previousChurn.mapDiscarded));
+        const auto verifyTotals = VerifyTotals();
+        for (std::size_t index = 0; index < verifyTotals.size(); ++index) {
+            if (VerifyRequested(static_cast<VerifyCount>(index))) field(VerifyFieldName(static_cast<VerifyCount>(index)), delta(verifyTotals[index], previousVerify[index]));
+        }
+        previousVerify = verifyTotals;
         std::fprintf(stderr, "%s\n", line);
         previousDraws = draws;
         previousResolves = resolves;

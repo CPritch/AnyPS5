@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StageDelay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -393,7 +394,7 @@ bool DrawPipeline::VerifyPendingWriteIndex() {
 
 namespace {
 void PendingIndexDisagrees(const char* query) {
-    std::fprintf(stderr, "[pending-write-index] APS5_VERIFY_PENDING_WRITE_INDEX: %s differs from the scan\n", query);
+    std::fprintf(stderr, "FATAL: APS5_VERIFY_PENDING_WRITE_INDEX: %s differs from the scan\n", query);
     std::fflush(stderr);
     std::abort();
 }
@@ -449,6 +450,7 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
         std::lock_guard lock(mutex);
         std::lock_guard index(indexLock);
         const bool indexed = pendingUnknown != 0 || pendingRanges.Overlaps(begin, end);
+        CountVerify(VerifyCount::PendingWriteIndexChecked);
         if (indexed != scan()) PendingIndexDisagrees("PendingOverlaps");
         return indexed;
     }
@@ -493,6 +495,7 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
         std::lock_guard lock(mutex);
         std::lock_guard index(indexLock);
         const bool indexed = pendingUnknown != 0 || pendingRanges.OverlapsAny(ranges);
+        CountVerify(VerifyCount::PendingWriteIndexChecked);
         if (indexed != scan()) PendingIndexDisagrees("PendingOverlapsAny");
         return indexed;
     }
@@ -537,6 +540,7 @@ bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
         std::lock_guard lock(mutex);
         std::lock_guard index(indexLock);
         const bool found = indexed();
+        CountVerify(VerifyCount::PendingWriteIndexChecked);
         if (found != (scanNewestKey(key, shape, nullptr) != 0)) PendingIndexDisagrees("PendingKey");
         return found;
     }
@@ -561,6 +565,7 @@ bool DrawFinisher::WaitPendingKey(std::uint64_t key, std::uint64_t shape) {
         indexed();
         std::size_t scannedAfter = 0;
         const auto scanned = scanNewestKey(key, shape, &scannedAfter);
+        CountVerify(VerifyCount::PendingWriteIndexChecked);
         if (scanned != target || scannedAfter != after) PendingIndexDisagrees("WaitPendingKey");
     } else {
         std::lock_guard index(indexLock);
@@ -2486,7 +2491,14 @@ bool DrawPipeline::WrittenSince(const Watch& watch, std::span<const Range> reads
         return answer != RetiredWrites::Answer::Clear;
     };
     const bool answer = indexed();
-    if (VerifyPendingWriteIndex() && answer != scan() && !overflowed) PendingIndexDisagrees("WrittenSince");
+    if (VerifyPendingWriteIndex()) {
+        if (overflowed) {
+            CountVerify(VerifyCount::PendingWriteIndexSkipped);
+        } else {
+            CountVerify(VerifyCount::PendingWriteIndexChecked);
+            if (answer != scan()) PendingIndexDisagrees("WrittenSince");
+        }
+    }
     return answer;
 }
 

@@ -3,6 +3,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StageDelay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
@@ -622,8 +623,12 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     if (DrawFinisher::RecycledHeldWrites() && WorkerPools()) {
         held.writes = DrawFinisher::TakeSpareWrites();
         heldDrawWritesInto(tail.writesSource != nullptr ? tail.writesSource : tail.decode, held.writes);
-        if (VerifyHeldWrites()) verifyHeldWrites(*tail.decode, held.writes);
+        if (VerifyHeldWrites()) {
+            CountVerify(VerifyCount::HeldWritesChecked);
+            verifyHeldWrites(*tail.decode, held.writes);
+        }
     } else {
+        if (VerifyRequested(VerifyCount::HeldWritesSkipped)) CountVerify(VerifyCount::HeldWritesSkipped);
         held.writes = heldDrawWrites(tail.decode);
     }
     held.unknown = false;

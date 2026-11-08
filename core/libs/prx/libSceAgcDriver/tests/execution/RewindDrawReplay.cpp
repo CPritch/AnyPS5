@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <optional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -203,6 +205,42 @@ void Compare(const char* what) {
     }
 }
 
+void RequireVerifyCounters() {
+    using namespace AgcDriver::DriverDetail;
+    struct Expectation {
+        VerifyCount which;
+        const char* disabledBy;
+        std::optional<VerifyCount> skippedWhenDisabled;
+    };
+    const std::array<Expectation, 5> expectations{{
+        {VerifyCount::PacketOverlapChecked, "APS5_NO_PACKET_OVERLAP_MEMO", VerifyCount::PacketOverlapSkipped},
+        {VerifyCount::HeldWritesChecked, "APS5_NO_RECYCLED_HELD_WRITES", VerifyCount::HeldWritesSkipped},
+        {VerifyCount::PendingWriteIndexChecked, "APS5_NO_PENDING_WRITE_INDEX", std::nullopt},
+        {VerifyCount::RegisterKeyMemoChecked, "APS5_NO_REGISTRY_LOOKUP_MEMO", std::nullopt},
+        {VerifyCount::RegisterKeyHashChecked, "APS5_NO_INCREMENTAL_REGISTER_KEY", VerifyCount::RegisterKeySkipped},
+    }};
+    const auto totals = VerifyTotals();
+    for (std::size_t index = 0; index < totals.size(); ++index) {
+        const auto which = static_cast<VerifyCount>(index);
+        const bool set = std::getenv(VerifySwitchName(which)) != nullptr;
+        Require(set == VerifyRequested(which), std::string(VerifyFieldName(which)) + " is requested differently from its switch " + VerifySwitchName(which));
+        if (!set) Require(totals[index] == 0, std::string(VerifyFieldName(which)) + " moved to " + std::to_string(totals[index]) + " with " + VerifySwitchName(which) + " unset");
+        std::printf("rewind draw replay: %s %llu (%s)\n", VerifyFieldName(which), static_cast<unsigned long long>(totals[index]), set ? "switch set" : "switch unset");
+    }
+    const char* pipeline = std::getenv("APS5_DRAW_PIPELINE");
+    if (pipeline == nullptr || std::strcmp(pipeline, "1") != 0) return;
+    for (const auto& expectation : expectations) {
+        if (!VerifyRequested(expectation.which)) continue;
+        const auto checked = totals[static_cast<std::size_t>(expectation.which)];
+        if (std::getenv(expectation.disabledBy) == nullptr) {
+            Require(checked != 0, std::string(VerifyFieldName(expectation.which)) + " stayed at 0 with " + VerifySwitchName(expectation.which) + " set");
+        } else {
+            Require(checked == 0, std::string(VerifyFieldName(expectation.which)) + " moved with " + expectation.disabledBy + " set");
+            if (expectation.skippedWhenDisabled) Require(totals[static_cast<std::size_t>(*expectation.skippedWhenDisabled)] != 0, std::string(VerifyFieldName(*expectation.skippedWhenDisabled)) + " stayed at 0 with " + expectation.disabledBy + " set");
+        }
+    }
+}
+
 }
 
 int main() {
@@ -232,6 +270,7 @@ int main() {
             best = std::min(best, WorkerCpuNs() - before);
         }
         if (best != 0) std::printf("rewind draw replay: queue worker CPU %.0f ns a draw (best of %d released chains of %zu draws with indirect register lists)\n", static_cast<double>(best) / static_cast<double>(draws), Measured, draws);
+        RequireVerifyCounters();
         AgcDriverShutdown_nid_postfix();
         return 0;
     } catch (const std::exception& error) {

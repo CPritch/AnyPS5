@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -106,9 +107,13 @@ public:
     explicit PacketOverlaps(std::uint32_t opcode) : opcode(opcode) {}
 
     bool Overlaps(std::uint64_t address, std::size_t bytes) {
-        if (!packetOverlapMemo()) return DrawPipeline::Queue0().Overlaps(address, bytes);
+        if (!packetOverlapMemo()) {
+            if (VerifyRequested(VerifyCount::PacketOverlapSkipped)) CountVerify(VerifyCount::PacketOverlapSkipped);
+            return DrawPipeline::Queue0().Overlaps(address, bytes);
+        }
         for (std::size_t index = 0; index < count; ++index) {
             if (clear[index].first != address || clear[index].second != bytes) continue;
+            if (verifyPacketOverlapMemo()) CountVerify(VerifyCount::PacketOverlapChecked);
             if (verifyPacketOverlapMemo() && DrawPipeline::Queue0().Overlaps(address, bytes)) {
                 std::fprintf(stderr, "FATAL: APS5_VERIFY_PACKET_OVERLAP_MEMO: packet 0x%02x found 0x%llx+0x%zx clear of queued writes, and a later query in the same packet overlaps them\n", opcode, static_cast<unsigned long long>(address), bytes);
                 std::fflush(stderr);
