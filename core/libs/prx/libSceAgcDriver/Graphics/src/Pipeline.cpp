@@ -746,6 +746,14 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
                 secondChannels[index].colorBlendOp = state.blends[index].alphaBlendOp;
             }
         }
+        const auto uniformBlends = [](const std::vector<VkPipelineColorBlendAttachmentState>& channels) {
+            return std::ranges::all_of(channels, [&](const VkPipelineColorBlendAttachmentState& other) {
+                const auto& first = channels.front();
+                return other.blendEnable == first.blendEnable && other.srcColorBlendFactor == first.srcColorBlendFactor && other.dstColorBlendFactor == first.dstColorBlendFactor && other.colorBlendOp == first.colorBlendOp &&
+                    other.srcAlphaBlendFactor == first.srcAlphaBlendFactor && other.dstAlphaBlendFactor == first.dstAlphaBlendFactor && other.alphaBlendOp == first.alphaBlendOp && other.colorWriteMask == first.colorWriteMask;
+            });
+        };
+        Require(context.independentBlend || (uniformBlends(firstChannels) && (!alternateAlpha || uniformBlends(secondChannels))), "color targets with different blend states or write masks need the independentBlend device feature, which the device does not support");
         if (const auto logicOp = LogicOpFromRop(state.colorRop); logicOp != VK_LOGIC_OP_COPY) {
             blend.logicOpEnable = VK_TRUE;
             blend.logicOp = logicOp;
