@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -68,8 +69,10 @@ StageEntry resolveStage(const ShaderRegistry& registry, std::uint64_t address) {
         static const bool verify = std::getenv("APS5_VERIFY_REGISTER_KEY") != nullptr;
         if (verify) {
             const auto fresh = lookupStage(registry, address);
+            CountVerify(VerifyCount::RegisterKeyMemoChecked);
             if (fresh.snapshots != slot.entry.snapshots || fresh.offset != slot.entry.offset) {
-                std::fprintf(stderr, "APS5_VERIFY_REGISTER_KEY: the shader registry lookup memo for 0x%llx disagrees with the registry\n", static_cast<unsigned long long>(address));
+                std::fprintf(stderr, "FATAL: APS5_VERIFY_REGISTER_KEY: the shader registry lookup memo for 0x%llx disagrees with the registry\n", static_cast<unsigned long long>(address));
+                std::fflush(stderr);
                 std::abort();
             }
         }
@@ -174,7 +177,10 @@ std::uint64_t legacyRegisterStateKey(const QueueState& queue, bool allUserWords,
 }
 
 std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, std::uint64_t* shapeKey, RegisterStateKeyParts* parts) {
-    if (!incrementalRegisterKey()) return legacyRegisterStateKey(queue, allUserWords, incremental, shapeKey, parts);
+    if (!incrementalRegisterKey()) {
+        if (verifyRegisterKey()) CountVerify(VerifyCount::RegisterKeySkipped);
+        return legacyRegisterStateKey(queue, allUserWords, incremental, shapeKey, parts);
+    }
     const auto& masks = registerMasks();
     const auto fingerprint = [&](const Registers& registers, Graphics::RegisterBank bank) {
         const auto& mask = masks[static_cast<std::size_t>(bank)];
@@ -207,11 +213,14 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
         memo.lineage = shader.Lineage();
         memo.allUserWords = allUserWords;
     }
-    if (reused && verifyRegisterKey()) {
-        for (std::size_t i = 0; i < hashes.size(); ++i) {
+    if (verifyRegisterKey()) {
+        if (!reused) CountVerify(VerifyCount::RegisterKeySkipped);
+        for (std::size_t i = 0; reused && i < hashes.size(); ++i) {
             const auto& block = i < UserBlocks.size() ? UserBlocks[i] : AuxiliaryBlocks[i - UserBlocks.size()];
+            CountVerify(VerifyCount::RegisterKeyHashChecked);
             if (hashes[i] == blockHash(shader, block, allUserWords)) continue;
-            std::fprintf(stderr, "APS5_VERIFY_REGISTER_KEY: the kept hash of the user words at 0x%x disagrees with the registers\n", block.base);
+            std::fprintf(stderr, "FATAL: APS5_VERIFY_REGISTER_KEY: the kept hash of the user words at 0x%x disagrees with the registers\n", block.base);
+            std::fflush(stderr);
             std::abort();
         }
     }
