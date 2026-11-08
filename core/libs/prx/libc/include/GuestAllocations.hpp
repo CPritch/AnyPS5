@@ -76,6 +76,8 @@ Lease GuestAllocationsAcquireMapped_nid_no_patch(const Mapped& mapped);
 Lease GuestAllocationsAcquireAll_nid_postfix();
 Lease GuestAllocationsAcquireRegistered_nid_postfix();
 bool GuestAllocationsAcquireSettled_nid_no_patch(Lease* lease, std::uint64_t* published);
+bool GuestAllocationsAcquireChanged_nid_no_patch(std::uint64_t since, const std::function<void(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& cover)>& select, std::vector<std::pair<std::uint64_t, std::uint64_t>>* changed, std::uint64_t* through, Lease* lease, Lease* whole);
+bool GuestAllocationsLeaseCurrent_nid_no_patch(const Lease& lease, std::uint64_t* generation);
 std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t address, bool next);
 // Changes whenever a mutation ends, so callers can cache facts about guest mappings between changes.
 std::uint64_t GuestAllocationsGeneration_nid_postfix();
