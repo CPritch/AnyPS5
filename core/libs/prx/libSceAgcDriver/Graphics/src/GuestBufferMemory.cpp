@@ -306,10 +306,52 @@ const bool importsLockOrderChecked = MapImportGate::LockOrderChecked();
 
 thread_local std::uint32_t importsHeld = 0;
 
+struct ImportChurn {
+    std::atomic<std::uint64_t> reconciles{0};
+    std::atomic<std::uint64_t> reconcileNs{0};
+    std::atomic<std::uint64_t> journalRefreshes{0};
+    std::atomic<std::uint64_t> fullRefreshes{0};
+    std::atomic<std::uint64_t> fullRefreshNs{0};
+    std::atomic<std::uint64_t> absorbs{0};
+    std::atomic<std::uint64_t> retires{0};
+    std::atomic<std::uint64_t> inserts{0};
+    std::atomic<std::uint64_t> revalidations{0};
+    std::atomic<std::uint64_t> revalidateNs{0};
+    std::atomic<std::uint64_t> proofWalks{0};
+    std::atomic<std::uint64_t> lockWaits{0};
+    std::atomic<std::uint64_t> lockWaitNs{0};
+};
+
+ImportChurn& Churn() {
+    static ImportChurn churn;
+    return churn;
+}
+
+std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+struct ChurnTimer {
+    std::atomic<std::uint64_t>& count;
+    std::atomic<std::uint64_t>& ns;
+    const bool counted = ImportChurnCounted();
+    const std::chrono::steady_clock::time_point start = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ChurnTimer(std::atomic<std::uint64_t>& count, std::atomic<std::uint64_t>& ns) : count(count), ns(ns) {}
+    ~ChurnTimer() {
+        count.fetch_add(1, std::memory_order_relaxed);
+        if (counted) ns.fetch_add(nanosecondsSince(start), std::memory_order_relaxed);
+    }
+    ChurnTimer(const ChurnTimer&) = delete;
+    ChurnTimer& operator=(const ChurnTimer&) = delete;
+};
+
 class ImportsMutex {
 public:
     void lock() noexcept {
-        mutex.lock();
+        if (!mutex.try_lock()) {
+            const ChurnTimer waited(Churn().lockWaits, Churn().lockWaitNs);
+            mutex.lock();
+        }
         if (importsLockOrderChecked) ++importsHeld;
     }
 
@@ -545,6 +587,7 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
         return covers(lease) || covers(current);
     });
     ++state.epoch;
+    Churn().retires.fetch_add(1, std::memory_order_relaxed);
     GuestMemory::BreakProofs(GuestMemory::ProofBreak::Import);
     state.liveBytes -= it->second.pinnedBytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
@@ -2451,7 +2494,10 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
 #endif
     const auto [placed, added] = state.imports.emplace(base, entry);
-    if (added) ++state.inserted;
+    if (added) {
+        ++state.inserted;
+        Churn().inserts.fetch_add(1, std::memory_order_relaxed);
+    }
     GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Import);
     owner.armed = false;
     return &placed->second;
@@ -2547,6 +2593,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
     GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::Import, __builtin_return_address(0));
+    const ChurnTimer timed(Churn().fullRefreshes, Churn().fullRefreshNs);
     state.refreshedGeneration = generation;
     state.proofGeneration = generation;
     state.gateRefusals.clear();
@@ -2829,6 +2876,7 @@ bool absorbUnrelatedChanges(const Context& context, HostImports& state) {
     }
     state.gateRefusals.clear();
     state.refreshedGeneration = through;
+    Churn().absorbs.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -2837,6 +2885,8 @@ bool importsCurrent(const Context& context, HostImports& state) {
 }
 
 void reconcileImports(const Context& context, HostImports& state) {
+    if (!importsStale(context, state)) return;
+    const ChurnTimer timed(Churn().reconciles, Churn().reconcileNs);
     if (!importsCurrent(context, state)) refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix());
 }
 
@@ -7445,6 +7495,40 @@ HostImportsProof HostImportsIdentity(const Context& context) {
     std::lock_guard lock(state.mutex);
     if (!importsCurrent(context, state)) return {};
     return {state.device, state.epoch, state.proofGeneration, state.inserted};
+}
+
+bool ImportChurnCounted() {
+    static const bool counted = std::getenv("APS5_LONG_WAIT_LOG") != nullptr;
+    return counted;
+}
+
+ImportChurnCounts ImportChurnTotals() {
+    const auto& churn = Churn();
+    ImportChurnCounts counts;
+    counts.generations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    counts.reconciles = churn.reconciles.load(std::memory_order_relaxed);
+    counts.reconcileNs = churn.reconcileNs.load(std::memory_order_relaxed);
+    counts.journalRefreshes = churn.journalRefreshes.load(std::memory_order_relaxed);
+    counts.fullRefreshes = churn.fullRefreshes.load(std::memory_order_relaxed);
+    counts.fullRefreshNs = churn.fullRefreshNs.load(std::memory_order_relaxed);
+    counts.absorbs = churn.absorbs.load(std::memory_order_relaxed);
+    counts.retires = churn.retires.load(std::memory_order_relaxed);
+    counts.inserts = churn.inserts.load(std::memory_order_relaxed);
+    counts.revalidations = churn.revalidations.load(std::memory_order_relaxed);
+    counts.revalidateNs = churn.revalidateNs.load(std::memory_order_relaxed);
+    counts.proofWalks = churn.proofWalks.load(std::memory_order_relaxed);
+    counts.lockWaits = churn.lockWaits.load(std::memory_order_relaxed);
+    counts.lockWaitNs = churn.lockWaitNs.load(std::memory_order_relaxed);
+    return counts;
+}
+
+void NoteRevalidateFull(std::uint64_t ns) {
+    Churn().revalidations.fetch_add(1, std::memory_order_relaxed);
+    Churn().revalidateNs.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void NoteImportProofWalk() {
+    Churn().proofWalks.fetch_add(1, std::memory_order_relaxed);
 }
 
 }

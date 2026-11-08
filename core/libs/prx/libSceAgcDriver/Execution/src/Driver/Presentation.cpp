@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -79,11 +80,16 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     static const bool logged = std::getenv("APS5_LONG_WAIT_LOG") != nullptr;
     if (logged) {
         static std::uint64_t previousDraws = 0, previousResolves = 0, previousBuilds = 0;
+        static Graphics::ImportChurnCounts previousChurn = Graphics::ImportChurnTotals();
         const auto draws = DrawPipeline::CommittedDraws(), resolves = DrawPipeline::OwnResolves(), builds = Graphics::DrawTemplateBuilds();
-        std::fprintf(stderr, "[present] %lld draws %llu own_resolves %llu template_builds %llu\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), static_cast<unsigned long long>(draws - previousDraws), static_cast<unsigned long long>(resolves - previousResolves), static_cast<unsigned long long>(builds - previousBuilds));
+        const auto churn = Graphics::ImportChurnTotals();
+        const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
+        const auto micros = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>((now - before) / 1000u); };
+        std::fprintf(stderr, "[present] %lld draws %llu own_resolves %llu template_builds %llu alloc_generations %llu import_reconciles %llu import_reconcile_us %llu import_journal_refreshes %llu import_full_refreshes %llu import_full_refresh_us %llu import_absorbs %llu import_retires %llu import_inserts %llu revalidate_full %llu revalidate_full_us %llu import_proof_walks %llu import_lock_waits %llu import_lock_wait_us %llu\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), static_cast<unsigned long long>(draws - previousDraws), static_cast<unsigned long long>(resolves - previousResolves), static_cast<unsigned long long>(builds - previousBuilds), delta(churn.generations, previousChurn.generations), delta(churn.reconciles, previousChurn.reconciles), micros(churn.reconcileNs, previousChurn.reconcileNs), delta(churn.journalRefreshes, previousChurn.journalRefreshes), delta(churn.fullRefreshes, previousChurn.fullRefreshes), micros(churn.fullRefreshNs, previousChurn.fullRefreshNs), delta(churn.absorbs, previousChurn.absorbs), delta(churn.retires, previousChurn.retires), delta(churn.inserts, previousChurn.inserts), delta(churn.revalidations, previousChurn.revalidations), micros(churn.revalidateNs, previousChurn.revalidateNs), delta(churn.proofWalks, previousChurn.proofWalks), delta(churn.lockWaits, previousChurn.lockWaits), micros(churn.lockWaitNs, previousChurn.lockWaitNs));
         previousDraws = draws;
         previousResolves = resolves;
         previousBuilds = builds;
+        previousChurn = churn;
     }
     PerformanceContext timingContext(window.timing.get());
     PerformanceTimer timing("Driver.Present");

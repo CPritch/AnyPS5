@@ -4123,6 +4123,13 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    struct ChurnScope {
+        const bool counted = ImportChurnCounted();
+        const std::chrono::steady_clock::time_point start = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~ChurnScope() {
+            if (counted) NoteRevalidateFull(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+        }
+    } churnScope;
     struct ProvingOnLane {
         std::atomic<bool>& flag;
         bool held = false;
@@ -4376,6 +4383,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (importsReconcilable ? HostImportsReconciledUnchanged(context, importsProof) : HostImportsUnchanged(context, importsProof)) {
             if (profile) Revalidations().importSkips.fetch_add(1, std::memory_order_relaxed);
         } else {
+            if (churnScope.counted) NoteImportProofWalk();
             if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
             importsProof = HostImportsIdentity(context);
         }

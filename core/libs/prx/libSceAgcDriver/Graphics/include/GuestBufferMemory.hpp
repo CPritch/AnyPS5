@@ -196,6 +196,27 @@ bool HostImportsReconciledUnchanged(const Context& context, const HostImportsPro
 // The table's identity when it is reconciled with the live registry (one lock), else empty.
 HostImportsProof HostImportsIdentity(const Context& context);
 
+struct ImportChurnCounts {
+    std::uint64_t generations = 0;
+    std::uint64_t reconciles = 0;
+    std::uint64_t reconcileNs = 0;
+    std::uint64_t journalRefreshes = 0;
+    std::uint64_t fullRefreshes = 0;
+    std::uint64_t fullRefreshNs = 0;
+    std::uint64_t absorbs = 0;
+    std::uint64_t retires = 0;
+    std::uint64_t inserts = 0;
+    std::uint64_t revalidations = 0;
+    std::uint64_t revalidateNs = 0;
+    std::uint64_t proofWalks = 0;
+    std::uint64_t lockWaits = 0;
+    std::uint64_t lockWaitNs = 0;
+};
+bool ImportChurnCounted();
+ImportChurnCounts ImportChurnTotals();
+void NoteRevalidateFull(std::uint64_t ns);
+void NoteImportProofWalk();
+
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
 // HostImportSerial for main-image ranges, which no import serves): a serial unique for the life of
 // one mirror with its top bit set, 0 when no read-only mirror whose registered range still exists
