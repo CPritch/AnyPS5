@@ -343,6 +343,8 @@ public:
     bool PendingKey(std::uint64_t key, std::uint64_t shape);
     bool WaitPendingKey(std::uint64_t key, std::uint64_t shape);
     static bool LookupDrainsEvery();
+    static bool RecycledHeldWrites();
+    static std::vector<Range> TakeSpareWrites();
     enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, Enqueue, Count };
     static void NoteDrain(DrainSite site, bool drained);
     static std::string DrainText();
@@ -395,6 +397,7 @@ private:
     std::uint32_t pendingUnknown = 0;
     NewestSequenceMap pendingKeys;
     NewestSequenceMap pendingShapes;
+    std::vector<std::vector<Range>> spareWrites;
     std::uint64_t enqueuedJobs = 0;
     void addToIndex(const Pending& held);
     void removeFromIndex(const Pending& held);

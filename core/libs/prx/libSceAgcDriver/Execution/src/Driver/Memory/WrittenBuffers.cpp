@@ -190,8 +190,14 @@ void appendDepthRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ran
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact) {
-    constexpr std::uint64_t UnknownBytes = DrawUnknownBytes;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    DrawWriteRanges(graphics, stages, exact, ranges);
+    return ranges;
+}
+
+void DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    constexpr std::uint64_t UnknownBytes = DrawUnknownBytes;
+    ranges.clear();
     const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
         if (begin != 0) ranges.emplace_back(begin, begin + bytes);
     };
@@ -216,7 +222,6 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
     if (graphics.hasColorTarget) appendColorRanges(ranges, graphics.color, exact);
     for (const auto& color : graphics.colors) appendColorRanges(ranges, color, exact);
     if (graphics.depth) appendDepthRanges(ranges, *graphics.depth, exact);
-    return ranges;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawColorRanges(const Graphics::State& graphics) {

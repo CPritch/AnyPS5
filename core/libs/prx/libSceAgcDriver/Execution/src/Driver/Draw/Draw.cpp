@@ -324,6 +324,7 @@ struct DrawTail {
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
     std::shared_ptr<const DrawDecode> relocatedDecode;
+    std::shared_ptr<const DrawDecode> writesSource;
     std::shared_ptr<DrawEntry> dataEntry;
     std::uint64_t shapeKey = 0;
     DrawRelocationPending relocationPending{};
@@ -518,6 +519,39 @@ struct HeldWritesMemo {
 
 struct HeldWritesStorage {};
 
+bool VerifyHeldWrites() {
+    static const bool enabled = DrawFinisher::RecycledHeldWrites() && std::getenv("APS5_VERIFY_HELD_WRITES") != nullptr;
+    return enabled;
+}
+
+void heldDrawWritesInto(const std::shared_ptr<const DrawDecode>& source, decltype(DrawFinisher::Pending::writes)& writes) {
+    auto& memo = HostThreadLocal<HeldWritesMemo, HeldWritesStorage>();
+    auto& entry = memo.entries[(reinterpret_cast<std::uintptr_t>(source.get()) >> 6u) % HeldWritesMemo::Entries];
+    if (entry.decode != source) {
+        entry.decode = source;
+        entry.stored = false;
+        entry.writes.clear();
+        DrawWriteRanges(source->state, {}, ExactDrawWrites(), writes);
+        return;
+    }
+    if (!entry.stored) {
+        DrawWriteRanges(source->state, {}, ExactDrawWrites(), entry.writes);
+        entry.stored = true;
+    }
+    writes.assign(entry.writes.begin(), entry.writes.end());
+}
+
+void verifyHeldWrites(const DrawDecode& decode, const decltype(DrawFinisher::Pending::writes)& writes) {
+    const auto fresh = DrawWriteRanges(decode.state, {}, ExactDrawWrites());
+    if (fresh == writes) return;
+    std::size_t differing = 0;
+    while (differing < fresh.size() && differing < writes.size() && fresh[differing] == writes[differing]) ++differing;
+    const auto range = [](const decltype(fresh)& ranges, std::size_t index) { return index < ranges.size() ? ranges[index] : std::pair<std::uint64_t, std::uint64_t>{}; };
+    std::fprintf(stderr, "FATAL: APS5_VERIFY_HELD_WRITES: a held draw's write ranges differ from its decode's (%zu kept, %zu fresh; range %zu kept 0x%llx-0x%llx, fresh 0x%llx-0x%llx)\n", writes.size(), fresh.size(), differing, static_cast<unsigned long long>(range(writes, differing).first), static_cast<unsigned long long>(range(writes, differing).second), static_cast<unsigned long long>(range(fresh, differing).first), static_cast<unsigned long long>(range(fresh, differing).second));
+    std::fflush(stderr);
+    std::abort();
+}
+
 decltype(DrawFinisher::Pending::writes) heldDrawWrites(const std::shared_ptr<const DrawDecode>& decode) {
     if (!WorkerPools()) return DrawWriteRanges(decode->state, {}, ExactDrawWrites());
     auto& memo = HostThreadLocal<HeldWritesMemo, HeldWritesStorage>();
@@ -585,7 +619,13 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
         }
     }
     noteHeld(HeldReason::Known);
-    held.writes = heldDrawWrites(tail.decode);
+    if (DrawFinisher::RecycledHeldWrites() && WorkerPools()) {
+        held.writes = DrawFinisher::TakeSpareWrites();
+        heldDrawWritesInto(tail.writesSource != nullptr ? tail.writesSource : tail.decode, held.writes);
+        if (VerifyHeldWrites()) verifyHeldWrites(*tail.decode, held.writes);
+    } else {
+        held.writes = heldDrawWrites(tail.decode);
+    }
     held.unknown = false;
     return held;
 }
@@ -846,6 +886,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (dataEntry != nullptr && !DecodeProgramsCurrent(*dataEntry->decode, *submission.shaders)) dataEntry = nullptr;
     phaseTiming.Phase(DrawRowKeyLookupValidate);
 
+    const DrawDecode* refreshedDecode = nullptr;
     if (dataEntry != nullptr) {
         auto refreshed = CopyDecode(*dataEntry->decode);
         for (auto& program : refreshed->programs) {
@@ -863,6 +904,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
         }
         decode = std::move(refreshed);
+        refreshedDecode = decode.get();
     }
     if (decode != nullptr && !userPatches.empty() && verifyDrawRecipe()) {
         auto patched = CopyDecode(*decode);
@@ -871,6 +913,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     try {
         resolveDrawDecode(queue, submission, localDevice->graphicsContext(), decode, registerKey, drawKey, profile);
+        tail.writesSource = dataEntry != nullptr && decode.get() == refreshedDecode ? dataEntry->decode : decode;
     } catch (...) {
         TraceDrawAttemptFailure(traceToken, "decode", "exception", submission.serial, submission.queue, packetOffset, ExceptionReason(std::current_exception()));
         throw;

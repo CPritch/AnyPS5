@@ -500,6 +500,27 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
     return pendingUnknown != 0 || pendingRanges.OverlapsAny(ranges);
 }
 
+bool DrawFinisher::RecycledHeldWrites() {
+    static const bool enabled = std::getenv("APS5_NO_RECYCLED_HELD_WRITES") == nullptr;
+    return enabled;
+}
+
+namespace {
+
+constexpr std::size_t MostSpareWrites = 256;
+
+struct SpareWritesStorage {};
+
+std::vector<DrawFinisher::Range>& spareWritesStash() {
+    return HostThreadLocal<std::vector<DrawFinisher::Range>, SpareWritesStorage>();
+}
+
+}
+
+std::vector<DrawFinisher::Range> DrawFinisher::TakeSpareWrites() {
+    return std::exchange(spareWritesStash(), {});
+}
+
 bool DrawFinisher::LookupDrainsEvery() {
     static const bool every = std::getenv("APS5_LOOKUP_DRAIN") != nullptr;
     return every;
@@ -722,6 +743,13 @@ void DrawFinisher::push(Slot slot, Pending held) {
         pending.push_back(std::move(held));
         ++enqueuedJobs;
         addToIndex(pending.back());
+        if (RecycledHeldWrites() && !spareWrites.empty()) {
+            auto& stash = spareWritesStash();
+            if (stash.capacity() == 0) {
+                stash = std::move(spareWrites.back());
+                spareWrites.pop_back();
+            }
+        }
     }
     outstanding.fetch_add(1, std::memory_order_release);
     if (!running) {
@@ -747,6 +775,14 @@ void DrawFinisher::retireHead() {
     {
         std::lock_guard index(indexLock);
         removeFromIndex(pending.front());
+        if (RecycledHeldWrites()) {
+            auto& writes = pending.front().writes;
+            if (writes.capacity() != 0 && spareWrites.size() < MostSpareWrites) {
+                if (spareWrites.capacity() == 0) spareWrites.reserve(MostSpareWrites);
+                writes.clear();
+                spareWrites.push_back(std::move(writes));
+            }
+        }
         pending.pop_front();
         ranJobs.fetch_add(1, std::memory_order_release);
     }
