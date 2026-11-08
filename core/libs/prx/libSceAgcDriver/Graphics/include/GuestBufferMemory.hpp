@@ -225,6 +225,8 @@ struct ImportChurnCounts {
     std::uint64_t tableOther = 0;
     std::uint64_t proofGenerationBumps = 0;
     std::uint64_t proofsSurvived = 0;
+    std::uint64_t mapUnlocked = 0;
+    std::uint64_t mapDiscarded = 0;
     std::uint64_t fullRefreshes = 0;
     std::uint64_t fullRefreshNs = 0;
     std::uint64_t absorbs = 0;
@@ -240,6 +242,7 @@ bool ImportChurnCounted();
 ImportChurnCounts ImportChurnTotals();
 void NoteRevalidateFull(std::uint64_t ns);
 void NoteImportProofWalk();
+void SetMapImportHookForTest(void (*hook)());
 
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
 // HostImportSerial for main-image ranges, which no import serves): a serial unique for the life of

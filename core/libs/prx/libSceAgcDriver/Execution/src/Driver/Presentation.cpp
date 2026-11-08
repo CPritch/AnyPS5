@@ -124,6 +124,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         field("import_table_other", delta(churn.tableOther, previousChurn.tableOther));
         field("import_proof_generation_bumps", delta(churn.proofGenerationBumps, previousChurn.proofGenerationBumps));
         field("import_proofs_survived", delta(churn.proofsSurvived, previousChurn.proofsSurvived));
+        field("import_map_unlocked", delta(churn.mapUnlocked, previousChurn.mapUnlocked));
+        field("import_map_discarded", delta(churn.mapDiscarded, previousChurn.mapDiscarded));
         std::fprintf(stderr, "%s\n", line);
         previousDraws = draws;
         previousResolves = resolves;

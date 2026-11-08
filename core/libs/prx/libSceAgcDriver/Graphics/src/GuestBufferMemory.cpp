@@ -333,6 +333,8 @@ struct ImportChurn {
     std::atomic<std::uint64_t> tableOther{0};
     std::atomic<std::uint64_t> proofGenerationBumps{0};
     std::atomic<std::uint64_t> proofsSurvived{0};
+    std::atomic<std::uint64_t> mapUnlocked{0};
+    std::atomic<std::uint64_t> mapDiscarded{0};
     std::atomic<std::uint64_t> fullRefreshes{0};
     std::atomic<std::uint64_t> fullRefreshNs{0};
     std::atomic<std::uint64_t> absorbs{0};
@@ -2174,6 +2176,14 @@ struct ImportConstruction {
 
 void ensurePinWaiter();
 
+thread_local std::unique_lock<ImportsMutex>* mapImportLock = nullptr;
+std::atomic<void (*)()> mapImportHookForTest{nullptr};
+
+bool unlockedMapImportsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_UNLOCKED_MAP_IMPORT") == nullptr;
+    return enabled;
+}
+
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, ImportRequester requester, std::uint64_t end = 0, bool evict = true, std::uint64_t largest = std::numeric_limits<std::uint64_t>::max()) {
     ensurePinWaiter();
 #ifdef _WIN32
@@ -2445,8 +2455,16 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
 #endif
     const bool watchedHostPointer = watching.hostPointer;
     const bool watchedDmaBuf = watching.dmaBuf;
+    const bool coherent = state.dmaBufImportsCoherent;
+#ifndef _WIN32
+    auto* unlocked = requester == ImportRequester::Map && watchedHostPointer && watchedDmaBuf && unlockedMapImportsEnabled() && mapImportLock != nullptr && mapImportLock->owns_lock() ? mapImportLock : nullptr;
+    if (unlocked != nullptr) {
+        unlocked->unlock();
+        if (const auto hook = mapImportHookForTest.load(std::memory_order_acquire)) hook();
+    }
+#endif
     GuestMemory::ImportWatched(base, bytes, [&] {
-        step = watchedDmaBuf == watchedHostPointer ? createImport(context, entry, result, state.dmaBufImportsCoherent) : createHostPointerImport(context, entry, result);
+        step = watchedDmaBuf == watchedHostPointer ? createImport(context, entry, result, coherent) : createHostPointerImport(context, entry, result);
 #ifdef _WIN32
         if (step == nullptr && settled && (step = settleImport(context, state, entry, result)) != nullptr) {
             destroyImport(context, entry);
@@ -2457,7 +2475,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         return step == nullptr;
     }, watchedHostPointer);
 #ifndef _WIN32
-    if (step != nullptr && watchedDmaBuf != watchedHostPointer && state.dmaBufImportsCoherent) {
+    if (step != nullptr && watchedDmaBuf != watchedHostPointer && coherent) {
         int runsFile = -1;
         std::array<GuestArena::SharedBackingRun, DmaBufRunLimit> runs{};
         std::size_t count = 0;
@@ -2468,6 +2486,17 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
                 return step == nullptr;
             }, watchedDmaBuf, false);
         }
+    }
+    if (unlocked != nullptr) {
+        unlocked->lock();
+        Churn().mapUnlocked.fetch_add(1, std::memory_order_relaxed);
+        const auto next = state.imports.lower_bound(base);
+        const bool overlapped = (next != state.imports.end() && next->first < base + bytes) || (next != state.imports.begin() && std::prev(next)->second.base + std::prev(next)->second.bytes > base);
+        if (state.device != context.device || overlapped) {
+            Churn().mapDiscarded.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+        if (step == nullptr && state.liveBytes + bytes > budget) retireLeastRecent(context, state, lease, state.liveBytes + bytes - budget);
     }
     if (step == nullptr && entry.dmaBuf && bytes >= settleFloorBytes && context.settleQueue != VK_NULL_HANDLE && context.settleQueueMutex != nullptr) {
         static const bool traceSettle = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
@@ -5140,6 +5169,12 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
                 if (leasedRangeOwner(current, range->address) != range) continue;
             }
             if (!state.importedAtMap.emplace(range->address, range->bytes).second && findImport(state, range->address, range->address + range->bytes) == nullptr) continue;
+            struct Unlockable {
+                explicit Unlockable(std::unique_lock<ImportsMutex>* lock) { mapImportLock = lock; }
+                ~Unlockable() { mapImportLock = nullptr; }
+                Unlockable(const Unlockable&) = delete;
+                Unlockable& operator=(const Unlockable&) = delete;
+            } unlockable(withoutGpu ? &lock : nullptr);
             importAllocation(context, state, range->address, current, ImportRequester::Map, 0, false);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] import of GPU memory mapped at 0x%llx+0x%zx failed: %s\n", static_cast<unsigned long long>(range->address), range->bytes, error.what());
@@ -8120,6 +8155,8 @@ ImportChurnCounts ImportChurnTotals() {
     counts.tableOther = churn.tableOther.load(std::memory_order_relaxed);
     counts.proofGenerationBumps = churn.proofGenerationBumps.load(std::memory_order_relaxed);
     counts.proofsSurvived = churn.proofsSurvived.load(std::memory_order_relaxed);
+    counts.mapUnlocked = churn.mapUnlocked.load(std::memory_order_relaxed);
+    counts.mapDiscarded = churn.mapDiscarded.load(std::memory_order_relaxed);
     counts.fullRefreshes = churn.fullRefreshes.load(std::memory_order_relaxed);
     counts.fullRefreshNs = churn.fullRefreshNs.load(std::memory_order_relaxed);
     counts.absorbs = churn.absorbs.load(std::memory_order_relaxed);
@@ -8136,6 +8173,10 @@ ImportChurnCounts ImportChurnTotals() {
 void NoteRevalidateFull(std::uint64_t ns) {
     Churn().revalidations.fetch_add(1, std::memory_order_relaxed);
     Churn().revalidateNs.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void SetMapImportHookForTest(void (*hook)()) {
+    mapImportHookForTest.store(hook, std::memory_order_release);
 }
 
 void NoteImportProofWalk() {
