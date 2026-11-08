@@ -650,8 +650,13 @@ if(WIN32 OR APPLE)
     endif()
 endif()
 
+include(cmake/FastBuild.cmake)
 add_subdirectory(core/shader/recompiler)
 add_subdirectory(core/Decoder/Jpeg)
 add_subdirectory(core/Decoder/Png)
 add_subdirectory(core/libs)
 add_subdirectory(core/relinker)
+
+if(ANYPS5_LTO_ACTIVE)
+    anyps5_exclude_targets_from_lto("${CMAKE_SOURCE_DIR}")
+endif()
