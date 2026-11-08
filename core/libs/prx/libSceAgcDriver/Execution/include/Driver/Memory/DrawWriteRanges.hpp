@@ -12,6 +12,7 @@
 namespace AgcDriver::DriverDetail {
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact);
+void DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 enum class DispatchUnbounded : std::uint8_t { None, Gds, AddressWrites, AddressReadOnly, ImageDescriptor, Special, Count };
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded, DispatchUnbounded* reason = nullptr);
 bool ExactDrawWrites();

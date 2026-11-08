@@ -500,6 +500,27 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
     return pendingUnknown != 0 || pendingRanges.OverlapsAny(ranges);
 }
 
+bool DrawFinisher::RecycledHeldWrites() {
+    static const bool enabled = std::getenv("APS5_NO_RECYCLED_HELD_WRITES") == nullptr;
+    return enabled;
+}
+
+namespace {
+
+constexpr std::size_t MostSpareWrites = 256;
+
+struct SpareWritesStorage {};
+
+std::vector<DrawFinisher::Range>& spareWritesStash() {
+    return HostThreadLocal<std::vector<DrawFinisher::Range>, SpareWritesStorage>();
+}
+
+}
+
+std::vector<DrawFinisher::Range> DrawFinisher::TakeSpareWrites() {
+    return std::exchange(spareWritesStash(), {});
+}
+
 bool DrawFinisher::LookupDrainsEvery() {
     static const bool every = std::getenv("APS5_LOOKUP_DRAIN") != nullptr;
     return every;
@@ -549,7 +570,9 @@ bool DrawFinisher::WaitPendingKey(std::uint64_t key, std::uint64_t shape) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher wait under the GPU lock");
     PerformanceTimer timing("DrawFinisher.WaitKey");
     const auto start = std::chrono::steady_clock::now();
-    SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) <= after; });
+    static const bool monitored = std::getenv("APS5_NO_KEY_WAIT_MONITOR") == nullptr;
+    if (monitored) IdleUntil(&ranJobs, HandoffSpinWindow(), [&] { return ranJobs.load(std::memory_order_acquire) >= target; });
+    else SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) <= after; });
     std::unique_lock lock(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return ranJobs >= target || failure != nullptr; });
@@ -720,6 +743,13 @@ void DrawFinisher::push(Slot slot, Pending held) {
         pending.push_back(std::move(held));
         ++enqueuedJobs;
         addToIndex(pending.back());
+        if (RecycledHeldWrites() && !spareWrites.empty()) {
+            auto& stash = spareWritesStash();
+            if (stash.capacity() == 0) {
+                stash = std::move(spareWrites.back());
+                spareWrites.pop_back();
+            }
+        }
     }
     outstanding.fetch_add(1, std::memory_order_release);
     if (!running) {
@@ -745,6 +775,14 @@ void DrawFinisher::retireHead() {
     {
         std::lock_guard index(indexLock);
         removeFromIndex(pending.front());
+        if (RecycledHeldWrites()) {
+            auto& writes = pending.front().writes;
+            if (writes.capacity() != 0 && spareWrites.size() < MostSpareWrites) {
+                if (spareWrites.capacity() == 0) spareWrites.reserve(MostSpareWrites);
+                writes.clear();
+                spareWrites.push_back(std::move(writes));
+            }
+        }
         pending.pop_front();
         ranJobs.fetch_add(1, std::memory_order_release);
     }
@@ -2118,12 +2156,20 @@ void DrawPipeline::run() {
         }
         {
             std::lock_guard lock(mutex);
-            countWrites(items.front().writes, false);
             const auto retiredNow = retiredItems.load(std::memory_order_relaxed) + 1;
-            if (PendingWriteIndexed()) retiredWrites.Note(retiredNow, items.front().writes);
+            const bool unlockedWatch = UnlockedWriteWatch();
+            if (unlockedWatch) {
+                std::lock_guard counted(queuedWritesLock);
+                uncountWrites(items.front().writes);
+                retiredWrites.Note(retiredNow, items.front().writes);
+                retiredItems.store(retiredNow, std::memory_order_release);
+            } else {
+                countWrites(items.front().writes, false);
+                if (PendingWriteIndexed()) retiredWrites.Note(retiredNow, items.front().writes);
+            }
             retired.push_back(std::move(items.front()));
             items.pop_front();
-            retiredItems.store(retiredNow, std::memory_order_release);
+            if (!unlockedWatch) retiredItems.store(retiredNow, std::memory_order_release);
             ++commits;
             commitNs += spent;
             ++kindCommits[kind];
@@ -2357,20 +2403,37 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 
 void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
     std::lock_guard counted(queuedWritesLock);
+    if (!added) {
+        uncountWrites(writes);
+        return;
+    }
     for (const auto& range : writes) {
         const auto found = std::find_if(queuedWrites.begin(), queuedWrites.end(), [&](const auto& entry) { return entry.first == range; });
-        if (added) {
-            if (found != queuedWrites.end()) ++found->second;
-            else queuedWrites.emplace_back(range, 1u);
-        } else if (found != queuedWrites.end() && --found->second == 0) {
-            *found = queuedWrites.back();
-            queuedWrites.pop_back();
-        }
+        if (found != queuedWrites.end()) ++found->second;
+        else queuedWrites.emplace_back(range, 1u);
     }
+}
+
+void DrawPipeline::uncountWrites(const std::vector<Range>& writes) {
+    for (const auto& range : writes) {
+        const auto found = std::find_if(queuedWrites.begin(), queuedWrites.end(), [&](const auto& entry) { return entry.first == range; });
+        if (found == queuedWrites.end() || --found->second != 0) continue;
+        *found = queuedWrites.back();
+        queuedWrites.pop_back();
+    }
+}
+
+bool DrawPipeline::UnlockedWriteWatch() {
+    static const bool unlocked = PendingWriteIndexed() && std::getenv("APS5_NO_UNLOCKED_WRITE_WATCH") == nullptr;
+    return unlocked;
 }
 
 DrawPipeline::Watch DrawPipeline::WatchWrites() {
     if (!Busy()) return {Retired(), 0, {}};
+    if (UnlockedWriteWatch() && !VerifyPendingWriteIndex()) {
+        std::lock_guard counted(queuedWritesLock);
+        return {retiredItems.load(std::memory_order_acquire), outstanding.load(std::memory_order_acquire), {}};
+    }
     std::lock_guard lock(mutex);
     Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
     if (PendingWriteIndexed() && !VerifyPendingWriteIndex()) return watch;
@@ -2378,13 +2441,25 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
     return watch;
 }
 
-bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& reads) {
+bool DrawPipeline::WrittenSince(const Watch& watch, std::span<const Range> reads) {
     const auto overlaps = [&reads](const std::vector<Range>& writes) {
         return std::any_of(reads.begin(), reads.end(), [&writes](const Range& read) {
             return std::any_of(writes.begin(), writes.end(), [&read](const Range& write) { return read.first < write.second && write.first < read.second; });
         });
     };
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
+    if (UnlockedWriteWatch() && !VerifyPendingWriteIndex()) {
+        std::lock_guard counted(queuedWritesLock);
+        for (const auto& [range, count] : queuedWrites) {
+            for (const auto& [begin, end] : reads) {
+                if (begin < range.second && range.first < end) return true;
+            }
+        }
+        const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
+        if (retiredNow == watch.retired) return false;
+        if (retiredNow - watch.retired > watch.items) return true;
+        return retiredWrites.Since(watch.retired, reads) != RetiredWrites::Answer::Clear;
+    }
     std::lock_guard lock(mutex);
     const auto scan = [&] {
         if (std::any_of(items.begin(), items.end(), [&](const Item& item) { return overlaps(item.writes); })) return true;

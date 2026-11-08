@@ -15,6 +15,15 @@
 #include <stdexcept>
 #include <string>
 
+namespace AgcDriver {
+
+std::uint64_t NextRegistersLineage() {
+    static std::atomic<std::uint64_t> next{0};
+    return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+}
+
 namespace AgcDriver::Pm4 {
 
 namespace {
@@ -992,6 +1001,25 @@ std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> 
     return pairs;
 }
 
+void AppendIndirectRegisters(std::span<const std::uint32_t> packet, std::vector<std::uint32_t>& pairs) {
+    require(packet.size() == 5 && IndirectRegisterOpcode((packet[0] >> 8u) & 0xffu), "expected indirect register packet");
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
+    const auto first = pairs.size();
+    const auto count = static_cast<std::size_t>(packet[4]);
+    pairs.resize(first + count * 2);
+    const auto out = std::span(pairs).subspan(first);
+    if (packet[3] == 0x80000000u) {
+        GuestMemory::Read(address(packet[1], packet[2]), std::as_writable_bytes(out), 4);
+        return;
+    }
+    GuestMemory::Read(address(packet[1], packet[2]), std::as_writable_bytes(out.subspan(count)), 4);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto value = out[count + i];
+        out[2 * i] = packet[3] + static_cast<std::uint32_t>(i);
+        out[2 * i + 1] = value;
+    }
+}
+
 void NoteDispatchRegisters(std::span<const std::uint32_t> packet, QueueState& queue) {
     const bool direct = ((packet[0] >> 8u) & 0xffu) == 0x15u;
     queue.shader.insert_or_assign(0x200, packet.back());
@@ -1008,6 +1036,12 @@ bool IndirectRegistersValid(std::span<const std::uint32_t> pairs) {
     return true;
 }
 
+namespace {
+
+void traceIndirectRegisters(std::uint32_t opcode, std::span<const std::uint32_t> pairs, const QueueState& queue, bool skipInvalid);
+
+}
+
 void ExecuteIndirectRegisters(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> pairs, QueueState& queue, bool skipInvalid) {
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     require(packet.size() == 5 && IndirectRegisterOpcode(opcode), "expected indirect register packet");
@@ -1019,6 +1053,21 @@ void ExecuteIndirectRegisters(std::span<const std::uint32_t> packet, std::span<c
     for (std::size_t i = 0; i < pairs.size(); i += 2) {
         if (usable(pairs[i])) writeRegister(queue, opcode, registerOffset(pairs[i]), pairs[i + 1]);
     }
+    traceIndirectRegisters(opcode, pairs, queue, skipInvalid);
+}
+
+void ExecuteValidatedIndirectRegisters(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> pairs, QueueState& queue) {
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    require(packet.size() == 5 && IndirectRegisterOpcode(opcode), "expected indirect register packet");
+    require(pairs.size() == static_cast<std::size_t>(packet[4]) * 2, "indirect register list does not match its packet");
+    for (std::size_t i = 0; i < pairs.size(); i += 2) writeRegister(queue, opcode, pairs[i] & ~0x70000000u, pairs[i + 1]);
+    traceIndirectRegisters(opcode, pairs, queue, false);
+}
+
+namespace {
+
+void traceIndirectRegisters(std::uint32_t opcode, std::span<const std::uint32_t> pairs, const QueueState& queue, bool skipInvalid) {
+    const auto usable = [&](std::uint32_t value) { return !skipInvalid || IndirectRegistersValid(std::span(&value, 1)); };
     if (queue.savedContext.has_value() && TraceContextState()) {
         std::fprintf(stderr, "[context]   indirect 0x%x:", opcode);
         for (std::size_t i = 0; i < pairs.size(); i += 2) {
@@ -1026,6 +1075,8 @@ void ExecuteIndirectRegisters(std::span<const std::uint32_t> packet, std::span<c
         }
         std::fprintf(stderr, "\n");
     }
+}
+
 }
 
 namespace {

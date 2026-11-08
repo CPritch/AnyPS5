@@ -96,10 +96,32 @@ public:
     };
     using iterator = const_iterator;
 
-    ShaderRegistry() = default;
-    ShaderRegistry(std::initializer_list<value_type> entries) {
+    ShaderRegistry() : serial(NextSerial()) {}
+    ShaderRegistry(const ShaderRegistry& other) : chunks(other.chunks), count(other.count), serial(NextSerial()) {}
+    ShaderRegistry(ShaderRegistry&& other) noexcept : chunks(std::move(other.chunks)), count(std::exchange(other.count, 0)), serial(NextSerial()) {
+        other.chunks.clear();
+        other.serial = NextSerial();
+    }
+    ShaderRegistry& operator=(const ShaderRegistry& other) {
+        if (this == &other) return *this;
+        chunks = other.chunks;
+        count = other.count;
+        serial = NextSerial();
+        return *this;
+    }
+    ShaderRegistry& operator=(ShaderRegistry&& other) noexcept {
+        if (this == &other) return *this;
+        chunks = std::move(other.chunks);
+        count = std::exchange(other.count, 0);
+        other.chunks.clear();
+        other.serial = NextSerial();
+        serial = NextSerial();
+        return *this;
+    }
+    ShaderRegistry(std::initializer_list<value_type> entries) : serial(NextSerial()) {
         for (const auto& [address, headers] : entries) emplace(address, headers);
     }
+    std::uint64_t Serial() const { return serial; }
 
     const_iterator begin() const { return chunks.empty() ? end() : const_iterator(chunks.cbegin(), chunks.cend(), chunks.front()->cbegin()); }
     const_iterator end() const { return const_iterator(chunks.cend(), chunks.cend(), {}); }
@@ -115,16 +137,19 @@ public:
     void clear() {
         chunks.clear();
         count = 0;
+        serial = NextSerial();
     }
 
 private:
     static constexpr std::size_t ChunkEntries = 64;
+    static std::uint64_t NextSerial();
 
     std::size_t chunkFor(std::uint64_t address) const;
     Chunk& writable(std::size_t index);
 
     Chunks chunks;
     std::size_t count = 0;
+    std::uint64_t serial = 0;
 };
 
 struct PreparedShaderState {

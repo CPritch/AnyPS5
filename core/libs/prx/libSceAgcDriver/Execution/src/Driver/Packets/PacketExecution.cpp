@@ -14,11 +14,13 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <utility>
 
 namespace AgcDriver::DriverDetail {
@@ -89,7 +91,45 @@ bool waitTakesPendingLabel(std::span<const std::uint32_t> packet) {
     return value.has_value() && Pm4::WaitComparesValue(packet, *value);
 }
 
-bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
+bool packetOverlapMemo() {
+    static const bool enabled = std::getenv("APS5_NO_PACKET_OVERLAP_MEMO") == nullptr;
+    return enabled;
+}
+
+bool verifyPacketOverlapMemo() {
+    static const bool enabled = packetOverlapMemo() && std::getenv("APS5_VERIFY_PACKET_OVERLAP_MEMO") != nullptr;
+    return enabled;
+}
+
+class PacketOverlaps {
+public:
+    explicit PacketOverlaps(std::uint32_t opcode) : opcode(opcode) {}
+
+    bool Overlaps(std::uint64_t address, std::size_t bytes) {
+        if (!packetOverlapMemo()) return DrawPipeline::Queue0().Overlaps(address, bytes);
+        for (std::size_t index = 0; index < count; ++index) {
+            if (clear[index].first != address || clear[index].second != bytes) continue;
+            if (verifyPacketOverlapMemo() && DrawPipeline::Queue0().Overlaps(address, bytes)) {
+                std::fprintf(stderr, "FATAL: APS5_VERIFY_PACKET_OVERLAP_MEMO: packet 0x%02x found 0x%llx+0x%zx clear of queued writes, and a later query in the same packet overlaps them\n", opcode, static_cast<unsigned long long>(address), bytes);
+                std::fflush(stderr);
+                std::abort();
+            }
+            return false;
+        }
+        const bool overlaps = DrawPipeline::Queue0().Overlaps(address, bytes);
+        if (!overlaps && count < clear.size()) clear[count++] = {address, bytes};
+        return overlaps;
+    }
+
+    void Forget() { count = 0; }
+
+private:
+    std::uint32_t opcode;
+    std::array<std::pair<std::uint64_t, std::size_t>, 4> clear{};
+    std::size_t count = 0;
+};
+
+bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, PacketOverlaps& overlaps) {
     if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
     if (Pm4::DrawOpcode(opcode)) return true;
     switch (opcode) {
@@ -98,7 +138,7 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
         case 0x15: return orderedFills();
         case 0x16: return orderedFills() && indirectDispatchItems();
         case 0x63: case 0x64: case 0x9f:
-            return packet.size() >= 5 && !DrawPipeline::Queue0().Overlaps(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u), static_cast<std::size_t>(packet[4]) * 8);
+            return packet.size() >= 5 && !overlaps.Overlaps(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u), static_cast<std::size_t>(packet[4]) * 8);
         case 0x50: {
             if (packet.size() < 7) return false;
             const auto destination = Pm4::DmaDestination(packet);
@@ -106,16 +146,16 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
             const auto bytes = Pm4::DmaBytes(packet);
             if (bytes == 0) return true;
             const auto source = Pm4::DmaSource(packet);
-            if ((source == 0 || source == 3) && DrawPipeline::Queue0().Overlaps(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), bytes)) return false;
-            if (source == Pm4::DmaSelectGds && DrawPipeline::Queue0().Overlaps(Pm4::GdsAddress() + packet[2], bytes)) return false;
+            if ((source == 0 || source == 3) && overlaps.Overlaps(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), bytes)) return false;
+            if (source == Pm4::DmaSelectGds && overlaps.Overlaps(Pm4::GdsAddress() + packet[2], bytes)) return false;
             const auto address = destination == Pm4::DmaSelectGds ? Pm4::GdsAddress() + packet[4] : packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
-            return !DrawPipeline::Queue0().Overlaps(address, bytes);
+            return !overlaps.Overlaps(address, bytes);
         }
         case 0x3c: case 0x93: {
             if (packet.size() < 5) return false;
             const auto bytes = Pm4::WaitAwaitedBytes(packet);
             const std::uint64_t awaited = (packet[2] & (bytes == 8 ? ~7u : ~3u)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
-            if (DrawPipeline::Queue0().Overlaps(awaited, bytes)) return false;
+            if (overlaps.Overlaps(awaited, bytes)) return false;
             GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), bytes, bytes);
             return Pm4::WaitSatisfiedUnchecked(packet);
         }
@@ -154,6 +194,26 @@ public:
 private:
     const decltype(Submission::flips)& flips;
     decltype(Submission::flips)::const_iterator at;
+};
+
+class RegisterListCursor {
+public:
+    explicit RegisterListCursor(const Submission& submission) : submission(submission) {}
+
+    ListedRegisters At(std::size_t cursor) {
+        const auto& index = submission.registerListIndex;
+        if (FlatRegisterLists()) {
+            while (at < index.size() && index[at].cursor < cursor) ++at;
+            if (at < index.size() && index[at].cursor == cursor) return submission.RegisterListOf(index[at]);
+        }
+        const auto found = submission.FindRegisterList(cursor);
+        if (!found.found) throw std::out_of_range("indirect register packet has no register list read at submission");
+        return found;
+    }
+
+private:
+    const Submission& submission;
+    std::size_t at = 0;
 };
 
 bool& drawnSinceSeal() {
@@ -288,6 +348,7 @@ void Driver::execute(const Submission& submission) {
     }
     PacketHistory recent{submission.commands};
     FlipCursor flipAt{submission};
+    RegisterListCursor registerListAt{submission};
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
@@ -322,21 +383,25 @@ void Driver::execute(const Submission& submission) {
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        PacketOverlaps packetOverlaps(opcode);
         if (pipelined && !predicated && Pm4::IndirectRegisterOpcode(opcode) && packet.size() >= 5 && DrawPipeline::TargetedWaits() && DrawPipeline::Queue0().Busy()) {
             const std::uint64_t source = packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u);
             const DrawPipeline::Range read{source, source + static_cast<std::uint64_t>(packet[4]) * 8};
-            if (DrawPipeline::Queue0().Overlaps(read.first, static_cast<std::size_t>(read.second - read.first))) DrawPipeline::Queue0().WaitWrittenAny(std::span(&read, 1), DrawPipeline::DrainReason::Packet, opcode);
+            if (packetOverlaps.Overlaps(read.first, static_cast<std::size_t>(read.second - read.first))) DrawPipeline::Queue0().WaitWrittenAny(std::span(&read, 1), DrawPipeline::DrainReason::Packet, opcode);
         }
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesItem = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !flipAt.Contains(cursor);
             const bool queuesLabel = queuesItem && labelPacketQueues(packet, opcode);
             const bool queuesDump = queuesItem && sampleDumpQueues(packet, opcode, submission.queue);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
-            const bool beside = DrawFinisher::Overlap() && ((opcode != 0x15 && opcode != 0x16) || (dispatchesBesideFinisher() && queuesItem)) && (queuesLabel || queuesDump || heldLabelWait || keepsDrawPipeline(packet, header, opcode));
-            if (!beside) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherPacket);
+            const bool beside = DrawFinisher::Overlap() && ((opcode != 0x15 && opcode != 0x16) || (dispatchesBesideFinisher() && queuesItem)) && (queuesLabel || queuesDump || heldLabelWait || keepsDrawPipeline(packet, header, opcode, packetOverlaps));
+            if (!beside) {
+                DrawFinisher::Get().Drain(QueueWaits::Site::FinisherPacket);
+                packetOverlaps.Forget();
+            }
             if (DrawFinisher::Overlap()) {
                 DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside);
-                if (!beside) DrawFinisher::NoteDrainedOpcode(header == FlipPacketHeader ? 0xffu : opcode, keepsDrawPipeline(packet, header, opcode));
+                if (!beside) DrawFinisher::NoteDrainedOpcode(header == FlipPacketHeader ? 0xffu : opcode, keepsDrawPipeline(packet, header, opcode, packetOverlaps));
             }
         }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
@@ -362,7 +427,7 @@ void Driver::execute(const Submission& submission) {
                 cursor = nextCursor;
                 continue;
             }
-            if (!DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes) && Pm4::WaitSatisfiedUnchecked(packet) && !OwnStoreRejects(packet, awaited, awaitedBytes, submission.queue)) {
+            if (!packetOverlaps.Overlaps(awaited, awaitedBytes) && Pm4::WaitSatisfiedUnchecked(packet) && !OwnStoreRejects(packet, awaited, awaitedBytes, submission.queue)) {
                 std::uint32_t writer = submission.queue;
                 if (waitEpochSkip() >= 1 && storedSince(packet, awaited, awaitedBytes, submission.received, submission.queue, &writer) && writer == submission.queue) {
                     ++epochBumps().ownSkips;
@@ -379,7 +444,7 @@ void Driver::execute(const Submission& submission) {
             }
         }
         timing.Mark("pipeline_prepare");
-        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode, packetOverlaps)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         timing.Mark("pipeline_drain");
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
@@ -620,9 +685,11 @@ void Driver::execute(const Submission& submission) {
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
                 if (Pm4::IndirectRegisterOpcode(opcode)) {
-                    const auto& listed = submission.registerLists.at(cursor);
-                    if (Pm4::IndirectRegistersValid(listed)) {
-                        Pm4::ExecuteIndirectRegisters(packet, listed, queue);
+                    const auto registerList = registerListAt.At(cursor);
+                    const auto listed = registerList.pairs;
+                    if (registerList.valid) {
+                        if (FlatRegisterLists()) Pm4::ExecuteValidatedIndirectRegisters(packet, listed, queue);
+                        else Pm4::ExecuteIndirectRegisters(packet, listed, queue);
                     } else {
                         landPendingWaits(submission.queue);
                         recordQueuedLabelsBeforeRead(submission.queue);

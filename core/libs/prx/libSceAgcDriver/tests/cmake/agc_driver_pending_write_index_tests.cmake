@@ -1,6 +1,6 @@
 if(BUILD_TESTING)
     set_target_properties(agc_driver_pending_write_index_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
-    foreach(agcIndexMode IN ITEMS "index;" "verify;APS5_VERIFY_PENDING_WRITE_INDEX=1" "scan;APS5_NO_PENDING_WRITE_INDEX=1")
+    foreach(agcIndexMode IN ITEMS "index;" "verify;APS5_VERIFY_PENDING_WRITE_INDEX=1" "scan;APS5_NO_PENDING_WRITE_INDEX=1" "locked_watch;APS5_NO_UNLOCKED_WRITE_WATCH=1")
         list(GET agcIndexMode 0 agcIndexName)
         list(REMOVE_AT agcIndexMode 0)
         add_test(NAME agc_driver_pending_write_index_${agcIndexName} COMMAND agc_driver_pending_write_index_tests)
