@@ -1181,8 +1181,7 @@ void GuestAllocationsSetUnmapObserver_nid_postfix(void (*callback)(std::uintptr_
     unmapObserver.store(callback, std::memory_order_release);
 }
 
-Lease GuestAllocationsAcquire_nid_postfix() {
-    std::lock_guard lock(registry().mutex);
+static Lease acquireReadableLocked() {
     if (auto shared = registry().readableLease) {
         verifyCachedLease(*shared, true);
         return Lease(std::move(shared));
@@ -1196,6 +1195,11 @@ Lease GuestAllocationsAcquire_nid_postfix() {
     }
     if (!retiring) registry().readableLease = ranges;
     return Lease(std::move(ranges));
+}
+
+Lease GuestAllocationsAcquire_nid_postfix() {
+    std::lock_guard lock(registry().mutex);
+    return acquireReadableLocked();
 }
 
 Lease GuestAllocationsAcquireMapped_nid_no_patch(const Mapped& mapped) {
@@ -1261,6 +1265,46 @@ bool GuestAllocationsAcquireSettled_nid_no_patch(Lease* lease, std::uint64_t* pu
     if (!registry().retiring.empty() || registry().unlockedMutations != 0) return false;
     *published = generation.load(std::memory_order_acquire);
     *lease = acquireRegisteredLocked();
+    return true;
+}
+
+bool GuestAllocationsAcquireChanged_nid_no_patch(std::uint64_t since, const std::function<void(const std::vector<std::pair<std::uint64_t, std::uint64_t>>&, std::vector<std::pair<std::uint64_t, std::uint64_t>>&)>& select, std::vector<std::pair<std::uint64_t, std::uint64_t>>* changed, std::uint64_t* through, Lease* lease, Lease* whole) {
+    std::lock_guard lock(registry().mutex);
+    if (!GuestAllocationsChangesSince_nid_no_patch(since, changed, through)) return false;
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> cover;
+    cover.clear();
+    select(*changed, cover);
+    std::sort(cover.begin(), cover.end());
+    std::size_t kept = 0;
+    for (const auto& span : cover) {
+        if (span.second <= span.first) continue;
+        if (kept != 0 && span.first <= cover[kept - 1].second) cover[kept - 1].second = std::max(cover[kept - 1].second, span.second);
+        else cover[kept++] = span;
+    }
+    cover.resize(kept);
+    const auto& ranges = registry().ranges;
+    const bool retiring = !registry().retiring.empty();
+    auto picked = std::make_shared<Lease::Ranges>();
+    for (const auto& [begin, end] : cover) {
+        auto it = ranges.upper_bound(begin);
+        if (it != ranges.begin()) --it;
+        for (; it != ranges.end() && it->first < end; ++it) {
+            const auto& range = it->second;
+            if (range->bytes == 0 || range->address + range->bytes <= begin || !range->readable) continue;
+            if (!picked->empty() && range->address <= picked->back()->address) continue;
+            if (retiring && isRetiring(*range)) continue;
+            picked->push_back(range);
+        }
+    }
+    *lease = Lease(std::move(picked));
+    if (whole != nullptr) *whole = acquireReadableLocked();
+    return true;
+}
+
+bool GuestAllocationsLeaseCurrent_nid_no_patch(const Lease& lease, std::uint64_t* published) {
+    std::lock_guard lock(registry().mutex);
+    if (lease.Snapshot() == nullptr || lease.Snapshot() != registry().readableLease) return false;
+    *published = generation.load(std::memory_order_acquire);
     return true;
 }
 

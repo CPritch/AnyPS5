@@ -351,6 +351,70 @@ void heapFreeDropsSnapshots() {
 }
 
 
+void changedLeaseCoversOnlyTheCover(bool journal) {
+    auto* low = arena() + 7 * Granule;
+    auto* mid = low + 65536;
+    auto* far = low + 16 * 65536;
+    auto* hidden = low + 32 * 65536;
+    {
+        Mutation mutation;
+        mutation.Add(low, 65536, true, true, true);
+        mutation.Add(mid, 65536, true, true, true);
+        mutation.Add(far, 65536, true, true, true);
+        mutation.Add(hidden, 65536, false, false, true);
+    }
+    const auto at = [](const void* pointer) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer)); };
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> seen;
+    const auto select = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, std::vector<std::pair<std::uint64_t, std::uint64_t>>& cover) {
+        seen = spans;
+        cover.emplace_back(at(hidden), at(hidden) + 65536);
+        cover.emplace_back(at(low), at(mid) + 1);
+        cover.emplace_back(at(low) + 4096, at(mid) + 65536);
+    };
+    const auto stamp = now();
+    {
+        Mutation mutation;
+        mutation.Protect(mid, 65536, true, false, true, [] {});
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
+    std::uint64_t through = 0;
+    Lease lease;
+    Lease whole;
+    const bool answered = GuestAllocationsAcquireChanged_nid_no_patch(stamp, select, &changed, &through, &lease, &whole);
+    check(answered == journal, journal ? "the journal did not answer for the changes since a recent generation" : "without the journal a changed lease was handed out");
+    if (journal) {
+        check(through == now(), "the changed lease names an older generation than the registry's");
+        check(changed == seen && changed.size() == 1 && changed.front().first <= at(mid) && changed.front().second >= at(mid) + 65536 && changed.front().second <= at(far), "the changes handed to the selection are not the protected range alone");
+        check(lease.size() == 2 && lease[0]->address == at(low) && lease[1]->address == at(mid) && !lease[1]->writable, "the changed lease does not hold exactly the readable ranges over the cover, as they are now");
+        const auto full = GuestAllocationsAcquire_nid_postfix();
+        check(whole.size() == full.size() && std::equal(whole.begin(), whole.end(), full.begin()), "the whole lease taken with the changes is not the registry's");
+        check(rangeAt(whole, low).lock() == lease[0] && rangeAt(whole, mid).lock() == lease[1] && !rangeAt(whole, far).expired(), "the changed lease and the whole lease disagree on a range");
+        check(GuestAllocationsAcquireChanged_nid_no_patch(through, select, &changed, &through, &lease, nullptr) && changed.empty(), "the registry changed although no mutation ran");
+        check(!GuestAllocationsAcquireChanged_nid_no_patch(0, select, &changed, &through, &lease, nullptr), "a generation of zero produced a changed lease");
+    }
+    lease.clear();
+    whole.clear();
+    auto* added = low + 48 * 65536;
+    {
+        std::uint64_t published = 0;
+        const auto current = GuestAllocationsAcquire_nid_postfix();
+        check(GuestAllocationsLeaseCurrent_nid_no_patch(current, &published) && published == now(), "a lease taken with no mutation since is not current");
+        {
+            Mutation mutation;
+            mutation.Add(added, 65536, true, true, true);
+        }
+        check(!GuestAllocationsLeaseCurrent_nid_no_patch(current, &published), "a lease taken before a registration is still current");
+        check(!GuestAllocationsLeaseCurrent_nid_no_patch(Lease{}, &published), "an empty lease is current");
+        check(GuestAllocationsLeaseCurrent_nid_no_patch(GuestAllocationsAcquire_nid_postfix(), &published) && published == now(), "a lease taken after the registration is not current");
+    }
+    Mutation mutation;
+    mutation.Remove(low);
+    mutation.Remove(mid);
+    mutation.Remove(far);
+    mutation.Remove(hidden);
+    mutation.Remove(added);
+}
+
 void settledLeaseNeverShowsHalfAMutation() {
     auto* first = arena() + 4 * Granule;
     auto* second = first + 4096;
@@ -407,6 +471,7 @@ int main() {
     cachedSnapshotsFollowRemovals();
     aHeldLeaseBlocksRemoval();
     heapFreeDropsSnapshots();
+    changedLeaseCoversOnlyTheCover(journal);
     settledLeaseNeverShowsHalfAMutation();
     std::puts("guest allocation journal tests passed");
     return 0;
