@@ -69,6 +69,8 @@ struct Registry {
     std::uint64_t backingSerials = 0;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> retiring;
     std::size_t unlockedMutations = 0;
+    std::array<std::pair<std::weak_ptr<const Lease::Ranges>, std::uint64_t>, 64> snapshotGenerations{};
+    std::size_t snapshotNext = 0;
 };
 
 Registry& registry() {
@@ -1188,6 +1190,12 @@ void GuestAllocationsSetUnmapObserver_nid_postfix(void (*callback)(std::uintptr_
     unmapObserver.store(callback, std::memory_order_release);
 }
 
+static void noteSnapshot(const std::shared_ptr<const Lease::Ranges>& ranges) {
+    if (!settledLocked()) return;
+    auto& registered = registry();
+    registered.snapshotGenerations[registered.snapshotNext++ % registered.snapshotGenerations.size()] = {ranges, generation.load(std::memory_order_acquire)};
+}
+
 static Lease acquireReadableLocked() {
     if (auto shared = registry().readableLease) {
         verifyCachedLease(*shared, true);
@@ -1201,6 +1209,7 @@ static Lease acquireReadableLocked() {
         if (entry.readable && (!retiring || !isRetiring(*entry.node->second))) ranges->push_back(entry.node->second);
     }
     if (!retiring) registry().readableLease = ranges;
+    noteSnapshot(ranges);
     return Lease(std::move(ranges));
 }
 
@@ -1259,6 +1268,7 @@ static Lease acquireRegisteredLocked() {
         if (entry.readable) ranges->push_back(entry.node->second);
     }
     if (registry().retiring.empty()) registry().readableLease = ranges;
+    noteSnapshot(ranges);
     return Lease(std::move(ranges));
 }
 
@@ -1314,6 +1324,22 @@ bool GuestAllocationsLeaseCurrent_nid_no_patch(const Lease& lease, std::uint64_t
     if (!settledLocked() || lease.Snapshot() == nullptr || lease.Snapshot() != registry().readableLease) return false;
     *published = generation.load(std::memory_order_acquire);
     return true;
+}
+
+bool GuestAllocationsLeaseGeneration_nid_no_patch(const Lease& lease, std::uint64_t* published) {
+    std::lock_guard lock(registry().mutex);
+    const auto& snapshot = lease.Snapshot();
+    if (snapshot == nullptr) return false;
+    if (settledLocked() && snapshot == registry().readableLease) {
+        *published = generation.load(std::memory_order_acquire);
+        return true;
+    }
+    for (const auto& [noted, at] : registry().snapshotGenerations) {
+        if (noted.expired() || noted.owner_before(snapshot) || snapshot.owner_before(noted)) continue;
+        *published = at;
+        return true;
+    }
+    return false;
 }
 
 std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t address, bool next) {

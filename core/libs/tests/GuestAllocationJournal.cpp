@@ -473,6 +473,42 @@ void unpublishedChangesAreNeverJournalCovered(bool journal) {
     mutation.Remove(renewing);
 }
 
+void leasesKnowTheirGeneration() {
+    auto* pinned = arena() + 5 * Granule;
+    auto* later = pinned + 32 * 65536;
+    {
+        Mutation mutation;
+        mutation.Add(pinned, 65536, true, true, true);
+    }
+    const auto taken = now();
+    auto lease = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
+    std::uint64_t published = 0;
+    check(GuestAllocationsLeaseGeneration_nid_no_patch(*lease, &published) && published == taken, "a current settled lease does not know its generation");
+    {
+        Mutation mutation;
+        mutation.Add(later, 65536, true, true, true);
+    }
+    check(now() != taken && GuestAllocationsLeaseGeneration_nid_no_patch(*lease, &published) && published == taken, "a settled lease taken before a registration does not know the generation it was taken at");
+    check(!GuestAllocationsLeaseGeneration_nid_no_patch(Lease{}, &published), "an empty lease knows a generation");
+    std::thread mutator([&] {
+        Mutation mutation;
+        mutation.RequireUnpinned(pinned, 65536);
+        mutation.Remove(pinned);
+    });
+    const auto retiring = [&] { return GuestAllocationsMutationWaiting_nid_postfix() && rangeAt(GuestAllocationsAcquire_nid_postfix(), pinned).expired(); };
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!retiring() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    check(retiring(), "the mutation never waited for the leased range");
+    {
+        const auto waiting = GuestAllocationsAcquire_nid_postfix();
+        check(!GuestAllocationsLeaseGeneration_nid_no_patch(waiting, &published), "a lease taken while a mutation waits on a pinned range knows a generation");
+    }
+    lease.reset();
+    mutator.join();
+    Mutation mutation;
+    mutation.Remove(later);
+}
+
 void settledLeaseNeverShowsHalfAMutation() {
     auto* first = arena() + 4 * Granule;
     auto* second = first + 4096;
@@ -531,6 +567,7 @@ int main() {
     heapFreeDropsSnapshots();
     changedLeaseCoversOnlyTheCover(journal);
     unpublishedChangesAreNeverJournalCovered(journal);
+    leasesKnowTheirGeneration();
     settledLeaseNeverShowsHalfAMutation();
     std::puts("guest allocation journal tests passed");
     return 0;

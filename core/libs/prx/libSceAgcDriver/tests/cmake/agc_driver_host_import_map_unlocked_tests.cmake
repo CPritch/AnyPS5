@@ -1,0 +1,11 @@
+if(BUILD_TESTING)
+    add_test(NAME agc_driver_host_import_map_unlocked_off COMMAND agc_driver_host_import_map_unlocked_tests)
+    add_test(NAME agc_driver_host_import_map_unlocked_verify COMMAND agc_driver_host_import_map_unlocked_tests)
+    set_tests_properties(agc_driver_host_import_map_unlocked_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_UNLOCKED_MAP_IMPORT=1")
+    set_tests_properties(agc_driver_host_import_map_unlocked_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_JOURNAL_RECONCILE=1;APS5_VERIFY_ALLOCATION_JOURNAL=1;APS5_VERIFY_IMPORT_JOURNAL=1")
+    set_tests_properties(agc_driver_host_import_map_unlocked_off agc_driver_host_import_map_unlocked_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_host_import_map_unlocked_off agc_driver_host_import_map_unlocked_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

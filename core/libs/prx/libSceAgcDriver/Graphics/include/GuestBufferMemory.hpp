@@ -196,6 +196,8 @@ bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof)
 bool HostImportsReconciledUnchanged(const Context& context, const HostImportsProof& proof);
 // The table's identity when it is reconciled with the live registry (one lock), else empty.
 HostImportsProof HostImportsIdentity(const Context& context);
+enum class ImportsProofCheck : std::uint8_t { Changed, Unchanged, Survived };
+ImportsProofCheck HostImportsUnchangedOver(const Context& context, HostImportsProof& proof, std::span<const std::pair<std::uint64_t, std::uint64_t>> regions, bool reconcile);
 
 struct ImportChurnCounts {
     std::uint64_t generations = 0;
@@ -203,6 +205,28 @@ struct ImportChurnCounts {
     std::uint64_t reconcileNs = 0;
     std::uint64_t journalRefreshes = 0;
     std::uint64_t journalFallbacks = 0;
+    std::uint64_t rcAbsorbed = 0;
+    std::uint64_t rcOff = 0;
+    std::uint64_t rcDevice = 0;
+    std::uint64_t rcUnseeded = 0;
+    std::uint64_t rcWindow = 0;
+    std::uint64_t rcBudget = 0;
+    std::uint64_t rcWaiting = 0;
+    std::uint64_t rcUnproven = 0;
+    std::uint64_t rcAborted = 0;
+    std::uint64_t fullOutside = 0;
+    std::uint64_t fullLeases = 0;
+    std::uint64_t fullLeaseNs = 0;
+    std::uint64_t reseeded = 0;
+    std::uint64_t retireReconcile = 0;
+    std::uint64_t retireWaiter = 0;
+    std::uint64_t retireReplace = 0;
+    std::uint64_t retireEvict = 0;
+    std::uint64_t tableOther = 0;
+    std::uint64_t proofGenerationBumps = 0;
+    std::uint64_t proofsSurvived = 0;
+    std::uint64_t mapUnlocked = 0;
+    std::uint64_t mapDiscarded = 0;
     std::uint64_t fullRefreshes = 0;
     std::uint64_t fullRefreshNs = 0;
     std::uint64_t absorbs = 0;
@@ -218,6 +242,7 @@ bool ImportChurnCounted();
 ImportChurnCounts ImportChurnTotals();
 void NoteRevalidateFull(std::uint64_t ns);
 void NoteImportProofWalk();
+void SetMapImportHookForTest(void (*hook)());
 
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
 // HostImportSerial for main-image ranges, which no import serves): a serial unique for the life of
