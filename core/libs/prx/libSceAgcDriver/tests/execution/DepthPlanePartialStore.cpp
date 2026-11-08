@@ -117,10 +117,19 @@ DepthPlaneStoreStatistics Since(const DepthPlaneStoreStatistics& before) {
     return difference;
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> ReadStart(AgcDriver::VulkanDevice& device, std::uint64_t base) {
-    auto stored = AgcDriver::Graphics::FlushDepthPlanes(base - ReadBefore, ReadBytes);
+void PublishToCpu(const void* address, std::size_t bytes) {
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(address), bytes);
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushAndPublish(AgcDriver::VulkanDevice& device, std::uint64_t address, std::size_t bytes) {
+    auto stored = AgcDriver::Graphics::FlushDepthPlanes(address, bytes);
     device.WaitIdle();
+    for (const auto& [begin, length] : stored) AgcDriver::GuestMemory::FlushGpuWrites(begin, static_cast<std::size_t>(length));
     return stored;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> ReadStart(AgcDriver::VulkanDevice& device, std::uint64_t base) {
+    return FlushAndPublish(device, base - ReadBefore, ReadBytes);
 }
 
 }
@@ -171,8 +180,7 @@ int main(int argc, char** argv) {
             const std::array<std::uint32_t, 4> descriptor{static_cast<std::uint32_t>(vertexAddress), static_cast<std::uint32_t>((vertexAddress >> 32u) & 0xffffu) | (32u << 16u), 4u, 0x0004dfacu};
             auto* table = reinterpret_cast<std::byte*>(plane) + 4u * Block + 4096u;
             std::memcpy(table, descriptor.data(), sizeof(descriptor));
-            const auto stores = AgcDriver::Graphics::FlushDepthPlanes(base + 4u * Block + 128u, 192u);
-            device->WaitIdle();
+            const auto stores = FlushAndPublish(*device, base + 4u * Block + 128u, 192u);
             Require(std::memcmp(table, descriptor.data(), sizeof(descriptor)) == 0, "a depth flush overwrote CPU descriptors written after a memoized collect");
             Require(stores.empty(), "a depth flush stored the unit repurposed by the CPU");
             Require(!ReadStart(*device, base).empty(), "preserving the CPU descriptors dropped an untouched depth unit");
@@ -200,8 +208,7 @@ int main(int argc, char** argv) {
         Require(stored.stores == 0 && stored.units == 0 && stored.bytes == 0, "the same read again counted a store");
 
         before = AgcDriver::Graphics::DepthPlaneStoreCounts();
-        const auto rest = AgcDriver::Graphics::FlushDepthPlanes(base, PlaneBytes);
-        device->WaitIdle();
+        const auto rest = FlushAndPublish(*device, base, PlaneBytes);
         stored = Since(before);
         Require(rest.size() == 1 && rest[0].first == base + Block && rest[0].second == PlaneBytes - Block, "a read of the whole plane did not store the five units still stale");
         Require(stored.stores == 1 && stored.units == Units - 1u && stored.bytes == PlaneBytes - Block, "a read of the whole plane did not count one store of five units");
@@ -218,8 +225,7 @@ int main(int argc, char** argv) {
             FillUnit(plane, 4, 0.75f);
             draw(depth, {.depthTest = false});
             before = AgcDriver::Graphics::DepthPlaneStoreCounts();
-            Require(!AgcDriver::Graphics::FlushDepthPlanes(base, PlaneBytes).empty(), "a read of the whole plane after a guest write into unit 4 stored nothing");
-            device->WaitIdle();
+            Require(!FlushAndPublish(*device, base, PlaneBytes).empty(), "a read of the whole plane after a guest write into unit 4 stored nothing");
             stored = Since(before);
             Require(stored.units == 4 && stored.bytes == 4u * Block, "a read of the whole plane after a guest write into unit 4 did not store the four units still stale");
             for (const std::size_t unit : {0u, 1u, 2u, 3u, 5u}) RequireUnit(plane, unit, 0.5f, Texels(unit), "a guest write into unit 4 after unit 0 was stored, then a read of the whole plane");
@@ -243,6 +249,7 @@ int main(int argc, char** argv) {
             Require(AgcDriver::Graphics::DepthSurfaceTexture(AgcDriver::VulkanDeviceTestAccess::ContextOf(*device), words, levels, {}) == nullptr, "a view with two levels of a plane the guest wrote was served by the depth surface");
             device->WaitIdle();
             Require(!AgcDriver::Graphics::DepthSurfaceAt(base), "a view with two levels of a plane the guest wrote left the depth surface live");
+            PublishToCpu(plane, PlaneBytes);
             for (const std::size_t unit : {0u, 1u, 3u, 4u, 5u}) RequireUnit(plane, unit, 0.5f, Texels(unit), "the retire of a partly stored plane the guest wrote into");
             RequireUnit(plane, 2, 0.75f, UnitTexels, "the retire of a partly stored plane the guest wrote into, the written unit");
         }
@@ -255,6 +262,7 @@ int main(int argc, char** argv) {
         const std::span<std::byte> overLastUnit(reinterpret_cast<std::byte*>(plane + 5u * UnitTexels), SmallColorBytes);
         Draw(*device, shaders, smallDepth, {.depthTest = false}, SmallExtent, overLastUnit);
         Require(!AgcDriver::Graphics::DepthSurfaceAt(base), "a color target over the last unit left the depth surface live");
+        PublishToCpu(plane, PlaneBytes);
         for (std::size_t unit = 0; unit < 5u; ++unit) RequireUnit(plane, unit, 0.5f, Texels(unit), "a color target over the last unit of a partly stored plane");
 
         auto* looseBlocks = static_cast<std::byte*>(AllocateBlocks(Block + PlaneBytes, false));
@@ -321,6 +329,7 @@ int main(int argc, char** argv) {
         device->WaitIdle();
         stored = Since(before);
         Require(stored.stores == 1 && stored.units == Units, "a lookup of the first two layers of a three-layer array did not store the depth plane over its second layer");
+        PublishToCpu(layerPlane, PlaneBytes);
         for (std::size_t unit = 0; unit < Units; ++unit) RequireUnit(layerPlane, unit, 0.5f, Texels(unit), "a lookup of the first two layers of a three-layer array, the depth plane over its second layer");
 
         Require(draw(layerDepth, {.depthWrite = true, .depthCompare = VK_COMPARE_OP_ALWAYS, .minDepth = 0.25f, .maxDepth = 0.25f}) == PlaneTexels, "the draw writing depth 0.25 over the second layer of an array did not cover the plane");
@@ -329,6 +338,7 @@ int main(int argc, char** argv) {
         device->WaitIdle();
         stored = Since(before);
         Require(stored.stores == 1 && stored.units == Units, "a lookup of every layer of an array did not store the depth plane over its second layer");
+        PublishToCpu(layerPlane, PlaneBytes);
         for (std::size_t unit = 0; unit < Units; ++unit) RequireUnit(layerPlane, unit, 0.25f, Texels(unit), "a lookup of every layer of an array, the depth plane over its second layer");
         const auto direct = AgcDriver::Graphics::DirectDepthCopyCount();
         Require(!forcedOff || direct == 0, "depth plane copies went directly with the buffer path forced");
