@@ -7338,7 +7338,95 @@ std::uint64_t GuestBufferMemory::SpaceSerial() const {
     return space != nullptr ? space->serial : 0;
 }
 
-GuestBufferMemory::SpaceAttach GuestBufferMemory::AttachSpace(std::uint64_t serial, std::span<const GuestMemorySnapshot> snapshots) {
+namespace {
+
+struct MirrorProbe {
+    struct Range {
+        const ImageMirror* mirror;
+        std::uint64_t begin;
+        std::uint64_t end;
+    };
+    std::vector<Range> ranges;
+    std::uint64_t before = 0;
+};
+
+template<typename TSpace>
+MirrorProbe probeSpaceMirrors(const TSpace& space) {
+    MirrorProbe probe;
+    const auto since = space.mirrorsChecked.load(std::memory_order_acquire);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    for (const auto& region : space.base) {
+        if (region.mirror == nullptr) continue;
+        const auto begin = std::max(region.begin, region.mirror->base);
+        const auto end = std::min(region.end, region.mirror->base + region.mirror->bytes);
+        if (begin >= end) continue;
+        if (since == 0) {
+            probe.ranges.push_back({region.mirror.get(), begin, end});
+            continue;
+        }
+        GuestMemory::CollectWrittenBlocks(begin, static_cast<std::size_t>(end - begin), since, written);
+        for (const auto& [first, last] : written) probe.ranges.push_back({region.mirror.get(), first, last});
+    }
+    probe.before = GuestMemory::TrackerGeneration();
+    return probe;
+}
+
+const char* mirrorKind(const ImageMirror& mirror) {
+    return mirror.heap ? (mirror.sparse ? "sparse heap" : "heap") : mirror.writable ? "writable image" : "read-only image";
+}
+
+template<typename TSpace>
+bool checkSpaceMirrors(const TSpace& space, const MirrorProbe& probe) {
+    constexpr std::uint64_t Chunk = 65536;
+    std::vector<std::byte> held;
+    bool synced = false;
+    const auto differs = [&](const ImageMirror& mirror, std::uint64_t at, std::size_t bytes, std::uint64_t& where) {
+        GuestMemory::CollectWritesUncached(at, bytes);
+        if (!GuestMemory::UnchangedSince(at, bytes, probe.before)) return false;
+        for (const auto& [first, last] : GuestMemory::DescribeCommitted(at, bytes).ranges) {
+            const auto length = static_cast<std::size_t>(last - first);
+            held.resize(length);
+            if (mirror.resident != nullptr) mirror.resident->Read(first, held);
+            else std::memcpy(held.data(), mirror.buffer->Bytes().data() + (first - mirror.base), length);
+            const auto* guest = reinterpret_cast<const std::byte*>(first);
+            if (std::memcmp(held.data(), guest, length) == 0) continue;
+            std::size_t offset = 0;
+            while (offset < length && held[offset] == guest[offset]) ++offset;
+            where = first + offset;
+            return true;
+        }
+        return false;
+    };
+    for (const auto& range : probe.ranges) {
+        const auto& mirror = *range.mirror;
+        for (auto at = range.begin; at < range.end;) {
+            const auto next = std::min(range.end, (at / Chunk + 1) * Chunk);
+            const auto bytes = static_cast<std::size_t>(next - at);
+            std::uint64_t where = 0;
+            bool stale = differs(mirror, at, bytes, where);
+            if (stale && mirror.writable && !synced) {
+                if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion()) recorder->Sync();
+                synced = true;
+                stale = differs(mirror, at, bytes, where);
+            }
+            if (stale) {
+                std::array<std::byte, 1> one{};
+                if (mirror.resident != nullptr) mirror.resident->Read(where, one);
+                else one[0] = mirror.buffer->Bytes()[static_cast<std::size_t>(where - mirror.base)];
+                std::fprintf(stderr, "FATAL: APS5_VERIFY_BDA_TEMPLATES: a reused address-based template's space serves a stale %s mirror: 0x%llx holds 0x%02x, guest memory 0x%02x\n", mirrorKind(mirror), static_cast<unsigned long long>(where), static_cast<unsigned>(one[0]), static_cast<unsigned>(*reinterpret_cast<const std::uint8_t*>(where)));
+                std::fflush(stderr);
+                std::abort();
+            }
+            at = next;
+        }
+    }
+    space.mirrorsChecked.store(probe.before, std::memory_order_release);
+    return synced;
+}
+
+}
+
+GuestBufferMemory::SpaceAttach GuestBufferMemory::AttachSpace(std::uint64_t serial, std::span<const GuestMemorySnapshot> snapshots, bool verifyMirrors) {
     Require(space == nullptr && lease.empty() && uploaded && !committed && regions.empty(), "an address-based template's space is taken while it holds one");
     if (serial == 0 || !addressSpaceCacheEnabled() || context.hostImportAlignment == 0) return SpaceAttach::Space;
     auto current = Spaces().current.load();
@@ -7379,6 +7467,8 @@ GuestBufferMemory::SpaceAttach GuestBufferMemory::AttachSpace(std::uint64_t seri
         stampSpaceUse(state, *space);
         state.buildFloor = floor;
     }
+    const bool probed = verifyMirrors && space->mirrored;
+    const auto probe = probed ? probeSpaceMirrors(*space) : MirrorProbe{};
     std::vector<RefreshBlock> blocks;
     buildingBlocks = &blocks;
     if (!refreshSpaceSparseMirrors(current, blocks)) {
@@ -7408,6 +7498,10 @@ GuestBufferMemory::SpaceAttach GuestBufferMemory::AttachSpace(std::uint64_t seri
     if (!space->base.empty()) StorageTexture::PublishShadowsOnly(space->base.front().begin, static_cast<std::size_t>(space->base.back().end - space->base.front().begin), PublishScope::Whole, "address-based heaps");
     ResidentBuffer::FlushChanged(context);
     if (!SpaceImportsCurrent()) {
+        space.reset();
+        return SpaceAttach::Imports;
+    }
+    if (probed && checkSpaceMirrors(*space, probe) && !SpaceImportsCurrent()) {
         space.reset();
         return SpaceAttach::Imports;
     }

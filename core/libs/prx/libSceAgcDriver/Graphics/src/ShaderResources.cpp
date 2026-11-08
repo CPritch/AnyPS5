@@ -2980,7 +2980,7 @@ ShaderResources::AddressRefusal ShaderResources::AttachAddressSpace(std::span<co
     if (!bdaTemplate) return AddressRefusal::None;
     if (guestMemory.HoldsLease()) return AddressRefusal::Busy;
     if (MultisampleTargetRangeGeneration() != bdaGuardSerial) return AddressRefusal::Targets;
-    switch (guestMemory.AttachSpace(bdaSpaceSerial, snapshots)) {
+    switch (guestMemory.AttachSpace(bdaSpaceSerial, snapshots, VerifyAddressTemplates())) {
         case GuestBufferMemory::SpaceAttach::Attached: return AddressRefusal::None;
         case GuestBufferMemory::SpaceAttach::Space: return AddressRefusal::Space;
         case GuestBufferMemory::SpaceAttach::Imports: return AddressRefusal::Imports;

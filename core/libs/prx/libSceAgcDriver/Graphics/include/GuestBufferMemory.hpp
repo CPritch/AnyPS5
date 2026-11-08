@@ -414,7 +414,7 @@ public:
     std::uint32_t SpaceKinds() const;
     std::uint64_t SpaceSerial() const;
     enum class SpaceAttach : std::uint8_t { Attached, Space, Imports, Snapshot };
-    SpaceAttach AttachSpace(std::uint64_t serial, std::span<const GuestMemorySnapshot> snapshots);
+    SpaceAttach AttachSpace(std::uint64_t serial, std::span<const GuestMemorySnapshot> snapshots, bool verifyMirrors);
     bool SpaceImportsCurrent();
     std::optional<VkDescriptorBufferInfo> InPlaceDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t adjustment) const;
     std::shared_ptr<const void> DetachSpace();
