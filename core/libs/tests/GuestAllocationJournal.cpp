@@ -415,6 +415,64 @@ void changedLeaseCoversOnlyTheCover(bool journal) {
     mutation.Remove(added);
 }
 
+bool spansCover(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, const void* pointer, std::size_t bytes) {
+    const auto begin = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
+    return std::any_of(spans.begin(), spans.end(), [&](const auto& span) { return span.first <= begin && span.second >= begin + bytes; });
+}
+
+void unpublishedChangesAreNeverJournalCovered(bool journal) {
+    auto* pinned = arena() + 5 * Granule;
+    auto* added = pinned + 16 * 65536;
+    auto* renewing = pinned + 64 * 65536;
+    {
+        Mutation mutation;
+        mutation.Add(pinned, 65536, true, true, true);
+        mutation.Add(renewing, 4 * 65536, true, true, true);
+    }
+    auto stamp = now();
+    {
+        Mutation mutation;
+        mutation.RequireUnpinned(renewing + 65536, 65536);
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::uint64_t through = 0;
+    if (journal) check(GuestAllocationsChangesSince_nid_no_patch(stamp, &spans, &through) && spansCover(spans, renewing, 4 * 65536), "renewing the backing of a range journaled only the unpinned part of it");
+    const auto select = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& cover) { cover = changed; };
+    stamp = now();
+    auto held = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
+    std::thread mutator([&] {
+        Mutation mutation;
+        mutation.Add(added, 4 * 65536, true, true, true);
+        mutation.RequireUnpinned(pinned, 65536);
+        mutation.Remove(pinned);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const auto retiring = [&] { return GuestAllocationsMutationWaiting_nid_postfix() && rangeAt(GuestAllocationsAcquire_nid_postfix(), pinned).expired(); };
+    while (!retiring() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    check(retiring(), "the mutation never waited for the leased range");
+    {
+        const auto live = GuestAllocationsAcquire_nid_postfix();
+        check(!rangeAt(live, added).expired() && rangeAt(live, pinned).expired(), "while a mutation waits on a pinned range, a lease does not show its earlier registration and hide the retiring range");
+        if (journal) check(GuestAllocationsChangesSince_nid_no_patch(stamp, &spans, &through) && !spansCover(spans, added, 1), "the journal covers a registration its mutation has not published");
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
+        Lease partial;
+        Lease whole;
+        check(!GuestAllocationsAcquireChanged_nid_no_patch(stamp, select, &changed, &through, &partial, &whole), "a changed lease was handed out while a mutation waits on a pinned range, so its unpublished changes were not covered");
+        std::uint64_t published = 0;
+        check(!GuestAllocationsLeaseCurrent_nid_no_patch(live, &published), "a lease taken while a mutation waits on a pinned range is current");
+    }
+    held.reset();
+    mutator.join();
+    if (journal) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
+        Lease partial;
+        check(GuestAllocationsAcquireChanged_nid_no_patch(stamp, select, &changed, &through, &partial, nullptr) && spansCover(changed, added, 4 * 65536) && spansCover(changed, pinned, 65536), "once the mutation ended, the journal does not cover what it changed");
+    }
+    Mutation mutation;
+    mutation.Remove(added);
+    mutation.Remove(renewing);
+}
+
 void settledLeaseNeverShowsHalfAMutation() {
     auto* first = arena() + 4 * Granule;
     auto* second = first + 4096;
@@ -472,6 +530,7 @@ int main() {
     aHeldLeaseBlocksRemoval();
     heapFreeDropsSnapshots();
     changedLeaseCoversOnlyTheCover(journal);
+    unpublishedChangesAreNeverJournalCovered(journal);
     settledLeaseNeverShowsHalfAMutation();
     std::puts("guest allocation journal tests passed");
     return 0;

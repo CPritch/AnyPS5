@@ -152,7 +152,7 @@ const std::vector<LeaseIndexEntry>& currentLeaseIndex() {
     return index.entries;
 }
 
-void renewBacking(std::uintptr_t address, std::size_t bytes) {
+void renewBacking(std::uintptr_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& renewedSpans) {
     auto& ranges = registry().ranges;
     auto it = ranges.upper_bound(address);
     if (it != ranges.begin()) --it;
@@ -161,7 +161,12 @@ void renewBacking(std::uintptr_t address, std::size_t bytes) {
         auto renewed = *it->second;
         renewed.backingSerial = freshBacking();
         it->second = std::make_shared<const Range>(renewed);
+        renewedSpans.emplace_back(renewed.address, renewed.address + std::max<std::uint64_t>(renewed.bytes, 1));
     }
+}
+
+bool settledLocked() {
+    return registry().retiring.empty() && registry().unlockedMutations == 0;
 }
 
 bool isRetiring(const Range& range) {
@@ -413,7 +418,9 @@ void* GuestAllocationsBegin_nid_postfix() {
 
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     auto* state = static_cast<MutationState*>(mutation);
-    for (const auto& [address, bytes] : state->unpinned) renewBacking(address, bytes);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> renewedSpans;
+    for (const auto& [address, bytes] : state->unpinned) renewBacking(address, bytes, renewedSpans);
+    for (const auto& [begin, end] : renewedSpans) state->journaled.push_back({0, begin, end});
     const bool whole = std::exchange(registry().wholeChangePending, false);
     std::shared_ptr<const SnapshotRanges> snapshot;
     if (journalEnabled() && verifyJournal()) {
@@ -521,7 +528,7 @@ bool GuestAllocationsChangesSince_nid_no_patch(std::uint64_t since, std::vector<
 
 bool GuestAllocationsMutationWaiting_nid_postfix() {
     std::lock_guard lock(registry().mutex);
-    return !registry().retiring.empty() || registry().unlockedMutations != 0;
+    return !settledLocked();
 }
 
 bool GuestAllocationsAnyGpuRange_nid_postfix(std::uintptr_t address, std::size_t bytes) {
@@ -1270,7 +1277,8 @@ bool GuestAllocationsAcquireSettled_nid_no_patch(Lease* lease, std::uint64_t* pu
 
 bool GuestAllocationsAcquireChanged_nid_no_patch(std::uint64_t since, const std::function<void(const std::vector<std::pair<std::uint64_t, std::uint64_t>>&, std::vector<std::pair<std::uint64_t, std::uint64_t>>&)>& select, std::vector<std::pair<std::uint64_t, std::uint64_t>>* changed, std::uint64_t* through, Lease* lease, Lease* whole) {
     std::lock_guard lock(registry().mutex);
-    if (!GuestAllocationsChangesSince_nid_no_patch(since, changed, through)) return false;
+    changed->clear();
+    if (!settledLocked() || !GuestAllocationsChangesSince_nid_no_patch(since, changed, through)) return false;
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> cover;
     cover.clear();
     select(*changed, cover);
@@ -1303,7 +1311,7 @@ bool GuestAllocationsAcquireChanged_nid_no_patch(std::uint64_t since, const std:
 
 bool GuestAllocationsLeaseCurrent_nid_no_patch(const Lease& lease, std::uint64_t* published) {
     std::lock_guard lock(registry().mutex);
-    if (lease.Snapshot() == nullptr || lease.Snapshot() != registry().readableLease) return false;
+    if (!settledLocked() || lease.Snapshot() == nullptr || lease.Snapshot() != registry().readableLease) return false;
     *published = generation.load(std::memory_order_acquire);
     return true;
 }
