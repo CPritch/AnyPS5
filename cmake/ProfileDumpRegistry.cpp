@@ -2,7 +2,6 @@
 #include <cstddef>
 #include <mutex>
 
-extern "C" void __gcov_dump();
 extern "C" [[noreturn]] void __real__Exit(int code);
 
 namespace {
@@ -35,7 +34,6 @@ extern "C" void LibcDumpProfiles_nid_no_patch() {
         dumps = profileDumps;
         count = profileDumpCount;
     }
-    __gcov_dump();
     for (std::size_t index = 0; index < count; ++index) dumps[index]();
 }
 
