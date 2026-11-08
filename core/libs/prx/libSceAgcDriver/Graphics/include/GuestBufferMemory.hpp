@@ -122,6 +122,7 @@ void SetHostImportDeferredSettles(bool enabled);
 // that heap: the other half stays for the buffers, mirrors and textures that share it.
 std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, std::uint64_t physicalBytes);
 void SetHostImportMaxBytes(std::uint64_t bytes);
+void DropAddressSpaceCacheForTest();
 std::uint64_t HostImportLiveBytes();
 // A flip ends a frame: an import used in the current or the previous frame is never evicted for another one.
 void NoteHostImportFrame();

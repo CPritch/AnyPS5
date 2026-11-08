@@ -2260,6 +2260,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 if (resolved.addressUse.Active()) {
                     resolved.resources->NoteAddressReuse(resolved.moved);
                     if (ShaderResources::VerifyAddressTemplates()) {
+                        ShaderResources::RunAddressVerifyHook();
+                        const ShaderResources::UncountedAddressBuild uncounted;
                         const auto built = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
                         resolved.resources->VerifyAddressReuse(*built, resolved.moved);
                         recorder->Keep(built);

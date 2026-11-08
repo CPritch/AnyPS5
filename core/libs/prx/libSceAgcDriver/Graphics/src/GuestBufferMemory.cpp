@@ -3898,6 +3898,14 @@ SnapshotStats& Snapshots() {
     return stats;
 }
 
+bool dropCachedSpace() {
+    auto dropped = Spaces().current.exchange(nullptr);
+    if (dropped == nullptr) return false;
+    Spaces().droppedByWaiter.store(true, std::memory_order_relaxed);
+    Spaces().waiterDrops.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     const auto start = std::chrono::steady_clock::now();
     bool synced = false;
@@ -3908,10 +3916,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     // reference: no GPU wait, no device lock (the mutating thread may be a driver thread holding
     // it). The registry rescans; a range still pinned by a build or a batch holding the space comes
     // back here and finishes lease batches below.
-    if (auto dropped = Spaces().current.exchange(nullptr); dropped != nullptr) {
-        Spaces().droppedByWaiter.store(true, std::memory_order_relaxed);
-        Spaces().waiterDrops.fetch_add(1, std::memory_order_relaxed);
-        dropped.reset();
+    if (dropCachedSpace()) {
         droppedAddressSpace = true;
         auto& imports = Imports();
         const auto end = static_cast<std::uint64_t>(address) + bytes;
@@ -4486,6 +4491,10 @@ void SetHostImportWindow(std::uint64_t bytes) {
 
 void SetHostImportRangeWindow(std::uint64_t bytes) {
     rangeImportWindow.store(bytes, std::memory_order_relaxed);
+}
+
+void DropAddressSpaceCacheForTest() {
+    static_cast<void>(dropCachedSpace());
 }
 
 void SetHostImportMaxBytes(std::uint64_t bytes) {

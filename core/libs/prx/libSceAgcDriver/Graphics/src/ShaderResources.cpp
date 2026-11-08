@@ -2902,6 +2902,9 @@ void CountAddress(ShaderResources::AddressCount count) {
     addressCounts[static_cast<std::size_t>(count)].fetch_add(1, std::memory_order_relaxed);
 }
 
+thread_local bool uncountedAddressBuild = false;
+std::atomic<void (*)()> addressVerifyHook{nullptr};
+
 }
 
 void ShaderResources::noteReusable() {
@@ -2913,14 +2916,15 @@ void ShaderResources::noteReusable() {
     importsReconcilable = false;
     directRegions.clear();
     const bool addressCandidate = usesBda && BdaTemplatesEnabled() && drawBuild && !GuestMemory::OnResolverThread();
+    const bool counting = addressCandidate && !uncountedAddressBuild;
     const auto served = addressCandidate && bdaReadOnly ? guestMemory.SpaceServesTemplate() : GuestBufferMemory::SpaceTemplate::NoSpace;
     const bool addressTemplate = addressCandidate && bdaReadOnly && served == GuestBufferMemory::SpaceTemplate::Served;
     const auto notTemplate = [&] {
-        if (addressTemplate) CountAddress(AddressCount::NotOther);
+        if (addressTemplate && counting) CountAddress(AddressCount::NotOther);
     };
-    if (addressCandidate && !bdaReadOnly) CountAddress(AddressCount::NotReadOnly);
-    else if (addressCandidate && !addressTemplate) CountAddress(served == GuestBufferMemory::SpaceTemplate::Copied ? AddressCount::CopiedRanges : served == GuestBufferMemory::SpaceTemplate::OddRegions ? AddressCount::OddSpaceRegions : served == GuestBufferMemory::SpaceTemplate::OwnRegions ? AddressCount::OwnRegions : served == GuestBufferMemory::SpaceTemplate::Writes ? AddressCount::DescriptorWrites : AddressCount::NoSpace);
-    if (addressCandidate) {
+    if (counting && !bdaReadOnly) CountAddress(AddressCount::NotReadOnly);
+    else if (counting && !addressTemplate) CountAddress(served == GuestBufferMemory::SpaceTemplate::Copied ? AddressCount::CopiedRanges : served == GuestBufferMemory::SpaceTemplate::OddRegions ? AddressCount::OddSpaceRegions : served == GuestBufferMemory::SpaceTemplate::OwnRegions ? AddressCount::OwnRegions : served == GuestBufferMemory::SpaceTemplate::Writes ? AddressCount::DescriptorWrites : AddressCount::NoSpace);
+    if (counting) {
         const auto kinds = guestMemory.SpaceKinds();
         constexpr std::array<std::pair<std::uint32_t, AddressCount>, 7> counted{{{GuestBufferMemory::SpaceMirrored, AddressCount::KindMirrored}, {GuestBufferMemory::SpaceReadOnlyMirrors, AddressCount::KindReadOnlyMirrors}, {GuestBufferMemory::SpaceWritableMirrors, AddressCount::KindWritableMirrors}, {GuestBufferMemory::SpaceHeapMirrors, AddressCount::KindHeapMirrors}, {GuestBufferMemory::SpaceSparseMirrors, AddressCount::KindSparseMirrors}, {GuestBufferMemory::SpaceSparseRegions, AddressCount::KindSparseRegions}, {GuestBufferMemory::SpaceCopied, AddressCount::KindCopied}}};
         for (const auto& [bit, count] : counted) {
@@ -2972,7 +2976,7 @@ void ShaderResources::noteReusable() {
     importsReconcilable = !mirrored && !bounded;
     bdaTemplate = addressTemplate;
     bdaSpaceSerial = addressTemplate ? guestMemory.SpaceSerial() : 0;
-    if (addressTemplate) CountAddress(AddressCount::Made);
+    if (addressTemplate && counting) CountAddress(AddressCount::Made);
     reusable = true;
 }
 
@@ -3027,6 +3031,22 @@ void ShaderResources::NoteAddressRefusal(AddressRefusal refusal) {
     if (count != AddressCount::Count) CountAddress(count);
 }
 
+ShaderResources::UncountedAddressBuild::UncountedAddressBuild() {
+    uncountedAddressBuild = true;
+}
+
+ShaderResources::UncountedAddressBuild::~UncountedAddressBuild() {
+    uncountedAddressBuild = false;
+}
+
+void ShaderResources::SetAddressVerifyHookForTest(void (*hook)()) {
+    addressVerifyHook.store(hook, std::memory_order_release);
+}
+
+void ShaderResources::RunAddressVerifyHook() {
+    if (auto* hook = addressVerifyHook.load(std::memory_order_acquire); hook != nullptr) hook();
+}
+
 bool ShaderResources::VerifyAddressTemplates() {
     static const bool enabled = std::getenv("APS5_VERIFY_BDA_TEMPLATES") != nullptr;
     return enabled;
@@ -3045,18 +3065,30 @@ void ShaderResources::VerifyAddressReuse(const ShaderResources& built, std::span
     };
     const auto info = [&](const VkDescriptorBufferInfo& bound) { return hex(reinterpret_cast<std::uint64_t>(bound.buffer)) + "+" + hex(bound.offset) + "/" + hex(bound.range); };
     if (!built.bdaTemplate) fail("being a template: the full build is not served whole by the cached address space");
-    if (built.bdaSpaceSerial != bdaSpaceSerial) fail("its address space: serial " + std::to_string(bdaSpaceSerial) + " reused, " + std::to_string(built.bdaSpaceSerial) + " built");
+    const bool sameSpace = built.bdaSpaceSerial == bdaSpaceSerial;
+    if (!sameSpace) CountAddress(AddressCount::VerifiedNewerSpace);
     if (built.bdaGuardSerial != bdaGuardSerial) fail("the multisample target generation its table was built under: " + std::to_string(bdaGuardSerial) + " reused, " + std::to_string(built.bdaGuardSerial) + " built");
     if (built.allocations.size() != allocations.size() || built.bindings.size() != bindings.size() || built.descriptorBuffers.size() != descriptorBuffers.size() || built.descriptorImages.size() != descriptorImages.size()) fail("its bindings: " + std::to_string(allocations.size()) + " buffers and " + std::to_string(descriptorImages.size()) + " images reused, " + std::to_string(built.allocations.size()) + " and " + std::to_string(built.descriptorImages.size()) + " built");
     const auto ranges = guestMemory.AddressRanges();
     const auto builtRanges = built.guestMemory.AddressRanges();
-    if (ranges.size() != builtRanges.size()) fail("its BDA table: " + std::to_string(ranges.size()) + " ranges reused, " + std::to_string(builtRanges.size()) + " built");
-    for (std::size_t index = 0; index < ranges.size(); ++index) {
-        const auto& mine = ranges[index];
-        const auto& theirs = builtRanges[index];
-        if (mine.begin != theirs.begin || mine.end != theirs.end || mine.deviceAddress != theirs.deviceAddress || mine.permissions != theirs.permissions) fail("BDA table range " + std::to_string(index) + ": " + hex(mine.begin) + "-" + hex(mine.end) + " at " + hex(mine.deviceAddress) + " reused, " + hex(theirs.begin) + "-" + hex(theirs.end) + " at " + hex(theirs.deviceAddress) + " built");
+    if (sameSpace) {
+        if (ranges.size() != builtRanges.size()) fail("its BDA table: " + std::to_string(ranges.size()) + " ranges reused, " + std::to_string(builtRanges.size()) + " built");
+        for (std::size_t index = 0; index < ranges.size(); ++index) {
+            const auto& mine = ranges[index];
+            const auto& theirs = builtRanges[index];
+            if (mine.begin != theirs.begin || mine.end != theirs.end || mine.deviceAddress != theirs.deviceAddress || mine.permissions != theirs.permissions) fail("BDA table range " + std::to_string(index) + ": " + hex(mine.begin) + "-" + hex(mine.end) + " at " + hex(mine.deviceAddress) + " reused, " + hex(theirs.begin) + "-" + hex(theirs.end) + " at " + hex(theirs.deviceAddress) + " built");
+        }
+        if (guestMemory.InPlaceReads() != built.guestMemory.InPlaceReads()) fail("the ranges it reads in place");
+    } else {
+        for (const auto& mine : ranges) {
+            const bool held = std::any_of(builtRanges.begin(), builtRanges.end(), [&](const auto& theirs) { return theirs.begin == mine.begin && theirs.end == mine.end && theirs.permissions == mine.permissions; });
+            if (!held) fail("its BDA table: the range " + hex(mine.begin) + "-" + hex(mine.end) + " of the reused space " + std::to_string(bdaSpaceSerial) + " is missing from the newer space " + std::to_string(built.bdaSpaceSerial) + " a full build takes now");
+        }
+        const auto builtReads = built.guestMemory.InPlaceReads();
+        for (const auto& [begin, end] : guestMemory.InPlaceReads()) {
+            if (std::none_of(builtReads.begin(), builtReads.end(), [&](const auto& range) { return range.first <= begin && end <= range.second; })) fail("the ranges it reads in place: " + hex(begin) + "-" + hex(end) + " of the reused space is not read in place by the newer space");
+        }
     }
-    if (guestMemory.InPlaceReads() != built.guestMemory.InPlaceReads()) fail("the ranges it reads in place");
     if (guestMemory.Writes() != built.guestMemory.Writes()) fail("the ranges it writes");
     if (pushPatches != built.pushPatches) fail("its push constant patches");
     if (dataPatches.size() != built.dataPatches.size() || !std::equal(dataPatches.begin(), dataPatches.end(), built.dataPatches.begin(), [](const DataPatch& a, const DataPatch& b) { return a.allocation == b.allocation && a.byte == b.byte && a.adjustment == b.adjustment; })) fail("its data word patches");
@@ -3069,9 +3101,10 @@ void ShaderResources::VerifyAddressReuse(const ShaderResources& built, std::span
             const auto address = override != moved.end() ? override->address : mine.address;
             const auto size = override != moved.end() ? override->size : mine.size;
             if (address != theirs.address || size != theirs.size || mine.adjustment != theirs.adjustment) fail("the range of guest buffer " + std::to_string(index) + ": " + hex(address) + "+" + hex(size) + " adjusted by " + std::to_string(mine.adjustment) + " reused, " + hex(theirs.address) + "+" + hex(theirs.size) + " adjusted by " + std::to_string(theirs.adjustment) + " built");
-            std::uint32_t adjustment = 0;
-            const auto expected = wholeDwordRange(built.guestMemory.Descriptor(theirs.address, theirs.size, adjustment));
-            const auto bound = override != moved.end() ? override->inPlace : wholeDwordRange(guestMemory.Descriptor(mine.address, mine.size, adjustment));
+            if (!sameSpace) continue;
+            std::uint32_t described = 0;
+            const auto expected = wholeDwordRange(built.guestMemory.Descriptor(theirs.address, theirs.size, described));
+            const auto bound = override != moved.end() ? override->inPlace : wholeDwordRange(guestMemory.Descriptor(mine.address, mine.size, described));
             if (bound.buffer != expected.buffer || bound.offset != expected.offset || bound.range != expected.range) fail("the import binding of guest buffer " + std::to_string(index) + ": " + info(bound) + " reused, " + info(expected) + " built");
             continue;
         }
@@ -3121,8 +3154,9 @@ std::string ShaderResources::TakeAddressTemplateText() {
     std::lock_guard lock(mutex);
     const auto now = AddressTemplateTotals();
     const auto at = [&](AddressCount count) { return static_cast<unsigned long long>(now[static_cast<std::size_t>(count)] - seen[static_cast<std::size_t>(count)]); };
-    char text[1024];
-    std::snprintf(text, sizeof(text), "; BDA templates (10 s): reused %llu (with moved buffers %llu, with new data words %llu), made %llu; reuses refused: busy %llu, space moved on %llu, imports %llu, multisample targets %llu, a snapshot outside the space %llu, the proof %llu, words not movable %llu, a buffer outside it or misaligned %llu; builds not made templates: not read-only %llu, no cached space %llu, copied ranges in the space %llu, other space regions %llu, regions outside the space %llu, descriptor writes %llu, other %llu; their spaces carry: mirrors %llu (read-only image %llu, writable image %llu, heap %llu, sparse heap %llu), sparse regions %llu, copied ranges %llu%s", at(AddressCount::Reused), at(AddressCount::ReusedMovedBuffers), at(AddressCount::ReusedMovedData), at(AddressCount::Made), at(AddressCount::RefusedBusy), at(AddressCount::RefusedSpace), at(AddressCount::RefusedImports), at(AddressCount::RefusedTargets), at(AddressCount::RefusedSnapshot), at(AddressCount::RefusedProof), at(AddressCount::RefusedUnmovable), at(AddressCount::RefusedBuffer), at(AddressCount::NotReadOnly), at(AddressCount::NoSpace), at(AddressCount::CopiedRanges), at(AddressCount::OddSpaceRegions), at(AddressCount::OwnRegions), at(AddressCount::DescriptorWrites), at(AddressCount::NotOther), at(AddressCount::KindMirrored), at(AddressCount::KindReadOnlyMirrors), at(AddressCount::KindWritableMirrors), at(AddressCount::KindHeapMirrors), at(AddressCount::KindSparseMirrors), at(AddressCount::KindSparseRegions), at(AddressCount::KindCopied), BdaTemplatesEnabled() ? "" : " (off: APS5_NO_BDA_TEMPLATES)");
+    const auto verifyText = VerifyAddressTemplates() ? "; verify builds over a newer space " + std::to_string(at(AddressCount::VerifiedNewerSpace)) : std::string();
+    char text[1600];
+    std::snprintf(text, sizeof(text), "; BDA templates (10 s): reused %llu (with moved buffers %llu, with new data words %llu), made %llu; reuses refused: busy %llu, space moved on %llu, imports %llu, multisample targets %llu, a snapshot outside the space %llu, the proof %llu, words not movable %llu, a buffer outside it or misaligned %llu; builds not made templates: not read-only %llu, no cached space %llu, copied ranges in the space %llu, other space regions %llu, regions outside the space %llu, descriptor writes %llu, other %llu; their spaces carry: mirrors %llu (read-only image %llu, writable image %llu, heap %llu, sparse heap %llu), sparse regions %llu, copied ranges %llu%s%s", at(AddressCount::Reused), at(AddressCount::ReusedMovedBuffers), at(AddressCount::ReusedMovedData), at(AddressCount::Made), at(AddressCount::RefusedBusy), at(AddressCount::RefusedSpace), at(AddressCount::RefusedImports), at(AddressCount::RefusedTargets), at(AddressCount::RefusedSnapshot), at(AddressCount::RefusedProof), at(AddressCount::RefusedUnmovable), at(AddressCount::RefusedBuffer), at(AddressCount::NotReadOnly), at(AddressCount::NoSpace), at(AddressCount::CopiedRanges), at(AddressCount::OddSpaceRegions), at(AddressCount::OwnRegions), at(AddressCount::DescriptorWrites), at(AddressCount::NotOther), at(AddressCount::KindMirrored), at(AddressCount::KindReadOnlyMirrors), at(AddressCount::KindWritableMirrors), at(AddressCount::KindHeapMirrors), at(AddressCount::KindSparseMirrors), at(AddressCount::KindSparseRegions), at(AddressCount::KindCopied), verifyText.c_str(), BdaTemplatesEnabled() ? "" : " (off: APS5_NO_BDA_TEMPLATES)");
     seen = now;
     return text;
 }

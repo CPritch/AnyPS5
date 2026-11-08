@@ -351,9 +351,18 @@ public:
     static void NoteAddressRefusal(AddressRefusal refusal);
     static bool VerifyAddressTemplates();
     void VerifyAddressReuse(const ShaderResources& built, std::span<const MovedBuffer> moved) const;
-    enum class AddressCount : std::size_t { Reused, ReusedMovedBuffers, ReusedMovedData, Made, RefusedBusy, RefusedSpace, RefusedImports, RefusedTargets, RefusedSnapshot, RefusedProof, RefusedUnmovable, RefusedBuffer, NotReadOnly, NoSpace, CopiedRanges, OddSpaceRegions, OwnRegions, DescriptorWrites, NotOther, KindMirrored, KindReadOnlyMirrors, KindWritableMirrors, KindHeapMirrors, KindSparseMirrors, KindSparseRegions, KindCopied, Count };
+    enum class AddressCount : std::size_t { Reused, ReusedMovedBuffers, ReusedMovedData, Made, RefusedBusy, RefusedSpace, RefusedImports, RefusedTargets, RefusedSnapshot, RefusedProof, RefusedUnmovable, RefusedBuffer, NotReadOnly, NoSpace, CopiedRanges, OddSpaceRegions, OwnRegions, DescriptorWrites, NotOther, KindMirrored, KindReadOnlyMirrors, KindWritableMirrors, KindHeapMirrors, KindSparseMirrors, KindSparseRegions, KindCopied, VerifiedNewerSpace, Count };
     static std::array<std::uint64_t, static_cast<std::size_t>(AddressCount::Count)> AddressTemplateTotals();
     static std::string TakeAddressTemplateText();
+    class UncountedAddressBuild {
+    public:
+        UncountedAddressBuild();
+        ~UncountedAddressBuild();
+        UncountedAddressBuild(const UncountedAddressBuild&) = delete;
+        UncountedAddressBuild& operator=(const UncountedAddressBuild&) = delete;
+    };
+    static void SetAddressVerifyHookForTest(void (*hook)());
+    static void RunAddressVerifyHook();
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders, bool committerDraw = false);

@@ -356,8 +356,32 @@ void RefusesAChangedSpace(Fixture& fixture) {
     ExpectColors(before, {255, 255, 255}, "a draw before the space changed");
     ExpectColors(changed, {255, 255, 255}, "the draw after the space changed");
     ExpectColors(after, {255, 255, 255}, "a draw over the new space");
-    const auto verifyBuilds = fixture.verify ? counts.Since(Count::Reused) : 0;
-    if (!fixture.off) Expect(counts.Since(Count::RefusedSpace) == 1 && counts.Since(Count::Made) == 1 + verifyBuilds && counts.Since(Count::Reused) == 1, "a template over a space that changed was not refused once, rebuilt over the new space and reused");
+    if (!fixture.off) Expect(counts.Since(Count::RefusedSpace) == 1 && counts.Since(Count::Made) == 1 && counts.Since(Count::Reused) == 1, "a template over a space that changed was not refused once, rebuilt over the new space and reused");
+}
+
+void ReuseSurvivesASpaceDropBeforeItsVerify(Fixture& fixture) {
+    const auto& data = fixture.data;
+    WriteFloat(data, 0x100, 1.0f);
+    WriteFloat(data, 0x400, 0.0f);
+    WriteFloat(data, 0x410, 1.0f);
+    static bool dropped = false;
+    const auto first = DrawRead(fixture, data.At(0x100), data.At(0x400));
+    const Counts counts;
+    ShaderResources::SetAddressVerifyHookForTest(+[] {
+        if (std::exchange(dropped, true)) return;
+        AgcDriver::Graphics::DropAddressSpaceCacheForTest();
+    });
+    const auto reused = DrawRead(fixture, data.At(0x100), data.At(0x400));
+    ShaderResources::SetAddressVerifyHookForTest(nullptr);
+    if (!dropped) AgcDriver::Graphics::DropAddressSpaceCacheForTest();
+    const auto refused = DrawRead(fixture, data.At(0x100), data.At(0x400));
+    const auto again = DrawRead(fixture, data.At(0x100), data.At(0x400));
+    const auto since = [&](Count count) { return static_cast<unsigned long long>(counts.Since(count)); };
+    std::printf("draws around a drop of the cached space %s: %s, %s, %s, %s; reused %llu, refused for the space %llu, made %llu, verify builds over a newer space %llu\n", fixture.verify ? "between a reuse and its verify build" : "after a reuse", Text(first).c_str(), Text(reused).c_str(), Text(refused).c_str(), Text(again).c_str(), since(Count::Reused), since(Count::RefusedSpace), since(Count::Made), since(Count::VerifiedNewerSpace));
+    for (const auto& [colors, what] : {std::pair{first, "the first draw"}, std::pair{reused, "the reuse before the drop"}, std::pair{refused, "the draw after the drop"}, std::pair{again, "the reuse over the new space"}}) ExpectColors(colors, {255, 0, 255}, what);
+    if (fixture.off) return;
+    Expect(since(Count::Reused) == 2 && since(Count::RefusedSpace) == 1 && since(Count::Made) == 1, "the drop of the cached space did not refuse the next reuse once, rebuild it over the new space and reuse that");
+    Expect(since(Count::VerifiedNewerSpace) == (fixture.verify ? 1u : 0u), "the verify build after the drop did not take the newer space");
 }
 
 void MirroredSpacesRefreshPerReuse(Fixture& fixture) {
@@ -386,8 +410,7 @@ void MirroredSpacesRefreshPerReuse(Fixture& fixture) {
         return;
     }
     Expect(since(Count::KindHeapMirrors) != 0 && since(Count::KindSparseMirrors) != 0 && since(Count::KindReadOnlyMirrors) != 0 && since(Count::KindWritableMirrors) != 0, "the space did not carry heap, sparse heap, read-only image and writable image mirrors, so the case does not test them");
-    const auto verifyBuilds = fixture.verify ? since(Count::Reused) : 0;
-    Expect(since(Count::Reused) == 3 && since(Count::Made) == 1 + verifyBuilds, "the draws after the first did not all reuse its template over the mirrored space");
+    Expect(since(Count::Reused) == 3 && since(Count::Made) == 1, "the draws after the first did not all reuse its template over the mirrored space");
     Expect(since(Count::ReusedMovedBuffers) == 2, "the reuses through the image mirrors did not bind their moved buffer in place");
     Expect(since(Count::ReusedMovedData) == 1, "the reuse after the CPU rewrote the word its program loads did not bind the new word, or a reuse whose loaded word equals the template's moved it");
 }
@@ -421,6 +444,7 @@ int main(int argc, char** argv) {
         if (only.empty() || only == "--writes") ReuseReadsWritesIntoItsRanges(fixture);
         if (only.empty() || only == "--outside") RefusesABufferOutsideTheSpace(fixture);
         if (only.empty() || only == "--space") RefusesAChangedSpace(fixture);
+        if (only == "--verify-drop") ReuseSurvivesASpaceDropBeforeItsVerify(fixture);
         std::printf("%s\n", ShaderResources::TakeAddressTemplateText().c_str());
         AgcDriverShutdown_nid_postfix();
         std::puts(fixture.off ? "BDA templates: with APS5_NO_BDA_TEMPLATES=1 every address-based draw builds its own resources" : "BDA templates: a reused address-based draw template binds each draw's words and refuses a moved space or a buffer outside it");
