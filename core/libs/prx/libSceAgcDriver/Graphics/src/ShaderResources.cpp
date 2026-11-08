@@ -2694,6 +2694,7 @@ void ShaderResources::buildComplete() {
         requireGuestBuffers();
         guestMemory.UploadFinish(usesBda, htileClear);
         timing.uploadMs += phase(BuildPhase::Upload);
+        if (usesBda) bdaGuardSerial = MultisampleTargetRangeGeneration();
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         if (bda) bda->SetSrtGuards(std::move(srtGuardFaults));
@@ -2890,19 +2891,52 @@ bool LoopGuardEnabled() {
     return enabled;
 }
 
+bool BdaTemplatesEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_BDA_TEMPLATES") == nullptr;
+    return enabled;
+}
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::AddressCount::Count)> addressCounts{};
+
+void CountAddress(ShaderResources::AddressCount count) {
+    addressCounts[static_cast<std::size_t>(count)].fetch_add(1, std::memory_order_relaxed);
+}
+
 }
 
 void ShaderResources::noteReusable() {
     // Taken whether or not the object turns out reusable: the lookups' records are this build's.
     captureValidation();
     reusable = false;
+    bdaTemplate = false;
+    bdaSpaceSerial = 0;
     importsReconcilable = false;
     directRegions.clear();
-    if (htileClear.has_value() || guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
-    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
-    const auto regions = guestMemory.DirectRegions();
-    if (!regions.has_value()) return;
+    const bool addressCandidate = usesBda && BdaTemplatesEnabled() && drawBuild && !GuestMemory::OnResolverThread();
+    const auto served = addressCandidate && bdaReadOnly ? guestMemory.SpaceServesTemplate() : GuestBufferMemory::SpaceTemplate::NoSpace;
+    const bool addressTemplate = addressCandidate && bdaReadOnly && served == GuestBufferMemory::SpaceTemplate::Served;
+    const auto notTemplate = [&] {
+        if (addressTemplate) CountAddress(AddressCount::NotOther);
+    };
+    if (addressCandidate && !bdaReadOnly) CountAddress(AddressCount::NotReadOnly);
+    else if (addressCandidate && !addressTemplate) CountAddress(served == GuestBufferMemory::SpaceTemplate::Mirrored ? AddressCount::MirroredSpace : served == GuestBufferMemory::SpaceTemplate::OwnRegions ? AddressCount::OwnRegions : served == GuestBufferMemory::SpaceTemplate::Writes ? AddressCount::DescriptorWrites : AddressCount::NoSpace);
+    if (htileClear.has_value() || guestMemory.HasCopiedWrites() || (HoldsLease() && !addressTemplate) || (usesBda && !addressTemplate) || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) {
+        notTemplate();
+        return;
+    }
+    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) {
+        notTemplate();
+        return;
+    }
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) {
+        notTemplate();
+        return;
+    }
+    const auto regions = guestMemory.DirectRegions(!addressTemplate);
+    if (!regions.has_value()) {
+        notTemplate();
+        return;
+    }
     bool mirrored = false;
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
@@ -2912,7 +2946,10 @@ void ShaderResources::noteReusable() {
         // bit set, so the two spaces never collide.
         const bool imported = serial != 0;
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return;
+        if (serial == 0) {
+            notTemplate();
+            return;
+        }
         directRegions.push_back({begin, end, serial});
         mirrored = mirrored || !imported;
     }
@@ -2926,17 +2963,90 @@ void ShaderResources::noteReusable() {
         }
     }
     importsReconcilable = !mirrored && !bounded;
+    bdaTemplate = addressTemplate;
+    bdaSpaceSerial = addressTemplate ? guestMemory.SpaceSerial() : 0;
+    if (addressTemplate) CountAddress(AddressCount::Made);
     reusable = true;
+}
+
+ShaderResources::AddressRefusal ShaderResources::AttachAddressSpace(std::span<const GuestMemorySnapshot> snapshots) {
+    if (!bdaTemplate) return AddressRefusal::None;
+    if (guestMemory.HoldsLease()) return AddressRefusal::Busy;
+    if (MultisampleTargetRangeGeneration() != bdaGuardSerial) return AddressRefusal::Targets;
+    switch (guestMemory.AttachSpace(bdaSpaceSerial, snapshots)) {
+        case GuestBufferMemory::SpaceAttach::Attached: return AddressRefusal::None;
+        case GuestBufferMemory::SpaceAttach::Space: return AddressRefusal::Space;
+        case GuestBufferMemory::SpaceAttach::Imports: return AddressRefusal::Imports;
+        case GuestBufferMemory::SpaceAttach::Snapshot: return AddressRefusal::Snapshot;
+    }
+    return AddressRefusal::Space;
+}
+
+bool ShaderResources::AddressSpaceCurrent() {
+    return !bdaTemplate || guestMemory.SpaceImportsCurrent();
+}
+
+ShaderResources::AddressRefusal ShaderResources::ResolveAddressMoves(std::vector<MovedBuffer>& moved) const {
+    if (!bdaTemplate) return AddressRefusal::None;
+    for (auto& entry : moved) {
+        if (!entry.words.empty()) continue;
+        Require(entry.allocation < allocations.size() && allocations[entry.allocation].guest, "a moved buffer of an address-based template is not a guest buffer");
+        const auto inPlace = guestMemory.InPlaceDescriptor(entry.address, entry.size, allocations[entry.allocation].adjustment);
+        if (!inPlace.has_value()) return AddressRefusal::Buffer;
+        entry.inPlace = wholeDwordRange(*inPlace);
+    }
+    return AddressRefusal::None;
+}
+
+void ShaderResources::ReleaseAddressSpace(Recorder& recorder) {
+    if (!bdaTemplate) return;
+    auto space = guestMemory.DetachSpace();
+    if (space != nullptr) recorder.Keep(std::const_pointer_cast<void>(std::move(space)));
+}
+
+void ShaderResources::DropAddressSpace() noexcept {
+    if (bdaTemplate) static_cast<void>(guestMemory.DetachSpace());
+}
+
+void ShaderResources::NoteAddressReuse(std::span<const MovedBuffer> moved) const {
+    CountAddress(AddressCount::Reused);
+    if (std::any_of(moved.begin(), moved.end(), [](const MovedBuffer& entry) { return entry.words.empty(); })) CountAddress(AddressCount::ReusedMovedBuffers);
+    if (std::any_of(moved.begin(), moved.end(), [](const MovedBuffer& entry) { return !entry.words.empty(); })) CountAddress(AddressCount::ReusedMovedData);
+}
+
+void ShaderResources::NoteAddressRefusal(AddressRefusal refusal) {
+    constexpr std::array<AddressCount, static_cast<std::size_t>(AddressRefusal::Count)> counts{AddressCount::Count, AddressCount::RefusedBusy, AddressCount::RefusedSpace, AddressCount::RefusedImports, AddressCount::RefusedTargets, AddressCount::RefusedSnapshot, AddressCount::RefusedProof, AddressCount::RefusedUnmovable, AddressCount::RefusedBuffer};
+    const auto count = counts[static_cast<std::size_t>(refusal)];
+    if (count != AddressCount::Count) CountAddress(count);
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::AddressCount::Count)> ShaderResources::AddressTemplateTotals() {
+    std::array<std::uint64_t, static_cast<std::size_t>(AddressCount::Count)> totals{};
+    for (std::size_t index = 0; index < totals.size(); ++index) totals[index] = addressCounts[index].load(std::memory_order_relaxed);
+    return totals;
+}
+
+std::string ShaderResources::TakeAddressTemplateText() {
+    static AgcDriver::Mutex mutex;
+    static std::array<std::uint64_t, static_cast<std::size_t>(AddressCount::Count)> seen{};
+    std::lock_guard lock(mutex);
+    const auto now = AddressTemplateTotals();
+    const auto at = [&](AddressCount count) { return static_cast<unsigned long long>(now[static_cast<std::size_t>(count)] - seen[static_cast<std::size_t>(count)]); };
+    char text[768];
+    std::snprintf(text, sizeof(text), "; BDA templates (10 s): reused %llu (with moved buffers %llu, with new data words %llu), made %llu; reuses refused: busy %llu, space moved on %llu, imports %llu, multisample targets %llu, a snapshot outside the space %llu, the proof %llu, words not movable %llu, a buffer outside it or misaligned %llu; builds not made templates: not read-only %llu, no cached space %llu, mirrored or sparse space %llu, regions outside the space %llu, descriptor writes %llu, other %llu%s", at(AddressCount::Reused), at(AddressCount::ReusedMovedBuffers), at(AddressCount::ReusedMovedData), at(AddressCount::Made), at(AddressCount::RefusedBusy), at(AddressCount::RefusedSpace), at(AddressCount::RefusedImports), at(AddressCount::RefusedTargets), at(AddressCount::RefusedSnapshot), at(AddressCount::RefusedProof), at(AddressCount::RefusedUnmovable), at(AddressCount::RefusedBuffer), at(AddressCount::NotReadOnly), at(AddressCount::NoSpace), at(AddressCount::MirroredSpace), at(AddressCount::OwnRegions), at(AddressCount::DescriptorWrites), at(AddressCount::NotOther), BdaTemplatesEnabled() ? "" : " (off: APS5_NO_BDA_TEMPLATES)");
+    seen = now;
+    return text;
 }
 
 std::uint64_t ShaderResources::DepthGuardRefusals() {
     return depthGuardRefusals.load(std::memory_order_relaxed);
 }
 
-bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
+bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders, bool committerDraw) {
     const bool loopGuard = LoopGuardEnabled();
-    return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {
-        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
+    const bool tablesRefused = !committerDraw || !BdaTemplatesEnabled() || std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Compute; });
+    return std::any_of(shaders.begin(), shaders.end(), [loopGuard, tablesRefused](const CompiledShader& shader) {
+        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard, tablesRefused](const ShaderRecompiler::DescriptorBinding& binding) { return (tablesRefused && binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
     });
 }
 
@@ -6465,7 +6575,7 @@ std::string ShaderResources::TakeCommitterMovedText() {
 
 std::optional<ShaderResources::MovedPlan> ShaderResources::PlanMovedBuffers(std::span<const CompiledShader> shaders, const ColorTarget* target) const {
     MovedPlan plan;
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return plan;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !bdaTemplate)) return plan;
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
@@ -6479,6 +6589,8 @@ std::optional<ShaderResources::MovedPlan> ShaderResources::PlanMovedBuffers(std:
                 const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
                 if (same) continue;
                 if (item.dataWords.empty() && patched) return std::nullopt;
+                if (bdaTemplate && binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt && shader.program->poisonedSrtReads != 0) return std::nullopt;
+                if (bdaTemplate && binding.role == ShaderRecompiler::DescriptorRole::ShaderData) ValidateRuntimeResources(shader, binding.guestDescriptor);
                 if (plan.moved.empty()) plan.moved.reserve(allocations.size());
                 plan.moved.push_back({index, 0, item.size, binding.guestDescriptor});
                 continue;
@@ -6515,7 +6627,7 @@ std::optional<ShaderResources::MovedPlan> ShaderResources::PlanMovedBuffers(std:
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::CheckMovedPlan(MovedPlan plan, Recorder& recorder) const {
     const bool counted = CommitterProofCounted();
     const auto checkStart = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto usable = std::all_of(plan.checks.begin(), plan.checks.end(), [&](const std::pair<std::uint64_t, std::size_t>& check) {
+    const auto usable = bdaTemplate || std::all_of(plan.checks.begin(), plan.checks.end(), [&](const std::pair<std::uint64_t, std::size_t>& check) {
         const auto [begin, bytes] = check;
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) || guestMemory.WritesOverlap(begin, bytes)) return false;
         const bool pending = recorder.PendingWriteOverlaps(begin, bytes);
@@ -6877,7 +6989,12 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     };
     CountBinding(CountCalls);
     requireGuestBuffers(moved);
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return false;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && (!bdaTemplate || moved.empty()))) return false;
+    if (usesBda && onLane) {
+        result->declined = true;
+        return false;
+    }
+    Require(!usesBda || guestMemory.HoldsLease(), "a reused address-based template's moved words reached its bindings without its address space");
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
     guestMemory.InPlaceReads(reads);
@@ -6887,6 +7004,9 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     thread_local std::vector<std::size_t>* selectedSlot = nullptr;
     auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
     selected.clear();
+    thread_local std::vector<std::size_t>* placedSlot = nullptr;
+    auto& placed = ShaderRecompiler::ThreadOwned(placedSlot);
+    placed.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
     static const bool lockedStamp = std::getenv("APS5_LOCKED_SNAPSHOT_STAMP") != nullptr;
@@ -6939,6 +7059,12 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             upload({slice.bytes, reinterpret_cast<const std::byte*>(override->words.data()), override->size, index});
             selected.push_back(index);
             keep({0, slice.buffer, slice.offset, override->size}, recorder.DrawUploadOwner(slice.buffer));
+            continue;
+        }
+        if (usesBda) {
+            if (override == moved.end()) continue;
+            Require(override->inPlace.buffer != VK_NULL_HANDLE, "a moved buffer of an address-based template has no binding in its address space");
+            placed.push_back(index);
             continue;
         }
         std::uint64_t address = item.address;
@@ -7041,10 +7167,16 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
         }
     }
     part(PartSnapshots);
-    if (selected.empty()) {
+    if (selected.empty() && placed.empty()) {
         CountBinding(CountEmpty);
         return false;
     }
+    const auto placedRange = [&](std::size_t allocation) -> const VkDescriptorBufferInfo* {
+        if (placed.empty() || std::find(placed.begin(), placed.end(), allocation) == placed.end()) return nullptr;
+        const auto entry = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& candidate) { return candidate.allocation == allocation; });
+        Require(entry != moved.end(), "a binding taken in place has no moved buffer");
+        return &entry->inPlace;
+    };
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     const auto poolSizes = [&](std::array<std::vector<VkDescriptorPoolSize>, 2>& counts, std::array<bool, 2>& described) {
         described = {};
@@ -7125,6 +7257,10 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             const auto range = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
             for (const auto slot : plan.allocationSlots[selected[index]]) buffers[slot] = range;
         }
+        for (const auto allocation : placed) {
+            const auto range = *placedRange(allocation);
+            for (const auto slot : plan.allocationSlots[allocation]) buffers[slot] = range;
+        }
         CountBinding(CountWrites, writes.size());
         part(PartWrites);
         context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -7147,7 +7283,10 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             write.pBufferInfo = buffers.data() + offset;
             for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
                 const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
-                if (snapshotIndex == selected.size()) continue;
+                if (snapshotIndex == selected.size()) {
+                    if (const auto* range = placedRange(binding.allocations[element]); range != nullptr) buffers[offset + element] = *range;
+                    continue;
+                }
                 const auto& snapshot = result->snapshots[snapshotIndex];
                 buffers[offset + element] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
             }

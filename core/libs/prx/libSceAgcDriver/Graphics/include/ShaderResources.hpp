@@ -223,6 +223,7 @@ public:
         std::uint64_t address;
         std::size_t size;
         std::span<const std::uint32_t> words;
+        VkDescriptorBufferInfo inPlace{};
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     DrawBindings* PrepareBatchDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
@@ -339,9 +340,21 @@ public:
     static std::uint64_t TakePreProvedReuses();
     bool InResourceCache() const { return inResourceCache.load(std::memory_order_acquire); }
     bool Reusable() const { return reusable; }
+    bool AddressTemplate() const { return bdaTemplate; }
+    enum class AddressRefusal : std::size_t { None, Busy, Space, Imports, Targets, Snapshot, Proof, Unmovable, Buffer, Count };
+    AddressRefusal AttachAddressSpace(std::span<const GuestMemorySnapshot> snapshots);
+    bool AddressSpaceCurrent();
+    AddressRefusal ResolveAddressMoves(std::vector<MovedBuffer>& moved) const;
+    void ReleaseAddressSpace(Recorder& recorder);
+    void DropAddressSpace() noexcept;
+    void NoteAddressReuse(std::span<const MovedBuffer> moved) const;
+    static void NoteAddressRefusal(AddressRefusal refusal);
+    enum class AddressCount : std::size_t { Reused, ReusedMovedBuffers, ReusedMovedData, Made, RefusedBusy, RefusedSpace, RefusedImports, RefusedTargets, RefusedSnapshot, RefusedProof, RefusedUnmovable, RefusedBuffer, NotReadOnly, NoSpace, MirroredSpace, OwnRegions, DescriptorWrites, NotOther, Count };
+    static std::array<std::uint64_t, static_cast<std::size_t>(AddressCount::Count)> AddressTemplateTotals();
+    static std::string TakeAddressTemplateText();
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
-    static bool NeverReusable(std::span<const CompiledShader> shaders);
+    static bool NeverReusable(std::span<const CompiledShader> shaders, bool committerDraw = false);
     static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     static std::size_t LookupLogCapacity();
@@ -727,6 +740,9 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    bool bdaTemplate = false;
+    std::uint64_t bdaSpaceSerial = 0;
+    std::uint64_t bdaGuardSerial = 0;
     mutable std::atomic<std::uint64_t> guardsCheckedDepth{~std::uint64_t{0}};
     mutable std::atomic<std::uint64_t> guardsCheckedColor{~std::uint64_t{0}};
     mutable std::atomic<std::uint64_t> guardsCheckedMoved{~std::uint64_t{0}};

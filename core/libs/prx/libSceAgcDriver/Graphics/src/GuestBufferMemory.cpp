@@ -7289,10 +7289,92 @@ void GuestBufferMemory::WriteBack() {
     releaseHeapReferences();
 }
 
-std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions() const {
+GuestBufferMemory::SpaceTemplate GuestBufferMemory::SpaceServesTemplate() const {
+    if (space == nullptr || !lease.empty() || !uploaded || committed || !addressSpaceCacheEnabled() || context.hostImportAlignment == 0) return SpaceTemplate::NoSpace;
+    if (space->mirrored || !space->copied.empty() || !space->writableMirrors.empty() || !space->heapMirrors.empty() || !space->heapRuns.empty() || !space->sparseMirrors.empty()) return SpaceTemplate::Mirrored;
+    if (std::any_of(space->base.begin(), space->base.end(), [](const Region& region) { return region.direct == nullptr || region.mirror != nullptr || region.sparse || region.runCut; })) return SpaceTemplate::Mirrored;
+    if (!regions.empty() || !readsOverBase.empty() || !servedInsideBase.empty()) return SpaceTemplate::OwnRegions;
+    if (!writes.empty() || !heapReferences.empty()) return SpaceTemplate::Writes;
+    return SpaceTemplate::Served;
+}
+
+std::uint64_t GuestBufferMemory::SpaceSerial() const {
+    return space != nullptr ? space->serial : 0;
+}
+
+GuestBufferMemory::SpaceAttach GuestBufferMemory::AttachSpace(std::uint64_t serial, std::span<const GuestMemorySnapshot> snapshots) {
+    Require(space == nullptr && lease.empty() && uploaded && !committed && regions.empty(), "an address-based template's space is taken while it holds one");
+    if (serial == 0 || !addressSpaceCacheEnabled() || context.hostImportAlignment == 0) return SpaceAttach::Space;
+    auto current = Spaces().current.load();
+    if (current == nullptr || current->serial != serial || current->device != context.device) return SpaceAttach::Space;
+    space = std::move(current);
+    const auto inside = [&](const GuestMemorySnapshot& snapshot) { return !snapshot.bytes.empty() && snapshot.bytes.size() <= std::numeric_limits<std::uint64_t>::max() - snapshot.address && baseOverlap(snapshot.address, snapshot.address + snapshot.bytes.size(), nullptr) == BaseOverlap::Inside; };
+    if (!std::all_of(snapshots.begin(), snapshots.end(), inside)) {
+        space.reset();
+        return SpaceAttach::Snapshot;
+    }
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (importsStale(context, state)) static_cast<void>(absorbUnrelatedChanges(context, state));
+        if (space->keptThrough.load(std::memory_order_acquire) != generation && !spaceUnchangedSince(context, *space, state, generation)) {
+            space.reset();
+            return SpaceAttach::Space;
+        }
+        if (space->importsEpoch != state.epoch) {
+            space.reset();
+            return SpaceAttach::Imports;
+        }
+        const auto floor = state.useCounter + 1;
+        stampSpaceUse(state, *space);
+        state.buildFloor = floor;
+    }
+    completeSpaceWrites();
+    if (!space->base.empty()) StorageTexture::PublishShadowsOnly(space->base.front().begin, static_cast<std::size_t>(space->base.back().end - space->base.front().begin), PublishScope::Whole, "address-based heaps");
+    ResidentBuffer::FlushChanged(context);
+    if (SpaceImportsCurrent()) return SpaceAttach::Attached;
+    space.reset();
+    return SpaceAttach::Imports;
+}
+
+bool GuestBufferMemory::SpaceImportsCurrent() {
+    if (space == nullptr) return false;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (importsStale(context, state)) {
+        if (space->keptThrough.load(std::memory_order_acquire) != space->generation) refreshImports(context, state, GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix());
+        else refreshImports(context, state, space->lease);
+    }
+    return state.epoch == space->importsEpoch;
+}
+
+std::optional<VkDescriptorBufferInfo> GuestBufferMemory::InPlaceDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t adjustment) const {
+    if (space == nullptr || !regions.empty() || !uploaded || committed || address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address - 3) return std::nullopt;
+    const auto begin = address & ~std::uint64_t{3};
+    const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
+    const Region* inside = nullptr;
+    if (baseOverlap(begin, end, &inside) != BaseOverlap::Inside || inside == nullptr || inside->direct == nullptr || inside->mirror != nullptr || inside->runCut) return std::nullopt;
+    const auto base = inside->direct->base - inside->direct->lead;
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+    if (context.limits.minStorageBufferOffsetAlignment == 0 || base % 4 != 0 || address < base || (address - base) % alignment != adjustment) return std::nullopt;
+    auto range = ViewBytes(bytes, adjustment);
+    if (bytes <= context.limits.maxStorageBufferRange) range = std::min<std::uint64_t>(range, context.limits.maxStorageBufferRange & ~std::uint64_t{3});
+    if (range > context.limits.maxStorageBufferRange || address - adjustment + range > inside->direct->base + inside->direct->bytes) return std::nullopt;
+    std::uint32_t described = 0;
+    const auto info = Descriptor(address, bytes, described);
+    if (described != adjustment) return std::nullopt;
+    return info;
+}
+
+std::shared_ptr<const void> GuestBufferMemory::DetachSpace() {
+    return std::exchange(space, nullptr);
+}
+
+std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions(bool withSpace) const {
     if (!uploaded || committed) return std::nullopt;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (space != nullptr) {
+    if (space != nullptr && withSpace) {
         for (const auto& region : space->base) {
             if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return std::nullopt;
             result.emplace_back(region.begin, region.end);
