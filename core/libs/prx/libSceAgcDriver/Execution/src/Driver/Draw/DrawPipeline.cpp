@@ -510,6 +510,12 @@ bool DrawFinisher::RecycledHeldWrites() {
 
 namespace {
 
+template<typename T>
+struct ReclaimOnExit {
+    std::vector<T>& reclaimed;
+    ~ReclaimOnExit() { reclaimed.clear(); }
+};
+
 constexpr std::size_t MostSpareWrites = 256;
 
 struct SpareWritesStorage {};
@@ -728,7 +734,7 @@ void DrawFinisher::push(Slot slot, Pending held) {
     const std::size_t depth = FinisherDepth();
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
-    reclaim.clear();
+    const ReclaimOnExit<Job> reclaimOnExit{reclaim};
     std::unique_lock lock(mutex);
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
@@ -1780,7 +1786,7 @@ bool DrawPipeline::PreparesAhead() {
 void DrawPipeline::queuePrepare(Prepare prepare) {
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Prepare>, ReclaimStorage>();
-    reclaim.clear();
+    const ReclaimOnExit<Prepare> reclaimOnExit{reclaim};
     std::lock_guard lock(prepareMutex);
     if (!spentPrepares.empty()) std::swap(spentPrepares, reclaim);
     if (preparersClosing.load(std::memory_order_relaxed)) return;
@@ -1882,7 +1888,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
-    reclaim.clear();
+    const ReclaimOnExit<Item> reclaimOnExit{reclaim};
     const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::unique_lock lock(mutex);
     if (!retired.empty()) std::swap(retired, reclaim);
@@ -2257,6 +2263,13 @@ void DrawPipeline::Stop() {
 
 void DrawPipeline::ReleaseRetired() {
     std::vector<Item> done;
+    std::vector<Prepare> spent;
+    std::deque<Prepare> unprepared;
+    {
+        std::lock_guard lock(prepareMutex);
+        std::swap(spent, spentPrepares);
+        std::swap(unprepared, prepares);
+    }
     std::lock_guard lock(mutex);
     std::swap(done, retired);
 }
