@@ -98,10 +98,10 @@ void PreparationForTheDeviceIsUsed(AgcDriver::VulkanDevice& device, const Draw& 
 }
 
 void PreparationForAnotherDeviceIsDiscarded(AgcDriver::VulkanDevice& device, const Draw& draw) {
-    auto replaced = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
-    replaced.bufferPool = std::make_shared<BufferPool>(replaced);
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     DrawAhead ahead;
-    PrepareDrawAhead(replaced, draw.state, draw.parameters, draw.shaders, 0, ahead);
+    PrepareDrawAhead(context, draw.state, draw.parameters, draw.shaders, 0, ahead);
+    ahead.pool = std::make_shared<BufferPool>(context);
     const auto used = Total(DrawAheadEvent::Used);
     const auto device0 = Total(DrawAheadEvent::Device);
     const auto covered = Commit(device, draw, &ahead);
