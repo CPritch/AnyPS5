@@ -2976,7 +2976,8 @@ void ShaderResources::noteReusable() {
     importsReconcilable = !mirrored && !bounded;
     bdaTemplate = addressTemplate;
     bdaSpaceSerial = addressTemplate ? guestMemory.SpaceSerial() : 0;
-    if (addressTemplate && counting) CountAddress(AddressCount::Made);
+    addressCounted = addressTemplate && counting;
+    if (addressCounted) CountAddress(AddressCount::Made);
     reusable = true;
 }
 
@@ -3032,6 +3033,7 @@ void ShaderResources::DropAddressSpace() noexcept {
 
 void ShaderResources::NoteAddressReuse(std::span<const MovedBuffer> moved) const {
     CountAddress(AddressCount::Reused);
+    addressReuses.fetch_add(1, std::memory_order_relaxed);
     if (std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.inPlace.buffer != VK_NULL_HANDLE && entry.adjustment != allocations[entry.allocation].adjustment; })) CountAddress(AddressCount::ReusedRepatched);
     if (std::any_of(moved.begin(), moved.end(), [](const MovedBuffer& entry) { return entry.words.empty(); })) CountAddress(AddressCount::ReusedMovedBuffers);
     if (std::any_of(moved.begin(), moved.end(), [](const MovedBuffer& entry) { return !entry.words.empty(); })) CountAddress(AddressCount::ReusedMovedData);
@@ -3183,7 +3185,7 @@ std::string ShaderResources::TakeAddressTemplateText() {
     const auto at = [&](AddressCount count) { return static_cast<unsigned long long>(now[static_cast<std::size_t>(count)] - seen[static_cast<std::size_t>(count)]); };
     const auto verifyText = VerifyAddressTemplates() ? "; verify builds over a newer space " + std::to_string(at(AddressCount::VerifiedNewerSpace)) : std::string();
     char text[1600];
-    std::snprintf(text, sizeof(text), "; BDA templates (10 s): reused %llu (with moved buffers %llu, with new data words %llu), made %llu; reuses refused: busy %llu, space moved on %llu, imports %llu, multisample targets %llu, a snapshot outside the space %llu, the proof %llu, words not movable %llu, a buffer outside it or misaligned %llu; builds not made templates: not read-only %llu, no cached space %llu, copied ranges in the space %llu, other space regions %llu, regions outside the space %llu, descriptor writes %llu, other %llu; their spaces carry: mirrors %llu (read-only image %llu, writable image %llu, heap %llu, sparse heap %llu), sparse regions %llu, copied ranges %llu; reuses that repatched a buffer offset %llu%s%s", at(AddressCount::Reused), at(AddressCount::ReusedMovedBuffers), at(AddressCount::ReusedMovedData), at(AddressCount::Made), at(AddressCount::RefusedBusy), at(AddressCount::RefusedSpace), at(AddressCount::RefusedImports), at(AddressCount::RefusedTargets), at(AddressCount::RefusedSnapshot), at(AddressCount::RefusedProof), at(AddressCount::RefusedUnmovable), at(AddressCount::RefusedBuffer), at(AddressCount::NotReadOnly), at(AddressCount::NoSpace), at(AddressCount::CopiedRanges), at(AddressCount::OddSpaceRegions), at(AddressCount::OwnRegions), at(AddressCount::DescriptorWrites), at(AddressCount::NotOther), at(AddressCount::KindMirrored), at(AddressCount::KindReadOnlyMirrors), at(AddressCount::KindWritableMirrors), at(AddressCount::KindHeapMirrors), at(AddressCount::KindSparseMirrors), at(AddressCount::KindSparseRegions), at(AddressCount::KindCopied), at(AddressCount::ReusedRepatched), verifyText.c_str(), BdaTemplatesEnabled() ? "" : " (off: APS5_NO_BDA_TEMPLATES)");
+    std::snprintf(text, sizeof(text), "; BDA templates (10 s): reused %llu (with moved buffers %llu, with new data words %llu), made %llu; reuses refused: busy %llu, space moved on %llu, imports %llu, multisample targets %llu, a snapshot outside the space %llu, the proof %llu, words not movable %llu, a buffer outside it or misaligned %llu; builds not made templates: not read-only %llu, no cached space %llu, copied ranges in the space %llu, other space regions %llu, regions outside the space %llu, descriptor writes %llu, other %llu; their spaces carry: mirrors %llu (read-only image %llu, writable image %llu, heap %llu, sparse heap %llu), sparse regions %llu, copied ranges %llu; reuses that repatched a buffer offset %llu; templates ended after reuses: none %llu, one %llu, 2-9 %llu, 10-99 %llu, 100 or more %llu; left the cache: replaced by a build of their key %llu, evicted for room %llu, their images gone %llu, removed (refused or failed proof) %llu, cleared %llu%s%s", at(AddressCount::Reused), at(AddressCount::ReusedMovedBuffers), at(AddressCount::ReusedMovedData), at(AddressCount::Made), at(AddressCount::RefusedBusy), at(AddressCount::RefusedSpace), at(AddressCount::RefusedImports), at(AddressCount::RefusedTargets), at(AddressCount::RefusedSnapshot), at(AddressCount::RefusedProof), at(AddressCount::RefusedUnmovable), at(AddressCount::RefusedBuffer), at(AddressCount::NotReadOnly), at(AddressCount::NoSpace), at(AddressCount::CopiedRanges), at(AddressCount::OddSpaceRegions), at(AddressCount::OwnRegions), at(AddressCount::DescriptorWrites), at(AddressCount::NotOther), at(AddressCount::KindMirrored), at(AddressCount::KindReadOnlyMirrors), at(AddressCount::KindWritableMirrors), at(AddressCount::KindHeapMirrors), at(AddressCount::KindSparseMirrors), at(AddressCount::KindSparseRegions), at(AddressCount::KindCopied), at(AddressCount::ReusedRepatched), at(AddressCount::EndedUnused), at(AddressCount::EndedOnce), at(AddressCount::EndedFew), at(AddressCount::EndedTens), at(AddressCount::EndedHundreds), at(AddressCount::LeftReplaced), at(AddressCount::LeftEvicted), at(AddressCount::LeftImages), at(AddressCount::LeftRemoved), at(AddressCount::LeftCleared), verifyText.c_str(), BdaTemplatesEnabled() ? "" : " (off: APS5_NO_BDA_TEMPLATES)");
     seen = now;
     return text;
 }
@@ -4952,7 +4954,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     dropReleasedTextures(evicted);
     if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
     if (const auto found = index.find(key); found != index.end()) {
-        forget(found->second->second);
+        forget(found->second->second, ShaderResources::AddressCount::LeftReplaced);
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         entries.erase(found->second);
         index.erase(found);
@@ -4971,7 +4973,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     noteUse(key);
     while (entries.size() > capacity) {
         noteEvicted(entries.back().first);
-        forget(entries.back().second);
+        forget(entries.back().second, ShaderResources::AddressCount::LeftEvicted);
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
         index.erase(entries.back().first);
         entries.pop_back();
@@ -4986,7 +4988,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
             continue;
         }
         tables -= elements;
-        forget(it->second);
+        forget(it->second, ShaderResources::AddressCount::LeftEvicted);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = std::prev(entries.erase(it));
@@ -5020,7 +5022,7 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
-        forget(it->second);
+        forget(it->second, ShaderResources::AddressCount::LeftImages);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
@@ -5047,7 +5049,7 @@ void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResou
             continue;
         }
         ++dropped;
-        forget(it->second);
+        forget(it->second, ShaderResources::AddressCount::LeftImages);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
@@ -5098,7 +5100,7 @@ std::uint64_t ResourceCache::Touches() {
 
 void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
-    for (const auto& entry : entries) forget(entry.second);
+    for (const auto& entry : entries) forget(entry.second, ShaderResources::AddressCount::LeftCleared);
     index.clear();
     entries.clear();
     evictedKeys.clear();
@@ -5147,13 +5149,15 @@ std::uint64_t ResourceCache::TableElements() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
-    forget(found->second->second);
+    forget(found->second->second, ShaderResources::AddressCount::LeftRemoved);
     entries.erase(found->second);
     index.erase(found);
 }
 
-void ResourceCache::forget(const std::shared_ptr<ShaderResources>& resources) {
-    if (resources != nullptr) resources->inResourceCache.store(false, std::memory_order_release);
+void ResourceCache::forget(const std::shared_ptr<ShaderResources>& resources, ShaderResources::AddressCount reason) {
+    if (resources == nullptr) return;
+    if (resources->addressCounted) CountAddress(reason);
+    resources->inResourceCache.store(false, std::memory_order_release);
 }
 
 ResourceCache& SharedResourceCache() {
@@ -6552,6 +6556,10 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
 }
 
 ShaderResources::~ShaderResources() {
+    if (addressCounted) {
+        const auto reuses = addressReuses.load(std::memory_order_relaxed);
+        CountAddress(reuses == 0 ? AddressCount::EndedUnused : reuses == 1 ? AddressCount::EndedOnce : reuses < 10 ? AddressCount::EndedFew : reuses < 100 ? AddressCount::EndedTens : AddressCount::EndedHundreds);
+    }
     release();
 }
 

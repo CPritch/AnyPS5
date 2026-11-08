@@ -352,7 +352,7 @@ public:
     static void NoteAddressRefusal(AddressRefusal refusal);
     static bool VerifyAddressTemplates();
     void VerifyAddressReuse(const ShaderResources& built, std::span<const MovedBuffer> moved) const;
-    enum class AddressCount : std::size_t { Reused, ReusedMovedBuffers, ReusedMovedData, Made, RefusedBusy, RefusedSpace, RefusedImports, RefusedTargets, RefusedSnapshot, RefusedProof, RefusedUnmovable, RefusedBuffer, NotReadOnly, NoSpace, CopiedRanges, OddSpaceRegions, OwnRegions, DescriptorWrites, NotOther, KindMirrored, KindReadOnlyMirrors, KindWritableMirrors, KindHeapMirrors, KindSparseMirrors, KindSparseRegions, KindCopied, ReusedRepatched, VerifiedNewerSpace, Count };
+    enum class AddressCount : std::size_t { Reused, ReusedMovedBuffers, ReusedMovedData, Made, RefusedBusy, RefusedSpace, RefusedImports, RefusedTargets, RefusedSnapshot, RefusedProof, RefusedUnmovable, RefusedBuffer, NotReadOnly, NoSpace, CopiedRanges, OddSpaceRegions, OwnRegions, DescriptorWrites, NotOther, KindMirrored, KindReadOnlyMirrors, KindWritableMirrors, KindHeapMirrors, KindSparseMirrors, KindSparseRegions, KindCopied, ReusedRepatched, EndedUnused, EndedOnce, EndedFew, EndedTens, EndedHundreds, LeftReplaced, LeftEvicted, LeftImages, LeftRemoved, LeftCleared, VerifiedNewerSpace, Count };
     static std::array<std::uint64_t, static_cast<std::size_t>(AddressCount::Count)> AddressTemplateTotals();
     static std::string TakeAddressTemplateText();
     class UncountedAddressBuild {
@@ -756,6 +756,8 @@ private:
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
     bool bdaTemplate = false;
+    bool addressCounted = false;
+    mutable std::atomic<std::uint64_t> addressReuses{0};
     std::uint64_t bdaSpaceSerial = 0;
     std::uint64_t bdaGuardSerial = 0;
     mutable std::atomic<std::uint64_t> guardsCheckedDepth{~std::uint64_t{0}};
@@ -863,7 +865,7 @@ public:
 
 private:
     void erase(const Key& key);
-    static void forget(const std::shared_ptr<ShaderResources>& resources);
+    static void forget(const std::shared_ptr<ShaderResources>& resources, ShaderResources::AddressCount reason);
     void noteMiss(const Key& key);
     void dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteEvicted(const Key& key);
