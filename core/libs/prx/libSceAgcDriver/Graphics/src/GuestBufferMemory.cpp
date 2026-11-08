@@ -154,6 +154,8 @@ struct GuestBufferMemory::AddressSpace {
     };
     mutable std::map<std::vector<std::uint64_t>, Table> tables;
     mutable std::list<const std::vector<std::uint64_t>*> tableRecency;
+    mutable std::atomic<std::uint32_t> kinds{0};
+    mutable std::atomic<std::uint64_t> mirrorsChecked{0};
 };
 
 std::atomic<std::uint64_t> testHeapMirrorBudget{0};
@@ -7305,11 +7307,31 @@ void GuestBufferMemory::WriteBack() {
 
 GuestBufferMemory::SpaceTemplate GuestBufferMemory::SpaceServesTemplate() const {
     if (space == nullptr || !lease.empty() || !uploaded || committed || !addressSpaceCacheEnabled() || context.hostImportAlignment == 0) return SpaceTemplate::NoSpace;
-    if (space->mirrored || !space->copied.empty() || !space->writableMirrors.empty() || !space->heapMirrors.empty() || !space->heapRuns.empty() || !space->sparseMirrors.empty()) return SpaceTemplate::Mirrored;
-    if (std::any_of(space->base.begin(), space->base.end(), [](const Region& region) { return region.direct == nullptr || region.mirror != nullptr || region.sparse || region.runCut; })) return SpaceTemplate::Mirrored;
+    const auto kinds = SpaceKinds();
+    if ((kinds & SpaceCopied) != 0) return SpaceTemplate::Copied;
+    if ((kinds & SpaceOddRegions) != 0) return SpaceTemplate::OddRegions;
     if (!regions.empty() || !readsOverBase.empty() || !servedInsideBase.empty()) return SpaceTemplate::OwnRegions;
     if (!writes.empty() || !heapReferences.empty()) return SpaceTemplate::Writes;
     return SpaceTemplate::Served;
+}
+
+std::uint32_t GuestBufferMemory::SpaceKinds() const {
+    if (space == nullptr) return 0;
+    auto bits = space->kinds.load(std::memory_order_relaxed);
+    if (bits != 0) return bits;
+    bits = SpaceKindsKnown;
+    if (space->mirrored) bits |= SpaceMirrored;
+    if (!space->copied.empty()) bits |= SpaceCopied;
+    if (!space->writableMirrors.empty()) bits |= SpaceWritableMirrors;
+    if (!space->heapMirrors.empty()) bits |= SpaceHeapMirrors;
+    if (!space->sparseMirrors.empty()) bits |= SpaceSparseMirrors;
+    for (const auto& region : space->base) {
+        if (region.mirror != nullptr && !region.mirror->heap && !region.mirror->writable) bits |= SpaceReadOnlyMirrors;
+        if (region.sparse) bits |= SpaceSparseRegions;
+        if ((region.direct == nullptr && region.mirror == nullptr) || region.runCut) bits |= SpaceOddRegions;
+    }
+    space->kinds.store(bits, std::memory_order_relaxed);
+    return bits;
 }
 
 std::uint64_t GuestBufferMemory::SpaceSerial() const {
@@ -7321,7 +7343,16 @@ GuestBufferMemory::SpaceAttach GuestBufferMemory::AttachSpace(std::uint64_t seri
     if (serial == 0 || !addressSpaceCacheEnabled() || context.hostImportAlignment == 0) return SpaceAttach::Space;
     auto current = Spaces().current.load();
     if (current == nullptr || current->serial != serial || current->device != context.device) return SpaceAttach::Space;
-    space = std::move(current);
+    struct BuildingScope {
+        explicit BuildingScope(GuestBufferMemory* self) { buildingBufferMemory = self; }
+        ~BuildingScope() {
+            buildingBufferMemory = nullptr;
+            buildingBlocks = nullptr;
+        }
+    };
+    const BuildingScope buildingScope(this);
+    ensurePinWaiter();
+    space = current;
     const auto inside = [&](const GuestMemorySnapshot& snapshot) { return !snapshot.bytes.empty() && snapshot.bytes.size() <= std::numeric_limits<std::uint64_t>::max() - snapshot.address && baseOverlap(snapshot.address, snapshot.address + snapshot.bytes.size(), nullptr) == BaseOverlap::Inside; };
     if (!std::all_of(snapshots.begin(), snapshots.end(), inside)) {
         space.reset();
@@ -7340,16 +7371,47 @@ GuestBufferMemory::SpaceAttach GuestBufferMemory::AttachSpace(std::uint64_t seri
             space.reset();
             return SpaceAttach::Imports;
         }
+        if (!spaceKeepsMirrors(context, state, *space)) {
+            space.reset();
+            return SpaceAttach::Space;
+        }
         const auto floor = state.useCounter + 1;
         stampSpaceUse(state, *space);
         state.buildFloor = floor;
     }
+    std::vector<RefreshBlock> blocks;
+    buildingBlocks = &blocks;
+    if (!refreshSpaceSparseMirrors(current, blocks)) {
+        space.reset();
+        return SpaceAttach::Space;
+    }
+    std::vector<std::pair<std::size_t, std::uint64_t>> writableChecked;
+    appendSpaceWritableMirrors(*space, blocks, writableChecked);
+    const auto checked = refreshHeapRuns(*space, blocks);
+    compareBlocks(blocks);
+    for (const auto& [run, collected] : checked) space->verified[run].store(collected, std::memory_order_relaxed);
+    for (const auto& [slot, collected] : writableChecked) space->writableVerified[slot].store(collected, std::memory_order_relaxed);
+    if (mirrorsEnabled()) {
+        if (space->mirrored) ++Mirrors().builds;
+        sweepMirrors();
+        reportMirrors();
+    }
     completeSpaceWrites();
+    if (space->mirrored) {
+        auto& mirrors = Mirrors();
+        std::lock_guard lock(mirrors.mutex);
+        const auto stamp = ++mirrors.dispatchCounter;
+        for (const auto& region : space->base) {
+            if (region.mirror != nullptr) region.mirror->lastDispatch = stamp;
+        }
+    }
     if (!space->base.empty()) StorageTexture::PublishShadowsOnly(space->base.front().begin, static_cast<std::size_t>(space->base.back().end - space->base.front().begin), PublishScope::Whole, "address-based heaps");
     ResidentBuffer::FlushChanged(context);
-    if (SpaceImportsCurrent()) return SpaceAttach::Attached;
-    space.reset();
-    return SpaceAttach::Imports;
+    if (!SpaceImportsCurrent()) {
+        space.reset();
+        return SpaceAttach::Imports;
+    }
+    return SpaceAttach::Attached;
 }
 
 bool GuestBufferMemory::SpaceImportsCurrent() {
@@ -7368,13 +7430,19 @@ std::optional<VkDescriptorBufferInfo> GuestBufferMemory::InPlaceDescriptor(std::
     const auto begin = address & ~std::uint64_t{3};
     const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
     const Region* inside = nullptr;
-    if (baseOverlap(begin, end, &inside) != BaseOverlap::Inside || inside == nullptr || inside->direct == nullptr || inside->mirror != nullptr || inside->runCut) return std::nullopt;
-    const auto base = inside->direct->base - inside->direct->lead;
+    if (baseOverlap(begin, end, &inside) != BaseOverlap::Inside || inside == nullptr || (inside->direct == nullptr && inside->mirror == nullptr) || !servesView(*inside, begin)) return std::nullopt;
+    const auto& region = *inside;
+    const auto base = region.direct != nullptr ? region.direct->base - region.direct->lead : mirrorStart(*region.mirror);
     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     if (context.limits.minStorageBufferOffsetAlignment == 0 || base % 4 != 0 || address < base || (address - base) % alignment != adjustment) return std::nullopt;
     auto range = ViewBytes(bytes, adjustment);
+    const auto served = region.direct != nullptr ? region.direct->base + region.direct->bytes : servedEnd(region);
+    if ((region.direct == nullptr || region.runCut) && served < region.end) {
+        if (address - adjustment >= served) return std::nullopt;
+        range = std::min<std::uint64_t>(range, served - (address - adjustment));
+    }
     if (bytes <= context.limits.maxStorageBufferRange) range = std::min<std::uint64_t>(range, context.limits.maxStorageBufferRange & ~std::uint64_t{3});
-    if (range > context.limits.maxStorageBufferRange || address - adjustment + range > inside->direct->base + inside->direct->bytes) return std::nullopt;
+    if (range > context.limits.maxStorageBufferRange || address - adjustment + range > served) return std::nullopt;
     std::uint32_t described = 0;
     const auto info = Descriptor(address, bytes, described);
     if (described != adjustment) return std::nullopt;

@@ -408,8 +408,10 @@ public:
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
-    enum class SpaceTemplate : std::uint8_t { Served, NoSpace, Mirrored, OwnRegions, Writes };
+    enum class SpaceTemplate : std::uint8_t { Served, NoSpace, Copied, OddRegions, OwnRegions, Writes };
     SpaceTemplate SpaceServesTemplate() const;
+    enum SpaceKind : std::uint32_t { SpaceKindsKnown = 1u, SpaceMirrored = 2u, SpaceReadOnlyMirrors = 4u, SpaceWritableMirrors = 8u, SpaceHeapMirrors = 16u, SpaceSparseMirrors = 32u, SpaceSparseRegions = 64u, SpaceCopied = 128u, SpaceOddRegions = 256u };
+    std::uint32_t SpaceKinds() const;
     std::uint64_t SpaceSerial() const;
     enum class SpaceAttach : std::uint8_t { Attached, Space, Imports, Snapshot };
     SpaceAttach AttachSpace(std::uint64_t serial, std::span<const GuestMemorySnapshot> snapshots);

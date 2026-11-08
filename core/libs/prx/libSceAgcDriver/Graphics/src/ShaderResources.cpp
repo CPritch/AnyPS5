@@ -2919,7 +2919,14 @@ void ShaderResources::noteReusable() {
         if (addressTemplate) CountAddress(AddressCount::NotOther);
     };
     if (addressCandidate && !bdaReadOnly) CountAddress(AddressCount::NotReadOnly);
-    else if (addressCandidate && !addressTemplate) CountAddress(served == GuestBufferMemory::SpaceTemplate::Mirrored ? AddressCount::MirroredSpace : served == GuestBufferMemory::SpaceTemplate::OwnRegions ? AddressCount::OwnRegions : served == GuestBufferMemory::SpaceTemplate::Writes ? AddressCount::DescriptorWrites : AddressCount::NoSpace);
+    else if (addressCandidate && !addressTemplate) CountAddress(served == GuestBufferMemory::SpaceTemplate::Copied ? AddressCount::CopiedRanges : served == GuestBufferMemory::SpaceTemplate::OddRegions ? AddressCount::OddSpaceRegions : served == GuestBufferMemory::SpaceTemplate::OwnRegions ? AddressCount::OwnRegions : served == GuestBufferMemory::SpaceTemplate::Writes ? AddressCount::DescriptorWrites : AddressCount::NoSpace);
+    if (addressCandidate) {
+        const auto kinds = guestMemory.SpaceKinds();
+        constexpr std::array<std::pair<std::uint32_t, AddressCount>, 7> counted{{{GuestBufferMemory::SpaceMirrored, AddressCount::KindMirrored}, {GuestBufferMemory::SpaceReadOnlyMirrors, AddressCount::KindReadOnlyMirrors}, {GuestBufferMemory::SpaceWritableMirrors, AddressCount::KindWritableMirrors}, {GuestBufferMemory::SpaceHeapMirrors, AddressCount::KindHeapMirrors}, {GuestBufferMemory::SpaceSparseMirrors, AddressCount::KindSparseMirrors}, {GuestBufferMemory::SpaceSparseRegions, AddressCount::KindSparseRegions}, {GuestBufferMemory::SpaceCopied, AddressCount::KindCopied}}};
+        for (const auto& [bit, count] : counted) {
+            if ((kinds & bit) != 0) CountAddress(count);
+        }
+    }
     if (htileClear.has_value() || guestMemory.HasCopiedWrites() || (HoldsLease() && !addressTemplate) || (usesBda && !addressTemplate) || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) {
         notTemplate();
         return;
@@ -3114,8 +3121,8 @@ std::string ShaderResources::TakeAddressTemplateText() {
     std::lock_guard lock(mutex);
     const auto now = AddressTemplateTotals();
     const auto at = [&](AddressCount count) { return static_cast<unsigned long long>(now[static_cast<std::size_t>(count)] - seen[static_cast<std::size_t>(count)]); };
-    char text[768];
-    std::snprintf(text, sizeof(text), "; BDA templates (10 s): reused %llu (with moved buffers %llu, with new data words %llu), made %llu; reuses refused: busy %llu, space moved on %llu, imports %llu, multisample targets %llu, a snapshot outside the space %llu, the proof %llu, words not movable %llu, a buffer outside it or misaligned %llu; builds not made templates: not read-only %llu, no cached space %llu, mirrored or sparse space %llu, regions outside the space %llu, descriptor writes %llu, other %llu%s", at(AddressCount::Reused), at(AddressCount::ReusedMovedBuffers), at(AddressCount::ReusedMovedData), at(AddressCount::Made), at(AddressCount::RefusedBusy), at(AddressCount::RefusedSpace), at(AddressCount::RefusedImports), at(AddressCount::RefusedTargets), at(AddressCount::RefusedSnapshot), at(AddressCount::RefusedProof), at(AddressCount::RefusedUnmovable), at(AddressCount::RefusedBuffer), at(AddressCount::NotReadOnly), at(AddressCount::NoSpace), at(AddressCount::MirroredSpace), at(AddressCount::OwnRegions), at(AddressCount::DescriptorWrites), at(AddressCount::NotOther), BdaTemplatesEnabled() ? "" : " (off: APS5_NO_BDA_TEMPLATES)");
+    char text[1024];
+    std::snprintf(text, sizeof(text), "; BDA templates (10 s): reused %llu (with moved buffers %llu, with new data words %llu), made %llu; reuses refused: busy %llu, space moved on %llu, imports %llu, multisample targets %llu, a snapshot outside the space %llu, the proof %llu, words not movable %llu, a buffer outside it or misaligned %llu; builds not made templates: not read-only %llu, no cached space %llu, copied ranges in the space %llu, other space regions %llu, regions outside the space %llu, descriptor writes %llu, other %llu; their spaces carry: mirrors %llu (read-only image %llu, writable image %llu, heap %llu, sparse heap %llu), sparse regions %llu, copied ranges %llu%s", at(AddressCount::Reused), at(AddressCount::ReusedMovedBuffers), at(AddressCount::ReusedMovedData), at(AddressCount::Made), at(AddressCount::RefusedBusy), at(AddressCount::RefusedSpace), at(AddressCount::RefusedImports), at(AddressCount::RefusedTargets), at(AddressCount::RefusedSnapshot), at(AddressCount::RefusedProof), at(AddressCount::RefusedUnmovable), at(AddressCount::RefusedBuffer), at(AddressCount::NotReadOnly), at(AddressCount::NoSpace), at(AddressCount::CopiedRanges), at(AddressCount::OddSpaceRegions), at(AddressCount::OwnRegions), at(AddressCount::DescriptorWrites), at(AddressCount::NotOther), at(AddressCount::KindMirrored), at(AddressCount::KindReadOnlyMirrors), at(AddressCount::KindWritableMirrors), at(AddressCount::KindHeapMirrors), at(AddressCount::KindSparseMirrors), at(AddressCount::KindSparseRegions), at(AddressCount::KindCopied), BdaTemplatesEnabled() ? "" : " (off: APS5_NO_BDA_TEMPLATES)");
     seen = now;
     return text;
 }
