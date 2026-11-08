@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -13,6 +14,9 @@
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <chrono>
+#include <memory>
 
 namespace {
 
@@ -133,6 +137,35 @@ Outcome ReconcileFollowsTheChanges() {
     Require(Graphics::HostImportsReconciledUnchanged(context, proof) && serial(first) == kept && serial(second) == pending, "host import reconcile: an unrelated registration after a fresh import dropped an import");
     RequirePath(before, Today::Refreshes, "an unrelated registration after a fresh import");
 
+    const auto waiting = arena.Address(3 * Window);
+    auto held = std::make_unique<GuestAllocations::Lease>(GuestAllocations::GuestAllocationsAcquire_nid_postfix());
+    std::thread mutator([&] {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(arena.At(3 * Window + 2 * MiB), Piece, true, true, true);
+        mutation.RequireUnpinned(arena.At(3 * Window), Piece);
+    });
+    const auto retiring = [&] {
+        const auto live = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        return GuestAllocations::GuestAllocationsMutationWaiting_nid_postfix() && std::none_of(live.begin(), live.end(), [&](const auto& range) { return range->address == waiting; });
+    };
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!retiring() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool waited = retiring();
+    before = Graphics::ImportChurnTotals();
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(arena.Address(2 * Window)), ProbeBytes);
+    const bool proofHeld = Graphics::HostImportsReconciledUnchanged(context, proof) && serial(first) == kept && serial(second) == pending;
+    const auto during = Graphics::ImportChurnTotals();
+    held.reset();
+    mutator.join();
+    Require(waited, "host import reconcile: the mutation never waited for the leased range at " + Hex(waiting));
+    Require(proofHeld, "host import reconcile: a reconcile while a mutation waited on a pinned range dropped an import");
+    if (JournalExpected()) {
+        Require(during.journalFallbacks > before.journalFallbacks && during.journalRefreshes == before.journalRefreshes && during.fullRefreshes > before.fullRefreshes, "host import reconcile: a reconcile while a mutation waited on a pinned range trusted the journal (fallbacks " + std::to_string(during.journalFallbacks - before.journalFallbacks) + ", journal " + std::to_string(during.journalRefreshes - before.journalRefreshes) + ")");
+    } else {
+        Require(during.journalFallbacks == before.journalFallbacks && during.journalRefreshes == before.journalRefreshes, "host import reconcile: without the journal reconcile a fallback was counted");
+    }
+    Require(reconciled(first) == kept, "host import reconcile: the import at " + Hex(first) + " was dropped once the waiting mutation ended");
+
     Remove(arena, HalfWindow + MiB);
     Remove(arena, HalfWindow + 2 * MiB);
     Require(Graphics::HostImportsReconciledUnchanged(context, proof) && serial(first) == kept, "host import reconcile: removing registrations apart from its run dropped the import at " + Hex(first));
@@ -155,6 +188,7 @@ Outcome ReconcileFollowsTheChanges() {
     Remove(arena, Window);
     Remove(arena, 2 * Window);
     Remove(arena, 3 * Window);
+    Remove(arena, 3 * Window + 2 * MiB);
     Require(!Graphics::HostImportsReconciledUnchanged(context, proof) && serial(first) == 0 && serial(second) == 0, "host import reconcile: imports outlived the ranges they were made from");
     return Outcome::Passed;
 }
