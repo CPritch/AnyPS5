@@ -201,6 +201,7 @@ struct ImportChurnCounts {
     std::uint64_t reconciles = 0;
     std::uint64_t reconcileNs = 0;
     std::uint64_t journalRefreshes = 0;
+    std::uint64_t journalFallbacks = 0;
     std::uint64_t fullRefreshes = 0;
     std::uint64_t fullRefreshNs = 0;
     std::uint64_t absorbs = 0;

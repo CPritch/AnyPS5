@@ -310,6 +310,7 @@ struct ImportChurn {
     std::atomic<std::uint64_t> reconciles{0};
     std::atomic<std::uint64_t> reconcileNs{0};
     std::atomic<std::uint64_t> journalRefreshes{0};
+    std::atomic<std::uint64_t> journalFallbacks{0};
     std::atomic<std::uint64_t> fullRefreshes{0};
     std::atomic<std::uint64_t> fullRefreshNs{0};
     std::atomic<std::uint64_t> absorbs{0};
@@ -2981,18 +2982,20 @@ void verifyJournalCovers(HostImports& state, const std::vector<std::pair<std::ui
     }
 }
 
-bool journalReconcile(const Context& context, HostImports& state) {
-    if (!importJournalEnabled() || state.device != context.device || state.refreshedGeneration == 0 || state.journalFrom == 0) return false;
+enum class JournalReconcile : std::uint8_t { Reconciled, Unavailable, Unproven };
+
+JournalReconcile journalReconcile(const Context& context, HostImports& state) {
+    if (!importJournalEnabled() || state.device != context.device || state.refreshedGeneration == 0 || state.journalFrom == 0) return JournalReconcile::Unavailable;
     const auto window = importWindow.load(std::memory_order_relaxed);
     const auto budget = effectiveBudget(context, state);
-    if (window == 0 || window != state.refreshedWindow || budget != state.refreshedBudget) return false;
+    if (window == 0 || window != state.refreshedWindow || budget != state.refreshedBudget) return JournalReconcile::Unavailable;
     const bool verifying = verifyJournalReconcile();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
     std::uint64_t through = 0;
     GuestAllocations::Lease lease;
     GuestAllocations::Lease whole;
     const auto select = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, std::vector<std::pair<std::uint64_t, std::uint64_t>>& cover) { importCover(state, spans, window, cover); };
-    if (!GuestAllocations::GuestAllocationsAcquireChanged_nid_no_patch(state.journalFrom, select, &changed, &through, &lease, verifying ? &whole : nullptr)) return false;
+    if (!GuestAllocations::GuestAllocationsAcquireChanged_nid_no_patch(state.journalFrom, select, &changed, &through, &lease, verifying ? &whole : nullptr)) return JournalReconcile::Unproven;
     if (verifying) verifyJournalCovers(state, changed, whole, through);
     const JournalChanges journal{through, &changed, window, budget, verifying ? &whole : nullptr};
     refreshImports(context, state, lease, &journal);
@@ -3001,13 +3004,21 @@ bool journalReconcile(const Context& context, HostImports& state) {
         state.verifyRanges = refreshedFrom(whole);
         state.verifyFrom = through;
     }
-    return true;
+    return JournalReconcile::Reconciled;
 }
 
 void reconcileImports(const Context& context, HostImports& state) {
     if (!importsStale(context, state)) return;
     const ChurnTimer timed(Churn().reconciles, Churn().reconcileNs);
-    if (journalReconcileEnabled() && journalReconcile(context, state)) return;
+    if (journalReconcileEnabled()) {
+        const auto outcome = journalReconcile(context, state);
+        if (outcome == JournalReconcile::Reconciled) return;
+        if (outcome == JournalReconcile::Unproven) {
+            Churn().journalFallbacks.fetch_add(1, std::memory_order_relaxed);
+            refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix());
+            return;
+        }
+    }
     if (!importsCurrent(context, state)) refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix());
 }
 
@@ -7630,6 +7641,7 @@ ImportChurnCounts ImportChurnTotals() {
     counts.reconciles = churn.reconciles.load(std::memory_order_relaxed);
     counts.reconcileNs = churn.reconcileNs.load(std::memory_order_relaxed);
     counts.journalRefreshes = churn.journalRefreshes.load(std::memory_order_relaxed);
+    counts.journalFallbacks = churn.journalFallbacks.load(std::memory_order_relaxed);
     counts.fullRefreshes = churn.fullRefreshes.load(std::memory_order_relaxed);
     counts.fullRefreshNs = churn.fullRefreshNs.load(std::memory_order_relaxed);
     counts.absorbs = churn.absorbs.load(std::memory_order_relaxed);
