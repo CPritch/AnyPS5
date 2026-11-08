@@ -313,6 +313,26 @@ struct ImportChurn {
     std::atomic<std::uint64_t> reconcileNs{0};
     std::atomic<std::uint64_t> journalRefreshes{0};
     std::atomic<std::uint64_t> journalFallbacks{0};
+    std::atomic<std::uint64_t> rcAbsorbed{0};
+    std::atomic<std::uint64_t> rcOff{0};
+    std::atomic<std::uint64_t> rcUnseeded{0};
+    std::atomic<std::uint64_t> rcWindow{0};
+    std::atomic<std::uint64_t> rcBudget{0};
+    std::atomic<std::uint64_t> rcDevice{0};
+    std::atomic<std::uint64_t> rcWaiting{0};
+    std::atomic<std::uint64_t> rcUnproven{0};
+    std::atomic<std::uint64_t> rcAborted{0};
+    std::atomic<std::uint64_t> fullOutside{0};
+    std::atomic<std::uint64_t> fullLeases{0};
+    std::atomic<std::uint64_t> fullLeaseNs{0};
+    std::atomic<std::uint64_t> reseeded{0};
+    std::atomic<std::uint64_t> retireReconcile{0};
+    std::atomic<std::uint64_t> retireWaiter{0};
+    std::atomic<std::uint64_t> retireReplace{0};
+    std::atomic<std::uint64_t> retireEvict{0};
+    std::atomic<std::uint64_t> tableOther{0};
+    std::atomic<std::uint64_t> proofGenerationBumps{0};
+    std::atomic<std::uint64_t> proofsSurvived{0};
     std::atomic<std::uint64_t> fullRefreshes{0};
     std::atomic<std::uint64_t> fullRefreshNs{0};
     std::atomic<std::uint64_t> absorbs{0};
@@ -381,6 +401,15 @@ struct RefreshedRange {
     std::weak_ptr<const GuestAllocations::Range> range;
 };
 
+struct TableEvent {
+    std::uint64_t stamp = 0;
+    std::uint64_t base = 0;
+    std::uint64_t end = 0;
+    bool insert = false;
+};
+
+constexpr std::size_t TableEventCapacity = 4096;
+
 struct HostImports {
     ImportsMutex mutex;
     VkDevice device = VK_NULL_HANDLE;
@@ -408,6 +437,8 @@ struct HostImports {
     std::uint64_t journalFrom = 0;
     std::vector<RefreshedRange> verifyRanges;
     std::uint64_t verifyFrom = 0;
+    bool rangesStale = false;
+    std::vector<TableEvent> tableEvents = std::vector<TableEvent>(TableEventCapacity);
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
     // reused while it is unchanged.
     std::uint64_t epoch = 1;
@@ -578,7 +609,14 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
 bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
-void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, bool hold = true) {
+enum class RetireCause : std::uint8_t { Reconcile, Waiter, Replace, Evict };
+
+void noteTableEvent(HostImports& state, std::uint64_t base, std::uint64_t end, bool insert) {
+    const auto stamp = state.epoch + state.inserted;
+    state.tableEvents[stamp % state.tableEvents.size()] = {stamp, base, end, insert};
+}
+
+void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, RetireCause cause, bool hold = true) {
     GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Import);
 #ifdef _WIN32
     auto* reading = forgetSettle(state, it->first);
@@ -593,7 +631,10 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
         return covers(lease) || covers(current);
     });
     ++state.epoch;
+    noteTableEvent(state, it->second.base, it->second.base + it->second.bytes, false);
     Churn().retires.fetch_add(1, std::memory_order_relaxed);
+    const std::array<std::atomic<std::uint64_t>*, 4> retired{&Churn().retireReconcile, &Churn().retireWaiter, &Churn().retireReplace, &Churn().retireEvict};
+    retired[static_cast<std::size_t>(cause)]->fetch_add(1, std::memory_order_relaxed);
     GuestMemory::BreakProofs(GuestMemory::ProofBreak::Import);
     state.liveBytes -= it->second.pinnedBytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
@@ -1917,7 +1958,7 @@ std::uint64_t retireLeastRecent(const Context& context, HostImports& state, cons
         if (oldest == state.imports.end()) break;
         freed += oldest->second.pinnedBytes;
         noteRetiredUnwatched(unwatched, oldest->second, lease);
-        retireImport(context.device, state, oldest, lease);
+        retireImport(context.device, state, oldest, lease, RetireCause::Evict);
     }
     rewatchRetired(state, std::move(unwatched));
     return freed;
@@ -2240,7 +2281,11 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
     const auto existing = state.imports.find(run.base);
     const bool existed = existing != state.imports.end() && sameRun(existing->second, run);
     const auto* entry = importRunAt(context, state, std::move(run), true, begin, lease, end, true, ImportRequester::Join);
-    if (entry != nullptr && !existed) ++state.epoch;
+    if (entry != nullptr && !existed) {
+        ++state.epoch;
+        noteTableEvent(state, entry->base, entry->base + entry->bytes, false);
+        Churn().tableOther.fetch_add(1, std::memory_order_relaxed);
+    }
     return entry;
 }
 
@@ -2343,7 +2388,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
     for (auto it = first; it != state.imports.end() && it->first < base + bytes;) {
         const auto next = std::next(it);
-        retireImport(context.device, state, it, lease);
+        retireImport(context.device, state, it, lease, RetireCause::Replace);
         it = next;
     }
     if (state.liveBytes + bytes > budget) retireLeastRecent(context, state, lease, state.liveBytes + bytes - budget);
@@ -2502,6 +2547,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     const auto [placed, added] = state.imports.emplace(base, entry);
     if (added) {
         ++state.inserted;
+        noteTableEvent(state, base, base + bytes, true);
         Churn().inserts.fetch_add(1, std::memory_order_relaxed);
     }
     GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Import);
@@ -2570,6 +2616,29 @@ bool verifyJournalReconcile() {
     return enabled;
 }
 
+bool journalReseedEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_JOURNAL_RESEED") == nullptr;
+    return enabled;
+}
+
+bool regionProofsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_REGION_PROOFS") == nullptr;
+    return enabled;
+}
+
+thread_local bool inReconcile = false;
+
+void mergeSpans(std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& more) {
+    spans.insert(spans.end(), more.begin(), more.end());
+    std::sort(spans.begin(), spans.end());
+    std::size_t kept = 0;
+    for (const auto& span : spans) {
+        if (kept != 0 && span.first <= spans[kept - 1].second) spans[kept - 1].second = std::max(spans[kept - 1].second, span.second);
+        else spans[kept++] = span;
+    }
+    spans.resize(kept);
+}
+
 bool blockTouched(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed, std::uint64_t window, std::uint64_t base, std::uint64_t bytes) {
     const auto low = base / window * window;
     const auto high = std::max(low + window, base + bytes);
@@ -2581,6 +2650,8 @@ bool blockTouched(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ch
     std::fprintf(stderr, "FATAL: APS5_VERIFY_JOURNAL_RECONCILE: %s 0x%llx+0x%llx: the journal reconcile's lease %s it where the whole registry %s it (generation %llu)\n", what, static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), kept ? "keeps" : "drops", kept ? "drops" : "keeps", static_cast<unsigned long long>(through));
     std::abort();
 }
+
+void verifyTableInvariant(HostImports& state, bool journaled);
 
 // Drops imports whose registered range changed or disappeared: their pages may no longer back the
 // guest addresses. Walks the imports only when the registry changed since the last walk.
@@ -2623,6 +2694,8 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         state.refreshedGeneration = 0;
         state.proofGeneration = 0;
         ++state.epoch;
+        noteTableEvent(state, 0, std::numeric_limits<std::uint64_t>::max(), false);
+        Churn().tableOther.fetch_add(1, std::memory_order_relaxed);
     }
     if (state.destroyBuffer == nullptr) state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
     if (state.freeMemory == nullptr) state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
@@ -2630,22 +2703,43 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     if (generation == state.refreshedGeneration) return;
     GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::Import, __builtin_return_address(0));
     std::optional<ChurnTimer> timed;
-    if (journal == nullptr) timed.emplace(Churn().fullRefreshes, Churn().fullRefreshNs);
+    if (journal == nullptr) {
+        timed.emplace(Churn().fullRefreshes, Churn().fullRefreshNs);
+        if (!inReconcile) Churn().fullOutside.fetch_add(1, std::memory_order_relaxed);
+    }
     state.refreshedGeneration = generation;
-    if (journal == nullptr) state.proofGeneration = generation;
+    if (journal == nullptr && !regionProofsEnabled()) {
+        state.proofGeneration = generation;
+        Churn().proofGenerationBumps.fetch_add(1, std::memory_order_relaxed);
+    }
     state.gateRefusals.clear();
     const auto budget = journal != nullptr ? journal->budget : effectiveBudget(context, state);
     const auto window = journal != nullptr ? journal->window : importWindow.load(std::memory_order_relaxed);
-    const bool whole = window == 0 || window != state.refreshedWindow || budget != state.refreshedBudget;
-    const auto changed = journal != nullptr ? *journal->spans : changedSpans(state.refreshedRanges, lease);
+    bool whole = window == 0 || window != state.refreshedWindow || budget != state.refreshedBudget;
+    auto changed = journal != nullptr ? *journal->spans : changedSpans(state.refreshedRanges, lease);
+    if (journal == nullptr && state.rangesStale && !whole) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> journaled;
+        std::uint64_t through = 0;
+        if (state.journalFrom != 0 && GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(state.journalFrom, &journaled, &through)) mergeSpans(changed, journaled);
+        else whole = true;
+    }
     if (journal != nullptr) {
         state.journalFrom = journal->through;
-    } else if (journalReconcileEnabled()) {
-        std::uint64_t published = 0;
-        state.journalFrom = GuestAllocations::GuestAllocationsLeaseCurrent_nid_no_patch(lease, &published) ? generation : 0;
-        if (verifyJournalReconcile()) {
-            state.verifyRanges = state.refreshedRanges;
-            state.verifyFrom = state.journalFrom;
+        state.rangesStale = true;
+    } else {
+        state.rangesStale = false;
+        if (journalReconcileEnabled()) {
+            std::uint64_t published = 0;
+            if (journalReseedEnabled()) {
+                state.journalFrom = GuestAllocations::GuestAllocationsLeaseGeneration_nid_no_patch(lease, &published) ? published : 0;
+                if (state.journalFrom != 0 && state.journalFrom != generation) Churn().reseeded.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                state.journalFrom = GuestAllocations::GuestAllocationsLeaseCurrent_nid_no_patch(lease, &published) ? generation : 0;
+            }
+            if (verifyJournalReconcile()) {
+                state.verifyRanges = state.refreshedRanges;
+                state.verifyFrom = state.journalFrom;
+            }
         }
     }
     state.refreshedWindow = window;
@@ -2677,7 +2771,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         if (trace && leasedRangeOwner(lease, it->first, it->first + it->second.bytes) != nullptr) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired: the range was mapped again\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second.bytes));
         const auto next = std::next(it);
         noteRetiredUnwatched(unwatched, it->second, lease);
-        retireImport(context.device, state, it, lease);
+        retireImport(context.device, state, it, lease, RetireCause::Reconcile);
         return next;
     };
     if (whole) {
@@ -2703,6 +2797,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     for (auto it = state.failedBlocks.begin(); it != state.failedBlocks.end();) it = !affected(it->first.first, it->first.second) || decide("failed block", it->first.first, it->first.second, [&](const GuestAllocations::Lease& ranges) { return sameRun(it->second, exactRun(ranges, it->first.first, it->first.second)); }) ? std::next(it) : state.failedBlocks.erase(it);
     for (auto it = state.refusals.begin(); it != state.refusals.end();) it = !affected(it->first.first, it->first.second) || (stillRefused(state, &it->second, budget) && decide("refusal", it->first.first, it->first.second, [&](const GuestAllocations::Lease& ranges) { return sameRun(it->second, exactRun(ranges, it->first.first, it->first.second)); })) ? std::next(it) : state.refusals.erase(it);
     for (auto it = state.evictingRefusals.begin(); it != state.evictingRefusals.end();) it = !affected(it->first.first, it->first.second) || (evictingRefusalCurrent(state, it->second, budget) && decide("evicting refusal", it->first.first, it->first.second, [&](const GuestAllocations::Lease& ranges) { return sameRun(it->second, exactRun(ranges, it->first.first, it->first.second)); })) ? std::next(it) : state.evictingRefusals.erase(it);
+    if (journalReconcileEnabled() && verifyJournalReconcile()) verifyTableInvariant(state, journal != nullptr);
 }
 
 const HostImport* peekImport(const HostImports& state, std::uint64_t begin, std::uint64_t end) {
@@ -2887,6 +2982,26 @@ const HostImport* importKeptByJournal(const Context& context, HostImports& state
     return entry;
 }
 
+void verifyTableInvariant(HostImports& state, bool journaled) {
+    if (state.journalFrom == 0) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
+    std::uint64_t through = 0;
+    GuestAllocations::Lease partial;
+    GuestAllocations::Lease whole;
+    const auto none = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>&, std::vector<std::pair<std::uint64_t, std::uint64_t>>&) {};
+    if (!GuestAllocations::GuestAllocationsAcquireChanged_nid_no_patch(state.journalFrom, none, &changed, &through, &partial, &whole)) return;
+    for (const auto& [base, entry] : state.imports) {
+        if (state.pendingImports.contains(base)) continue;
+        const auto [first, last] = importExtent(entry);
+        const auto found = std::upper_bound(changed.begin(), changed.end(), first, [](std::uint64_t value, const auto& span) { return value < span.second; });
+        if (found != changed.end() && found->first < last) continue;
+        const auto bytes = keptBytes(entry, whole);
+        if (bytes.current) continue;
+        std::fprintf(stderr, "FATAL: APS5_VERIFY_JOURNAL_RECONCILE: after a %s reconcile the import 0x%llx+0x%llx was kept over a range the registry no longer has at generation %llu (kept %s, registry %s), and no change journaled since generation %llu touches it, so no journal reconcile would check it\n", journaled ? "journal" : "full", static_cast<unsigned long long>(base), static_cast<unsigned long long>(entry.bytes), static_cast<unsigned long long>(through), describeRange(bytes.kept).c_str(), describeRange(bytes.found).c_str(), static_cast<unsigned long long>(state.journalFrom));
+        std::abort();
+    }
+}
+
 bool absorbUnrelatedChanges(const Context& context, HostImports& state) {
     if (!importJournalEnabled() || state.device != context.device || state.refreshedGeneration == 0 || !state.pendingImports.empty()) return false;
     if (importWindow.load(std::memory_order_relaxed) != state.refreshedWindow || effectiveBudget(context, state) != state.refreshedBudget) return false;
@@ -2984,20 +3099,23 @@ void verifyJournalCovers(HostImports& state, const std::vector<std::pair<std::ui
     }
 }
 
-enum class JournalReconcile : std::uint8_t { Reconciled, Unavailable, Unproven };
+enum class JournalReconcile : std::uint8_t { Reconciled, Off, Device, Unseeded, Window, Budget, Waiting, Unproven };
 
 JournalReconcile journalReconcile(const Context& context, HostImports& state) {
-    if (!importJournalEnabled() || state.device != context.device || state.refreshedGeneration == 0 || state.journalFrom == 0) return JournalReconcile::Unavailable;
+    if (!importJournalEnabled()) return JournalReconcile::Off;
+    if (state.device != context.device || state.refreshedGeneration == 0) return JournalReconcile::Device;
+    if (state.journalFrom == 0) return JournalReconcile::Unseeded;
     const auto window = importWindow.load(std::memory_order_relaxed);
+    if (window == 0 || window != state.refreshedWindow) return JournalReconcile::Window;
     const auto budget = effectiveBudget(context, state);
-    if (window == 0 || window != state.refreshedWindow || budget != state.refreshedBudget) return JournalReconcile::Unavailable;
+    if (budget != state.refreshedBudget) return JournalReconcile::Budget;
     const bool verifying = verifyJournalReconcile();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
     std::uint64_t through = 0;
     GuestAllocations::Lease lease;
     GuestAllocations::Lease whole;
     const auto select = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, std::vector<std::pair<std::uint64_t, std::uint64_t>>& cover) { importCover(state, spans, window, cover); };
-    if (!GuestAllocations::GuestAllocationsAcquireChanged_nid_no_patch(state.journalFrom, select, &changed, &through, &lease, verifying ? &whole : nullptr)) return JournalReconcile::Unproven;
+    if (!GuestAllocations::GuestAllocationsAcquireChanged_nid_no_patch(state.journalFrom, select, &changed, &through, &lease, verifying ? &whole : nullptr)) return GuestAllocations::GuestAllocationsMutationWaiting_nid_postfix() ? JournalReconcile::Waiting : JournalReconcile::Unproven;
     if (verifying) verifyJournalCovers(state, changed, whole, through);
     const JournalChanges journal{through, &changed, window, budget, verifying ? &whole : nullptr};
     refreshImports(context, state, lease, &journal);
@@ -3012,16 +3130,50 @@ JournalReconcile journalReconcile(const Context& context, HostImports& state) {
 void reconcileImports(const Context& context, HostImports& state) {
     if (!importsStale(context, state)) return;
     const ChurnTimer timed(Churn().reconciles, Churn().reconcileNs);
+    struct Path {
+        std::atomic<std::uint64_t>* counter = &Churn().rcAborted;
+        const bool outer = !inReconcile;
+        Path() { inReconcile = true; }
+        ~Path() {
+            if (counter != nullptr) counter->fetch_add(1, std::memory_order_relaxed);
+            if (outer) inReconcile = false;
+        }
+        Path(const Path&) = delete;
+        Path& operator=(const Path&) = delete;
+    } path;
+    const auto full = [&](std::atomic<std::uint64_t>& reason) {
+        GuestAllocations::Lease lease;
+        {
+            const ChurnTimer leased(Churn().fullLeases, Churn().fullLeaseNs);
+            lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        }
+        refreshImports(context, state, lease);
+        path.counter = &reason;
+    };
+    auto outcome = JournalReconcile::Off;
     if (journalReconcileEnabled()) {
-        const auto outcome = journalReconcile(context, state);
-        if (outcome == JournalReconcile::Reconciled) return;
-        if (outcome == JournalReconcile::Unproven) {
+        outcome = journalReconcile(context, state);
+        if (outcome == JournalReconcile::Reconciled) {
+            path.counter = nullptr;
+            return;
+        }
+        if (outcome == JournalReconcile::Waiting || outcome == JournalReconcile::Unproven) {
             Churn().journalFallbacks.fetch_add(1, std::memory_order_relaxed);
-            refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix());
+            full(outcome == JournalReconcile::Waiting ? Churn().rcWaiting : Churn().rcUnproven);
             return;
         }
     }
-    if (!importsCurrent(context, state)) refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix());
+    if (importsCurrent(context, state)) {
+        path.counter = &Churn().rcAbsorbed;
+        return;
+    }
+    switch (outcome) {
+        case JournalReconcile::Device: full(Churn().rcDevice); break;
+        case JournalReconcile::Unseeded: full(Churn().rcUnseeded); break;
+        case JournalReconcile::Window: full(Churn().rcWindow); break;
+        case JournalReconcile::Budget: full(Churn().rcBudget); break;
+        default: full(Churn().rcOff); break;
+    }
 }
 
 // The mirror registry: by range base. The map is protected by `mutex` (findMirror runs in a build's
@@ -4140,7 +4292,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
                     continue;
                 }
                 const auto next = std::next(it);
-                retireImport(imports.device, imports, it, lease, false);
+                retireImport(imports.device, imports, it, lease, RetireCause::Waiter, false);
                 it = next;
                 retiredImport = true;
             }
@@ -4215,7 +4367,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
                         continue;
                     }
                     const auto next = std::next(it);
-                    retireImport(imports.device, imports, it, lease, false);
+                    retireImport(imports.device, imports, it, lease, RetireCause::Waiter, false);
                     it = next;
                     retiredImport = true;
                 }
@@ -4437,6 +4589,8 @@ void ClearHostImports(VkDevice device) {
     state.device = VK_NULL_HANDLE;
     state.refreshedGeneration = 0;
     ++state.epoch;
+    noteTableEvent(state, 0, std::numeric_limits<std::uint64_t>::max(), false);
+    Churn().tableOther.fetch_add(1, std::memory_order_relaxed);
 }
 
 namespace {
@@ -7903,6 +8057,36 @@ HostImportsProof HostImportsIdentity(const Context& context) {
     return {state.device, state.epoch, state.proofGeneration, state.inserted};
 }
 
+ImportsProofCheck HostImportsUnchangedOver(const Context& context, HostImportsProof& proof, std::span<const std::pair<std::uint64_t, std::uint64_t>> regions, bool reconcile) {
+    if (!regionProofsEnabled()) return (reconcile ? HostImportsReconciledUnchanged(context, proof) : HostImportsUnchanged(context, proof)) ? ImportsProofCheck::Unchanged : ImportsProofCheck::Changed;
+    if (proof.device == VK_NULL_HANDLE || proof.device != context.device) return ImportsProofCheck::Changed;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (state.device != proof.device) return ImportsProofCheck::Changed;
+    if (reconcile) {
+        if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) reconcileImports(context, state);
+        if (state.device != proof.device) return ImportsProofCheck::Changed;
+    } else if (state.proofGeneration != proof.refreshedGeneration || !importsCurrent(context, state)) {
+        return ImportsProofCheck::Changed;
+    }
+    if (state.epoch == proof.epoch && (!reconcile || state.inserted == proof.inserted)) return ImportsProofCheck::Unchanged;
+    const auto then = proof.epoch + proof.inserted;
+    const auto now = state.epoch + state.inserted;
+    if (state.epoch < proof.epoch || state.inserted < proof.inserted || now - then > state.tableEvents.size()) return ImportsProofCheck::Changed;
+    for (auto stamp = then + 1; stamp <= now; ++stamp) {
+        const auto& event = state.tableEvents[stamp % state.tableEvents.size()];
+        if (event.stamp != stamp) return ImportsProofCheck::Changed;
+        if (event.insert && !reconcile) continue;
+        for (const auto& [begin, end] : regions) {
+            if (begin < event.end && event.base < end) return ImportsProofCheck::Changed;
+        }
+    }
+    proof.epoch = state.epoch;
+    proof.inserted = state.inserted;
+    Churn().proofsSurvived.fetch_add(1, std::memory_order_relaxed);
+    return ImportsProofCheck::Survived;
+}
+
 bool ImportChurnCounted() {
     static const bool counted = std::getenv("APS5_LONG_WAIT_LOG") != nullptr;
     return counted;
@@ -7916,6 +8100,26 @@ ImportChurnCounts ImportChurnTotals() {
     counts.reconcileNs = churn.reconcileNs.load(std::memory_order_relaxed);
     counts.journalRefreshes = churn.journalRefreshes.load(std::memory_order_relaxed);
     counts.journalFallbacks = churn.journalFallbacks.load(std::memory_order_relaxed);
+    counts.rcAbsorbed = churn.rcAbsorbed.load(std::memory_order_relaxed);
+    counts.rcOff = churn.rcOff.load(std::memory_order_relaxed);
+    counts.rcDevice = churn.rcDevice.load(std::memory_order_relaxed);
+    counts.rcUnseeded = churn.rcUnseeded.load(std::memory_order_relaxed);
+    counts.rcWindow = churn.rcWindow.load(std::memory_order_relaxed);
+    counts.rcBudget = churn.rcBudget.load(std::memory_order_relaxed);
+    counts.rcWaiting = churn.rcWaiting.load(std::memory_order_relaxed);
+    counts.rcUnproven = churn.rcUnproven.load(std::memory_order_relaxed);
+    counts.rcAborted = churn.rcAborted.load(std::memory_order_relaxed);
+    counts.fullOutside = churn.fullOutside.load(std::memory_order_relaxed);
+    counts.fullLeases = churn.fullLeases.load(std::memory_order_relaxed);
+    counts.fullLeaseNs = churn.fullLeaseNs.load(std::memory_order_relaxed);
+    counts.reseeded = churn.reseeded.load(std::memory_order_relaxed);
+    counts.retireReconcile = churn.retireReconcile.load(std::memory_order_relaxed);
+    counts.retireWaiter = churn.retireWaiter.load(std::memory_order_relaxed);
+    counts.retireReplace = churn.retireReplace.load(std::memory_order_relaxed);
+    counts.retireEvict = churn.retireEvict.load(std::memory_order_relaxed);
+    counts.tableOther = churn.tableOther.load(std::memory_order_relaxed);
+    counts.proofGenerationBumps = churn.proofGenerationBumps.load(std::memory_order_relaxed);
+    counts.proofsSurvived = churn.proofsSurvived.load(std::memory_order_relaxed);
     counts.fullRefreshes = churn.fullRefreshes.load(std::memory_order_relaxed);
     counts.fullRefreshNs = churn.fullRefreshNs.load(std::memory_order_relaxed);
     counts.absorbs = churn.absorbs.load(std::memory_order_relaxed);

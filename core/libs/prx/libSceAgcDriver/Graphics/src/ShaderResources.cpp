@@ -4642,8 +4642,24 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             }
         }
         proofLap(PartRegions);
-        if (importsReconcilable ? HostImportsReconciledUnchanged(context, importsProof) : HostImportsUnchanged(context, importsProof)) {
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* importedSlot = nullptr;
+        auto& imported = ShaderRecompiler::ThreadOwned(importedSlot);
+        imported.clear();
+        for (const auto& region : directRegions) imported.emplace_back(region.begin, std::max(region.end, region.regionEnd));
+        const auto check = HostImportsUnchangedOver(context, importsProof, imported, importsReconcilable);
+        if (check != ImportsProofCheck::Changed) {
             if (profile) Revalidations().importSkips.fetch_add(1, std::memory_order_relaxed);
+            static const bool verifySurvivals = std::getenv("APS5_VERIFY_JOURNAL_RECONCILE") != nullptr;
+            if (verifySurvivals && check == ImportsProofCheck::Survived) {
+                for (const auto& region : directRegions) {
+                    const auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), false);
+                    const bool imported = region.serial != 0 && (region.serial >> 63u) == 0;
+                    if (serial == (imported ? region.serial : 0) || (!imported && !importsReconcilable)) continue;
+                    std::fprintf(stderr, "FATAL: APS5_VERIFY_JOURNAL_RECONCILE: a template's import proof survived import table changes, but the region 0x%llx-0x%llx is now served by import serial %llu instead of %llu\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end), static_cast<unsigned long long>(serial), static_cast<unsigned long long>(region.serial));
+                    std::fflush(stderr);
+                    std::abort();
+                }
+            }
         } else {
             if (churnScope.counted) NoteImportProofWalk();
             if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
