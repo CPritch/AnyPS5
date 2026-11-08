@@ -98,6 +98,23 @@ bool EopRelease(std::span<const std::uint32_t> words) {
     return words.size() >= 8 && (words[0] >> 30u) == 3u && Pm4::PacketWords(words[0]) == 8u && ((words[0] >> 8u) & 0xffu) == 0x49u && ((words[2] >> 24u) & 7u) == 2u;
 }
 
+bool RewindTailReserve() {
+    static const bool enabled = std::getenv("APS5_NO_REWIND_TAIL_RESERVE") == nullptr;
+    return enabled;
+}
+
+struct RewindTailSizes {
+    std::size_t commands = 0;
+    std::size_t listWords = 0;
+    std::size_t listEntries = 0;
+};
+
+struct RewindTailSizesStorage {};
+
+std::size_t DecayedSize(std::size_t kept, std::size_t seen) {
+    return std::max(seen, kept - kept / 8u);
+}
+
 }
 
 std::uint64_t Driver::FlipSubmissions() const {
@@ -426,10 +443,22 @@ void Driver::executeRewindTail(const Submission& stalled) {
         released.clear();
         tail.enqueuedAt = std::chrono::steady_clock::now();
     }
+    auto& sizes = HostThreadLocal<RewindTailSizes, RewindTailSizesStorage>();
+    const bool reserve = RewindTailReserve();
+    if (reserve) {
+        tail.commands.reserve(sizes.commands);
+        tail.registerListWords.reserve(sizes.listWords);
+        tail.registerListIndex.reserve(sizes.listEntries);
+    }
     copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
     if (APS5_ENABLE_TIMING_LOG) tail.copiedAt = std::chrono::steady_clock::now();
     validate(tail, stalled.rewindTail);
     readRegisterLists(tail);
+    if (reserve) {
+        sizes.commands = DecayedSize(sizes.commands, tail.commands.size());
+        sizes.listWords = DecayedSize(sizes.listWords, tail.registerListWords.size());
+        sizes.listEntries = DecayedSize(sizes.listEntries, tail.registerListIndex.size());
+    }
     if (LibraryPrebuildsWaiting()) PrioritizeLibraryPrebuilds(BoundGraphicsPrograms(tail));
     if (APS5_ENABLE_TIMING_LOG) tail.validatedAt = std::chrono::steady_clock::now();
     waitForFlipRoom(tail);
