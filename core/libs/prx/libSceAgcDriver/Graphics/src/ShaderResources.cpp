@@ -3020,6 +3020,88 @@ void ShaderResources::NoteAddressRefusal(AddressRefusal refusal) {
     if (count != AddressCount::Count) CountAddress(count);
 }
 
+bool ShaderResources::VerifyAddressTemplates() {
+    static const bool enabled = std::getenv("APS5_VERIFY_BDA_TEMPLATES") != nullptr;
+    return enabled;
+}
+
+void ShaderResources::VerifyAddressReuse(const ShaderResources& built, std::span<const MovedBuffer> moved) const {
+    const auto fail = [](const std::string& what) {
+        std::fprintf(stderr, "FATAL: APS5_VERIFY_BDA_TEMPLATES: a reused address-based template differs from a full build of its draw in %s\n", what.c_str());
+        std::fflush(stderr);
+        std::abort();
+    };
+    const auto hex = [](std::uint64_t value) {
+        char text[24];
+        std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+        return std::string(text);
+    };
+    const auto info = [&](const VkDescriptorBufferInfo& bound) { return hex(reinterpret_cast<std::uint64_t>(bound.buffer)) + "+" + hex(bound.offset) + "/" + hex(bound.range); };
+    if (!built.bdaTemplate) fail("being a template: the full build is not served whole by the cached address space");
+    if (built.bdaSpaceSerial != bdaSpaceSerial) fail("its address space: serial " + std::to_string(bdaSpaceSerial) + " reused, " + std::to_string(built.bdaSpaceSerial) + " built");
+    if (built.bdaGuardSerial != bdaGuardSerial) fail("the multisample target generation its table was built under: " + std::to_string(bdaGuardSerial) + " reused, " + std::to_string(built.bdaGuardSerial) + " built");
+    if (built.allocations.size() != allocations.size() || built.bindings.size() != bindings.size() || built.descriptorBuffers.size() != descriptorBuffers.size() || built.descriptorImages.size() != descriptorImages.size()) fail("its bindings: " + std::to_string(allocations.size()) + " buffers and " + std::to_string(descriptorImages.size()) + " images reused, " + std::to_string(built.allocations.size()) + " and " + std::to_string(built.descriptorImages.size()) + " built");
+    const auto ranges = guestMemory.AddressRanges();
+    const auto builtRanges = built.guestMemory.AddressRanges();
+    if (ranges.size() != builtRanges.size()) fail("its BDA table: " + std::to_string(ranges.size()) + " ranges reused, " + std::to_string(builtRanges.size()) + " built");
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        const auto& mine = ranges[index];
+        const auto& theirs = builtRanges[index];
+        if (mine.begin != theirs.begin || mine.end != theirs.end || mine.deviceAddress != theirs.deviceAddress || mine.permissions != theirs.permissions) fail("BDA table range " + std::to_string(index) + ": " + hex(mine.begin) + "-" + hex(mine.end) + " at " + hex(mine.deviceAddress) + " reused, " + hex(theirs.begin) + "-" + hex(theirs.end) + " at " + hex(theirs.deviceAddress) + " built");
+    }
+    if (guestMemory.InPlaceReads() != built.guestMemory.InPlaceReads()) fail("the ranges it reads in place");
+    if (guestMemory.Writes() != built.guestMemory.Writes()) fail("the ranges it writes");
+    if (pushPatches != built.pushPatches) fail("its push constant patches");
+    if (dataPatches.size() != built.dataPatches.size() || !std::equal(dataPatches.begin(), dataPatches.end(), built.dataPatches.begin(), [](const DataPatch& a, const DataPatch& b) { return a.allocation == b.allocation && a.byte == b.byte && a.adjustment == b.adjustment; })) fail("its data word patches");
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& mine = allocations[index];
+        const auto& theirs = built.allocations[index];
+        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        if (mine.guest != theirs.guest || mine.role != theirs.role || mine.written != theirs.written) fail("the kind of buffer " + std::to_string(index));
+        if (mine.guest) {
+            const auto address = override != moved.end() ? override->address : mine.address;
+            const auto size = override != moved.end() ? override->size : mine.size;
+            if (address != theirs.address || size != theirs.size || mine.adjustment != theirs.adjustment) fail("the range of guest buffer " + std::to_string(index) + ": " + hex(address) + "+" + hex(size) + " adjusted by " + std::to_string(mine.adjustment) + " reused, " + hex(theirs.address) + "+" + hex(theirs.size) + " adjusted by " + std::to_string(theirs.adjustment) + " built");
+            std::uint32_t adjustment = 0;
+            const auto expected = wholeDwordRange(built.guestMemory.Descriptor(theirs.address, theirs.size, adjustment));
+            const auto bound = override != moved.end() ? override->inPlace : wholeDwordRange(guestMemory.Descriptor(mine.address, mine.size, adjustment));
+            if (bound.buffer != expected.buffer || bound.offset != expected.offset || bound.range != expected.range) fail("the import binding of guest buffer " + std::to_string(index) + ": " + info(bound) + " reused, " + info(expected) + " built");
+            continue;
+        }
+        if (mine.buffer == nullptr || theirs.buffer == nullptr) {
+            if ((mine.buffer == nullptr) != (theirs.buffer == nullptr) || mine.size != theirs.size) fail("the placeholder of buffer " + std::to_string(index));
+            continue;
+        }
+        if (mine.size != theirs.size) fail("the size of data buffer " + std::to_string(index) + ": " + std::to_string(mine.size) + " reused, " + std::to_string(theirs.size) + " built");
+        std::vector<std::byte> bytes(mine.size);
+        if (override != moved.end() && !override->words.empty()) {
+            if (override->words.size() * sizeof(std::uint32_t) != mine.size) fail("the size of the moved data words of buffer " + std::to_string(index));
+            std::memcpy(bytes.data(), override->words.data(), mine.size);
+            for (const auto& patch : dataPatches) {
+                if (patch.allocation == index && patch.byte < bytes.size()) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+            }
+        } else {
+            std::memcpy(bytes.data(), mine.buffer->Bytes().data(), mine.size);
+        }
+        const auto theirBytes = theirs.buffer->Bytes().subspan(0, theirs.size);
+        if (std::memcmp(bytes.data(), theirBytes.data(), bytes.size()) == 0) continue;
+        std::size_t word = 0;
+        while ((word + 1) * 4 <= bytes.size() && std::memcmp(bytes.data() + word * 4, theirBytes.data() + word * 4, 4) == 0) ++word;
+        std::uint32_t reused = 0;
+        std::uint32_t fresh = 0;
+        if ((word + 1) * 4 <= bytes.size()) {
+            std::memcpy(&reused, bytes.data() + word * 4, 4);
+            std::memcpy(&fresh, theirBytes.data() + word * 4, 4);
+        }
+        fail("the words of " + std::string(override != moved.end() ? "moved" : "kept") + " data buffer " + std::to_string(index) + ": word " + std::to_string(word) + " " + hex(reused) + " reused, " + hex(fresh) + " built");
+    }
+    for (std::size_t index = 0; index < descriptorImages.size(); ++index) {
+        const auto& mine = descriptorImages[index];
+        const auto& theirs = built.descriptorImages[index];
+        if (mine.sampler != theirs.sampler || mine.imageView != theirs.imageView || mine.imageLayout != theirs.imageLayout) fail("image or sampler descriptor " + std::to_string(index));
+    }
+}
+
 std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::AddressCount::Count)> ShaderResources::AddressTemplateTotals() {
     std::array<std::uint64_t, static_cast<std::size_t>(AddressCount::Count)> totals{};
     for (std::size_t index = 0; index < totals.size(); ++index) totals[index] = addressCounts[index].load(std::memory_order_relaxed);

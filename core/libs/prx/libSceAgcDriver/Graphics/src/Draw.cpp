@@ -2257,7 +2257,14 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
                 if (counted) split.hits.fetch_add(1, std::memory_order_relaxed);
-                if (resolved.addressUse.Active()) resolved.resources->NoteAddressReuse(resolved.moved);
+                if (resolved.addressUse.Active()) {
+                    resolved.resources->NoteAddressReuse(resolved.moved);
+                    if (ShaderResources::VerifyAddressTemplates()) {
+                        const auto built = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+                        resolved.resources->VerifyAddressReuse(*built, resolved.moved);
+                        recorder->Keep(built);
+                    }
+                }
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);
                 if (counted) split.unmoved.fetch_add(1, std::memory_order_relaxed);
