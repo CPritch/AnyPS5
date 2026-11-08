@@ -5010,6 +5010,48 @@ static void stampSpaceUse(HostImports& state, const TSpace& current) {
     }
 }
 
+template<typename TSpace>
+static bool spaceKeepsMirrors(const Context& context, HostImports& state, const TSpace& current) {
+    const auto keeps = [&](ImageMirror* mirror) { return heapMirrorWatched(*mirror) || !importsNow(context, state, current.lease, mirror->base); };
+    return std::all_of(current.heapMirrors.begin(), current.heapMirrors.end(), keeps) && std::all_of(current.sparseMirrors.begin(), current.sparseMirrors.end(), keeps);
+}
+
+template<typename TSpace>
+static bool refreshSpaceSparseMirrors(std::shared_ptr<const TSpace> current, std::vector<RefreshBlock>& blocks) {
+    for (auto* mirror : current->sparseMirrors) {
+        if (refreshSparseMirror(*mirror, blocks)) continue;
+        blocks.clear();
+        Spaces().current.compare_exchange_strong(current, std::shared_ptr<const TSpace>{});
+        return false;
+    }
+    return true;
+}
+
+template<typename TSpace>
+static void appendSpaceWritableMirrors(const TSpace& space, std::vector<RefreshBlock>& blocks, std::vector<std::pair<std::size_t, std::uint64_t>>& checked) {
+    auto& spaces = Spaces();
+    const bool stamps = writableMirrorStamps();
+    for (std::size_t slot = 0; slot < space.writableMirrors.size(); ++slot) {
+        const auto& region = space.base[space.writableMirrors[slot]];
+        if (!prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) continue;
+        if (stamps) {
+            const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+            const auto collected = GuestMemory::CollectWrites(region.begin, bytes);
+            const auto since = space.writableVerified[slot].load(std::memory_order_relaxed);
+            if (since != 0 && GuestMemory::UnchangedSince(region.begin, bytes, since)) {
+                if (verifyWritableMirrorStamps() && region.mirror->resident == nullptr && !region.mirror->shadow.empty()) {
+                    Require(std::memcmp(region.mirror->shadow.data() + (region.begin - region.mirror->base), reinterpret_cast<const void*>(region.begin), bytes) == 0, "a writable mirror skipped by its write stamps differs from guest memory (APS5_VERIFY_WRITABLE_MIRROR_STAMPS)");
+                }
+                spaces.writableSkipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            checked.emplace_back(slot, collected);
+        }
+        spaces.writableCompared.fetch_add(1, std::memory_order_relaxed);
+        appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
+    }
+}
+
 void GuestBufferMemory::AcquireRegistered() {
     struct BuildingScope {
         explicit BuildingScope(GuestBufferMemory* self) { buildingBufferMemory = self; }
@@ -5051,24 +5093,15 @@ void GuestBufferMemory::AcquireRegistered() {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
             if (current != nullptr && importsStale(context, state)) static_cast<void>(absorbUnrelatedChanges(context, state));
-            const auto keeps = [&](ImageMirror* mirror) { return heapMirrorWatched(*mirror) || !importsNow(context, state, current->lease, mirror->base); };
             if (current == nullptr) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
             else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
             else if (current->keptThrough.load(std::memory_order_acquire) != generation && !spaceUntouched(*current, state)) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
             else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
-            else hit = std::all_of(current->heapMirrors.begin(), current->heapMirrors.end(), keeps) && std::all_of(current->sparseMirrors.begin(), current->sparseMirrors.end(), keeps);
+            else hit = spaceKeepsMirrors(context, state, *current);
             importFloor = state.useCounter + 1;
             if (hit) stampSpaceUse(state, *current);
         }
-        if (hit) {
-            for (auto* mirror : current->sparseMirrors) {
-                if (refreshSparseMirror(*mirror, blocks)) continue;
-                hit = false;
-                blocks.clear();
-                spaces.current.compare_exchange_strong(current, std::shared_ptr<const AddressSpace>{});
-                break;
-            }
-        }
+        if (hit && !refreshSpaceSparseMirrors(current, blocks)) hit = false;
         if (hit) {
             spaces.hits.fetch_add(1, std::memory_order_relaxed);
             space = std::move(current);
@@ -5082,26 +5115,7 @@ void GuestBufferMemory::AcquireRegistered() {
             // before any of them is dereferenced.
             served = true;
             mirrored = space->mirrored;
-            const bool stamps = writableMirrorStamps();
-            for (std::size_t slot = 0; slot < space->writableMirrors.size(); ++slot) {
-                const auto& region = space->base[space->writableMirrors[slot]];
-                if (!prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) continue;
-                if (stamps) {
-                    const auto bytes = static_cast<std::size_t>(region.end - region.begin);
-                    const auto collected = GuestMemory::CollectWrites(region.begin, bytes);
-                    const auto since = space->writableVerified[slot].load(std::memory_order_relaxed);
-                    if (since != 0 && GuestMemory::UnchangedSince(region.begin, bytes, since)) {
-                        if (verifyWritableMirrorStamps() && region.mirror->resident == nullptr && !region.mirror->shadow.empty()) {
-                            Require(std::memcmp(region.mirror->shadow.data() + (region.begin - region.mirror->base), reinterpret_cast<const void*>(region.begin), bytes) == 0, "a writable mirror skipped by its write stamps differs from guest memory (APS5_VERIFY_WRITABLE_MIRROR_STAMPS)");
-                        }
-                        spaces.writableSkipped.fetch_add(1, std::memory_order_relaxed);
-                        continue;
-                    }
-                    writableChecked.emplace_back(slot, collected);
-                }
-                spaces.writableCompared.fetch_add(1, std::memory_order_relaxed);
-                appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
-            }
+            appendSpaceWritableMirrors(*space, blocks, writableChecked);
             lap(timing.mirrorsUs, at);
         }
     }
