@@ -224,6 +224,7 @@ public:
         std::size_t size;
         std::span<const std::uint32_t> words;
         VkDescriptorBufferInfo inPlace{};
+        std::uint32_t adjustment = 0;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     DrawBindings* PrepareBatchDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
@@ -351,7 +352,7 @@ public:
     static void NoteAddressRefusal(AddressRefusal refusal);
     static bool VerifyAddressTemplates();
     void VerifyAddressReuse(const ShaderResources& built, std::span<const MovedBuffer> moved) const;
-    enum class AddressCount : std::size_t { Reused, ReusedMovedBuffers, ReusedMovedData, Made, RefusedBusy, RefusedSpace, RefusedImports, RefusedTargets, RefusedSnapshot, RefusedProof, RefusedUnmovable, RefusedBuffer, NotReadOnly, NoSpace, CopiedRanges, OddSpaceRegions, OwnRegions, DescriptorWrites, NotOther, KindMirrored, KindReadOnlyMirrors, KindWritableMirrors, KindHeapMirrors, KindSparseMirrors, KindSparseRegions, KindCopied, VerifiedNewerSpace, Count };
+    enum class AddressCount : std::size_t { Reused, ReusedMovedBuffers, ReusedMovedData, Made, RefusedBusy, RefusedSpace, RefusedImports, RefusedTargets, RefusedSnapshot, RefusedProof, RefusedUnmovable, RefusedBuffer, NotReadOnly, NoSpace, CopiedRanges, OddSpaceRegions, OwnRegions, DescriptorWrites, NotOther, KindMirrored, KindReadOnlyMirrors, KindWritableMirrors, KindHeapMirrors, KindSparseMirrors, KindSparseRegions, KindCopied, ReusedRepatched, VerifiedNewerSpace, Count };
     static std::array<std::uint64_t, static_cast<std::size_t>(AddressCount::Count)> AddressTemplateTotals();
     static std::string TakeAddressTemplateText();
     class UncountedAddressBuild {
@@ -397,8 +398,11 @@ public:
     // compiled shader's descriptors. A recipe hit refreshes the template iff the two differ.
     std::uint64_t DataWordsHash() const { return dataWordsHash; }
     static std::uint64_t DataWordsHash(const CompiledShader& shader);
-    void PatchPushConstants(std::span<std::byte, PipelinePushConstantBytes> bytes) const {
+    void PatchPushConstants(std::span<std::byte, PipelinePushConstantBytes> bytes, std::span<const MovedBuffer> moved = {}) const {
         for (const auto& [position, adjustment] : pushPatches) bytes[position] = static_cast<std::byte>(adjustment);
+        for (const auto& entry : moved) {
+            if (entry.inPlace.buffer != VK_NULL_HANDLE && allocations[entry.allocation].pushByte >= 0) bytes[static_cast<std::size_t>(allocations[entry.allocation].pushByte)] = static_cast<std::byte>(entry.adjustment);
+        }
     }
     // Whether RefreshData would record anything for `shader` (the per-word compare; verification).
     bool DataWordsDiffer(const CompiledShader& shader) const;

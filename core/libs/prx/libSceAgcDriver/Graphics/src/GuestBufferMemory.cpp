@@ -7528,7 +7528,7 @@ bool GuestBufferMemory::SpaceImportsCurrent() {
     return state.epoch == space->importsEpoch;
 }
 
-std::optional<VkDescriptorBufferInfo> GuestBufferMemory::InPlaceDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t adjustment) const {
+std::optional<std::pair<VkDescriptorBufferInfo, std::uint32_t>> GuestBufferMemory::InPlaceDescriptor(std::uint64_t address, std::size_t bytes) const {
     if (space == nullptr || !regions.empty() || !uploaded || committed || address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address - 3) return std::nullopt;
     const auto begin = address & ~std::uint64_t{3};
     const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
@@ -7537,7 +7537,8 @@ std::optional<VkDescriptorBufferInfo> GuestBufferMemory::InPlaceDescriptor(std::
     const auto& region = *inside;
     const auto base = region.direct != nullptr ? region.direct->base - region.direct->lead : mirrorStart(*region.mirror);
     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
-    if (context.limits.minStorageBufferOffsetAlignment == 0 || base % 4 != 0 || address < base || (address - base) % alignment != adjustment) return std::nullopt;
+    if (context.limits.minStorageBufferOffsetAlignment == 0 || base % 4 != 0 || address < base) return std::nullopt;
+    const auto adjustment = static_cast<std::uint32_t>((address - base) % alignment);
     auto range = ViewBytes(bytes, adjustment);
     const auto served = region.direct != nullptr ? region.direct->base + region.direct->bytes : servedEnd(region);
     if ((region.direct == nullptr || region.runCut) && served < region.end) {
@@ -7549,7 +7550,7 @@ std::optional<VkDescriptorBufferInfo> GuestBufferMemory::InPlaceDescriptor(std::
     std::uint32_t described = 0;
     const auto info = Descriptor(address, bytes, described);
     if (described != adjustment) return std::nullopt;
-    return info;
+    return std::pair{info, adjustment};
 }
 
 std::shared_ptr<const void> GuestBufferMemory::DetachSpace() {

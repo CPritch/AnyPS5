@@ -50,6 +50,9 @@ constexpr std::size_t StoreCodeOffset = 0x300;
 constexpr std::size_t VertexHeaderOffset = 0x400;
 constexpr std::size_t ReadHeaderOffset = 0x500;
 constexpr std::size_t StoreHeaderOffset = 0x600;
+constexpr std::size_t ImageCodeOffset = 0x800;
+constexpr std::size_t ImageHeaderOffset = 0x900;
+constexpr std::uint32_t TexelSide = 64;
 constexpr std::size_t SparseCommitted = 32768;
 constexpr std::size_t ImagePage = 4096;
 
@@ -71,6 +74,7 @@ constexpr std::array<std::uint32_t, 40> VertexCode{
 };
 
 constexpr std::array<std::uint32_t, 18> PixelBufferRead{0x7e040280u, 0xe0301000u, 0x80010c02u, 0x7e1a0280u, 0xdc308000u, 0x0e02000du, 0xf4000201u, 0xfa000010u, 0xbf8cc07fu, 0xbf8c3f70u, 0x7e10030cu, 0x7e12030eu, 0x7e140208u, 0x7e160280u, 0xf800180fu, 0x0b0a0908u, 0xbf810000u, 0xbf810000u};
+constexpr std::array<std::uint32_t, 22> PixelImageRead{0x7e000280u, 0x7e020280u, 0xf0000f08u, 0x00021000u, 0x7e040280u, 0xe0301000u, 0x80010c02u, 0x7e1a0280u, 0xdc308000u, 0x0e02000du, 0xf4000401u, 0xfa000010u, 0xbf8cc07fu, 0xbf8c3f70u, 0x7e10030cu, 0x7e12030eu, 0x7e140210u, 0x7e160310u, 0xf800180fu, 0x0b0a0908u, 0xbf810000u, 0xbf810000u};
 constexpr std::array<std::uint32_t, 11> PixelStore{0x7e1a0280u, 0x7e1802f2u, 0xdc708000u, 0x00020c0du, 0x7e1002f2u, 0x7e1202f2u, 0x7e1402f2u, 0x7e1602f2u, 0xf800180fu, 0x0b0a0908u, 0xbf810000u};
 
 struct Header {
@@ -147,7 +151,12 @@ struct Step {
     const std::uint32_t* pixel;
     std::uint64_t pointer;
     std::array<std::uint32_t, 4> descriptor{};
+    std::array<std::uint32_t, 8> image{};
 };
+
+std::array<std::uint32_t, 8> TexelDescriptor(std::uint64_t address) {
+    return {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((TexelSide - 1u) & 3u) << 30u), ((TexelSide - 1u) >> 2u) | ((TexelSide - 1u) << 14u), 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
+}
 
 template<std::size_t Words>
 const std::uint32_t* Place(const GuestBlock& programs, std::size_t codeOffset, std::size_t headerOffset, const std::array<std::uint32_t, Words>& code, std::uint8_t type) {
@@ -165,9 +174,11 @@ struct Fixture {
     GuestBlock outside;
     GuestBlock added;
     GuestBlock sparse{SparseCommitted};
+    GuestBlock texels;
     const std::uint32_t* vertexCode = Place(programs, VertexCodeOffset, VertexHeaderOffset, VertexCode, 2);
     const std::uint32_t* readCode = Place(programs, ReadCodeOffset, ReadHeaderOffset, PixelBufferRead, 1);
     const std::uint32_t* storeCode = Place(programs, StoreCodeOffset, StoreHeaderOffset, PixelStore, 1);
+    const std::uint32_t* imageCode = Place(programs, ImageCodeOffset, ImageHeaderOffset, PixelImageRead, 1);
     bool off = std::getenv("APS5_NO_BDA_TEMPLATES") != nullptr;
     bool verify = std::getenv("APS5_VERIFY_BDA_TEMPLATES") != nullptr;
 };
@@ -204,12 +215,13 @@ void Submit(const Fixture& fixture, std::initializer_list<Step> steps) {
     std::vector<std::uint32_t> commands;
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
-    for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 2u << 1u}, {0x8c, static_cast<std::uint32_t>(table)}, {0x8d, static_cast<std::uint32_t>(table >> 32u)}, {0x00b, 8u << 1u}, {0x00c, 0}, {0x00d, 0}}) Append(commands, 0x76, {offset, value});
+    for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 2u << 1u}, {0x8c, static_cast<std::uint32_t>(table)}, {0x8d, static_cast<std::uint32_t>(table >> 32u)}, {0x00b, 16u << 1u}, {0x00c, 0}, {0x00d, 0}}) Append(commands, 0x76, {offset, value});
     for (const auto& step : steps) {
         const auto pixel = reinterpret_cast<std::uintptr_t>(step.pixel);
         Append(commands, 0x76, {0x008, static_cast<std::uint32_t>(pixel >> 8u), static_cast<std::uint32_t>(pixel >> 40u)});
         Append(commands, 0x76, {0x00e, static_cast<std::uint32_t>(step.pointer), static_cast<std::uint32_t>(step.pointer >> 32u)});
         Append(commands, 0x76, {0x010, step.descriptor[0], step.descriptor[1], step.descriptor[2], step.descriptor[3]});
+        Append(commands, 0x76, {0x014, step.image[0], step.image[1], step.image[2], step.image[3], step.image[4], step.image[5], step.image[6], step.image[7]});
         Append(commands, 0x2d, {3, 2});
     }
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
@@ -242,10 +254,14 @@ void WriteFloat(const GuestBlock& block, std::size_t offset, float value) {
     std::memcpy(block.Bytes(offset), &value, sizeof(value));
 }
 
-Colors DrawRead(const Fixture& fixture, std::uint64_t buffer, std::uint64_t pointer) {
+Colors DrawWith(const Fixture& fixture, const std::uint32_t* code, std::uint64_t buffer, std::uint64_t pointer) {
     std::memset(fixture.target.Bytes(0), 0, ColorBytes);
-    Submit(fixture, {{fixture.readCode, pointer, DwordAt(buffer)}});
+    Submit(fixture, {{code, pointer, DwordAt(buffer), TexelDescriptor(fixture.texels.At(0))}});
     return Brightest(fixture);
+}
+
+Colors DrawRead(const Fixture& fixture, std::uint64_t buffer, std::uint64_t pointer) {
+    return DrawWith(fixture, fixture.readCode, buffer, pointer);
 }
 
 std::uint64_t Total(Count count) {
@@ -359,6 +375,28 @@ void RefusesAChangedSpace(Fixture& fixture) {
     if (!fixture.off) Expect(counts.Since(Count::RefusedSpace) == 1 && counts.Since(Count::Made) == 1 && counts.Since(Count::Reused) == 1, "a template over a space that changed was not refused once, rebuilt over the new space and reused");
 }
 
+void ReuseRepatchesBufferOffsets(Fixture& fixture, const std::uint32_t* code, const char* path) {
+    const auto& data = fixture.data;
+    WriteFloat(data, 0x1000, 1.0f);
+    WriteFloat(data, 0x1004, 0.0f);
+    WriteFloat(data, 0x1008, 1.0f);
+    WriteFloat(data, 0x400, 0.0f);
+    WriteFloat(data, 0x410, 0.0f);
+    const auto first = DrawWith(fixture, code, data.At(0x1000), data.At(0x400));
+    const Counts counts;
+    const auto second = DrawWith(fixture, code, data.At(0x1004), data.At(0x400));
+    const auto third = DrawWith(fixture, code, data.At(0x1008), data.At(0x400));
+    const auto fourth = DrawWith(fixture, code, data.At(0x1000), data.At(0x400));
+    const auto since = [&](Count count) { return static_cast<unsigned long long>(counts.Since(count)); };
+    std::printf("a template whose buffer offset sits in its %s, reused with the buffer 4 and 8 bytes further and back: %s, %s, %s, %s; reused %llu (repatched offsets %llu), refused for the buffer %llu\n", path, Text(first).c_str(), Text(second).c_str(), Text(third).c_str(), Text(fourth).c_str(), since(Count::Reused), since(Count::ReusedRepatched), since(Count::RefusedBuffer));
+    ExpectColors(first, {255, 0, 0}, std::string("the first draw with its buffer offset in its ") + path);
+    ExpectColors(second, {0, 0, 0}, std::string("a reuse with the buffer 4 bytes further did not read through its own offset (") + path + ")");
+    ExpectColors(third, {255, 0, 0}, std::string("a reuse with the buffer 8 bytes further did not read through its own offset (") + path + ")");
+    ExpectColors(fourth, {255, 0, 0}, std::string("a reuse with the template's own buffer offset (") + path + ")");
+    if (fixture.off) return;
+    Expect(since(Count::Reused) == 3 && since(Count::RefusedBuffer) == 0, std::string("a buffer moved within the storage buffer offset alignment was refused instead of repatched (") + path + ")");
+}
+
 void ReuseSurvivesASpaceDropBeforeItsVerify(Fixture& fixture) {
     const auto& data = fixture.data;
     WriteFloat(data, 0x100, 1.0f);
@@ -436,6 +474,7 @@ int main(int argc, char** argv) {
         fixture.vertices.Map(false);
         fixture.data.Map(true);
         fixture.target.Map(true);
+        fixture.texels.Map(false);
         if (mirrors) {
             fixture.sparse.Map(true);
             MirroredSpacesRefreshPerReuse(fixture);
@@ -444,6 +483,10 @@ int main(int argc, char** argv) {
         if (only.empty() || only == "--writes") ReuseReadsWritesIntoItsRanges(fixture);
         if (only.empty() || only == "--outside") RefusesABufferOutsideTheSpace(fixture);
         if (only.empty() || only == "--space") RefusesAChangedSpace(fixture);
+        if (only == "--offsets") {
+            ReuseRepatchesBufferOffsets(fixture, fixture.readCode, "push constants");
+            ReuseRepatchesBufferOffsets(fixture, fixture.imageCode, "shader data words");
+        }
         if (only == "--verify-drop") ReuseSurvivesASpaceDropBeforeItsVerify(fixture);
         std::printf("%s\n", ShaderResources::TakeAddressTemplateText().c_str());
         AgcDriverShutdown_nid_postfix();

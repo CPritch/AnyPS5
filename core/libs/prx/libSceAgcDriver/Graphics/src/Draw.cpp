@@ -2679,11 +2679,11 @@ void patchDepthRemapPush(std::array<std::byte, PipelinePushConstantBytes>& block
     std::memcpy(block.data() + ShaderRecompiler::DepthRemapPushOffsetBytes, words.data(), sizeof(words));
 }
 
-void recordStencilReplay(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, std::span<const std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> replay, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes = nullptr, VkShaderStageFlags stages = 0) {
+void recordStencilReplay(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, std::span<const std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> replay, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes = nullptr, VkShaderStageFlags stages = 0, std::span<const ShaderResources::MovedBuffer> moved = {}) {
     State selected = state;
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
     if (bytes == nullptr) {
-        resources.PatchPushConstants(block);
+        resources.PatchPushConstants(block, moved);
         stages = PushConstantStages(shaders);
     }
     patchDepthRemapPush(block, state);
@@ -2721,10 +2721,10 @@ void recordStencilReplay(const Context& context, VkCommandBuffer commands, const
     }
 }
 
-std::array<std::byte, PipelinePushConstantBytes> plainPushBlock(const State& state, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags& stages) {
+std::array<std::byte, PipelinePushConstantBytes> plainPushBlock(const State& state, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags& stages, std::span<const ShaderResources::MovedBuffer> moved = {}) {
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
     if (bytes == nullptr) {
-        resources.PatchPushConstants(block);
+        resources.PatchPushConstants(block, moved);
         stages = PushConstantStages(shaders);
     }
     patchDepthRemapPush(block, state);
@@ -2860,10 +2860,10 @@ SecondaryDrawRing& secondaryDrawRing() {
     return *ring;
 }
 
-void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false, std::uint32_t meshLayerStride = 0) {
+void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false, std::uint32_t meshLayerStride = 0, std::span<const ShaderResources::MovedBuffer> moved = {}) {
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
     if (bytes == nullptr) {
-        resources.PatchPushConstants(block);
+        resources.PatchPushConstants(block, moved);
         stages = PushConstantStages(shaders);
     }
     patchDepthRemapPush(block, state);
@@ -3113,7 +3113,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkShaderStageFlags deferredPushStages = record.pushStages;
     if (Recorder::ParallelRecord() >= 2 && secondaryDraw) {
         record.pipeline->CheckContinue(state);
-        deferredPush = plainPushBlock(state, shaders, resources, record.pushBytes, deferredPushStages);
+        deferredPush = plainPushBlock(state, shaders, resources, record.pushBytes, deferredPushStages, record.moved);
     }
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || PixelFunctionLdsSubgroup(shaders) != 0u || leavesSecondary, fenced, passAccess);
@@ -3245,7 +3245,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
         if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, record.pipeline->Layout());
         APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-        pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
+        pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride, record.moved);
         APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
         static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
         auto eachDrawTiming = Recorder::NoTiming;
@@ -3258,7 +3258,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
         else {
-            recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages);
+            recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages, record.moved);
             for (const auto& [reference, pipeline] : record.stencilReplay) recorder->Keep(pipeline);
         }
         if (record.pipeline->SplitsFaces()) {

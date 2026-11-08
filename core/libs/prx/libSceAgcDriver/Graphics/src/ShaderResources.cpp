@@ -2999,12 +2999,23 @@ bool ShaderResources::AddressSpaceCurrent() {
 
 ShaderResources::AddressRefusal ShaderResources::ResolveAddressMoves(std::vector<MovedBuffer>& moved) const {
     if (!bdaTemplate) return AddressRefusal::None;
-    for (auto& entry : moved) {
-        if (!entry.words.empty()) continue;
-        Require(entry.allocation < allocations.size() && allocations[entry.allocation].guest, "a moved buffer of an address-based template is not a guest buffer");
-        const auto inPlace = guestMemory.InPlaceDescriptor(entry.address, entry.size, allocations[entry.allocation].adjustment);
+    const auto guestMoves = moved.size();
+    for (std::size_t index = 0; index < guestMoves; ++index) {
+        if (!moved[index].words.empty()) continue;
+        const auto allocation = moved[index].allocation;
+        Require(allocation < allocations.size() && allocations[allocation].guest, "a moved buffer of an address-based template is not a guest buffer");
+        const auto inPlace = guestMemory.InPlaceDescriptor(moved[index].address, moved[index].size);
         if (!inPlace.has_value()) return AddressRefusal::Buffer;
-        entry.inPlace = wholeDwordRange(*inPlace);
+        moved[index].inPlace = wholeDwordRange(inPlace->first);
+        moved[index].adjustment = inPlace->second;
+        const auto& item = allocations[allocation];
+        if (inPlace->second == item.adjustment || item.pushByte >= 0) continue;
+        if (item.dataAllocation < 0) return AddressRefusal::Buffer;
+        const auto data = static_cast<std::size_t>(item.dataAllocation);
+        if (std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == data; })) continue;
+        const auto& held = allocations[data];
+        if (held.buffer == nullptr || held.dataWords.size() * sizeof(std::uint32_t) != held.size) return AddressRefusal::Buffer;
+        moved.push_back({data, 0, held.size, held.dataWords});
     }
     return AddressRefusal::None;
 }
@@ -3021,6 +3032,7 @@ void ShaderResources::DropAddressSpace() noexcept {
 
 void ShaderResources::NoteAddressReuse(std::span<const MovedBuffer> moved) const {
     CountAddress(AddressCount::Reused);
+    if (std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.inPlace.buffer != VK_NULL_HANDLE && entry.adjustment != allocations[entry.allocation].adjustment; })) CountAddress(AddressCount::ReusedRepatched);
     if (std::any_of(moved.begin(), moved.end(), [](const MovedBuffer& entry) { return entry.words.empty(); })) CountAddress(AddressCount::ReusedMovedBuffers);
     if (std::any_of(moved.begin(), moved.end(), [](const MovedBuffer& entry) { return !entry.words.empty(); })) CountAddress(AddressCount::ReusedMovedData);
 }
@@ -3090,17 +3102,32 @@ void ShaderResources::VerifyAddressReuse(const ShaderResources& built, std::span
         }
     }
     if (guestMemory.Writes() != built.guestMemory.Writes()) fail("the ranges it writes");
-    if (pushPatches != built.pushPatches) fail("its push constant patches");
-    if (dataPatches.size() != built.dataPatches.size() || !std::equal(dataPatches.begin(), dataPatches.end(), built.dataPatches.begin(), [](const DataPatch& a, const DataPatch& b) { return a.allocation == b.allocation && a.byte == b.byte && a.adjustment == b.adjustment; })) fail("its data word patches");
+    const auto movedOf = [&](std::size_t index) { return std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; }); };
+    const auto adjustmentOf = [&](std::size_t index) {
+        const auto entry = movedOf(index);
+        return entry != moved.end() && entry->inPlace.buffer != VK_NULL_HANDLE ? entry->adjustment : allocations[index].adjustment;
+    };
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> effectivePush;
+    std::vector<DataPatch> effectiveData;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        const auto adjustment = adjustmentOf(index);
+        if (adjustment == 0) continue;
+        if (item.pushByte >= 0) effectivePush.emplace_back(static_cast<std::uint32_t>(item.pushByte), adjustment);
+        else if (item.dataAllocation >= 0) effectiveData.push_back({static_cast<std::size_t>(item.dataAllocation), item.dataByte, adjustment});
+    }
+    if (effectivePush != built.pushPatches) fail("its push constant offset patches");
+    if (effectiveData.size() != built.dataPatches.size() || !std::equal(effectiveData.begin(), effectiveData.end(), built.dataPatches.begin(), [](const DataPatch& a, const DataPatch& b) { return a.allocation == b.allocation && a.byte == b.byte && a.adjustment == b.adjustment; })) fail("its data word offset patches");
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& mine = allocations[index];
         const auto& theirs = built.allocations[index];
-        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        const auto override = movedOf(index);
         if (mine.guest != theirs.guest || mine.role != theirs.role || mine.written != theirs.written) fail("the kind of buffer " + std::to_string(index));
         if (mine.guest) {
             const auto address = override != moved.end() ? override->address : mine.address;
             const auto size = override != moved.end() ? override->size : mine.size;
-            if (address != theirs.address || size != theirs.size || mine.adjustment != theirs.adjustment) fail("the range of guest buffer " + std::to_string(index) + ": " + hex(address) + "+" + hex(size) + " adjusted by " + std::to_string(mine.adjustment) + " reused, " + hex(theirs.address) + "+" + hex(theirs.size) + " adjusted by " + std::to_string(theirs.adjustment) + " built");
+            const auto adjustment = adjustmentOf(index);
+            if (address != theirs.address || size != theirs.size || adjustment != theirs.adjustment) fail("the range of guest buffer " + std::to_string(index) + ": " + hex(address) + "+" + hex(size) + " adjusted by " + std::to_string(adjustment) + " reused, " + hex(theirs.address) + "+" + hex(theirs.size) + " adjusted by " + std::to_string(theirs.adjustment) + " built");
             if (!sameSpace) continue;
             std::uint32_t described = 0;
             const auto expected = wholeDwordRange(built.guestMemory.Descriptor(theirs.address, theirs.size, described));
@@ -3117,7 +3144,7 @@ void ShaderResources::VerifyAddressReuse(const ShaderResources& built, std::span
         if (override != moved.end() && !override->words.empty()) {
             if (override->words.size() * sizeof(std::uint32_t) != mine.size) fail("the size of the moved data words of buffer " + std::to_string(index));
             std::memcpy(bytes.data(), override->words.data(), mine.size);
-            for (const auto& patch : dataPatches) {
+            for (const auto& patch : effectiveData) {
                 if (patch.allocation == index && patch.byte < bytes.size()) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
         } else {
@@ -3156,7 +3183,7 @@ std::string ShaderResources::TakeAddressTemplateText() {
     const auto at = [&](AddressCount count) { return static_cast<unsigned long long>(now[static_cast<std::size_t>(count)] - seen[static_cast<std::size_t>(count)]); };
     const auto verifyText = VerifyAddressTemplates() ? "; verify builds over a newer space " + std::to_string(at(AddressCount::VerifiedNewerSpace)) : std::string();
     char text[1600];
-    std::snprintf(text, sizeof(text), "; BDA templates (10 s): reused %llu (with moved buffers %llu, with new data words %llu), made %llu; reuses refused: busy %llu, space moved on %llu, imports %llu, multisample targets %llu, a snapshot outside the space %llu, the proof %llu, words not movable %llu, a buffer outside it or misaligned %llu; builds not made templates: not read-only %llu, no cached space %llu, copied ranges in the space %llu, other space regions %llu, regions outside the space %llu, descriptor writes %llu, other %llu; their spaces carry: mirrors %llu (read-only image %llu, writable image %llu, heap %llu, sparse heap %llu), sparse regions %llu, copied ranges %llu%s%s", at(AddressCount::Reused), at(AddressCount::ReusedMovedBuffers), at(AddressCount::ReusedMovedData), at(AddressCount::Made), at(AddressCount::RefusedBusy), at(AddressCount::RefusedSpace), at(AddressCount::RefusedImports), at(AddressCount::RefusedTargets), at(AddressCount::RefusedSnapshot), at(AddressCount::RefusedProof), at(AddressCount::RefusedUnmovable), at(AddressCount::RefusedBuffer), at(AddressCount::NotReadOnly), at(AddressCount::NoSpace), at(AddressCount::CopiedRanges), at(AddressCount::OddSpaceRegions), at(AddressCount::OwnRegions), at(AddressCount::DescriptorWrites), at(AddressCount::NotOther), at(AddressCount::KindMirrored), at(AddressCount::KindReadOnlyMirrors), at(AddressCount::KindWritableMirrors), at(AddressCount::KindHeapMirrors), at(AddressCount::KindSparseMirrors), at(AddressCount::KindSparseRegions), at(AddressCount::KindCopied), verifyText.c_str(), BdaTemplatesEnabled() ? "" : " (off: APS5_NO_BDA_TEMPLATES)");
+    std::snprintf(text, sizeof(text), "; BDA templates (10 s): reused %llu (with moved buffers %llu, with new data words %llu), made %llu; reuses refused: busy %llu, space moved on %llu, imports %llu, multisample targets %llu, a snapshot outside the space %llu, the proof %llu, words not movable %llu, a buffer outside it or misaligned %llu; builds not made templates: not read-only %llu, no cached space %llu, copied ranges in the space %llu, other space regions %llu, regions outside the space %llu, descriptor writes %llu, other %llu; their spaces carry: mirrors %llu (read-only image %llu, writable image %llu, heap %llu, sparse heap %llu), sparse regions %llu, copied ranges %llu; reuses that repatched a buffer offset %llu%s%s", at(AddressCount::Reused), at(AddressCount::ReusedMovedBuffers), at(AddressCount::ReusedMovedData), at(AddressCount::Made), at(AddressCount::RefusedBusy), at(AddressCount::RefusedSpace), at(AddressCount::RefusedImports), at(AddressCount::RefusedTargets), at(AddressCount::RefusedSnapshot), at(AddressCount::RefusedProof), at(AddressCount::RefusedUnmovable), at(AddressCount::RefusedBuffer), at(AddressCount::NotReadOnly), at(AddressCount::NoSpace), at(AddressCount::CopiedRanges), at(AddressCount::OddSpaceRegions), at(AddressCount::OwnRegions), at(AddressCount::DescriptorWrites), at(AddressCount::NotOther), at(AddressCount::KindMirrored), at(AddressCount::KindReadOnlyMirrors), at(AddressCount::KindWritableMirrors), at(AddressCount::KindHeapMirrors), at(AddressCount::KindSparseMirrors), at(AddressCount::KindSparseRegions), at(AddressCount::KindCopied), at(AddressCount::ReusedRepatched), verifyText.c_str(), BdaTemplatesEnabled() ? "" : " (off: APS5_NO_BDA_TEMPLATES)");
     seen = now;
     return text;
 }
@@ -7160,6 +7187,11 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
         if (pending.patched == Unpatched) return;
         for (const auto& patch : dataPatches) {
             if (patch.allocation == pending.patched && patch.byte < pending.bytes) pending.destination[patch.byte] = static_cast<std::byte>(patch.adjustment);
+        }
+        for (const auto& entry : moved) {
+            if (entry.inPlace.buffer == VK_NULL_HANDLE) continue;
+            const auto& item = allocations[entry.allocation];
+            if (item.pushByte < 0 && item.dataAllocation == static_cast<std::int64_t>(pending.patched) && item.dataByte < pending.bytes) pending.destination[item.dataByte] = static_cast<std::byte>(entry.adjustment);
         }
     };
     const auto upload = [&](const PendingCopy& pending) {
