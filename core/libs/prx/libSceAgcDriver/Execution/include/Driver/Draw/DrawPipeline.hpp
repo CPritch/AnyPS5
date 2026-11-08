@@ -93,6 +93,7 @@ public:
     };
     static bool PendingWriteIndexed();
     static bool VerifyPendingWriteIndex();
+    static bool UnlockedWriteWatch();
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class ItemKind : std::uint8_t { Other, Draw, IndirectDraw, Dispatch, DispatchMiss, DispatchNoRecipe, Label, Fill, Copy, Store, Pass, Seal, Completion, Dump, Count };
 
@@ -189,7 +190,7 @@ public:
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     Watch WatchWrites();
-    bool WrittenSince(const Watch& watch, const std::vector<Range>& reads);
+    bool WrittenSince(const Watch& watch, std::span<const Range> reads);
     std::uint64_t Retired() const { return retiredItems.load(std::memory_order_acquire); }
     void NoteDecodeDrain() { decodeDrains.fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t DecodeDrains() const { return decodeDrains.load(std::memory_order_relaxed); }
@@ -220,6 +221,7 @@ private:
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
     void countWrites(const std::vector<Range>& writes, bool added);
+    void uncountWrites(const std::vector<Range>& writes);
 
     std::mutex mutex;
     std::condition_variable wake;

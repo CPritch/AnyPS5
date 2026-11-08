@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PendingWriteIndex.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <map>
@@ -128,6 +129,51 @@ void watches() {
     Require(!pipeline.WrittenSince(fresh, readA), "a watch after the items retired sees nothing");
 }
 
+void concurrentWatches() {
+    auto& pipeline = DrawPipeline::Queue0();
+    pipeline.Drain(DrawPipeline::DrainReason::Flush);
+    std::mt19937_64 random(11);
+    struct Queued {
+        std::uint64_t sequence;
+        DrawPipeline::Range range;
+    };
+    std::vector<Queued> recent;
+    std::uint64_t sequence = pipeline.Retired();
+    std::uint64_t checked = 0, seenWritten = 0;
+    for (int step = 0; step < 20000; ++step) {
+        const auto slot = random() % 16;
+        const DrawPipeline::Range range{0x100000 + slot * 0x1000, 0x100000 + slot * 0x1000 + 0x800};
+        const auto spin = std::chrono::nanoseconds(random() % 4000);
+        pipeline.Enqueue([spin] {
+            const auto until = std::chrono::steady_clock::now() + spin;
+            while (std::chrono::steady_clock::now() < until) {
+            }
+        }, {range});
+        recent.push_back({++sequence, range});
+        if (recent.size() > 48) recent.erase(recent.begin());
+        if (step % 3 != 0) continue;
+        const auto watch = pipeline.WatchWrites();
+        std::vector<std::pair<const Queued*, bool>> pending;
+        for (const auto& item : recent) {
+            if (watch.retired >= item.sequence) continue;
+            const std::vector<DrawPipeline::Range> read{{item.range.first + 0x10, item.range.first + 0x20}};
+            const bool written = pipeline.WrittenSince(watch, read);
+            Require(written, "an item queued before the watch and not retired at it is not counted as written");
+            pending.emplace_back(&item, written);
+            ++checked;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(random() % 20));
+        for (const auto& [item, written] : pending) {
+            const std::vector<DrawPipeline::Range> read{{item->range.first + 0x10, item->range.first + 0x20}};
+            Require(pipeline.WrittenSince(watch, read), "a write seen since a watch is no longer seen after more items retired");
+            seenWritten += written ? 1u : 0u;
+        }
+    }
+    pipeline.Drain(DrawPipeline::DrainReason::Flush);
+    Require(checked != 0 && seenWritten == checked, "the concurrent watch checks never ran");
+    std::cout << "concurrent watches: " << checked << " queued writes checked against watches taken while the committer retired items\n";
+}
+
 }
 
 int main() {
@@ -137,6 +183,7 @@ int main() {
         retiredRing();
         pendingQueries();
         watches();
+        concurrentWatches();
         DrawPipeline::Queue0().Stop();
         std::cout << "pending write index ok\n";
         return 0;

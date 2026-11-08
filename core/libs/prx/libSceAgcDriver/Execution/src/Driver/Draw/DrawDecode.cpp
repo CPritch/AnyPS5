@@ -3,12 +3,17 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <spirv/unified1/spirv.hpp>
 
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+bool DecodeScratch() {
+    return DrawPipeline::UnlockedWriteWatch();
+}
 
 std::uint32_t ReadGraphicsRegister(const Registers& registers, std::uint32_t offset) {
     const auto found = registers.find(offset);
@@ -41,7 +46,10 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeOrderedVertexStageInfo(std::span<c
     const auto watch = queue.WatchWrites();
     auto info = decode();
     if (watch.items == 0 && !queue.Busy() && queue.Retired() == watch.retired) return info;
-    std::vector<DrawPipeline::Range> ranges;
+    struct RangesStorage {};
+    std::vector<DrawPipeline::Range> ownRanges;
+    auto& ranges = DecodeScratch() ? HostThreadLocal<std::vector<DrawPipeline::Range>, RangesStorage>() : ownRanges;
+    ranges.clear();
     ranges.reserve(reads.size());
     for (const auto& read : reads) ranges.emplace_back(read.address, read.address + read.size);
     if (!queue.WrittenSince(watch, ranges)) return info;
