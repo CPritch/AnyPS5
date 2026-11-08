@@ -170,8 +170,8 @@ struct ResidentDevices {
 };
 
 ResidentDevices& Devices() {
-    static ResidentDevices devices;
-    return devices;
+    static auto* devices = new ResidentDevices();
+    return *devices;
 }
 
 std::shared_ptr<ResidentMemory> residentMemory(const Context& context, std::uint32_t type) {
