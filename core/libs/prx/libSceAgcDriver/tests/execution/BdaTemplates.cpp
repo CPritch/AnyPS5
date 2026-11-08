@@ -27,6 +27,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <new>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,6 +50,11 @@ constexpr std::size_t StoreCodeOffset = 0x300;
 constexpr std::size_t VertexHeaderOffset = 0x400;
 constexpr std::size_t ReadHeaderOffset = 0x500;
 constexpr std::size_t StoreHeaderOffset = 0x600;
+constexpr std::size_t SparseCommitted = 32768;
+constexpr std::size_t ImagePage = 4096;
+
+alignas(ImagePage) std::array<float, ImagePage / sizeof(float)> ImageWords{1.0f};
+alignas(ImagePage) const std::array<float, ImagePage / sizeof(float)> ImageConstants{0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
 
 constexpr std::array<std::uint32_t, 40> VertexCode{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
@@ -85,24 +91,25 @@ void Register(Header& header, const std::uint32_t* code, std::size_t bytes, std:
 
 class GuestBlock {
 public:
-    GuestBlock() {
+    explicit GuestBlock(std::size_t committed = BlockBytes) {
 #ifdef _WIN32
         block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
-        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
+        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, committed, PAGE_READWRITE, committed);
 #else
         constexpr std::uintptr_t alignment = 65536;
-        void* mapped = mmap(nullptr, BlockBytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* mapped = mmap(nullptr, BlockBytes + alignment, committed == BlockBytes ? PROT_READ | PROT_WRITE : PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
             const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
             const auto aligned = (begin + alignment - 1) & ~(alignment - 1);
             if (aligned != begin) munmap(mapped, aligned - begin);
             if (aligned + BlockBytes != begin + BlockBytes + alignment) munmap(reinterpret_cast<void*>(aligned + BlockBytes), begin + alignment - aligned);
             block = reinterpret_cast<std::uint8_t*>(aligned);
+            if (committed != BlockBytes) Require(mprotect(block, committed, PROT_READ | PROT_WRITE) == 0, "BDA templates: cannot commit the sparse block's prefix");
             GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
         }
 #endif
         Require(block != nullptr, "BDA templates: cannot allocate a guest block");
-        std::memset(block, 0, BlockBytes);
+        std::memset(block, 0, committed);
     }
 
     GuestBlock(const GuestBlock&) = delete;
@@ -157,6 +164,7 @@ struct Fixture {
     GuestBlock target;
     GuestBlock outside;
     GuestBlock added;
+    GuestBlock sparse{SparseCommitted};
     const std::uint32_t* vertexCode = Place(programs, VertexCodeOffset, VertexHeaderOffset, VertexCode, 2);
     const std::uint32_t* readCode = Place(programs, ReadCodeOffset, ReadHeaderOffset, PixelBufferRead, 1);
     const std::uint32_t* storeCode = Place(programs, StoreCodeOffset, StoreHeaderOffset, PixelStore, 1);
@@ -242,6 +250,24 @@ Colors DrawRead(const Fixture& fixture, std::uint64_t buffer, std::uint64_t poin
 
 std::uint64_t Total(Count count) {
     return ShaderResources::AddressTemplateTotals()[static_cast<std::size_t>(count)];
+}
+
+struct ImportBudget {
+    explicit ImportBudget(std::uint64_t bytes) { AgcDriver::Graphics::SetHostImportBudget(bytes); }
+    ~ImportBudget() { AgcDriver::Graphics::SetHostImportBudget(0); }
+    ImportBudget(const ImportBudget&) = delete;
+    ImportBudget& operator=(const ImportBudget&) = delete;
+};
+
+std::uint64_t AddressOf(const void* pointer) {
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
+}
+
+void MapImagePages() {
+    GuestAllocations::Mutation mutation;
+    mutation.RegisterMainImage();
+    mutation.Protect(ImageConstants.data(), sizeof(ImageConstants), true, false, true, [] {});
+    mutation.Protect(ImageWords.data(), sizeof(ImageWords), true, true, true, [] {});
 }
 
 struct Counts {
@@ -334,6 +360,38 @@ void RefusesAChangedSpace(Fixture& fixture) {
     if (!fixture.off) Expect(counts.Since(Count::RefusedSpace) == 1 && counts.Since(Count::Made) == 1 + verifyBuilds && counts.Since(Count::Reused) == 1, "a template over a space that changed was not refused once, rebuilt over the new space and reused");
 }
 
+void MirroredSpacesRefreshPerReuse(Fixture& fixture) {
+    const auto& data = fixture.data;
+    const auto& sparse = fixture.sparse;
+    WriteFloat(data, 0x100, 1.0f);
+    WriteFloat(sparse, 0x400, 0.0f);
+    WriteFloat(sparse, 0x410, 1.0f);
+    const Counts counts;
+    const auto first = DrawRead(fixture, data.At(0x100), sparse.At(0x400));
+    WriteFloat(data, 0x100, 0.0f);
+    WriteFloat(sparse, 0x400, 1.0f);
+    WriteFloat(sparse, 0x410, 0.0f);
+    const auto heaps = DrawRead(fixture, data.At(0x100), sparse.At(0x400));
+    const auto images = DrawRead(fixture, AddressOf(ImageWords.data()), AddressOf(ImageConstants.data()));
+    ImageWords[0] = 0.0f;
+    const auto written = DrawRead(fixture, AddressOf(ImageWords.data()), AddressOf(ImageConstants.data()));
+    const auto since = [&](Count count) { return static_cast<unsigned long long>(counts.Since(count)); };
+    std::printf("draws over a space of heap, sparse heap, writable image and read-only image mirrors: %s; after CPU writes into the heap mirrors %s; through the image mirrors %s; after a CPU write into the writable image mirror %s; reused %llu (moved buffers %llu, new data words %llu), made %llu, refused %llu; builds over spaces with mirrors %llu (read-only image %llu, writable image %llu, heap %llu, sparse heap %llu, sparse regions %llu, copied ranges %llu)\n", Text(first).c_str(), Text(heaps).c_str(), Text(images).c_str(), Text(written).c_str(), since(Count::Reused), since(Count::ReusedMovedBuffers), since(Count::ReusedMovedData), since(Count::Made), since(Count::RefusedBusy) + since(Count::RefusedSpace) + since(Count::RefusedImports) + since(Count::RefusedTargets) + since(Count::RefusedSnapshot) + since(Count::RefusedProof) + since(Count::RefusedUnmovable) + since(Count::RefusedBuffer), since(Count::KindMirrored), since(Count::KindReadOnlyMirrors), since(Count::KindWritableMirrors), since(Count::KindHeapMirrors), since(Count::KindSparseMirrors), since(Count::KindSparseRegions), since(Count::KindCopied));
+    ExpectColors(first, {255, 0, 255}, "the first draw over the mirrored space");
+    ExpectColors(heaps, {0, 255, 0}, "a draw after CPU writes into its heap and sparse heap mirrors read stale mirror bytes");
+    ExpectColors(images, {255, 0, 255}, "a draw reading through the writable and read-only image mirrors");
+    ExpectColors(written, {0, 0, 255}, "a draw after a CPU write into its writable image mirror read stale mirror bytes");
+    if (fixture.off) {
+        Expect(since(Count::Reused) == 0 && since(Count::Made) == 0, "APS5_NO_BDA_TEMPLATES=1 still made or reused an address-based template over a mirrored space");
+        return;
+    }
+    Expect(since(Count::KindHeapMirrors) != 0 && since(Count::KindSparseMirrors) != 0 && since(Count::KindReadOnlyMirrors) != 0 && since(Count::KindWritableMirrors) != 0, "the space did not carry heap, sparse heap, read-only image and writable image mirrors, so the case does not test them");
+    const auto verifyBuilds = fixture.verify ? since(Count::Reused) : 0;
+    Expect(since(Count::Reused) == 3 && since(Count::Made) == 1 + verifyBuilds, "the draws after the first did not all reuse its template over the mirrored space");
+    Expect(since(Count::ReusedMovedBuffers) == 2, "the reuses through the image mirrors did not bind their moved buffer in place");
+    Expect(since(Count::ReusedMovedData) == 1, "the reuse after the CPU rewrote the word its program loads did not bind the new word, or a reuse whose loaded word equals the template's moved it");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -342,13 +400,23 @@ int main(int argc, char** argv) {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
         }
+        const std::string only = argc > 1 ? argv[1] : "";
+        const bool mirrors = only == "--mirrors";
+        std::optional<ImportBudget> budget;
+        if (mirrors) {
+            budget.emplace(1);
+            MapImagePages();
+        }
         Fixture fixture;
         fixture.programs.Map(false);
         FillVertices(fixture.vertices);
         fixture.vertices.Map(false);
         fixture.data.Map(true);
         fixture.target.Map(true);
-        const std::string only = argc > 1 ? argv[1] : "";
+        if (mirrors) {
+            fixture.sparse.Map(true);
+            MirroredSpacesRefreshPerReuse(fixture);
+        }
         if (only.empty() || only == "--words") ReuseBindsTheDrawsWords(fixture);
         if (only.empty() || only == "--writes") ReuseReadsWritesIntoItsRanges(fixture);
         if (only.empty() || only == "--outside") RefusesABufferOutsideTheSpace(fixture);
