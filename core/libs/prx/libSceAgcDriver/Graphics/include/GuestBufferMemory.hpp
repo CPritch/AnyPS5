@@ -122,6 +122,7 @@ void SetHostImportDeferredSettles(bool enabled);
 // that heap: the other half stays for the buffers, mirrors and textures that share it.
 std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, std::uint64_t physicalBytes);
 void SetHostImportMaxBytes(std::uint64_t bytes);
+void DropAddressSpaceCacheForTest();
 std::uint64_t HostImportLiveBytes();
 // A flip ends a frame: an import used in the current or the previous frame is never evicted for another one.
 void NoteHostImportFrame();
@@ -430,6 +431,16 @@ public:
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
+    enum class SpaceTemplate : std::uint8_t { Served, NoSpace, Copied, OddRegions, OwnRegions, Writes };
+    SpaceTemplate SpaceServesTemplate() const;
+    enum SpaceKind : std::uint32_t { SpaceKindsKnown = 1u, SpaceMirrored = 2u, SpaceReadOnlyMirrors = 4u, SpaceWritableMirrors = 8u, SpaceHeapMirrors = 16u, SpaceSparseMirrors = 32u, SpaceSparseRegions = 64u, SpaceCopied = 128u, SpaceOddRegions = 256u };
+    std::uint32_t SpaceKinds() const;
+    std::uint64_t SpaceSerial() const;
+    enum class SpaceAttach : std::uint8_t { Attached, Space, Imports, Snapshot };
+    SpaceAttach AttachSpace(std::uint64_t serial, std::span<const GuestMemorySnapshot> snapshots, bool verifyMirrors);
+    bool SpaceImportsCurrent();
+    std::optional<std::pair<VkDescriptorBufferInfo, std::uint32_t>> InPlaceDescriptor(std::uint64_t address, std::size_t bytes) const;
+    std::shared_ptr<const void> DetachSpace();
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
         for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
@@ -438,7 +449,7 @@ public:
     // Every uploaded region as [begin, end) when all of them are served by host imports, in place or
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
-    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions() const;
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions(bool withSpace = true) const;
     struct CutRegion {
         std::uint64_t begin;
         std::uint64_t end;

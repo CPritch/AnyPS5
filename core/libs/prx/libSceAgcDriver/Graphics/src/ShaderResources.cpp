@@ -2694,6 +2694,7 @@ void ShaderResources::buildComplete() {
         requireGuestBuffers();
         guestMemory.UploadFinish(usesBda, htileClear);
         timing.uploadMs += phase(BuildPhase::Upload);
+        if (usesBda) bdaGuardSerial = MultisampleTargetRangeGeneration();
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         if (bda) bda->SetSrtGuards(std::move(srtGuardFaults));
@@ -2890,19 +2891,63 @@ bool LoopGuardEnabled() {
     return enabled;
 }
 
+bool BdaTemplatesEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_BDA_TEMPLATES") == nullptr;
+    return enabled;
+}
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::AddressCount::Count)> addressCounts{};
+
+void CountAddress(ShaderResources::AddressCount count) {
+    addressCounts[static_cast<std::size_t>(count)].fetch_add(1, std::memory_order_relaxed);
+}
+
+thread_local bool uncountedAddressBuild = false;
+std::atomic<void (*)()> addressVerifyHook{nullptr};
+
 }
 
 void ShaderResources::noteReusable() {
     // Taken whether or not the object turns out reusable: the lookups' records are this build's.
     captureValidation();
     reusable = false;
+    bdaTemplate = false;
+    bdaSpaceSerial = 0;
     importsReconcilable = false;
     directRegions.clear();
-    if (htileClear.has_value() || guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
-    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
-    const auto regions = guestMemory.DirectRegions();
-    if (!regions.has_value()) return;
+    const bool addressCandidate = usesBda && BdaTemplatesEnabled() && drawBuild && !GuestMemory::OnResolverThread();
+    const bool counting = addressCandidate && !uncountedAddressBuild;
+    const auto served = addressCandidate && bdaReadOnly ? guestMemory.SpaceServesTemplate() : GuestBufferMemory::SpaceTemplate::NoSpace;
+    const bool addressTemplate = addressCandidate && bdaReadOnly && served == GuestBufferMemory::SpaceTemplate::Served;
+    const auto notTemplate = [&] {
+        if (addressTemplate && counting) CountAddress(AddressCount::NotOther);
+    };
+    if (counting && !bdaReadOnly) CountAddress(AddressCount::NotReadOnly);
+    else if (counting && !addressTemplate) CountAddress(served == GuestBufferMemory::SpaceTemplate::Copied ? AddressCount::CopiedRanges : served == GuestBufferMemory::SpaceTemplate::OddRegions ? AddressCount::OddSpaceRegions : served == GuestBufferMemory::SpaceTemplate::OwnRegions ? AddressCount::OwnRegions : served == GuestBufferMemory::SpaceTemplate::Writes ? AddressCount::DescriptorWrites : AddressCount::NoSpace);
+    if (counting) {
+        const auto kinds = guestMemory.SpaceKinds();
+        constexpr std::array<std::pair<std::uint32_t, AddressCount>, 7> counted{{{GuestBufferMemory::SpaceMirrored, AddressCount::KindMirrored}, {GuestBufferMemory::SpaceReadOnlyMirrors, AddressCount::KindReadOnlyMirrors}, {GuestBufferMemory::SpaceWritableMirrors, AddressCount::KindWritableMirrors}, {GuestBufferMemory::SpaceHeapMirrors, AddressCount::KindHeapMirrors}, {GuestBufferMemory::SpaceSparseMirrors, AddressCount::KindSparseMirrors}, {GuestBufferMemory::SpaceSparseRegions, AddressCount::KindSparseRegions}, {GuestBufferMemory::SpaceCopied, AddressCount::KindCopied}}};
+        for (const auto& [bit, count] : counted) {
+            if ((kinds & bit) != 0) CountAddress(count);
+        }
+    }
+    if (htileClear.has_value() || guestMemory.HasCopiedWrites() || (HoldsLease() && !addressTemplate) || (usesBda && !addressTemplate) || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) {
+        notTemplate();
+        return;
+    }
+    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) {
+        notTemplate();
+        return;
+    }
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) {
+        notTemplate();
+        return;
+    }
+    const auto regions = guestMemory.DirectRegions(!addressTemplate);
+    if (!regions.has_value()) {
+        notTemplate();
+        return;
+    }
     bool mirrored = false;
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
@@ -2912,7 +2957,10 @@ void ShaderResources::noteReusable() {
         // bit set, so the two spaces never collide.
         const bool imported = serial != 0;
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return;
+        if (serial == 0) {
+            notTemplate();
+            return;
+        }
         directRegions.push_back({begin, end, serial});
         mirrored = mirrored || !imported;
     }
@@ -2926,17 +2974,231 @@ void ShaderResources::noteReusable() {
         }
     }
     importsReconcilable = !mirrored && !bounded;
+    bdaTemplate = addressTemplate;
+    bdaSpaceSerial = addressTemplate ? guestMemory.SpaceSerial() : 0;
+    addressCounted = addressTemplate && counting;
+    if (addressCounted) CountAddress(AddressCount::Made);
     reusable = true;
+}
+
+ShaderResources::AddressRefusal ShaderResources::AttachAddressSpace(std::span<const GuestMemorySnapshot> snapshots) {
+    if (!bdaTemplate) return AddressRefusal::None;
+    if (guestMemory.HoldsLease()) return AddressRefusal::Busy;
+    if (MultisampleTargetRangeGeneration() != bdaGuardSerial) return AddressRefusal::Targets;
+    switch (guestMemory.AttachSpace(bdaSpaceSerial, snapshots, VerifyAddressTemplates())) {
+        case GuestBufferMemory::SpaceAttach::Attached: return AddressRefusal::None;
+        case GuestBufferMemory::SpaceAttach::Space: return AddressRefusal::Space;
+        case GuestBufferMemory::SpaceAttach::Imports: return AddressRefusal::Imports;
+        case GuestBufferMemory::SpaceAttach::Snapshot: return AddressRefusal::Snapshot;
+    }
+    return AddressRefusal::Space;
+}
+
+bool ShaderResources::AddressSpaceCurrent() {
+    return !bdaTemplate || guestMemory.SpaceImportsCurrent();
+}
+
+ShaderResources::AddressRefusal ShaderResources::ResolveAddressMoves(std::vector<MovedBuffer>& moved) const {
+    if (!bdaTemplate) return AddressRefusal::None;
+    const auto guestMoves = moved.size();
+    for (std::size_t index = 0; index < guestMoves; ++index) {
+        if (!moved[index].words.empty()) continue;
+        const auto allocation = moved[index].allocation;
+        Require(allocation < allocations.size() && allocations[allocation].guest, "a moved buffer of an address-based template is not a guest buffer");
+        const auto inPlace = guestMemory.InPlaceDescriptor(moved[index].address, moved[index].size);
+        if (!inPlace.has_value()) return AddressRefusal::Buffer;
+        moved[index].inPlace = wholeDwordRange(inPlace->first);
+        moved[index].adjustment = inPlace->second;
+        const auto& item = allocations[allocation];
+        if (inPlace->second == item.adjustment || item.pushByte >= 0) continue;
+        if (item.dataAllocation < 0) return AddressRefusal::Buffer;
+        const auto data = static_cast<std::size_t>(item.dataAllocation);
+        if (std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == data; })) continue;
+        const auto& held = allocations[data];
+        if (held.buffer == nullptr || held.dataWords.size() * sizeof(std::uint32_t) != held.size) return AddressRefusal::Buffer;
+        moved.push_back({data, 0, held.size, held.dataWords});
+    }
+    return AddressRefusal::None;
+}
+
+void ShaderResources::ReleaseAddressSpace(Recorder& recorder) {
+    if (!bdaTemplate) return;
+    auto space = guestMemory.DetachSpace();
+    if (space != nullptr) recorder.Keep(std::const_pointer_cast<void>(std::move(space)));
+}
+
+void ShaderResources::DropAddressSpace() noexcept {
+    if (bdaTemplate) static_cast<void>(guestMemory.DetachSpace());
+}
+
+void ShaderResources::NoteAddressReuse(std::span<const MovedBuffer> moved) const {
+    CountAddress(AddressCount::Reused);
+    addressReuses.fetch_add(1, std::memory_order_relaxed);
+    if (std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.inPlace.buffer != VK_NULL_HANDLE && entry.adjustment != allocations[entry.allocation].adjustment; })) CountAddress(AddressCount::ReusedRepatched);
+    if (std::any_of(moved.begin(), moved.end(), [](const MovedBuffer& entry) { return entry.words.empty(); })) CountAddress(AddressCount::ReusedMovedBuffers);
+    if (std::any_of(moved.begin(), moved.end(), [](const MovedBuffer& entry) { return !entry.words.empty(); })) CountAddress(AddressCount::ReusedMovedData);
+}
+
+void ShaderResources::NoteAddressRefusal(AddressRefusal refusal) {
+    constexpr std::array<AddressCount, static_cast<std::size_t>(AddressRefusal::Count)> counts{AddressCount::Count, AddressCount::RefusedBusy, AddressCount::RefusedSpace, AddressCount::RefusedImports, AddressCount::RefusedTargets, AddressCount::RefusedSnapshot, AddressCount::RefusedProof, AddressCount::RefusedUnmovable, AddressCount::RefusedBuffer};
+    const auto count = counts[static_cast<std::size_t>(refusal)];
+    if (count != AddressCount::Count) CountAddress(count);
+}
+
+ShaderResources::UncountedAddressBuild::UncountedAddressBuild() {
+    uncountedAddressBuild = true;
+}
+
+ShaderResources::UncountedAddressBuild::~UncountedAddressBuild() {
+    uncountedAddressBuild = false;
+}
+
+void ShaderResources::SetAddressVerifyHookForTest(void (*hook)()) {
+    addressVerifyHook.store(hook, std::memory_order_release);
+}
+
+void ShaderResources::RunAddressVerifyHook() {
+    if (auto* hook = addressVerifyHook.load(std::memory_order_acquire); hook != nullptr) hook();
+}
+
+bool ShaderResources::VerifyAddressTemplates() {
+    static const bool enabled = std::getenv("APS5_VERIFY_BDA_TEMPLATES") != nullptr;
+    return enabled;
+}
+
+void ShaderResources::VerifyAddressReuse(const ShaderResources& built, std::span<const MovedBuffer> moved) const {
+    const auto fail = [](const std::string& what) {
+        std::fprintf(stderr, "FATAL: APS5_VERIFY_BDA_TEMPLATES: a reused address-based template differs from a full build of its draw in %s\n", what.c_str());
+        std::fflush(stderr);
+        std::abort();
+    };
+    const auto hex = [](std::uint64_t value) {
+        char text[24];
+        std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+        return std::string(text);
+    };
+    const auto info = [&](const VkDescriptorBufferInfo& bound) { return hex(reinterpret_cast<std::uint64_t>(bound.buffer)) + "+" + hex(bound.offset) + "/" + hex(bound.range); };
+    if (!built.bdaTemplate) fail("being a template: the full build is not served whole by the cached address space");
+    const bool sameSpace = built.bdaSpaceSerial == bdaSpaceSerial;
+    if (!sameSpace) CountAddress(AddressCount::VerifiedNewerSpace);
+    if (built.bdaGuardSerial != bdaGuardSerial) fail("the multisample target generation its table was built under: " + std::to_string(bdaGuardSerial) + " reused, " + std::to_string(built.bdaGuardSerial) + " built");
+    if (built.allocations.size() != allocations.size() || built.bindings.size() != bindings.size() || built.descriptorBuffers.size() != descriptorBuffers.size() || built.descriptorImages.size() != descriptorImages.size()) fail("its bindings: " + std::to_string(allocations.size()) + " buffers and " + std::to_string(descriptorImages.size()) + " images reused, " + std::to_string(built.allocations.size()) + " and " + std::to_string(built.descriptorImages.size()) + " built");
+    const auto ranges = guestMemory.AddressRanges();
+    const auto builtRanges = built.guestMemory.AddressRanges();
+    if (sameSpace) {
+        if (ranges.size() != builtRanges.size()) fail("its BDA table: " + std::to_string(ranges.size()) + " ranges reused, " + std::to_string(builtRanges.size()) + " built");
+        for (std::size_t index = 0; index < ranges.size(); ++index) {
+            const auto& mine = ranges[index];
+            const auto& theirs = builtRanges[index];
+            if (mine.begin != theirs.begin || mine.end != theirs.end || mine.deviceAddress != theirs.deviceAddress || mine.permissions != theirs.permissions) fail("BDA table range " + std::to_string(index) + ": " + hex(mine.begin) + "-" + hex(mine.end) + " at " + hex(mine.deviceAddress) + " reused, " + hex(theirs.begin) + "-" + hex(theirs.end) + " at " + hex(theirs.deviceAddress) + " built");
+        }
+        if (guestMemory.InPlaceReads() != built.guestMemory.InPlaceReads()) fail("the ranges it reads in place");
+    } else {
+        for (const auto& mine : ranges) {
+            const bool held = std::any_of(builtRanges.begin(), builtRanges.end(), [&](const auto& theirs) { return theirs.begin == mine.begin && theirs.end == mine.end && theirs.permissions == mine.permissions; });
+            if (!held) fail("its BDA table: the range " + hex(mine.begin) + "-" + hex(mine.end) + " of the reused space " + std::to_string(bdaSpaceSerial) + " is missing from the newer space " + std::to_string(built.bdaSpaceSerial) + " a full build takes now");
+        }
+        const auto builtReads = built.guestMemory.InPlaceReads();
+        for (const auto& [begin, end] : guestMemory.InPlaceReads()) {
+            if (std::none_of(builtReads.begin(), builtReads.end(), [&](const auto& range) { return range.first <= begin && end <= range.second; })) fail("the ranges it reads in place: " + hex(begin) + "-" + hex(end) + " of the reused space is not read in place by the newer space");
+        }
+    }
+    if (guestMemory.Writes() != built.guestMemory.Writes()) fail("the ranges it writes");
+    const auto movedOf = [&](std::size_t index) { return std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; }); };
+    const auto adjustmentOf = [&](std::size_t index) {
+        const auto entry = movedOf(index);
+        return entry != moved.end() && entry->inPlace.buffer != VK_NULL_HANDLE ? entry->adjustment : allocations[index].adjustment;
+    };
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> effectivePush;
+    std::vector<DataPatch> effectiveData;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        const auto adjustment = adjustmentOf(index);
+        if (adjustment == 0) continue;
+        if (item.pushByte >= 0) effectivePush.emplace_back(static_cast<std::uint32_t>(item.pushByte), adjustment);
+        else if (item.dataAllocation >= 0) effectiveData.push_back({static_cast<std::size_t>(item.dataAllocation), item.dataByte, adjustment});
+    }
+    if (effectivePush != built.pushPatches) fail("its push constant offset patches");
+    if (effectiveData.size() != built.dataPatches.size() || !std::equal(effectiveData.begin(), effectiveData.end(), built.dataPatches.begin(), [](const DataPatch& a, const DataPatch& b) { return a.allocation == b.allocation && a.byte == b.byte && a.adjustment == b.adjustment; })) fail("its data word offset patches");
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& mine = allocations[index];
+        const auto& theirs = built.allocations[index];
+        const auto override = movedOf(index);
+        if (mine.guest != theirs.guest || mine.role != theirs.role || mine.written != theirs.written) fail("the kind of buffer " + std::to_string(index));
+        if (mine.guest) {
+            const auto address = override != moved.end() ? override->address : mine.address;
+            const auto size = override != moved.end() ? override->size : mine.size;
+            const auto adjustment = adjustmentOf(index);
+            if (address != theirs.address || size != theirs.size || adjustment != theirs.adjustment) fail("the range of guest buffer " + std::to_string(index) + ": " + hex(address) + "+" + hex(size) + " adjusted by " + std::to_string(adjustment) + " reused, " + hex(theirs.address) + "+" + hex(theirs.size) + " adjusted by " + std::to_string(theirs.adjustment) + " built");
+            if (!sameSpace) continue;
+            std::uint32_t described = 0;
+            const auto expected = wholeDwordRange(built.guestMemory.Descriptor(theirs.address, theirs.size, described));
+            const auto bound = override != moved.end() ? override->inPlace : wholeDwordRange(guestMemory.Descriptor(mine.address, mine.size, described));
+            if (bound.buffer != expected.buffer || bound.offset != expected.offset || bound.range != expected.range) fail("the import binding of guest buffer " + std::to_string(index) + ": " + info(bound) + " reused, " + info(expected) + " built");
+            continue;
+        }
+        if (mine.buffer == nullptr || theirs.buffer == nullptr) {
+            if ((mine.buffer == nullptr) != (theirs.buffer == nullptr) || mine.size != theirs.size) fail("the placeholder of buffer " + std::to_string(index));
+            continue;
+        }
+        if (mine.size != theirs.size) fail("the size of data buffer " + std::to_string(index) + ": " + std::to_string(mine.size) + " reused, " + std::to_string(theirs.size) + " built");
+        std::vector<std::byte> bytes(mine.size);
+        if (override != moved.end() && !override->words.empty()) {
+            if (override->words.size() * sizeof(std::uint32_t) != mine.size) fail("the size of the moved data words of buffer " + std::to_string(index));
+            std::memcpy(bytes.data(), override->words.data(), mine.size);
+            for (const auto& patch : effectiveData) {
+                if (patch.allocation == index && patch.byte < bytes.size()) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+            }
+        } else {
+            std::memcpy(bytes.data(), mine.buffer->Bytes().data(), mine.size);
+        }
+        const auto theirBytes = theirs.buffer->Bytes().subspan(0, theirs.size);
+        if (std::memcmp(bytes.data(), theirBytes.data(), bytes.size()) == 0) continue;
+        std::size_t word = 0;
+        while ((word + 1) * 4 <= bytes.size() && std::memcmp(bytes.data() + word * 4, theirBytes.data() + word * 4, 4) == 0) ++word;
+        std::uint32_t reused = 0;
+        std::uint32_t fresh = 0;
+        if ((word + 1) * 4 <= bytes.size()) {
+            std::memcpy(&reused, bytes.data() + word * 4, 4);
+            std::memcpy(&fresh, theirBytes.data() + word * 4, 4);
+        }
+        fail("the words of " + std::string(override != moved.end() ? "moved" : "kept") + " data buffer " + std::to_string(index) + ": word " + std::to_string(word) + " " + hex(reused) + " reused, " + hex(fresh) + " built");
+    }
+    for (std::size_t index = 0; index < descriptorImages.size(); ++index) {
+        const auto& mine = descriptorImages[index];
+        const auto& theirs = built.descriptorImages[index];
+        if (mine.sampler != theirs.sampler || mine.imageView != theirs.imageView || mine.imageLayout != theirs.imageLayout) fail("image or sampler descriptor " + std::to_string(index));
+    }
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::AddressCount::Count)> ShaderResources::AddressTemplateTotals() {
+    std::array<std::uint64_t, static_cast<std::size_t>(AddressCount::Count)> totals{};
+    for (std::size_t index = 0; index < totals.size(); ++index) totals[index] = addressCounts[index].load(std::memory_order_relaxed);
+    return totals;
+}
+
+std::string ShaderResources::TakeAddressTemplateText() {
+    static AgcDriver::Mutex mutex;
+    static std::array<std::uint64_t, static_cast<std::size_t>(AddressCount::Count)> seen{};
+    std::lock_guard lock(mutex);
+    const auto now = AddressTemplateTotals();
+    const auto at = [&](AddressCount count) { return static_cast<unsigned long long>(now[static_cast<std::size_t>(count)] - seen[static_cast<std::size_t>(count)]); };
+    const auto verifyText = VerifyAddressTemplates() ? "; verify builds over a newer space " + std::to_string(at(AddressCount::VerifiedNewerSpace)) : std::string();
+    char text[1600];
+    std::snprintf(text, sizeof(text), "; BDA templates (10 s): reused %llu (with moved buffers %llu, with new data words %llu), made %llu; reuses refused: busy %llu, space moved on %llu, imports %llu, multisample targets %llu, a snapshot outside the space %llu, the proof %llu, words not movable %llu, a buffer outside it or misaligned %llu; builds not made templates: not read-only %llu, no cached space %llu, copied ranges in the space %llu, other space regions %llu, regions outside the space %llu, descriptor writes %llu, other %llu; their spaces carry: mirrors %llu (read-only image %llu, writable image %llu, heap %llu, sparse heap %llu), sparse regions %llu, copied ranges %llu; reuses that repatched a buffer offset %llu; templates ended after reuses: none %llu, one %llu, 2-9 %llu, 10-99 %llu, 100 or more %llu; left the cache: replaced by a build of their key %llu, evicted for room %llu, their images gone %llu, removed (refused or failed proof) %llu, cleared %llu%s%s", at(AddressCount::Reused), at(AddressCount::ReusedMovedBuffers), at(AddressCount::ReusedMovedData), at(AddressCount::Made), at(AddressCount::RefusedBusy), at(AddressCount::RefusedSpace), at(AddressCount::RefusedImports), at(AddressCount::RefusedTargets), at(AddressCount::RefusedSnapshot), at(AddressCount::RefusedProof), at(AddressCount::RefusedUnmovable), at(AddressCount::RefusedBuffer), at(AddressCount::NotReadOnly), at(AddressCount::NoSpace), at(AddressCount::CopiedRanges), at(AddressCount::OddSpaceRegions), at(AddressCount::OwnRegions), at(AddressCount::DescriptorWrites), at(AddressCount::NotOther), at(AddressCount::KindMirrored), at(AddressCount::KindReadOnlyMirrors), at(AddressCount::KindWritableMirrors), at(AddressCount::KindHeapMirrors), at(AddressCount::KindSparseMirrors), at(AddressCount::KindSparseRegions), at(AddressCount::KindCopied), at(AddressCount::ReusedRepatched), at(AddressCount::EndedUnused), at(AddressCount::EndedOnce), at(AddressCount::EndedFew), at(AddressCount::EndedTens), at(AddressCount::EndedHundreds), at(AddressCount::LeftReplaced), at(AddressCount::LeftEvicted), at(AddressCount::LeftImages), at(AddressCount::LeftRemoved), at(AddressCount::LeftCleared), verifyText.c_str(), BdaTemplatesEnabled() ? "" : " (off: APS5_NO_BDA_TEMPLATES)");
+    seen = now;
+    return text;
 }
 
 std::uint64_t ShaderResources::DepthGuardRefusals() {
     return depthGuardRefusals.load(std::memory_order_relaxed);
 }
 
-bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
+bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders, bool committerDraw) {
     const bool loopGuard = LoopGuardEnabled();
-    return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {
-        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
+    const bool tablesRefused = !committerDraw || !BdaTemplatesEnabled() || std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Compute; });
+    return std::any_of(shaders.begin(), shaders.end(), [loopGuard, tablesRefused](const CompiledShader& shader) {
+        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard, tablesRefused](const ShaderRecompiler::DescriptorBinding& binding) { return (tablesRefused && binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
     });
 }
 
@@ -4700,7 +4962,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     dropReleasedTextures(evicted);
     if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
     if (const auto found = index.find(key); found != index.end()) {
-        forget(found->second->second);
+        forget(found->second->second, ShaderResources::AddressCount::LeftReplaced);
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         entries.erase(found->second);
         index.erase(found);
@@ -4719,7 +4981,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     noteUse(key);
     while (entries.size() > capacity) {
         noteEvicted(entries.back().first);
-        forget(entries.back().second);
+        forget(entries.back().second, ShaderResources::AddressCount::LeftEvicted);
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
         index.erase(entries.back().first);
         entries.pop_back();
@@ -4734,7 +4996,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
             continue;
         }
         tables -= elements;
-        forget(it->second);
+        forget(it->second, ShaderResources::AddressCount::LeftEvicted);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = std::prev(entries.erase(it));
@@ -4768,7 +5030,7 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
-        forget(it->second);
+        forget(it->second, ShaderResources::AddressCount::LeftImages);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
@@ -4795,7 +5057,7 @@ void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResou
             continue;
         }
         ++dropped;
-        forget(it->second);
+        forget(it->second, ShaderResources::AddressCount::LeftImages);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
@@ -4846,7 +5108,7 @@ std::uint64_t ResourceCache::Touches() {
 
 void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
-    for (const auto& entry : entries) forget(entry.second);
+    for (const auto& entry : entries) forget(entry.second, ShaderResources::AddressCount::LeftCleared);
     index.clear();
     entries.clear();
     evictedKeys.clear();
@@ -4895,13 +5157,15 @@ std::uint64_t ResourceCache::TableElements() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
-    forget(found->second->second);
+    forget(found->second->second, ShaderResources::AddressCount::LeftRemoved);
     entries.erase(found->second);
     index.erase(found);
 }
 
-void ResourceCache::forget(const std::shared_ptr<ShaderResources>& resources) {
-    if (resources != nullptr) resources->inResourceCache.store(false, std::memory_order_release);
+void ResourceCache::forget(const std::shared_ptr<ShaderResources>& resources, ShaderResources::AddressCount reason) {
+    if (resources == nullptr) return;
+    if (resources->addressCounted) CountAddress(reason);
+    resources->inResourceCache.store(false, std::memory_order_release);
 }
 
 ResourceCache& SharedResourceCache() {
@@ -6300,6 +6564,10 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
 }
 
 ShaderResources::~ShaderResources() {
+    if (addressCounted) {
+        const auto reuses = addressReuses.load(std::memory_order_relaxed);
+        CountAddress(reuses == 0 ? AddressCount::EndedUnused : reuses == 1 ? AddressCount::EndedOnce : reuses < 10 ? AddressCount::EndedFew : reuses < 100 ? AddressCount::EndedTens : AddressCount::EndedHundreds);
+    }
     release();
 }
 
@@ -6473,7 +6741,7 @@ std::string ShaderResources::TakeCommitterMovedText() {
 
 std::optional<ShaderResources::MovedPlan> ShaderResources::PlanMovedBuffers(std::span<const CompiledShader> shaders, const ColorTarget* target) const {
     MovedPlan plan;
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return plan;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !bdaTemplate)) return plan;
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
@@ -6487,6 +6755,8 @@ std::optional<ShaderResources::MovedPlan> ShaderResources::PlanMovedBuffers(std:
                 const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
                 if (same) continue;
                 if (item.dataWords.empty() && patched) return std::nullopt;
+                if (bdaTemplate && binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt && shader.program->poisonedSrtReads != 0) return std::nullopt;
+                if (bdaTemplate && binding.role == ShaderRecompiler::DescriptorRole::ShaderData) ValidateRuntimeResources(shader, binding.guestDescriptor);
                 if (plan.moved.empty()) plan.moved.reserve(allocations.size());
                 plan.moved.push_back({index, 0, item.size, binding.guestDescriptor});
                 continue;
@@ -6523,7 +6793,7 @@ std::optional<ShaderResources::MovedPlan> ShaderResources::PlanMovedBuffers(std:
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::CheckMovedPlan(MovedPlan plan, Recorder& recorder) const {
     const bool counted = CommitterProofCounted();
     const auto checkStart = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto usable = std::all_of(plan.checks.begin(), plan.checks.end(), [&](const std::pair<std::uint64_t, std::size_t>& check) {
+    const auto usable = bdaTemplate || std::all_of(plan.checks.begin(), plan.checks.end(), [&](const std::pair<std::uint64_t, std::size_t>& check) {
         const auto [begin, bytes] = check;
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) || guestMemory.WritesOverlap(begin, bytes)) return false;
         const bool pending = recorder.PendingWriteOverlaps(begin, bytes);
@@ -6885,7 +7155,12 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     };
     CountBinding(CountCalls);
     requireGuestBuffers(moved);
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return false;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && (!bdaTemplate || moved.empty()))) return false;
+    if (usesBda && onLane) {
+        result->declined = true;
+        return false;
+    }
+    Require(!usesBda || guestMemory.HoldsLease(), "a reused address-based template's moved words reached its bindings without its address space");
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
     guestMemory.InPlaceReads(reads);
@@ -6895,6 +7170,9 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     thread_local std::vector<std::size_t>* selectedSlot = nullptr;
     auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
     selected.clear();
+    thread_local std::vector<std::size_t>* placedSlot = nullptr;
+    auto& placed = ShaderRecompiler::ThreadOwned(placedSlot);
+    placed.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
     static const bool lockedStamp = std::getenv("APS5_LOCKED_SNAPSHOT_STAMP") != nullptr;
@@ -6926,6 +7204,11 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
         for (const auto& patch : dataPatches) {
             if (patch.allocation == pending.patched && patch.byte < pending.bytes) pending.destination[patch.byte] = static_cast<std::byte>(patch.adjustment);
         }
+        for (const auto& entry : moved) {
+            if (entry.inPlace.buffer == VK_NULL_HANDLE) continue;
+            const auto& item = allocations[entry.allocation];
+            if (item.pushByte < 0 && item.dataAllocation == static_cast<std::int64_t>(pending.patched) && item.dataByte < pending.bytes) pending.destination[item.dataByte] = static_cast<std::byte>(entry.adjustment);
+        }
     };
     const auto upload = [&](const PendingCopy& pending) {
         if (deferCopies) pendingCopies.push_back(pending);
@@ -6947,6 +7230,12 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             upload({slice.bytes, reinterpret_cast<const std::byte*>(override->words.data()), override->size, index});
             selected.push_back(index);
             keep({0, slice.buffer, slice.offset, override->size}, recorder.DrawUploadOwner(slice.buffer));
+            continue;
+        }
+        if (usesBda) {
+            if (override == moved.end()) continue;
+            Require(override->inPlace.buffer != VK_NULL_HANDLE, "a moved buffer of an address-based template has no binding in its address space");
+            placed.push_back(index);
             continue;
         }
         std::uint64_t address = item.address;
@@ -7049,10 +7338,16 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
         }
     }
     part(PartSnapshots);
-    if (selected.empty()) {
+    if (selected.empty() && placed.empty()) {
         CountBinding(CountEmpty);
         return false;
     }
+    const auto placedRange = [&](std::size_t allocation) -> const VkDescriptorBufferInfo* {
+        if (placed.empty() || std::find(placed.begin(), placed.end(), allocation) == placed.end()) return nullptr;
+        const auto entry = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& candidate) { return candidate.allocation == allocation; });
+        Require(entry != moved.end(), "a binding taken in place has no moved buffer");
+        return &entry->inPlace;
+    };
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     const auto poolSizes = [&](std::array<std::vector<VkDescriptorPoolSize>, 2>& counts, std::array<bool, 2>& described) {
         described = {};
@@ -7133,6 +7428,10 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             const auto range = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
             for (const auto slot : plan.allocationSlots[selected[index]]) buffers[slot] = range;
         }
+        for (const auto allocation : placed) {
+            const auto range = *placedRange(allocation);
+            for (const auto slot : plan.allocationSlots[allocation]) buffers[slot] = range;
+        }
         CountBinding(CountWrites, writes.size());
         part(PartWrites);
         context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -7155,7 +7454,10 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             write.pBufferInfo = buffers.data() + offset;
             for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
                 const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
-                if (snapshotIndex == selected.size()) continue;
+                if (snapshotIndex == selected.size()) {
+                    if (const auto* range = placedRange(binding.allocations[element]); range != nullptr) buffers[offset + element] = *range;
+                    continue;
+                }
                 const auto& snapshot = result->snapshots[snapshotIndex];
                 buffers[offset + element] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
             }

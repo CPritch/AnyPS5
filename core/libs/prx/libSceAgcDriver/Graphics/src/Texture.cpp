@@ -254,8 +254,8 @@ bool SpanOverlaps(const LiveImages::Span& span, std::uint64_t address, std::size
 std::atomic<void (*)()> publishHookForTest{nullptr};
 
 LiveImages& Live() {
-    static LiveImages live;
-    return live;
+    static auto* live = new LiveImages();
+    return *live;
 }
 
 // Per-layer validity of array surfaces (see StorageTexture::layerBegin): a fill of one layer clears
@@ -1832,8 +1832,8 @@ struct PendingWrites {
 };
 
 PendingWrites& Pending() {
-    static PendingWrites pending;
-    return pending;
+    static auto* pending = new PendingWrites();
+    return *pending;
 }
 
 DrawnPending drawnPending() {
