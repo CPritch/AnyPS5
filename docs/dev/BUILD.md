@@ -156,6 +156,9 @@ Build configuration parameters:
 | `-DFFMPEG_PREBUILT_DIR=<path>`         | Unpacked FFmpeg package for the target platform; empty by default. |
 | `-DANYPS5_NODE=<path>`                 | Node.js 26 or newer that runs the memory64 Emscripten tests `guest_long_double` and `emscripten_module_unwind`; `node` by default, Emscripten builds only. |
 | `-DANYPS5_VIDEO_OUT_TEST_DRIVER=<driver>` | SDL video driver for the VideoOut flip tests; `windows` on Windows and `offscreen` elsewhere. |
+| `-DANYPS5_PGO=GENERATE`                | `OFF` (default), `GENERATE` or `USE`: [profile-guided optimization](#profile-guided-optimization) of the native libraries. Linux and GCC 11 or newer. |
+| `-DANYPS5_PGO_DIR=<path>`              | Absolute directory of the profiles that `ANYPS5_PGO=GENERATE` writes and `ANYPS5_PGO=USE` reads. |
+| `-DANYPS5_PGO_TARGETS=<targets>`       | Semicolon-separated library targets that `ANYPS5_PGO` instruments and optimizes; `libSceAgcDriver;shader_recompiler_agc_driver` by default, `ALL` for every library under `core/` except the relinker's. |
 | `-DANYPS5_AGC_EXECUTION_TESTS=<names>` | Semicolon-separated file names, without `.cpp`, of the `core/libs/prx/libSceAgcDriver/tests/execution` tests to build. Every other execution test is built from a stub that prints `skipped, this build leaves the test out with ANYPS5_AGC_EXECUTION_TESTS` and exits 77. A name with no source there fails the configure. Empty by default, which builds them all. |
 
 SDL and FreeType settings forced by the root `CMakeLists.txt` cannot be overridden with `-D`.
@@ -169,6 +172,23 @@ The Linux HTTP URI locale regression needs an ISO-8859-1 locale. With tests enab
 ## ThreadSanitizer
 
 A ThreadSanitizer build runs its tests with `TSAN_OPTIONS=suppressions=$PWD/tools/tsan-suppressions.txt`, which silences reports from Mesa's lavapipe, the LLVM it compiles shaders with, and PulseAudio: those system libraries are not instrumented, so ThreadSanitizer cannot see their locking. Guest memory written by the emulated GPU while a guest thread polls it, such as labels and fences, is shared without C++ atomics on purpose, as on the console, so ThreadSanitizer also reports those accesses.
+
+## Profile-guided optimization
+
+`-DANYPS5_PGO=GENERATE` instruments the library targets in `ANYPS5_PGO_TARGETS`, and every other target is built as usual. A static library is instrumented only when it is listed: `libSceAgcDriver` alone leaves `shader_recompiler_agc_driver`, which it links, uninstrumented. The default is the agc driver and its shader recompiler, the code of the driver threads (queue worker, draw committer, preparer, resolver and finishers). In `perf` profiles of the open world (Rockstar Editor replay, `-fno-semantic-interposition` builds), those threads spend their time outside the kernel, the GPU driver, glibc and the allocator almost only in `libSceAgcDriver.prx`, the recompiler's code on the finishers included; `libc.prx` (write-watch, on the preparer) is the one other prx above 0.2 % of the samples. Leaving libc and libkernel out keeps their counters off every guest thread. `ALL` instruments every library target under `core/` except the relinker's. A target that is not a library fails the configure. It compiles them with `-fprofile-generate -fprofile-update=prefer-atomic`, so threads that run the same code do not lose counter updates. Each instrumented library links its own copy of libgcov and keeps it out of its exports (`--exclude-libs,libgcov.a`): NID patching renames libc's exports, so a library that took libgcov's functions from libc would fail to load. A process that loads the libraries writes one `.gcda` file per object into `ANYPS5_PGO_DIR` when it ends through `exit`, each library from its own destructor, or through `_Exit`: each instrumented `.prx` registers its own `__gcov_dump` with libc when it loads (`cmake/ProfileDump.cpp`), and libc, instrumented or not, wraps `_Exit` to call every registered one first (`cmake/ProfileDumpRegistry.cpp`). Other instrumented shared libraries, such as test fixtures, write theirs at `exit` only. A title's quit, from the window or SIGINT, ends in `_Exit` (`LibcTerminate_nid_no_patch`). A crash or SIGKILL writes nothing. A later run adds its counts to the files already in the directory. `GCOV_PREFIX` and `GCOV_PREFIX_STRIP` move the files at run time, for a sandbox that cannot write `ANYPS5_PGO_DIR`.
+
+`-DANYPS5_PGO=USE` compiles the targets in `ANYPS5_PGO_TARGETS`, which should be the training build's, with `-fprofile-use -fprofile-partial-training -fprofile-correction` from the `.gcda` files in `ANYPS5_PGO_DIR`; the configure fails when there are none. Code the training never ran is optimized as it is without a profile (`-fprofile-partial-training`), and `-fprofile-correction` smooths the counts of threads that were still running while the profile was written. `-fprofile-use` and `-fprofile-partial-training` are also link options, for link-time optimization.
+
+Both pass `-fprofile-prefix-path=<build directory>`, so each file is named after its object's path relative to the build directory (`core#libs#prx#libSceAgcDriver#CMakeFiles#libSceAgcDriver.dir#...#Driver.cpp.gcda`) and a profile trained in one build directory applies in another. GCC's checksum of a function's source locations includes the source file's path, so a profile from another checkout fails the build under the default `-Werror=coverage-mismatch`. USE builds pass `-Wno-coverage-mismatch`: a function whose control flow changed since the training is built without its profile, without a warning, and one whose lines or path moved keeps it. `-Wno-missing-profile` silences the objects the training never loaded. Train and use with the same other flags, since early inlining changes the control flow GCC checks.
+
+```sh
+cmake -S . -B build-train -G Ninja -DCMAKE_BUILD_TYPE=Release -DANYPS5_PGO=GENERATE -DANYPS5_PGO_DIR=$PWD/profile
+cmake --build build-train --target libs --parallel
+cmake -S . -B build-pgo -G Ninja -DCMAKE_BUILD_TYPE=Release -DANYPS5_PGO=USE -DANYPS5_PGO_DIR=$PWD/profile
+cmake --build build-pgo --target libs --parallel
+```
+
+Run the title with `build-train`'s libraries between the two builds. Without `-DANYPS5_PGO` nothing changes.
 
 ## Quick syntax checks
 
