@@ -1,0 +1,10 @@
+if(BUILD_TESTING)
+    add_test(NAME agc_driver_host_import_reconcile_full COMMAND agc_driver_host_import_reconcile_tests)
+    add_test(NAME agc_driver_host_import_reconcile_verify COMMAND agc_driver_host_import_reconcile_tests)
+    set_tests_properties(agc_driver_host_import_reconcile_full PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_JOURNAL_RECONCILE=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_driver_host_import_reconcile_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_JOURNAL_RECONCILE=1;APS5_VERIFY_ALLOCATION_JOURNAL=1;APS5_VERIFY_IMPORT_JOURNAL=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_host_import_reconcile_full agc_driver_host_import_reconcile_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
