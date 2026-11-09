@@ -18,6 +18,7 @@
 #include <array>
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
 #include <algorithm>
 #include <bit>
 #include <charconv>
@@ -336,6 +337,11 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 thread_local std::uint64_t threadTrackerWaitNs = 0;
+std::atomic<std::uint64_t> unlockedImports{0};
+std::atomic<std::uint64_t> unlockedImportNs{0};
+std::atomic<std::uint64_t> unlockedImportRedos{0};
+std::atomic<std::uint64_t> importWindowWaits{0};
+std::atomic<std::uint64_t> importWindowWaitNs{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 std::atomic<std::uint64_t> aliasWalks{0};
 std::atomic<std::uint64_t> aliasWalkBytes{0};
@@ -1317,16 +1323,34 @@ void HashPages(std::uint64_t first, std::span<const std::pair<std::uint64_t, std
     });
 }
 
+struct WindowVerify {
+    std::vector<std::uint64_t> locked;
+    std::mutex mutex;
+    std::vector<std::uintptr_t> disagreed;
+};
+
 struct WindowCopy {
     std::uint64_t first;
     std::span<const std::uint64_t> hashes;
     std::span<const std::byte> image;
     StampKind held = StampKind::ImportWindow;
+    std::span<const std::uint8_t> stale{};
+    WindowVerify* verify = nullptr;
 
     bool Holds(std::uintptr_t page) const {
         if (held == StampKind::Driver) return page >= first && page - first <= image.size() && image.size() - (page - first) >= WritePageBytes && CompareMapped(page, image.subspan(page - first, WritePageBytes)) == Compare::Equal;
         if (page < first || (page - first) / WritePageBytes >= hashes.size()) return false;
-        return HashPage(reinterpret_cast<const std::byte*>(page)) == hashes[(page - first) / WritePageBytes];
+        const auto index = static_cast<std::size_t>((page - first) / WritePageBytes);
+        const auto hash = HashPage(reinterpret_cast<const std::byte*>(page));
+        const bool kept = hash == hashes[index] && (stale.empty() || stale[index] == 0);
+        if (verify != nullptr) {
+            DriverDetail::CountVerify(DriverDetail::VerifyCount::UnlockedImportChecked);
+            if (kept && hash != verify->locked[index]) {
+                std::lock_guard lock(verify->mutex);
+                verify->disagreed.push_back(page);
+            }
+        }
+        return kept;
     }
 };
 
@@ -1378,6 +1402,8 @@ struct WriteTracker {
     std::atomic<std::uint64_t> generation{1};
     std::atomic<std::uint64_t> stable{1};
     std::vector<void*> pages;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> importing;
+    std::condition_variable_any imported;
     // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
     // collect fully inside one skips GetWriteWatch, whose cost is proportional to the range's pages,
     // and the same surfaces are collected several times per epoch (each storage mip binding, a sampled
@@ -2192,7 +2218,36 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 }
 #endif
 
+bool importingOverlaps(const WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
+    return std::any_of(tracker.importing.begin(), tracker.importing.end(), [&](const auto& span) { return span.first < stop && first < span.second; });
+}
+
+void awaitUnlockedImports(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
+    if (tracker.importing.empty()) return;
+    const auto overlaps = [&] {
+        if (importingOverlaps(tracker, first, stop)) return true;
+#ifndef _WIN32
+        AliasPieces pieces;
+        aliasPieces(first, stop, pieces);
+        for (const auto& piece : pieces) {
+            if (importingOverlaps(tracker, piece.other, piece.other + (piece.end - piece.begin))) return true;
+        }
+#endif
+        return false;
+    };
+    if (!overlaps()) return;
+    importWindowWaits.fetch_add(1, std::memory_order_relaxed);
+    const auto start = std::chrono::steady_clock::now();
+    do tracker.imported.wait(tracker.mutex);
+    while (overlaps());
+    const auto waited = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    importWindowWaitNs.fetch_add(waited, std::memory_order_relaxed);
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    if (counted) threadTrackerWaitNs += waited;
+}
+
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
+    awaitUnlockedImports(tracker, first, stop);
     ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
@@ -2588,6 +2643,65 @@ std::uint64_t CollectEpoch() {
 namespace {
 
 std::atomic<void (*)(std::uint64_t, std::size_t)> unwatchHook{nullptr};
+std::atomic<void (*)(std::uint64_t, std::uint64_t)> importHashHookForTest{nullptr};
+
+bool unlockedImportEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_UNLOCKED_IMPORT") == nullptr;
+    return enabled;
+}
+
+bool verifyUnlockedImport() {
+    static const bool enabled = std::getenv("APS5_VERIFY_UNLOCKED_IMPORT") != nullptr;
+    return enabled;
+}
+
+void skipUnlockedImportVerify() {
+    if (verifyUnlockedImport()) DriverDetail::CountVerify(DriverDetail::VerifyCount::UnlockedImportSkipped);
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> coveredSpans(const WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    if (tracker.covers(first, static_cast<std::size_t>(stop - first))) {
+        spans.emplace_back(first, stop);
+        return spans;
+    }
+    for (auto begin = first; begin < stop;) {
+        const auto end = std::min<std::uint64_t>((begin / WriteBlockBytes + 1) * WriteBlockBytes, stop);
+        if (tracker.covers(begin, static_cast<std::size_t>(end - begin))) {
+            if (!spans.empty() && spans.back().second == begin) spans.back().second = end;
+            else spans.emplace_back(begin, end);
+        }
+        begin = end;
+    }
+    return spans;
+}
+
+class ImportingSpans {
+public:
+    ImportingSpans(WriteTracker& tracker, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans) : tracker(tracker), spans(spans) {
+        tracker.importing.insert(tracker.importing.end(), spans.begin(), spans.end());
+    }
+    ~ImportingSpans() {
+        Close();
+    }
+    ImportingSpans(const ImportingSpans&) = delete;
+    ImportingSpans& operator=(const ImportingSpans&) = delete;
+
+    void Close() {
+        if (closed) return;
+        closed = true;
+        for (const auto& span : spans) {
+            const auto found = std::find(tracker.importing.begin(), tracker.importing.end(), span);
+            if (found != tracker.importing.end()) tracker.importing.erase(found);
+        }
+        tracker.imported.notify_all();
+    }
+
+private:
+    WriteTracker& tracker;
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans;
+    bool closed = false;
+};
 
 thread_local bool unwatchWritesProven = true;
 std::atomic<int> importWalkFailureForTest{0};
@@ -2673,6 +2787,14 @@ bool UnwatchWritesProven() {
     return unwatchWritesProven;
 }
 
+void SetImportHashHookForTest(void (*hook)(std::uint64_t first, std::uint64_t stop)) {
+    importHashHookForTest.store(hook, std::memory_order_release);
+}
+
+UnlockedImportCounts UnlockedImportTotals() {
+    return {unlockedImports.load(std::memory_order_relaxed), unlockedImportNs.load(std::memory_order_relaxed), unlockedImportRedos.load(std::memory_order_relaxed), importWindowWaits.load(std::memory_order_relaxed), importWindowWaitNs.load(std::memory_order_relaxed)};
+}
+
 void SetImportWalkFailureForTest(int walk, std::uint64_t span) {
     importWalkFailureSpanForTest.store(span, std::memory_order_release);
     importWalkFailureForTest.store(walk, std::memory_order_release);
@@ -2732,6 +2854,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     tracker.initialize();
     if (!tracker.watched) {
         lock.Unlock();
+        skipUnlockedImportVerify();
         return import();
     }
     constexpr std::uint64_t page = 4096;
@@ -2750,6 +2873,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         return import();
     };
     if (!staysWatched) {
+        skipUnlockedImportVerify();
         const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
         if (!runImport()) return false;
         bumpSubscriptions(first, stop - first, WriteBumpSource::Import);
@@ -2757,21 +2881,45 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         unwatchLocked(tracker, address, bytes);
         return true;
     }
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
-    if (covered) spans.emplace_back(first, stop);
-    else {
-        for (auto begin = first; begin < stop;) {
-            const auto end = std::min<std::uint64_t>((begin / WriteBlockBytes + 1) * WriteBlockBytes, stop);
-            if (tracker.covers(begin, static_cast<std::size_t>(end - begin))) {
-                if (!spans.empty() && spans.back().second == begin) spans.back().second = end;
-                else spans.emplace_back(begin, end);
-            }
-            begin = end;
-        }
-    }
+    auto spans = coveredSpans(tracker, first, stop);
     std::vector<std::uint64_t> hashes(static_cast<std::size_t>((stop - first) / page), 0);
-    for (const auto& [begin, end] : spans) CheckRange(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin), 1, false);
-    HashPages(first, spans, hashes);
+    const auto hashSpans = [&] {
+        for (const auto& [begin, end] : spans) CheckRange(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin), 1, false);
+        HashPages(first, spans, hashes);
+    };
+    const auto elapsedNs = [](std::chrono::steady_clock::time_point start) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()); };
+    const bool unlocked = unlockedImportEnabled();
+    std::uint64_t since = 0;
+    std::uint64_t unlockedNs = 0;
+    std::optional<WindowVerify> verify;
+    if (unlocked && !spans.empty()) {
+        since = tracker.generation.load(std::memory_order_relaxed);
+        {
+            const TrackerLock::Suspension suspended{lock};
+            const auto start = std::chrono::steady_clock::now();
+            hashSpans();
+            unlockedNs += elapsedNs(start);
+            if (const auto hook = importHashHookForTest.load(std::memory_order_acquire)) hook(first, stop);
+        }
+        if (auto again = coveredSpans(tracker, first, stop); again != spans) {
+            unlockedImportRedos.fetch_add(1, std::memory_order_relaxed);
+            skipUnlockedImportVerify();
+            spans = std::move(again);
+            std::fill(hashes.begin(), hashes.end(), 0);
+            since = tracker.generation.load(std::memory_order_relaxed);
+            hashSpans();
+        } else if (verifyUnlockedImport()) {
+            verify.emplace();
+            verify->locked.assign(hashes.size(), 0);
+            HashPages(first, spans, verify->locked);
+            std::uint64_t compared = 0;
+            for (const auto& [begin, end] : spans) compared += (end - begin) / page;
+            DriverDetail::CountVerify(DriverDetail::VerifyCount::UnlockedImportChecked, compared);
+        }
+    } else {
+        if (!unlocked || spans.empty()) skipUnlockedImportVerify();
+        hashSpans();
+    }
     const auto failWalk = importWalkFailureForTest.load(std::memory_order_acquire);
     const auto failSpan = importWalkFailureSpanForTest.load(std::memory_order_acquire);
     const auto failsWalk = [&](int walk, std::uint64_t begin, std::uint64_t end) {
@@ -2789,9 +2937,34 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         return true;
     });
     leave(leaving);
-    if (!runImport()) return false;
+    std::vector<std::uint8_t> stale;
+    if (unlocked && !spans.empty()) {
+        stale.assign(hashes.size(), 0);
+        for (const auto& [begin, end] : spans) {
+            for (auto at = begin; at < end; at += page) {
+                const auto block = tracker.blockOf(at);
+                if (tracker.stampOf(block) > since || tracker.cpuStampOf(block) > since) stale[static_cast<std::size_t>((at - first) / page)] = 1;
+            }
+        }
+    }
+    if (unlocked) {
+        ImportingSpans importing(tracker, spans);
+        bool imported = false;
+        {
+            const TrackerLock::Suspension suspended{lock};
+            const auto start = std::chrono::steady_clock::now();
+            imported = runImport();
+            unlockedNs += elapsedNs(start);
+        }
+        importing.Close();
+        unlockedImports.fetch_add(1, std::memory_order_relaxed);
+        unlockedImportNs.fetch_add(unlockedNs, std::memory_order_relaxed);
+        if (!imported) return false;
+    } else if (!runImport()) {
+        return false;
+    }
     bumpSubscriptions(first, stop - first, WriteBumpSource::Import);
-    const WindowCopy window{first, hashes};
+    const WindowCopy window{first, hashes, {}, StampKind::ImportWindow, stale, verify ? &*verify : nullptr};
     leaving.clear();
     std::erase_if(spans, [&](const auto& span) {
         if (failsWalk(2, span.first, span.second) || !walkWrites(tracker, span.first, span.second, StampKind::Cpu, true, &window)) {
@@ -2803,6 +2976,13 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
 #endif
         return false;
     });
+    if (verify) {
+        for (const auto at : verify->disagreed) {
+            if (tracker.stampOf(tracker.blockOf(at)) > since) continue;
+            std::fprintf(stderr, "FATAL: APS5_VERIFY_UNLOCKED_IMPORT: the import window of 0x%llx-0x%llx held page 0x%llx against the bytes hashed outside the tracker lock, where the bytes hashed under it differ and nothing stamped its block since generation %llu\n", static_cast<unsigned long long>(first), static_cast<unsigned long long>(stop), static_cast<unsigned long long>(at), static_cast<unsigned long long>(since));
+            std::abort();
+        }
+    }
     leave(leaving);
     auto unwatchedFrom = first;
     for (const auto& [begin, end] : spans) {

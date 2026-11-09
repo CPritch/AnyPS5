@@ -166,6 +166,11 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         field("import_proofs_survived", delta(churn.proofsSurvived, previousChurn.proofsSurvived));
         field("import_map_unlocked", delta(churn.mapUnlocked, previousChurn.mapUnlocked));
         field("import_map_discarded", delta(churn.mapDiscarded, previousChurn.mapDiscarded));
+        field("import_tracker_unlocked", delta(churn.trackerUnlocked, previousChurn.trackerUnlocked));
+        field("import_tracker_unlocked_us", micros(churn.trackerUnlockedNs, previousChurn.trackerUnlockedNs));
+        field("import_tracker_redos", delta(churn.trackerRedos, previousChurn.trackerRedos));
+        field("import_window_waits", delta(churn.windowWaits, previousChurn.windowWaits));
+        field("import_window_wait_us", micros(churn.windowWaitNs, previousChurn.windowWaitNs));
         const auto specialization = ShaderRecompiler::SpecializationCounts();
         field("spec_first", delta(specialization.first, previousSpecialization.first));
         field("spec_first_us", micros(specialization.firstNs, previousSpecialization.firstNs));

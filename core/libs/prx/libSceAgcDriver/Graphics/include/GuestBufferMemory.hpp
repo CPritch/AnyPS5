@@ -253,6 +253,11 @@ struct ImportChurnCounts {
     std::uint64_t proofWalks = 0;
     std::uint64_t lockWaits = 0;
     std::uint64_t lockWaitNs = 0;
+    std::uint64_t trackerUnlocked = 0;
+    std::uint64_t trackerUnlockedNs = 0;
+    std::uint64_t trackerRedos = 0;
+    std::uint64_t windowWaits = 0;
+    std::uint64_t windowWaitNs = 0;
 };
 bool ImportChurnCounted();
 ImportChurnCounts ImportChurnTotals();

@@ -17,8 +17,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_write_tracking_generation_wrap PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
     add_test(NAME agc_write_tracking_mark_order COMMAND agc_write_tracking_tests --mark-order)
     set_tests_properties(agc_write_tracking_mark_order PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    add_test(NAME agc_write_tracking_unlocked_import_verify COMMAND agc_write_tracking_tests)
+    set_tests_properties(agc_write_tracking_unlocked_import_verify PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_VERIFY_UNLOCKED_IMPORT=1")
+    add_test(NAME agc_write_tracking_locked_import COMMAND agc_write_tracking_tests)
+    set_tests_properties(agc_write_tracking_locked_import PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_NO_UNLOCKED_IMPORT=1;APS5_VERIFY_UNLOCKED_IMPORT=1")
     if(WIN32)
-        set_tests_properties(agc_write_tracking_mark_order PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_write_tracking_mark_order agc_write_tracking_unlocked_import_verify agc_write_tracking_locked_import PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -20,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -1882,6 +1884,127 @@ void CheckImportWindow() {
     Require(!UnchangedSince(base, Block, after), "a store after the import window was missed");
 }
 
+bool UnlockedImports() {
+    return std::getenv("APS5_NO_UNLOCKED_IMPORT") == nullptr;
+}
+
+volatile std::uint8_t* storeDuringHashBytes = nullptr;
+std::uint64_t storeDuringHashGeneration = 0;
+bool storeDuringHashRan = false;
+
+void StoreDuringHash(std::uint64_t, std::uint64_t) {
+    storeDuringHashRan = true;
+    storeDuringHashBytes[0x100] = 0x55;
+    storeDuringHashGeneration = CollectWritesUncached(reinterpret_cast<std::uint64_t>(storeDuringHashBytes), Block);
+}
+
+void CheckStoreDuringUnlockedHash() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    const auto synced = CollectWritesUncached(base, 2 * Block);
+    Require(synced != 0, "the block of a store during the unlocked hash is not collected");
+    storeDuringHashBytes = bytes;
+    storeDuringHashRan = false;
+    SetImportHashHookForTest(&StoreDuringHash);
+    Require(ImportWatched(base, 2 * Block, [&] {
+        bytes[0x100] = 0x11;
+        bytes[Block + 0x100] = 0x11;
+        return true;
+    }), "the import with a store during its unlocked hash failed");
+    SetImportHashHookForTest(nullptr);
+    Require(storeDuringHashRan == UnlockedImports(), "the import hashed outside the tracker lock exactly when APS5_NO_UNLOCKED_IMPORT is unset");
+    if (storeDuringHashRan) {
+        Require(WrittenSince(base, Block, synced), "a store between the unlocked hash and the import was missed");
+        Require(storeDuringHashGeneration != 0 && WrittenSince(base, Block, storeDuringHashGeneration), "bytes the import put back over a store collected after the unlocked hash read as unchanged");
+    } else {
+        Require(UnchangedSince(base, Block, synced), "a page the locked import window resolved without changing its bytes reads as written");
+    }
+    Require(UnchangedSince(base + Block, Block, synced), "a block the import touched without changing its bytes reads as written");
+}
+
+std::uint64_t unwatchDuringHashAt = 0;
+
+void UnwatchDuringHash(std::uint64_t, std::uint64_t) {
+    Unwatch(unwatchDuringHashAt, Block);
+}
+
+void CheckCoverageChangeDuringUnlockedHash() {
+    void* memory = AllocateWatched(3 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 3 * Block);
+    const auto synced = CollectWritesUncached(base, 3 * Block);
+    Require(synced != 0, "the blocks of a coverage change during the unlocked hash are not collected");
+    const auto before = UnlockedImportTotals();
+    unwatchDuringHashAt = base + Block;
+    if (!UnlockedImports()) Unwatch(unwatchDuringHashAt, Block);
+    SetImportHashHookForTest(&UnwatchDuringHash);
+    Require(ImportWatched(base, 3 * Block, [&] {
+        bytes[0x100] = 0x11;
+        bytes[2 * Block + 0x100] = 0x22;
+        return true;
+    }), "the import with a coverage change during its unlocked hash failed");
+    SetImportHashHookForTest(nullptr);
+    const auto after = UnlockedImportTotals();
+    if (UnlockedImports()) Require(after.redos == before.redos + 1 && after.unlocked == before.unlocked + 1, "a coverage change during the unlocked hash did not redo the hash");
+    else Require(after.redos == before.redos && after.unlocked == before.unlocked, "the locked import path counted an unlocked import");
+    Require(!Watched(base + Block, Block), "the block unwatched during the hash is watched again");
+    Require(Watched(base, Block) && Watched(base + 2 * Block, Block), "an import after a coverage change took the watched blocks out of the write watch");
+    Require(UnchangedSince(base, Block, synced), "a page an import window resolved without changing its bytes reads as written after the hash was redone");
+    Require(WrittenSince(base + 2 * Block, Block, synced), "a store of new bytes within an import window was missed after the hash was redone");
+}
+
+void CheckForeignWalksDuringUnlockedImport() {
+    if (!UnlockedImports()) return;
+    void* memory = AllocateWatched(2 * Block);
+    void* elsewhere = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto other = reinterpret_cast<std::uint64_t>(elsewhere);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    auto* otherBytes = static_cast<volatile std::uint8_t*>(elsewhere);
+    std::memset(memory, 0x11, 2 * Block);
+    std::memset(elsewhere, 0x11, Block);
+    const auto synced = CollectWritesUncached(base, 2 * Block);
+    const auto otherSynced = CollectWritesUncached(other, Block);
+    Require(synced != 0 && otherSynced != 0, "the blocks of the foreign walk test are not collected");
+    const auto waitsBefore = UnlockedImportTotals().waits;
+    std::uint64_t otherCollected = 0;
+    std::uint64_t overlapping = 0;
+    std::thread walker;
+    bool waited = false;
+    Require(ImportWatched(base, 2 * Block, [&] {
+        bytes[0x100] = 0x11;
+        bytes[Block + 0x100] = 0x77;
+        std::thread([&] {
+            otherBytes[0x40] = 0x99;
+            otherCollected = CollectWritesUncached(other, Block);
+        }).join();
+        walker = std::thread([&] { overlapping = CollectWritesUncached(base, 2 * Block); });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!(waited = UnlockedImportTotals().waits != waitsBefore) && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        return true;
+    }), "the import with foreign walks during it failed");
+    walker.join();
+    Require(otherCollected != 0 && WrittenSince(other, Block, otherSynced), "a walk of another range did not run while an import was outside the tracker lock");
+    Require(waited, "a walk over a range being imported outside the tracker lock did not wait for the import window");
+    Require(overlapping != 0, "the walk that waited for the import window failed");
+    Require(UnchangedSince(base, Block, synced), "a page the import touched without changing its bytes reads as written after a walk waited for its window");
+    Require(WrittenSince(base + Block, Block, synced), "a store of new bytes during an import outside the tracker lock was missed");
+}
+
+void CheckUnlockedImportVerifyCounts() {
+    if (std::getenv("APS5_VERIFY_UNLOCKED_IMPORT") == nullptr) return;
+    using AgcDriver::DriverDetail::VerifyCount;
+    const auto totals = AgcDriver::DriverDetail::VerifyTotals();
+    const auto checked = totals[static_cast<std::size_t>(VerifyCount::UnlockedImportChecked)];
+    const auto skipped = totals[static_cast<std::size_t>(VerifyCount::UnlockedImportSkipped)];
+    std::cout << "unlocked import verify: " << checked << " pages checked, " << skipped << " imports skipped\n";
+    if (UnlockedImports()) Require(checked != 0, "APS5_VERIFY_UNLOCKED_IMPORT compared no pages");
+    else Require(checked == 0 && skipped != 0, "APS5_VERIFY_UNLOCKED_IMPORT did not count the locked imports as skipped");
+}
+
 void CheckImportWindowOtherThread() {
     void* memory = AllocateWatched(2 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -2678,6 +2801,9 @@ int main(int argc, char** argv) {
 #if defined(__linux__)
         CheckImportWindowOverAlias();
 #endif
+        CheckStoreDuringUnlockedHash();
+        CheckCoverageChangeDuringUnlockedHash();
+        CheckForeignWalksDuringUnlockedImport();
         CheckStoreAcrossImports();
         CheckImportWindowFootprint();
         CheckUnwatchedImport();
@@ -2689,6 +2815,7 @@ int main(int argc, char** argv) {
 #ifndef _WIN32
         CheckOwnStoreImages();
 #endif
+        CheckUnlockedImportVerifyCounts();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

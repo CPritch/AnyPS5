@@ -8678,6 +8678,12 @@ ImportChurnCounts ImportChurnTotals() {
     counts.proofWalks = churn.proofWalks.load(std::memory_order_relaxed);
     counts.lockWaits = churn.lockWaits.load(std::memory_order_relaxed);
     counts.lockWaitNs = churn.lockWaitNs.load(std::memory_order_relaxed);
+    const auto unlocked = GuestMemory::UnlockedImportTotals();
+    counts.trackerUnlocked = unlocked.unlocked;
+    counts.trackerUnlockedNs = unlocked.unlockedNs;
+    counts.trackerRedos = unlocked.redos;
+    counts.windowWaits = unlocked.waits;
+    counts.windowWaitNs = unlocked.waitNs;
     return counts;
 }
 

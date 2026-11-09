@@ -23,6 +23,8 @@ constexpr std::array<Entry, VerifyCountSize> Entries{{
     {"vf_register_key_skipped", "APS5_VERIFY_REGISTER_KEY"},
     {"vf_holder_note_checked", "APS5_VERIFY_HOLDER_NOTE"},
     {"vf_holder_note_unnamed", "APS5_VERIFY_HOLDER_NOTE"},
+    {"vf_unlocked_import_checked", "APS5_VERIFY_UNLOCKED_IMPORT"},
+    {"vf_unlocked_import_skipped", "APS5_VERIFY_UNLOCKED_IMPORT"},
 }};
 
 std::array<std::atomic<std::uint64_t>, VerifyCountSize> totals{};
