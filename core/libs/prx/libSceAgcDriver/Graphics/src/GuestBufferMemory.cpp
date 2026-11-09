@@ -384,6 +384,9 @@ struct ImportChurn {
     std::atomic<std::uint64_t> lockWaits{0};
     std::atomic<std::uint64_t> lockWaitNs{0};
     std::atomic<std::uint64_t> earlyBarrierAborts{0};
+    std::atomic<std::uint64_t> pinWaitJournal{0};
+    std::atomic<std::uint64_t> pinWaitFallbacks{0};
+    std::atomic<std::uint64_t> pinWaitReseeds{0};
 };
 
 ImportChurn& Churn() {
@@ -2881,8 +2884,10 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         if (journalReconcileEnabled()) {
             std::uint64_t published = 0;
             if (journalReseedEnabled()) {
-                state.journalFrom = GuestAllocations::GuestAllocationsLeaseGeneration_nid_no_patch(lease, &published) ? published : 0;
+                bool unsettled = false;
+                state.journalFrom = GuestAllocations::GuestAllocationsLeaseGeneration_nid_no_patch(lease, &published, &unsettled) ? published : 0;
                 if (state.journalFrom != 0 && state.journalFrom != generation) Churn().reseeded.fetch_add(1, std::memory_order_relaxed);
+                if (state.journalFrom != 0 && unsettled) Churn().pinWaitReseeds.fetch_add(1, std::memory_order_relaxed);
             } else {
                 state.journalFrom = GuestAllocations::GuestAllocationsLeaseCurrent_nid_no_patch(lease, &published) ? generation : 0;
             }
@@ -2900,7 +2905,10 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     };
     const auto decide = [&](const char* what, std::uint64_t base, std::uint64_t bytes, const auto& decision) {
         const bool kept = decision(lease);
-        if (journal != nullptr && journal->whole != nullptr && decision(*journal->whole) != kept) reconcileDisagreement(what, base, bytes, kept, generation);
+        if (journal != nullptr && journal->whole != nullptr) {
+            DriverDetail::CountVerify(DriverDetail::VerifyCount::JournalReconcileDecisions);
+            if (decision(*journal->whole) != kept) reconcileDisagreement(what, base, bytes, kept, generation);
+        }
         return kept;
     };
     const auto starts = [&](std::uint64_t address) {
@@ -3133,18 +3141,20 @@ const HostImport* importKeptByJournal(const Context& context, HostImports& state
 }
 
 void verifyTableInvariant(HostImports& state, bool journaled) {
-    if (state.journalFrom == 0) return;
+    const auto skipped = [] { DriverDetail::CountVerify(DriverDetail::VerifyCount::JournalReconcileSkipped); };
+    if (state.journalFrom == 0) return skipped();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
     std::uint64_t through = 0;
     GuestAllocations::Lease partial;
     GuestAllocations::Lease whole;
     const auto none = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>&, std::vector<std::pair<std::uint64_t, std::uint64_t>>&) {};
-    if (!GuestAllocations::GuestAllocationsAcquireChanged_nid_no_patch(state.journalFrom, none, &changed, &through, &partial, &whole)) return;
+    if (!GuestAllocations::GuestAllocationsAcquireChanged_nid_no_patch(state.journalFrom, none, &changed, &through, &partial, &whole)) return skipped();
     for (const auto& [base, entry] : state.imports) {
         if (state.pendingImports.contains(base)) continue;
         const auto [first, last] = importExtent(entry);
         const auto found = std::upper_bound(changed.begin(), changed.end(), first, [](std::uint64_t value, const auto& span) { return value < span.second; });
         if (found != changed.end() && found->first < last) continue;
+        DriverDetail::CountVerify(DriverDetail::VerifyCount::JournalReconcileInvariants);
         const auto bytes = keptBytes(entry, whole);
         if (bytes.current) continue;
         std::fprintf(stderr, "FATAL: APS5_VERIFY_JOURNAL_RECONCILE: after a %s reconcile the import 0x%llx+0x%llx was kept over a range the registry no longer has at generation %llu (kept %s, registry %s), and no change journaled since generation %llu touches it, so no journal reconcile would check it\n", journaled ? "journal" : "full", static_cast<unsigned long long>(base), static_cast<unsigned long long>(entry.bytes), static_cast<unsigned long long>(through), describeRange(bytes.kept).c_str(), describeRange(bytes.found).c_str(), static_cast<unsigned long long>(state.journalFrom));
@@ -3237,7 +3247,8 @@ std::vector<RefreshedRange> refreshedFrom(const GuestAllocations::Lease& lease) 
 }
 
 void verifyJournalCovers(HostImports& state, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed, const GuestAllocations::Lease& whole, std::uint64_t through) {
-    if (state.verifyFrom == 0 || state.verifyFrom != state.journalFrom) return;
+    if (state.verifyFrom == 0 || state.verifyFrom != state.journalFrom) return DriverDetail::CountVerify(DriverDetail::VerifyCount::JournalReconcileSkipped);
+    DriverDetail::CountVerify(DriverDetail::VerifyCount::JournalReconcileCovers);
     auto seen = state.verifyRanges;
     for (const auto& [begin, end] : changedSpans(seen, whole)) {
         auto found = std::upper_bound(changed.begin(), changed.end(), begin, [](std::uint64_t value, const auto& span) { return value < span.second; });
@@ -3266,11 +3277,20 @@ JournalReconcile journalReconcile(const Context& context, HostImports& state) {
     GuestAllocations::Lease whole;
     const auto select = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, std::vector<std::pair<std::uint64_t, std::uint64_t>>& cover) { importCover(state, spans, window, cover); };
     importBarrierBeforeLease(__builtin_return_address(0));
-    if (!GuestAllocations::GuestAllocationsAcquireChanged_nid_no_patch(state.journalFrom, select, &changed, &through, &lease, verifying ? &whole : nullptr)) return GuestAllocations::GuestAllocationsMutationWaiting_nid_postfix() ? JournalReconcile::Waiting : JournalReconcile::Unproven;
-    if (verifying) verifyJournalCovers(state, changed, whole, through);
+    bool unsettled = false;
+    if (!GuestAllocations::GuestAllocationsAcquireChanged_nid_no_patch(state.journalFrom, select, &changed, &through, &lease, verifying ? &whole : nullptr, &unsettled)) {
+        if (!GuestAllocations::GuestAllocationsMutationWaiting_nid_postfix()) return JournalReconcile::Unproven;
+        Churn().pinWaitFallbacks.fetch_add(1, std::memory_order_relaxed);
+        return JournalReconcile::Waiting;
+    }
+    if (verifying) {
+        verifyJournalCovers(state, changed, whole, through);
+        if (unsettled) DriverDetail::CountVerify(DriverDetail::VerifyCount::JournalReconcileUnsettled);
+    }
     const JournalChanges journal{through, &changed, window, budget, verifying ? &whole : nullptr};
     refreshImports(context, state, lease, &journal);
     Churn().journalRefreshes.fetch_add(1, std::memory_order_relaxed);
+    if (unsettled) Churn().pinWaitJournal.fetch_add(1, std::memory_order_relaxed);
     if (verifying) {
         state.verifyRanges = refreshedFrom(whole);
         state.verifyFrom = through;
@@ -8752,6 +8772,9 @@ ImportChurnCounts ImportChurnTotals() {
     counts.lockWaits = churn.lockWaits.load(std::memory_order_relaxed);
     counts.lockWaitNs = churn.lockWaitNs.load(std::memory_order_relaxed);
     counts.earlyBarrierAborts = churn.earlyBarrierAborts.load(std::memory_order_relaxed);
+    counts.pinWaitJournal = churn.pinWaitJournal.load(std::memory_order_relaxed);
+    counts.pinWaitFallbacks = churn.pinWaitFallbacks.load(std::memory_order_relaxed);
+    counts.pinWaitReseeds = churn.pinWaitReseeds.load(std::memory_order_relaxed);
     const auto unlocked = GuestMemory::UnlockedImportTotals();
     counts.trackerUnlocked = unlocked.unlocked;
     counts.trackerUnlockedNs = unlocked.unlockedNs;

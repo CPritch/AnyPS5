@@ -92,8 +92,23 @@ void RequirePath(const Graphics::ImportChurnCounts& before, Today today, const s
 
 enum class Outcome : std::uint8_t { NoDevice, NoImport, Passed };
 
+bool PinWaitJournalExpected() {
+    return JournalExpected() && std::getenv("APS5_NO_PIN_WAIT_JOURNAL") == nullptr;
+}
+
 bool EarlyBarrierExpected() {
     return std::getenv("APS5_NO_EARLY_IMPORT_BARRIER") == nullptr;
+}
+
+void RequireJournalVerifyCounts() {
+    if (std::getenv("APS5_VERIFY_JOURNAL_RECONCILE") == nullptr) return;
+    using AgcDriver::DriverDetail::VerifyCount;
+    const auto totals = AgcDriver::DriverDetail::VerifyTotals();
+    const auto count = [&](VerifyCount which) { return totals[static_cast<std::size_t>(which)]; };
+    std::printf("host import reconcile: journal reconcile verify: %llu decisions, %llu covers, %llu invariants, %llu during a pin wait, %llu skipped\n", static_cast<unsigned long long>(count(VerifyCount::JournalReconcileDecisions)), static_cast<unsigned long long>(count(VerifyCount::JournalReconcileCovers)), static_cast<unsigned long long>(count(VerifyCount::JournalReconcileInvariants)), static_cast<unsigned long long>(count(VerifyCount::JournalReconcileUnsettled)), static_cast<unsigned long long>(count(VerifyCount::JournalReconcileSkipped)));
+    if (!JournalExpected()) return;
+    Require(count(VerifyCount::JournalReconcileDecisions) != 0 && count(VerifyCount::JournalReconcileCovers) != 0 && count(VerifyCount::JournalReconcileInvariants) != 0, "host import reconcile: APS5_VERIFY_JOURNAL_RECONCILE counted no checks");
+    Require((count(VerifyCount::JournalReconcileUnsettled) != 0) == PinWaitJournalExpected(), "host import reconcile: APS5_VERIFY_JOURNAL_RECONCILE did not count the journal reconcile it checked during the pin wait exactly when the pin-wait journal is on");
 }
 
 void RequireEarlyBarrierVerifyCounts() {
@@ -202,12 +217,17 @@ Outcome ReconcileFollowsTheChanges() {
     mutator.join();
     Require(waited, "host import reconcile: the mutation never waited for the leased range at " + Hex(waiting));
     Require(proofHeld, "host import reconcile: a reconcile while a mutation waited on a pinned range dropped an import");
-    if (JournalExpected()) {
-        Require(during.journalFallbacks > before.journalFallbacks && during.journalRefreshes == before.journalRefreshes && during.fullRefreshes > before.fullRefreshes, "host import reconcile: a reconcile while a mutation waited on a pinned range trusted the journal (fallbacks " + std::to_string(during.journalFallbacks - before.journalFallbacks) + ", journal " + std::to_string(during.journalRefreshes - before.journalRefreshes) + ")");
+    const auto counts = " (fallbacks " + std::to_string(during.journalFallbacks - before.journalFallbacks) + ", journal " + std::to_string(during.journalRefreshes - before.journalRefreshes) + ", full " + std::to_string(during.fullRefreshes - before.fullRefreshes) + ", kept during the wait " + std::to_string(during.pinWaitJournal - before.pinWaitJournal) + ")";
+    if (PinWaitJournalExpected()) {
+        Require(during.journalRefreshes > before.journalRefreshes && during.pinWaitJournal > before.pinWaitJournal && during.fullRefreshes == before.fullRefreshes && during.journalFallbacks == before.journalFallbacks && during.pinWaitFallbacks == before.pinWaitFallbacks, "host import reconcile: a reconcile while a mutation waited on a pinned range left the journal" + counts);
+    } else if (JournalExpected()) {
+        Require(during.journalFallbacks > before.journalFallbacks && during.pinWaitFallbacks > before.pinWaitFallbacks && during.journalRefreshes == before.journalRefreshes && during.fullRefreshes > before.fullRefreshes && during.pinWaitJournal == before.pinWaitJournal, "host import reconcile: with APS5_NO_PIN_WAIT_JOURNAL a reconcile while a mutation waited on a pinned range trusted the journal" + counts);
     } else {
-        Require(during.journalFallbacks == before.journalFallbacks && during.journalRefreshes == before.journalRefreshes, "host import reconcile: without the journal reconcile a fallback was counted");
+        Require(during.journalFallbacks == before.journalFallbacks && during.journalRefreshes == before.journalRefreshes && during.pinWaitJournal == before.pinWaitJournal, "host import reconcile: without the journal reconcile a fallback was counted" + counts);
     }
+    before = Graphics::ImportChurnTotals();
     Require(reconciled(first) == kept, "host import reconcile: the import at " + Hex(first) + " was dropped once the waiting mutation ended");
+    if (PinWaitJournalExpected()) RequirePath(before, Today::Refreshes, "the first reconcile after a pin wait, seeded during the wait");
 
     Remove(arena, HalfWindow + MiB);
     Remove(arena, HalfWindow + 2 * MiB);
@@ -246,6 +266,7 @@ int main() {
             std::printf("skipped, the device does not import guest memory\n");
             return VulkanTestSkipped;
         }
+        RequireJournalVerifyCounts();
         RequireEarlyBarrierVerifyCounts();
         std::puts("host import reconcile tests passed");
         return 0;

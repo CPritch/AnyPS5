@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -5357,6 +5358,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             static const bool verifySurvivals = std::getenv("APS5_VERIFY_JOURNAL_RECONCILE") != nullptr;
             if (verifySurvivals && check == ImportsProofCheck::Survived) {
                 for (const auto& region : directRegions) {
+                    DriverDetail::CountVerify(DriverDetail::VerifyCount::JournalReconcileSurvivals);
                     const auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), false);
                     const bool imported = region.serial != 0 && (region.serial >> 63u) == 0;
                     if (serial == (imported ? region.serial : 0) || (!imported && !importsReconcilable)) continue;

@@ -28,6 +28,10 @@ std::byte* arena() {
     return base;
 }
 
+bool pinWaitJournal(bool journal) {
+    return journal && std::getenv("APS5_NO_PIN_WAIT_JOURNAL") == nullptr;
+}
+
 bool changed(std::uint64_t since, const void* pointer, std::size_t bytes) {
     return GuestAllocationsChangedSince_nid_postfix(since, reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
@@ -457,7 +461,18 @@ void unpublishedChangesAreNeverJournalCovered(bool journal) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
         Lease partial;
         Lease whole;
-        check(!GuestAllocationsAcquireChanged_nid_no_patch(stamp, select, &changed, &through, &partial, &whole), "a changed lease was handed out while a mutation waits on a pinned range, so its unpublished changes were not covered");
+        bool unsettled = false;
+        const bool answered = GuestAllocationsAcquireChanged_nid_no_patch(stamp, select, &changed, &through, &partial, &whole, &unsettled);
+        if (pinWaitJournal(journal)) {
+            check(answered && unsettled, "the journal was switched off while a mutation waits on a pinned range");
+            check(through == stamp, "a changed lease during a pin wait claims a generation the waiting mutation has not published");
+            check(spansCover(changed, added, 4 * 65536), "a changed lease during a pin wait does not cover the waiting mutation's unpublished registration");
+            check(spansCover(changed, pinned, 65536), "a changed lease during a pin wait does not cover the retiring range");
+            check(!rangeAt(partial, added).expired() && rangeAt(partial, pinned).expired(), "a changed lease during a pin wait does not show the unpublished registration and hide the retiring range");
+            check(rangeAt(whole, pinned).expired(), "the whole lease beside a changed lease during a pin wait shows the retiring range");
+        } else {
+            check(!answered && !unsettled, "a changed lease was handed out while a mutation waits on a pinned range, so its unpublished changes were not covered");
+        }
         std::uint64_t published = 0;
         check(!GuestAllocationsLeaseCurrent_nid_no_patch(live, &published), "a lease taken while a mutation waits on a pinned range is current");
     }
@@ -473,7 +488,7 @@ void unpublishedChangesAreNeverJournalCovered(bool journal) {
     mutation.Remove(renewing);
 }
 
-void leasesKnowTheirGeneration() {
+void leasesKnowTheirGeneration(bool journal) {
     auto* pinned = arena() + 5 * Granule;
     auto* later = pinned + 32 * 65536;
     {
@@ -501,7 +516,9 @@ void leasesKnowTheirGeneration() {
     check(retiring(), "the mutation never waited for the leased range");
     {
         const auto waiting = GuestAllocationsAcquire_nid_postfix();
-        check(!GuestAllocationsLeaseGeneration_nid_no_patch(waiting, &published), "a lease taken while a mutation waits on a pinned range knows a generation");
+        bool unsettled = false;
+        if (pinWaitJournal(journal)) check(GuestAllocationsLeaseGeneration_nid_no_patch(waiting, &published, &unsettled) && unsettled && published == now(), "a lease taken while a mutation waits on a pinned range does not know the last published generation");
+        else check(!GuestAllocationsLeaseGeneration_nid_no_patch(waiting, &published), "a lease taken while a mutation waits on a pinned range knows a generation");
     }
     lease.reset();
     mutator.join();
@@ -567,7 +584,7 @@ int main() {
     heapFreeDropsSnapshots();
     changedLeaseCoversOnlyTheCover(journal);
     unpublishedChangesAreNeverJournalCovered(journal);
-    leasesKnowTheirGeneration();
+    leasesKnowTheirGeneration(journal);
     settledLeaseNeverShowsHalfAMutation();
     std::puts("guest allocation journal tests passed");
     return 0;

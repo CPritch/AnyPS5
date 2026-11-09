@@ -23,9 +23,15 @@ enum class VerifyCount : std::size_t {
     UnlockedImportSkipped,
     EarlyImportBarrierChecked,
     EarlyImportBarrierSkipped,
+    JournalReconcileDecisions,
+    JournalReconcileCovers,
+    JournalReconcileInvariants,
+    JournalReconcileUnsettled,
+    JournalReconcileSurvivals,
+    JournalReconcileSkipped,
 };
 
-constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::EarlyImportBarrierSkipped) + 1;
+constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::JournalReconcileSkipped) + 1;
 
 using VerifyCounts = std::array<std::uint64_t, VerifyCountSize>;
 

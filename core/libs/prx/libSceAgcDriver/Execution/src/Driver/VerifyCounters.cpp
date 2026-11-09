@@ -27,6 +27,12 @@ constexpr std::array<Entry, VerifyCountSize> Entries{{
     {"vf_unlocked_import_skipped", "APS5_VERIFY_UNLOCKED_IMPORT"},
     {"vf_early_import_barrier_checked", "APS5_VERIFY_EARLY_IMPORT_BARRIER"},
     {"vf_early_import_barrier_skipped", "APS5_VERIFY_EARLY_IMPORT_BARRIER"},
+    {"vf_journal_reconcile_decisions", "APS5_VERIFY_JOURNAL_RECONCILE"},
+    {"vf_journal_reconcile_covers", "APS5_VERIFY_JOURNAL_RECONCILE"},
+    {"vf_journal_reconcile_invariants", "APS5_VERIFY_JOURNAL_RECONCILE"},
+    {"vf_journal_reconcile_unsettled", "APS5_VERIFY_JOURNAL_RECONCILE"},
+    {"vf_journal_reconcile_survivals", "APS5_VERIFY_JOURNAL_RECONCILE"},
+    {"vf_journal_reconcile_skipped", "APS5_VERIFY_JOURNAL_RECONCILE"},
 }};
 
 std::array<std::atomic<std::uint64_t>, VerifyCountSize> totals{};

@@ -172,6 +172,9 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         field("import_window_waits", delta(churn.windowWaits, previousChurn.windowWaits));
         field("import_window_wait_us", micros(churn.windowWaitNs, previousChurn.windowWaitNs));
         field("import_early_barrier_aborts", delta(churn.earlyBarrierAborts, previousChurn.earlyBarrierAborts));
+        field("import_pin_wait_journal", delta(churn.pinWaitJournal, previousChurn.pinWaitJournal));
+        field("import_pin_wait_fallbacks", delta(churn.pinWaitFallbacks, previousChurn.pinWaitFallbacks));
+        field("import_pin_wait_reseeds", delta(churn.pinWaitReseeds, previousChurn.pinWaitReseeds));
         const auto specialization = ShaderRecompiler::SpecializationCounts();
         field("spec_first", delta(specialization.first, previousSpecialization.first));
         field("spec_first_us", micros(specialization.firstNs, previousSpecialization.firstNs));
