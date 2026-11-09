@@ -1415,7 +1415,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_SPIRV_KEEP_MB",
     "APS5_NO_SPEC_PERSIST",
     "APS5_VERIFY_SPEC_PERSIST",
-    "APS5_NO_SPEC_SCRATCH",
+    "APS5_SPEC_SCRATCH",
     "APS5_VERIFY_SPEC_SCRATCH",
 };
 

@@ -1733,7 +1733,7 @@ void verifyNeutralSwitchKey(const char* self) {
     require(unset == switchKeyOf(self, {{"APS5_NO_SPIRV_KEEP", "1"}, {"APS5_SPIRV_KEEP_MB", "0"}}), "both SPIR-V keep switches together changed the disk cache key");
     require(unset == switchKeyOf(self, {{"APS5_NO_SPEC_PERSIST", "1"}}), "APS5_NO_SPEC_PERSIST changed the disk cache key");
     require(unset == switchKeyOf(self, {{"APS5_VERIFY_SPEC_PERSIST", "1"}}), "APS5_VERIFY_SPEC_PERSIST changed the disk cache key");
-    require(unset == switchKeyOf(self, {{"APS5_NO_SPEC_SCRATCH", "1"}}), "APS5_NO_SPEC_SCRATCH changed the disk cache key");
+    require(unset == switchKeyOf(self, {{"APS5_SPEC_SCRATCH", "1"}}), "APS5_SPEC_SCRATCH changed the disk cache key");
     require(unset == switchKeyOf(self, {{"APS5_VERIFY_SPEC_SCRATCH", "1"}}), "APS5_VERIFY_SPEC_SCRATCH changed the disk cache key");
     require(unset != switchKeyOf(self, {{"APS5_SINGLE_LANE", "all"}}), "a switch that changes the output left the disk cache key unchanged");
 }

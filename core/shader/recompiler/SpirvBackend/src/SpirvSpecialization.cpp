@@ -16,6 +16,7 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -1044,7 +1045,10 @@ private:
 };
 
 bool scratchTables() {
-    static const bool enabled = std::getenv("APS5_NO_SPEC_SCRATCH") == nullptr;
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_SPEC_SCRATCH");
+        return text != nullptr && *text != '\0' && std::string_view(text) != "0";
+    }();
     return enabled;
 }
 
