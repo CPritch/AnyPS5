@@ -2,6 +2,7 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test_executable(agc_alias_watch_tests
             tests/AliasWatch.cpp
             Execution/src/GuestMemory.cpp
+            Execution/src/Driver/VerifyCounters.cpp
             Execution/src/PerformanceTraceThread.cpp
     )
     target_include_directories(agc_alias_watch_tests PRIVATE ${LIBS_INCLUDE_DIR})

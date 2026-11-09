@@ -17,9 +17,11 @@ enum class VerifyCount : std::size_t {
     RegisterKeyMemoChecked,
     RegisterKeyHashChecked,
     RegisterKeySkipped,
+    HolderNoteChecked,
+    HolderNoteUnnamed,
 };
 
-constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::RegisterKeySkipped) + 1;
+constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::HolderNoteUnnamed) + 1;
 
 using VerifyCounts = std::array<std::uint64_t, VerifyCountSize>;
 

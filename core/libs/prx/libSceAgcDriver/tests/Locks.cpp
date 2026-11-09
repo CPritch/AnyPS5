@@ -4,13 +4,17 @@
 #include "prx/libc/include/HostThreadSlot.hpp"
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <pthread.h>
 #endif
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -152,6 +156,62 @@ void GpuMutexRecursion() {
     Check(counter == 80000, "every nested increment under the GPU mutex counted");
 }
 
+void AwaitGpuLockWaiter() {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (AgcDriver::GuestMemory::GpuLockWaiters() == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+}
+
+void PauseContendedHolder() {
+    AgcDriver::GuestMemory::SetGpuLockWaitedHookForTest(nullptr);
+    AwaitGpuLockWaiter();
+}
+
+void GpuMutexHolderNote() {
+    if (std::getenv("APS5_COMMIT_STATS") == nullptr) return;
+    using AgcDriver::GuestMemory::HotThread;
+    auto& mutex = AgcDriver::GuestMemory::GpuMutex();
+    static_cast<void>(AgcDriver::GuestMemory::TakeHotLockWaitText());
+    mutex.lock();
+    std::thread holder([&] {
+#ifdef __linux__
+        pthread_setname_np(pthread_self(), "holder-note");
+#endif
+        AgcDriver::GuestMemory::CountGpuLockWaits(HotThread::Worker);
+        mutex.lock();
+        mutex.unlock();
+        AgcDriver::GuestMemory::CountGpuLockWaits(HotThread::None);
+    });
+    AwaitGpuLockWaiter();
+    AgcDriver::GuestMemory::SetGpuLockWaitedHookForTest(&PauseContendedHolder);
+    mutex.unlock();
+    while (mutex.try_lock()) {
+        mutex.unlock();
+        std::this_thread::yield();
+    }
+    std::thread committer([&] {
+        AgcDriver::GuestMemory::CountGpuLockWaits(HotThread::Committer);
+        mutex.lock();
+        mutex.unlock();
+        AgcDriver::GuestMemory::CountGpuLockWaits(HotThread::None);
+    });
+    holder.join();
+    committer.join();
+    AgcDriver::GuestMemory::SetGpuLockWaitedHookForTest(nullptr);
+    const auto text = AgcDriver::GuestMemory::TakeHotLockWaitText();
+    const auto byHolder = text.find("committer GPU-lock waits by holder");
+    Check(byHolder != std::string::npos, "the committer's wait behind a contended holder is counted by holder");
+    if (byHolder == std::string::npos) return;
+    const bool unknown = text.find("unknown", byHolder) != std::string::npos;
+    if (std::getenv("APS5_NO_EARLY_HOLDER_NOTE") != nullptr) {
+        Check(unknown, "without the early holder note a holder sampled during its own wait bookkeeping reads as unknown");
+        return;
+    }
+    Check(!unknown, "a holder that waited for the GPU mutex is named as soon as it holds it");
+#ifdef __linux__
+    Check(text.find("holder-note", byHolder) != std::string::npos, "the committer's wait names the contended holder's thread");
+#endif
+}
+
 template<typename TTag>
 void SlotIsolation(const char* what) {
     using Slot = HostThreadSlot<std::uint64_t, TTag>;
@@ -212,6 +272,7 @@ int main() {
     MutexWakesSleeper();
     DeviceGate();
     GpuMutexRecursion();
+    GpuMutexHolderNote();
     ThreadSlots();
     if (failures != 0) {
         std::fprintf(stderr, "%d lock check(s) failed\n", failures);

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -3639,6 +3640,20 @@ void NoteGpuHolder(const void* site) {
     gpuHolderName.store(ThreadNameIndex(), std::memory_order_relaxed);
 }
 
+std::atomic<void (*)()> gpuLockWaitedHookForTest{nullptr};
+
+bool earlyHolderNote() {
+    static const bool enabled = std::getenv("APS5_NO_EARLY_HOLDER_NOTE") == nullptr;
+    return enabled;
+}
+
+void countHolderSample(std::uint32_t name) {
+    static const bool verify = std::getenv("APS5_VERIFY_HOLDER_NOTE") != nullptr;
+    if (!verify) return;
+    DriverDetail::CountVerify(DriverDetail::VerifyCount::HolderNoteChecked);
+    if (name == 0) DriverDetail::CountVerify(DriverDetail::VerifyCount::HolderNoteUnnamed);
+}
+
 void NoteCommitterHolderWait(std::uint32_t name, const void* site, std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end) {
     const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
     std::lock_guard lock(holderWaitsMutex);
@@ -3679,6 +3694,10 @@ std::string TakeCommitterHolderText() {
 
 void CountGpuLockWaits(HotThread thread) {
     hotThread = thread;
+}
+
+void SetGpuLockWaitedHookForTest(void (*hook)()) {
+    gpuLockWaitedHookForTest.store(hook, std::memory_order_release);
 }
 
 HotThread CurrentHotThread() {
@@ -4041,6 +4060,7 @@ void GpuMutexType::lock() {
     if (resolveHooksHere) [[unlikely]] NoteResolveLockTouch(__builtin_return_address(0), BarrierKind::Lock);
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::RecordingSlices() ? PerformanceTrace::Thread() : nullptr;
+        bool noted = false;
         if (trace == nullptr && hotThread == HotThread::None) {
             enter();
         } else {
@@ -4050,14 +4070,22 @@ void GpuMutexType::lock() {
                 const auto holderSite = gpuHolderSite.load(std::memory_order_relaxed);
                 const auto start = std::chrono::steady_clock::now();
                 LockCountingWaiters(mutex);
+                if (GpuHoldersCounted() && earlyHolderNote()) {
+                    NoteGpuHolder(__builtin_return_address(0));
+                    noted = true;
+                }
+                if (const auto hook = gpuLockWaitedHookForTest.load(std::memory_order_acquire)) hook();
                 const auto end = std::chrono::steady_clock::now();
                 if (trace != nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, end);
                 if (hotThread != HotThread::None) NoteHotLockWait(site, start, end);
-                if (hotThread == HotThread::Committer && GpuHoldersCounted()) NoteCommitterHolderWait(holderName, holderSite, start, end);
+                if (hotThread == HotThread::Committer && GpuHoldersCounted()) {
+                    countHolderSample(holderName);
+                    NoteCommitterHolderWait(holderName, holderSite, start, end);
+                }
             }
         }
         acquired();
-        if (depth == 1 && GpuHoldersCounted()) NoteGpuHolder(__builtin_return_address(0));
+        if (depth == 1 && GpuHoldersCounted() && !noted) NoteGpuHolder(__builtin_return_address(0));
         return;
     }
     auto& stats = LockStats();

@@ -2,6 +2,7 @@ if(BUILD_TESTING AND NOT WIN32)
     add_test_executable(agc_resolve_barrier_tests
             tests/ResolveBarrier.cpp
             Execution/src/GuestMemory.cpp
+            Execution/src/Driver/VerifyCounters.cpp
             Execution/src/PerformanceTraceThread.cpp
     )
     target_include_directories(agc_resolve_barrier_tests PRIVATE ${LIBS_INCLUDE_DIR})
