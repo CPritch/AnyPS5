@@ -1387,6 +1387,50 @@ void verifyFailureMemoSwitch(const char* self) {
     require(std::system(command.c_str()) == 0, "the process with APS5_NO_FAILURE_MEMO=1 failed");
 }
 
+void clearEnvironment(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
+int runSwitchKeyProcess(const char* path) {
+    SampleRequest sample;
+    const auto key = sample.Key();
+    std::string text;
+    char digits[3];
+    for (const auto byte : key) {
+        std::snprintf(digits, sizeof(digits), "%02x", static_cast<unsigned>(byte));
+        text += digits;
+    }
+    std::ofstream(path, std::ios::binary) << text;
+    return 0;
+}
+
+std::string switchKeyOf(const char* self, const std::vector<std::pair<const char*, const char*>>& switches) {
+    const auto path = std::filesystem::temp_directory_path() / ("aps5-switch-key-" + std::to_string(std::random_device{}()) + ".txt");
+    for (const auto& [name, value] : switches) setEnvironment(name, value);
+    const std::string command = "\"" + std::string(self) + "\" --print-switch-key \"" + path.string() + "\"";
+    const int status = std::system(command.c_str());
+    for (const auto& entry : switches) clearEnvironment(entry.first);
+    require(status == 0, "the process that prints the switch key failed");
+    std::ifstream stream(path, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    std::filesystem::remove(path);
+    require(!text.empty(), "the process printed no switch key");
+    return text;
+}
+
+void verifyNeutralSwitchKey(const char* self) {
+    const auto unset = switchKeyOf(self, {});
+    require(unset == switchKeyOf(self, {}), "the key differs between two runs with no switches");
+    require(unset == switchKeyOf(self, {{"APS5_NO_SPIRV_KEEP", "1"}}), "APS5_NO_SPIRV_KEEP changed the disk cache key");
+    require(unset == switchKeyOf(self, {{"APS5_SPIRV_KEEP_MB", "64"}}), "APS5_SPIRV_KEEP_MB changed the disk cache key");
+    require(unset == switchKeyOf(self, {{"APS5_NO_SPIRV_KEEP", "1"}, {"APS5_SPIRV_KEEP_MB", "0"}}), "both SPIR-V keep switches together changed the disk cache key");
+    require(unset != switchKeyOf(self, {{"APS5_SINGLE_LANE", "all"}}), "a switch that changes the output left the disk cache key unchanged");
+}
+
 void verifyInvocationIsolation() {
     ComputeRequest request(true);
     const auto first = Recompile(request.request);
@@ -2660,6 +2704,12 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--load-prebuilt") return runPrebuiltLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
+        if (argc == 3 && std::string_view(argv[1]) == "--print-switch-key") return runSwitchKeyProcess(argv[2]);
+        if (argc == 2 && std::string_view(argv[1]) == "--neutral-switch-key") {
+            verifyNeutralSwitchKey(argv[0]);
+            std::cout << "The SPIR-V keep switches leave the disk cache key unchanged\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]).starts_with("--load-plan")) return runPlanLoadingProcess(argv[1]);
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);
