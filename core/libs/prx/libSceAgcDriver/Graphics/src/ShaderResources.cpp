@@ -7830,10 +7830,25 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedD
     return moved;
 }
 
+namespace {
+
+std::atomic<bool> drawSnapshotCapForced{false};
+std::atomic<std::size_t> forcedDrawSnapshotBytes{0};
+
+}
+
 std::size_t ShaderResources::MaxDrawSnapshotBytes() {
-    const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
-    const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
-    return static_cast<std::size_t>(mib * 1024ull * 1024ull);
+    static const std::size_t configured = [] {
+        const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
+        const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
+        return static_cast<std::size_t>(mib * 1024ull * 1024ull);
+    }();
+    return drawSnapshotCapForced.load(std::memory_order_acquire) ? forcedDrawSnapshotBytes.load(std::memory_order_relaxed) : configured;
+}
+
+void ShaderResources::SetMaxDrawSnapshotBytesForTest(std::optional<std::size_t> bytes) {
+    forcedDrawSnapshotBytes.store(bytes.value_or(0), std::memory_order_relaxed);
+    drawSnapshotCapForced.store(bytes.has_value(), std::memory_order_release);
 }
 
 std::size_t ShaderResources::DrawUploadLimit() {
