@@ -44,6 +44,19 @@ struct Counters {
     std::uint64_t maxLoadNanoseconds = 0;
     std::uint64_t prebuiltBytesRead = 0;
     std::uint64_t prebuiltLoadNanoseconds = 0;
+    std::uint64_t specializationHits = 0;
+    std::uint64_t specializationMisses = 0;
+    std::uint64_t specializationWrites = 0;
+    std::uint64_t specializationLoadFailures = 0;
+    std::uint64_t specializationBytesWritten = 0;
+};
+
+struct SpecializedEntry {
+    SharedSpirv spirv;
+    std::vector<PipelineSpecializationConstant> specialization;
+    std::vector<std::uint32_t> bindings;
+    bool pushData = false;
+    SpirvContentHash hash;
 };
 
 [[nodiscard]] std::uint64_t SourceVersion();
@@ -64,6 +77,10 @@ void BuildPlanKey(const RecompileRequest& request, std::uint32_t hostSubgroupSiz
 [[nodiscard]] std::vector<std::byte> EncodePlanEntry(std::span<const std::byte> key, const IrResourcePlan& plan);
 [[nodiscard]] LoadStatus DecodePlanEntry(std::span<const std::byte> file, std::span<const std::byte> key, IrResourcePlan& plan);
 
+void BuildSpecializationKey(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, std::vector<std::byte>& key);
+[[nodiscard]] std::vector<std::byte> EncodeSpecializationEntry(std::span<const std::byte> key, const SpecializedEntry& entry);
+[[nodiscard]] LoadStatus DecodeSpecializationEntry(std::span<const std::byte> file, std::span<const std::byte> key, SpecializedEntry& entry);
+
 [[nodiscard]] bool Enabled();
 [[nodiscard]] std::filesystem::path EntryDirectory();
 
@@ -73,6 +90,8 @@ void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> va
 [[nodiscard]] bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan);
 [[nodiscard]] std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash);
 void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan);
+[[nodiscard]] bool LoadSpecialization(std::span<const std::byte> key, SpecializedEntry& entry, std::uint64_t* bytes = nullptr);
+void StoreSpecialization(std::vector<std::byte> key, std::shared_ptr<const SpecializedEntry> entry);
 void Flush();
 void Shutdown();
 [[nodiscard]] unsigned Writers();

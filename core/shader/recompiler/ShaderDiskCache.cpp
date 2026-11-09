@@ -42,6 +42,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <spirv/unified1/spirv.hpp>
 
 namespace ShaderRecompiler {
 
@@ -1024,6 +1025,7 @@ void decodeAllocation(Reader& reader, CompiledBindingLayout& allocation) {
 }
 
 constexpr std::uint32_t PlanEntryKind = 0x4e414c50u;
+constexpr std::uint32_t SpecializationEntryKind = 0x43455053u;
 constexpr std::uint32_t NoPlanIndex = std::numeric_limits<std::uint32_t>::max();
 
 void encodeMemoryInfo(Writer& out, const MemoryInfo& memory) {
@@ -1409,6 +1411,12 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_TABLE_RESOLUTION_REUSE",
     "APS5_NO_TABLE_SNAPSHOT_REUSE",
     "APS5_RESULT_MEMO_MB",
+    "APS5_NO_SPIRV_KEEP",
+    "APS5_SPIRV_KEEP_MB",
+    "APS5_NO_SPEC_PERSIST",
+    "APS5_VERIFY_SPEC_PERSIST",
+    "APS5_SPEC_SCRATCH",
+    "APS5_VERIFY_SPEC_SCRATCH",
 };
 
 const std::vector<std::byte>& switchKey() {
@@ -1510,6 +1518,20 @@ public:
         enqueue({std::move(key), nullptr, std::move(plan)});
     }
 
+    bool LoadSpecialization(std::span<const std::byte> key, SpecializedEntry& entry, std::uint64_t* bytes) {
+        std::uint64_t size = 0;
+        const bool loaded = load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) {
+            size = file.size();
+            return DecodeSpecializationEntry(file, key, entry);
+        }, specializationHits, specializationMisses, specializationLoadFailures);
+        if (bytes != nullptr) *bytes = loaded ? size : 0u;
+        return loaded;
+    }
+
+    void StoreSpecialization(std::vector<std::byte> key, std::shared_ptr<const SpecializedEntry> entry) {
+        enqueue({std::move(key), nullptr, nullptr, std::move(entry)});
+    }
+
     std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, const CompiledVariant& variant) {
         const auto path = directory / EntryName(key);
         const auto file = EncodeEntry(key, variant);
@@ -1568,6 +1590,11 @@ public:
         counters.maxLoadNanoseconds = maxLoadNanoseconds.load(std::memory_order_relaxed);
         counters.prebuiltBytesRead = prebuiltBytesRead.load(std::memory_order_relaxed);
         counters.prebuiltLoadNanoseconds = prebuiltLoadNanoseconds.load(std::memory_order_relaxed);
+        counters.specializationHits = specializationHits.load(std::memory_order_relaxed);
+        counters.specializationMisses = specializationMisses.load(std::memory_order_relaxed);
+        counters.specializationWrites = specializationWrites.load(std::memory_order_relaxed);
+        counters.specializationLoadFailures = specializationLoadFailures.load(std::memory_order_relaxed);
+        counters.specializationBytesWritten = specializationBytesWritten.load(std::memory_order_relaxed);
         return counters;
     }
 
@@ -1624,6 +1651,7 @@ private:
         std::vector<std::byte> key;
         std::shared_ptr<const CompiledVariant> variant;
         std::shared_ptr<const IrResourcePlan> plan;
+        std::shared_ptr<const SpecializedEntry> specialization;
     };
 
     bool loadPrebuilt(std::span<const std::byte> key, CompiledVariant& variant) {
@@ -1755,10 +1783,11 @@ private:
     }
 
     void write(const Job& job) {
-        const auto file = job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : EncodeEntry(job.key, *job.variant);
+        const auto file = job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : job.specialization != nullptr ? EncodeSpecializationEntry(job.key, *job.specialization) : EncodeEntry(job.key, *job.variant);
         if (!file.empty() && WriteFileAtomically(directory / EntryName(job.key), file)) {
-            (job.plan != nullptr ? planWrites : writes).fetch_add(1, std::memory_order_relaxed);
+            (job.plan != nullptr ? planWrites : job.specialization != nullptr ? specializationWrites : writes).fetch_add(1, std::memory_order_relaxed);
             bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
+            if (job.specialization != nullptr) specializationBytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
         } else {
             const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
             if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (directory / EntryName(job.key)).string().c_str());
@@ -1839,15 +1868,17 @@ private:
         const auto totals = Totals();
         const auto loadNs = loadNanoseconds.load(std::memory_order_relaxed);
         const auto delta = [](std::uint64_t after, std::uint64_t before) { return static_cast<unsigned long long>(after - before); };
-        const auto baseChanged = totals.hits != reported.hits || totals.misses != reported.misses || totals.writes != reported.writes || totals.loadFailures != reported.loadFailures || totals.writeFailures != reported.writeFailures || totals.planHits != reported.planHits || totals.planMisses != reported.planMisses || totals.planWrites != reported.planWrites || totals.planLoadFailures != reported.planLoadFailures;
+        const auto baseChanged = totals.hits != reported.hits || totals.misses != reported.misses || totals.writes != reported.writes || totals.loadFailures != reported.loadFailures || totals.writeFailures != reported.writeFailures || totals.planHits != reported.planHits || totals.planMisses != reported.planMisses || totals.planWrites != reported.planWrites || totals.planLoadFailures != reported.planLoadFailures
+            || totals.specializationHits != reported.specializationHits || totals.specializationMisses != reported.specializationMisses || totals.specializationWrites != reported.specializationWrites || totals.specializationLoadFailures != reported.specializationLoadFailures;
         const auto prebuiltChanged = totals.prebuiltHits != reported.prebuiltHits || totals.prebuiltMisses != reported.prebuiltMisses || totals.prebuiltRejected != reported.prebuiltRejected;
         if (!baseChanged && !prebuiltChanged) return;
-        if (baseChanged) std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
+        if (baseChanged) std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; specializations: %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses; specializations %llu hits, %llu misses)\n",
                      delta(totals.hits, reported.hits), delta(totals.misses, reported.misses), delta(totals.writes, reported.writes), static_cast<double>(totals.bytesWritten - reported.bytesWritten) / (1024.0 * 1024.0),
                      delta(totals.loadFailures, reported.loadFailures), delta(totals.writeFailures, reported.writeFailures),
                      delta(totals.planHits, reported.planHits), delta(totals.planMisses, reported.planMisses), delta(totals.planWrites, reported.planWrites), delta(totals.planLoadFailures, reported.planLoadFailures),
+                     delta(totals.specializationHits, reported.specializationHits), delta(totals.specializationMisses, reported.specializationMisses), delta(totals.specializationWrites, reported.specializationWrites), static_cast<double>(totals.specializationBytesWritten - reported.specializationBytesWritten) / (1024.0 * 1024.0), delta(totals.specializationLoadFailures, reported.specializationLoadFailures),
                      static_cast<double>(totals.bytesRead - reported.bytesRead) / (1024.0 * 1024.0), static_cast<double>(loadNs - reportedLoadNs) / 1e6,
-                     static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.misses), static_cast<unsigned long long>(totals.writes), static_cast<unsigned long long>(totals.planHits), static_cast<unsigned long long>(totals.planMisses));
+                     static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.misses), static_cast<unsigned long long>(totals.writes), static_cast<unsigned long long>(totals.planHits), static_cast<unsigned long long>(totals.planMisses), static_cast<unsigned long long>(totals.specializationHits), static_cast<unsigned long long>(totals.specializationMisses));
         if (prebuiltChanged && (!packs.empty() || !looseDirectories.empty())) std::fprintf(stderr, "[shader-prebuilt] interval: %llu hits, %llu misses, %llu rejected; lookup %.3f ms, file read %.3f ms, decode %.3f ms; total load %.3f ms, max %.3f ms (lifetime hits %llu)\n",
                      delta(totals.prebuiltHits, reported.prebuiltHits), delta(totals.prebuiltMisses, reported.prebuiltMisses), delta(totals.prebuiltRejected, reported.prebuiltRejected),
                      (totals.lookupNanoseconds - reported.lookupNanoseconds) / 1e6, (totals.readNanoseconds - reported.readNanoseconds) / 1e6, (totals.decodeNanoseconds - reported.decodeNanoseconds) / 1e6,
@@ -1869,6 +1900,7 @@ private:
     std::thread writer;
     std::atomic<std::uint64_t> hits{0}, misses{0}, writes{0}, loadFailures{0}, writeFailures{0}, bytesRead{0}, bytesWritten{0}, loadNanoseconds{0};
     std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0};
+    std::atomic<std::uint64_t> specializationHits{0}, specializationMisses{0}, specializationWrites{0}, specializationLoadFailures{0}, specializationBytesWritten{0};
     std::atomic<std::uint64_t> prebuiltHits{0}, prebuiltMisses{0}, prebuiltRejected{0}, lookupNanoseconds{0}, readNanoseconds{0}, decodeNanoseconds{0}, maxLoadNanoseconds{0}, prebuiltBytesRead{0}, prebuiltLoadNanoseconds{0};
     std::atomic<std::int64_t> lastReport{0};
     std::mutex reportMutex;
@@ -2016,6 +2048,76 @@ LoadStatus DecodePlanEntry(std::span<const std::byte> file, std::span<const std:
     return DecodePlan(payload, plan) ? LoadStatus::Loaded : LoadStatus::Rejected;
 }
 
+void BuildSpecializationKey(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, std::vector<std::byte>& key) {
+    key.clear();
+    Writer writer(key);
+    writer.Value(FileMagic);
+    writer.Value(FormatVersion);
+    writer.Value(SourceVersion());
+    writer.Value(static_cast<std::uint8_t>(GcnGuestShaders()));
+    writer.Value(SpecializationEntryKind);
+    const auto source = artifact.spirv.ContentHash();
+    writer.Value<std::uint64_t>(artifact.spirv.size());
+    writer.Value(source.low);
+    writer.Value(source.high);
+    writer.Value(!artifact.stencilReferences.empty());
+    writer.List(artifact.vertexInputPatches, [](Writer& out, const VertexInputPatch& patch) {
+        out.Value(patch.location);
+        out.Value(patch.word);
+        for (const auto value : patch.values) out.Value(value);
+    });
+    writer.Values(classes);
+    writer.List(constants, [](Writer& out, const PipelineSpecializationConstant& constant) {
+        out.Value(constant.id);
+        out.Value(constant.value);
+    });
+    thread_local std::vector<std::uint64_t>* targetKeySlot = nullptr;
+    auto& targetKey = ThreadOwned(targetKeySlot);
+    RecompileCacheKey::BuildTarget(target, targetKey);
+    writer.Values(std::span<const std::uint64_t>(targetKey));
+    const auto& switches = switchKey();
+    key.insert(key.end(), switches.begin(), switches.end());
+}
+
+std::vector<std::byte> EncodeSpecializationEntry(std::span<const std::byte> key, const SpecializedEntry& entry) {
+    std::vector<std::byte> payload;
+    payload.reserve((entry.spirv.size() + entry.specialization.size() * 2u + entry.bindings.size()) * sizeof(std::uint32_t) + 64u);
+    Writer writer(payload);
+    writer.Values(entry.spirv.Words());
+    writer.List(entry.specialization, [](Writer& out, const PipelineSpecializationConstant& constant) {
+        out.Value(constant.id);
+        out.Value(constant.value);
+    });
+    writer.Values(std::span<const std::uint32_t>(entry.bindings));
+    writer.Value(entry.pushData);
+    writer.Value(entry.hash.low);
+    writer.Value(entry.hash.high);
+    return wrapEntry(key, payload);
+}
+
+LoadStatus DecodeSpecializationEntry(std::span<const std::byte> file, std::span<const std::byte> key, SpecializedEntry& entry) {
+    std::span<const std::byte> payload;
+    const auto status = unwrapEntry(file, key, payload);
+    if (status != LoadStatus::Loaded) return status;
+    Reader reader(payload);
+    std::vector<std::uint32_t> words;
+    reader.Values(words);
+    SpecializedEntry decoded;
+    reader.List(decoded.specialization, 2u * sizeof(std::uint32_t), [](Reader& in, PipelineSpecializationConstant& constant) {
+        in.Value(constant.id);
+        in.Value(constant.value);
+    });
+    reader.Values(decoded.bindings);
+    reader.Value(decoded.pushData);
+    reader.Value(decoded.hash.low);
+    reader.Value(decoded.hash.high);
+    if (!reader.Done() || words.size() < 5u || words[0] != spv::MagicNumber) return LoadStatus::Rejected;
+    decoded.spirv = SharedSpirv(std::move(words));
+    if (decoded.spirv.ContentHash() != decoded.hash) return LoadStatus::Rejected;
+    entry = std::move(decoded);
+    return LoadStatus::Loaded;
+}
+
 bool Enabled() {
     return store().Enabled();
 }
@@ -2047,6 +2149,17 @@ std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> 
 void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan) {
     auto& instance = store();
     if (instance.Enabled() && plan != nullptr) instance.StorePlan(std::move(key), std::move(plan));
+}
+
+bool LoadSpecialization(std::span<const std::byte> key, SpecializedEntry& entry, std::uint64_t* bytes) {
+    if (bytes != nullptr) *bytes = 0u;
+    auto& instance = store();
+    return instance.Enabled() && instance.LoadSpecialization(key, entry, bytes);
+}
+
+void StoreSpecialization(std::vector<std::byte> key, std::shared_ptr<const SpecializedEntry> entry) {
+    auto& instance = store();
+    if (instance.Enabled() && entry != nullptr) instance.StoreSpecialization(std::move(key), std::move(entry));
 }
 
 std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, const CompiledVariant& variant) {

@@ -27,6 +27,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -1294,6 +1295,308 @@ void verifyAcrossProcesses(const char* self) {
     require(std::system(command.c_str()) == 0, "the loading process failed");
 }
 
+struct PersistPixel {
+    std::array<std::uint32_t, 5> code;
+    std::array<std::uint32_t, 1> userData{0x3f800000u};
+    std::array<std::uint32_t, 4> capabilities{1u, 11u, 5347u, 4448u};
+    std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    RecompileRequest request{};
+
+    explicit PersistPixel(std::uint32_t value = 7u, std::uint32_t reversedBlend = 0u) : code{0xbf800000u, 0x7e000280u + value, 0xf800180fu, 0u, 0xbf810000u} {
+        ShaderPixelStageInfo pixel{};
+        pixel.wave32 = true;
+        pixel.targetOutputMode[0] = 9u;
+        pixel.reversedBlend = reversedBlend;
+        request.shader = {ShaderStage::Fragment, 0x50000u, code, 0, {}};
+        request.context.waveSize = 32;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.pixel = pixel;
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.supportedExtensions = extensions;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = true;
+    }
+    PersistPixel(const PersistPixel&) = delete;
+    PersistPixel& operator=(const PersistPixel&) = delete;
+};
+
+bool specializationPersistOff() {
+    return std::getenv("APS5_NO_SPEC_PERSIST") != nullptr;
+}
+
+std::uint64_t specializationVerifyEvery() {
+    const char* text = std::getenv("APS5_VERIFY_SPEC_PERSIST");
+    return text == nullptr ? 0u : std::strtoull(text, nullptr, 10);
+}
+
+void writeResult(const std::filesystem::path& path, const RecompileResult& result) {
+    std::vector<std::byte> bytes;
+    ShaderDiskCache::EncodeResult(result, bytes);
+    require(WriteFileAtomically(path, bytes), "cannot write " + path.string());
+}
+
+RecompileResult readResult(const char* path) {
+    std::vector<std::byte> bytes;
+    require(ReadWholeFile(path, bytes), std::string("cannot read ") + path);
+    RecompileResult result;
+    require(ShaderDiskCache::DecodeResult(bytes, result), std::string("cannot decode ") + path);
+    return result;
+}
+
+std::set<std::filesystem::path> entryFiles() {
+    std::set<std::filesystem::path> files;
+    std::error_code error;
+    for (std::filesystem::directory_iterator it(ShaderDiskCache::EntryDirectory(), error), end; !error && it != end; it.increment(error)) {
+        if (it->path().extension() == ".bin") files.insert(it->path());
+    }
+    return files;
+}
+
+bool readSpecializationEntry(const std::filesystem::path& path, std::vector<std::byte>& file, std::vector<std::byte>& key, ShaderDiskCache::SpecializedEntry& entry) {
+    constexpr std::size_t headerBytes = 48u;
+    if (!ReadWholeFile(path, file) || file.size() < headerBytes) return false;
+    std::uint64_t keyBytes = 0;
+    std::memcpy(&keyBytes, file.data() + 16u, sizeof(keyBytes));
+    if (keyBytes > file.size() - headerBytes) return false;
+    key.assign(file.begin() + headerBytes, file.begin() + static_cast<std::ptrdiff_t>(headerBytes + keyBytes));
+    return ShaderDiskCache::DecodeSpecializationEntry(file, key, entry) == ShaderDiskCache::LoadStatus::Loaded;
+}
+
+int runSelf(const char* self, const std::string& arguments, const std::filesystem::path* log = nullptr) {
+    std::string command;
+#ifndef _WIN32
+    if (log != nullptr) command = "ulimit -c 0; ";
+#endif
+    command += "\"" + std::string(self) + "\" " + arguments;
+    if (log != nullptr) command += " 2> \"" + log->string() + "\"";
+    return std::system(command.c_str());
+}
+
+void verifySpecializationKey() {
+    CompiledShaderArtifact artifact;
+    artifact.spirv = std::vector<std::uint32_t>{spv::MagicNumber, 0x00010300u, 0u, 8u, 0u, (2u << 16u) | spv::OpCapability, spv::CapabilityShader};
+    artifact.vertexInputPatches = {{0u, 6u, {1u, 2u, 3u}}};
+    artifact.variantId = 1u;
+    const std::array<std::uint32_t, 4> classes{0u, 1u, 2u, 0u};
+    const std::vector<PipelineSpecializationConstant> constants{{1u, 2u}, {3u, 4u}};
+    const std::array<std::uint32_t, 2> capabilities{1u, 11u};
+    const std::array<std::uint32_t, 2> otherCapabilities{1u, 12u};
+    const std::array<std::string_view, 1> extensions{"SPV_KHR_physical_storage_buffer"};
+    SpirvTarget target{};
+    target.vulkanVersion = 0x00401000u;
+    target.spirvVersion = 0x00010300u;
+    target.subgroupSize = 32u;
+    target.supportedCapabilities = capabilities;
+    target.supportedExtensions = extensions;
+    const auto keyOf = [](const CompiledShaderArtifact& source, std::span<const std::uint32_t> kinds, std::span<const PipelineSpecializationConstant> values, const SpirvTarget& device) {
+        std::vector<std::byte> key;
+        ShaderDiskCache::BuildSpecializationKey(source, kinds, values, device, key);
+        return key;
+    };
+    const auto base = keyOf(artifact, classes, constants, target);
+    require(base == keyOf(artifact, classes, constants, target), "specialization key: the key changed between two builds of one input");
+    auto renumbered = artifact;
+    renumbered.variantId = 99u;
+    require(base == keyOf(renumbered, classes, constants, target), "specialization key: the process-local variant id entered the key");
+    auto words = artifact;
+    words.spirv[6] = spv::CapabilityInt64;
+    require(base != keyOf(words, classes, constants, target), "specialization key: a changed source module left the key unchanged");
+    auto longer = artifact;
+    longer.spirv = std::vector<std::uint32_t>{spv::MagicNumber, 0x00010300u, 0u, 8u, 0u, (2u << 16u) | spv::OpCapability, spv::CapabilityShader, (1u << 16u) | spv::OpNop};
+    require(base != keyOf(longer, classes, constants, target), "specialization key: a longer source module left the key unchanged");
+    auto patched = artifact;
+    patched.vertexInputPatches.Mutable().front().values[2] = 4u;
+    require(base != keyOf(patched, classes, constants, target), "specialization key: a changed vertex type patch left the key unchanged");
+    auto stencil = artifact;
+    stencil.stencilReferences = {1u};
+    require(base != keyOf(stencil, classes, constants, target), "specialization key: a stencil replay artifact shares the key of one without");
+    auto otherClasses = classes;
+    otherClasses[1] = 2u;
+    require(base != keyOf(artifact, otherClasses, constants, target), "specialization key: a changed vertex class left the key unchanged");
+    auto value = constants;
+    value[1].value = 5u;
+    require(base != keyOf(artifact, classes, value, target), "specialization key: a changed constant value left the key unchanged");
+    auto id = constants;
+    id[0].id = 2u;
+    require(base != keyOf(artifact, classes, id, target), "specialization key: a changed constant id left the key unchanged");
+    auto fewer = constants;
+    fewer.pop_back();
+    require(base != keyOf(artifact, classes, fewer, target), "specialization key: a missing constant left the key unchanged");
+    auto offsets = target;
+    offsets.nonConstantImageOffsets = true;
+    require(base != keyOf(artifact, classes, constants, offsets), "specialization key: a changed target flag left the key unchanged");
+    auto version = target;
+    version.spirvVersion = 0x00010500u;
+    require(base != keyOf(artifact, classes, constants, version), "specialization key: a changed SPIR-V version left the key unchanged");
+    auto features = target;
+    features.supportedCapabilities = otherCapabilities;
+    require(base != keyOf(artifact, classes, constants, features), "specialization key: a changed device capability left the key unchanged");
+}
+
+void verifySpecializationCodec() {
+    using ShaderDiskCache::SpecializedEntry;
+    SpecializedEntry entry;
+    entry.spirv = std::vector<std::uint32_t>{spv::MagicNumber, 0x00010300u, 0u, 8u, 0u, (2u << 16u) | spv::OpCapability, spv::CapabilityShader};
+    entry.specialization = {{1u, 2u}, {7u, 9u}};
+    entry.bindings = {0u, 3u};
+    entry.pushData = true;
+    entry.hash = entry.spirv.ContentHash();
+    const std::vector<std::byte> key{std::byte{1}, std::byte{2}, std::byte{3}};
+    const auto file = ShaderDiskCache::EncodeSpecializationEntry(key, entry);
+    SpecializedEntry decoded;
+    require(ShaderDiskCache::DecodeSpecializationEntry(file, key, decoded) == ShaderDiskCache::LoadStatus::Loaded, "specialization codec: an encoded entry does not decode");
+    require(decoded.spirv == entry.spirv && decoded.specialization == entry.specialization && decoded.bindings == entry.bindings && decoded.pushData && decoded.hash == entry.hash, "specialization codec: the round trip changed the entry");
+    const std::vector<std::byte> other{std::byte{1}, std::byte{2}, std::byte{4}};
+    require(ShaderDiskCache::DecodeSpecializationEntry(file, other, decoded) == ShaderDiskCache::LoadStatus::KeyMismatch, "specialization codec: an entry loaded under another key");
+    require(ShaderDiskCache::DecodeSpecializationEntry(std::span(file).first(file.size() - 1u), key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "specialization codec: a truncated entry loaded");
+    for (std::size_t offset = 56u; offset < file.size(); ++offset) {
+        auto damaged = file;
+        damaged[offset] ^= std::byte{0x10};
+        require(ShaderDiskCache::DecodeSpecializationEntry(damaged, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "specialization codec: an entry with a damaged payload byte at " + std::to_string(offset) + " loaded");
+    }
+    auto wrongHash = entry;
+    wrongHash.hash.low ^= 1u;
+    require(ShaderDiskCache::DecodeSpecializationEntry(ShaderDiskCache::EncodeSpecializationEntry(key, wrongHash), key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "specialization codec: words that do not match their stored hash loaded");
+    auto notSpirv = entry;
+    notSpirv.spirv = std::vector<std::uint32_t>{1u, 2u, 3u, 4u, 5u};
+    notSpirv.hash = notSpirv.spirv.ContentHash();
+    require(ShaderDiskCache::DecodeSpecializationEntry(ShaderDiskCache::EncodeSpecializationEntry(key, notSpirv), key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "specialization codec: an entry without a SPIR-V module loaded");
+}
+
+int runSpecializationLoad(const char* expectedPath) {
+    const bool off = specializationPersistOff();
+    const auto every = specializationVerifyEvery();
+    const auto expected = readResult(expectedPath);
+    PersistPixel pixel;
+    const auto loaded = Recompile(pixel.request);
+    const auto first = SpecializationCounts();
+    requireSameResult(expected, loaded, "a specialization in a second process");
+    require(expected.Identity() == loaded.Identity(), "a specialization in a second process has another pipeline identity");
+    if (off) {
+        require(first.first == 1u && first.diskHits == 0u && first.diskMisses == 0u, "APS5_NO_SPEC_PERSIST=1 looked up a specialization on disk (" + std::to_string(first.diskHits) + " hits, " + std::to_string(first.diskMisses) + " misses)");
+    } else {
+        require(first.diskHits == 1u && first.diskMisses == 0u && first.first == 0u, "the second process specialized again instead of loading (" + std::to_string(first.first) + " specialized, " + std::to_string(first.diskHits) + " hits, " + std::to_string(first.diskMisses) + " misses)");
+        require(first.verified == (every != 0u && 1u % every == 0u ? 1u : 0u), "APS5_VERIFY_SPEC_PERSIST checked " + std::to_string(first.verified) + " loads");
+        require(first.diskBytes != 0u, "the loaded specialization read no bytes");
+    }
+    PersistPixel blended(7u, 1u);
+    static_cast<void>(Recompile(blended.request));
+    const auto constant = SpecializationCounts();
+    require(constant.first == first.first + 1u && constant.diskHits == first.diskHits && constant.diskMisses == first.diskMisses + (off ? 0u : 1u), "a changed specialization constant did not miss");
+    PersistPixel changed(9u);
+    static_cast<void>(Recompile(changed.request));
+    const auto source = SpecializationCounts();
+    require(source.first == constant.first + 1u && source.diskHits == constant.diskHits && source.diskMisses == constant.diskMisses + (off ? 0u : 1u), "a changed source did not miss");
+    ShaderDiskCache::Flush();
+    const auto writes = ShaderDiskCache::Totals().specializationWrites;
+    require(writes == (off ? 0u : 2u), "the second process wrote " + std::to_string(writes) + " specializations");
+    std::cout << (off ? "with APS5_NO_SPEC_PERSIST=1 the second process specialized the module again" : "the second process loaded the specialized module from the disk cache") << " (" << loaded.spirv.size() << " words)\n";
+    return 0;
+}
+
+int runRejectedSpecialization(const char* expectedPath) {
+    const auto expected = readResult(expectedPath);
+    PersistPixel pixel;
+    const auto loaded = Recompile(pixel.request);
+    const auto counts = SpecializationCounts();
+    require(counts.diskHits == 0u && counts.diskMisses == 1u && counts.first == 1u && counts.diskRejected == 1u, "a damaged specialization entry was not rejected and specialized again");
+    requireSameResult(expected, loaded, "a specialization after a damaged entry");
+    ShaderDiskCache::Flush();
+    require(ShaderDiskCache::Totals().specializationWrites == 1u, "the damaged specialization entry was not written again");
+    return 0;
+}
+
+int runForgedSpecialization(const char* expectedPath) {
+    const auto expected = readResult(expectedPath);
+    PersistPixel pixel;
+    const auto loaded = Recompile(pixel.request);
+    const auto counts = SpecializationCounts();
+    require(counts.diskHits == 1u && counts.first == 0u, "the forged specialization entry was not loaded");
+    require(loaded.spirv != expected.spirv, "the forged specialization entry loaded the original words");
+    return 0;
+}
+
+int runVerifiedForgedSpecialization() {
+    setEnvironment("APS5_VERIFY_SPEC_PERSIST", "1");
+    PersistPixel pixel;
+    static_cast<void>(Recompile(pixel.request));
+    std::cerr << "APS5_VERIFY_SPEC_PERSIST=1 served a forged specialization entry\n";
+    return 1;
+}
+
+void verifySpecializationAcrossProcesses(const char* self, const std::filesystem::path& root) {
+    const bool off = specializationPersistOff();
+    const bool verify = specializationVerifyEvery() != 0u;
+    ShaderDiskCache::Flush();
+    const auto existing = entryFiles();
+    const auto before = SpecializationCounts();
+    const auto diskBefore = ShaderDiskCache::Totals();
+    PersistPixel pixel;
+    const auto first = Recompile(pixel.request);
+    ShaderDiskCache::Flush();
+    const auto after = SpecializationCounts();
+    const auto diskAfter = ShaderDiskCache::Totals();
+    require(first.specializationId != 0u, "the persistence fixture was not specialized");
+    require(after.first == before.first + 1u && after.diskHits == before.diskHits && after.diskMisses == before.diskMisses + (off ? 0u : 1u), "the first specialization was not looked up and built");
+    require(diskAfter.specializationWrites == diskBefore.specializationWrites + (off ? 0u : 1u), "the first specialization was " + std::string(off ? "written under APS5_NO_SPEC_PERSIST=1" : "not written"));
+    std::filesystem::path path;
+    std::vector<std::byte> original, key;
+    ShaderDiskCache::SpecializedEntry entry;
+    for (const auto& candidate : entryFiles()) {
+        if (existing.contains(candidate)) continue;
+        std::vector<std::byte> candidateFile, candidateKey;
+        ShaderDiskCache::SpecializedEntry candidateEntry;
+        if (!readSpecializationEntry(candidate, candidateFile, candidateKey, candidateEntry)) continue;
+        require(path.empty(), "the first specialization wrote two entries");
+        path = candidate;
+        original = std::move(candidateFile);
+        key = std::move(candidateKey);
+        entry = std::move(candidateEntry);
+    }
+    require(path.empty() == off, off ? "a specialization entry was written under APS5_NO_SPEC_PERSIST=1" : "no specialization entry was written");
+    const auto expected = root / "expected-specialization.result";
+    writeResult(expected, first);
+    const auto quoted = "\"" + expected.string() + "\"";
+    require(runSelf(self, "--spec-load " + quoted) == 0, "the second process did not handle the stored specialization");
+    if (off) return;
+    require(entry.spirv == first.spirv && entry.hash == first.spirv.ContentHash() && entry.specialization == std::vector<PipelineSpecializationConstant>(first.specialization.begin(), first.specialization.end()), "the stored specialization differs from the module it was stored for");
+    std::cout << "specialization entry: " << original.size() << " bytes on disk for " << entry.spirv.size() << " SPIR-V words (" << entry.spirv.size() * sizeof(std::uint32_t) << " bytes), " << entry.specialization.size() << " constants, " << entry.bindings.size() << " bindings, a " << key.size() << "-byte key\n";
+#ifdef _WIN32
+    if (PosixReplaceUnsupported(path.parent_path())) {
+        std::fprintf(stderr, "shader disk cache: %s has no POSIX rename (ERROR_INVALID_PARAMETER); skipping the damaged and forged specialization checks\n", path.parent_path().string().c_str());
+        return;
+    }
+#endif
+    auto damaged = original;
+    damaged[damaged.size() - 20u] ^= std::byte{0x10};
+    require(WriteFileAtomically(path, damaged), "cannot damage the specialization entry");
+    require(runSelf(self, "--spec-rejected " + quoted) == 0, "a damaged specialization entry was not rejected");
+    auto forged = entry;
+    auto words = entry.spirv.Copy();
+    words[4] ^= 1u;
+    forged.spirv = std::move(words);
+    forged.hash = forged.spirv.ContentHash();
+    require(WriteFileAtomically(path, ShaderDiskCache::EncodeSpecializationEntry(key, forged)), "cannot forge the specialization entry");
+    if (!verify) require(runSelf(self, "--spec-forged " + quoted) == 0, "a forged specialization entry that passes the file checks was not served without APS5_VERIFY_SPEC_PERSIST");
+    const auto log = root / "spec-verify.log";
+    require(runSelf(self, "--spec-verify-forged", &log) != 0, "APS5_VERIFY_SPEC_PERSIST=1 did not stop on a forged specialization entry");
+    std::ifstream stream(log, std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    require(text.find("[spec-persist] APS5_VERIFY_SPEC_PERSIST: shader disk cache entry " + path.filename().string() + " differs from specializing its key again") != std::string::npos, "APS5_VERIFY_SPEC_PERSIST=1 stopped without naming the forged entry: " + text);
+    require(WriteFileAtomically(path, original), "cannot restore the specialization entry");
+    std::cout << "a stored specialization loads in a second process, a changed constant or source misses, a damaged entry is specialized again and APS5_VERIFY_SPEC_PERSIST=1 stops on a forged one\n";
+}
+
+void verifySpecializationPersistence(const char* self, const std::filesystem::path& root) {
+    verifySpecializationKey();
+    verifySpecializationCodec();
+    verifySpecializationAcrossProcesses(self, root);
+}
+
 struct ClockRequest {
     std::vector<std::uint32_t> code{0xf4900100u, 0x00000000u, 0xbf8cc07fu, 0x7e020204u, 0xe0700000u, 0x80000100u, 0xf800180fu, 0x01010101u, 0xbf810000u};
     std::array<std::uint32_t, 4> userData{0x10000000u, 0x00000000u, 0x40u, 0x00027facu};
@@ -1385,6 +1688,54 @@ void verifyFailureMemoSwitch(const char* self) {
     setEnvironment("APS5_NO_FAILURE_MEMO", "1");
     const std::string command = "\"" + std::string(self) + "\" --no-failure-memo";
     require(std::system(command.c_str()) == 0, "the process with APS5_NO_FAILURE_MEMO=1 failed");
+}
+
+void clearEnvironment(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
+int runSwitchKeyProcess(const char* path) {
+    SampleRequest sample;
+    const auto key = sample.Key();
+    std::string text;
+    char digits[3];
+    for (const auto byte : key) {
+        std::snprintf(digits, sizeof(digits), "%02x", static_cast<unsigned>(byte));
+        text += digits;
+    }
+    std::ofstream(path, std::ios::binary) << text;
+    return 0;
+}
+
+std::string switchKeyOf(const char* self, const std::vector<std::pair<const char*, const char*>>& switches) {
+    const auto path = std::filesystem::temp_directory_path() / ("aps5-switch-key-" + std::to_string(std::random_device{}()) + ".txt");
+    for (const auto& [name, value] : switches) setEnvironment(name, value);
+    const std::string command = "\"" + std::string(self) + "\" --print-switch-key \"" + path.string() + "\"";
+    const int status = std::system(command.c_str());
+    for (const auto& entry : switches) clearEnvironment(entry.first);
+    require(status == 0, "the process that prints the switch key failed");
+    std::ifstream stream(path, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    std::filesystem::remove(path);
+    require(!text.empty(), "the process printed no switch key");
+    return text;
+}
+
+void verifyNeutralSwitchKey(const char* self) {
+    const auto unset = switchKeyOf(self, {});
+    require(unset == switchKeyOf(self, {}), "the key differs between two runs with no switches");
+    require(unset == switchKeyOf(self, {{"APS5_NO_SPIRV_KEEP", "1"}}), "APS5_NO_SPIRV_KEEP changed the disk cache key");
+    require(unset == switchKeyOf(self, {{"APS5_SPIRV_KEEP_MB", "64"}}), "APS5_SPIRV_KEEP_MB changed the disk cache key");
+    require(unset == switchKeyOf(self, {{"APS5_NO_SPIRV_KEEP", "1"}, {"APS5_SPIRV_KEEP_MB", "0"}}), "both SPIR-V keep switches together changed the disk cache key");
+    require(unset == switchKeyOf(self, {{"APS5_NO_SPEC_PERSIST", "1"}}), "APS5_NO_SPEC_PERSIST changed the disk cache key");
+    require(unset == switchKeyOf(self, {{"APS5_VERIFY_SPEC_PERSIST", "1"}}), "APS5_VERIFY_SPEC_PERSIST changed the disk cache key");
+    require(unset == switchKeyOf(self, {{"APS5_SPEC_SCRATCH", "1"}}), "APS5_SPEC_SCRATCH changed the disk cache key");
+    require(unset == switchKeyOf(self, {{"APS5_VERIFY_SPEC_SCRATCH", "1"}}), "APS5_VERIFY_SPEC_SCRATCH changed the disk cache key");
+    require(unset != switchKeyOf(self, {{"APS5_SINGLE_LANE", "all"}}), "a switch that changes the output left the disk cache key unchanged");
 }
 
 void verifyInvocationIsolation() {
@@ -2657,9 +3008,29 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--large-file") return runLargeFileWrite();
+        if (argc == 3 && std::string_view(argv[1]) == "--spec-load") return runSpecializationLoad(argv[2]);
+        if (argc == 3 && std::string_view(argv[1]) == "--spec-rejected") return runRejectedSpecialization(argv[2]);
+        if (argc == 3 && std::string_view(argv[1]) == "--spec-forged") return runForgedSpecialization(argv[2]);
+        if (argc == 2 && std::string_view(argv[1]) == "--spec-verify-forged") return runVerifiedForgedSpecialization();
+        if (argc == 2 && std::string_view(argv[1]) == "--spec-persist") {
+            const auto directory = std::filesystem::temp_directory_path() / ("aps5-spec-persist-test-" + std::to_string(std::random_device{}()));
+            std::filesystem::remove_all(directory);
+            setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
+            setPathEnvironment("ANYPS5_SHADER_CACHE_DIR", directory);
+            verifySpecializationPersistence(argv[0], directory);
+            ShaderRecompiler::ShaderDiskCache::Flush();
+            removeCacheDirectory(directory);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--load-prebuilt") return runPrebuiltLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
+        if (argc == 3 && std::string_view(argv[1]) == "--print-switch-key") return runSwitchKeyProcess(argv[2]);
+        if (argc == 2 && std::string_view(argv[1]) == "--neutral-switch-key") {
+            verifyNeutralSwitchKey(argv[0]);
+            std::cout << "The SPIR-V keep and specialization persistence switches leave the disk cache key unchanged\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]).starts_with("--load-plan")) return runPlanLoadingProcess(argv[1]);
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);
@@ -2690,6 +3061,7 @@ int main(int argc, char** argv) {
         verifyVertexTypeSpecialization();
         verifyBuiltinSpecialization();
         verifySpecializationLiveness();
+        verifySpecializationPersistence(argv[0], directory);
         ShaderRecompiler::ShaderDiskCache::Flush();
         removeCacheDirectory(directory);
         std::cout << "shader disk cache tests passed\n";

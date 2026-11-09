@@ -412,8 +412,15 @@ void verifyFrontendPair() {
     }
 }
 
+struct SpirvKeepDisabled {
+    SpirvKeepDisabled() : saved(ShaderRecompiler::SpirvKeepBytes()) { ShaderRecompiler::SetSpirvKeepBytes(0u); }
+    ~SpirvKeepDisabled() { ShaderRecompiler::SetSpirvKeepBytes(saved); }
+    std::uint64_t saved;
+};
+
 void verifySpecializedModuleRelease() {
     using namespace ShaderRecompiler;
+    const SpirvKeepDisabled disabled;
     const std::array<std::uint32_t, 1> color{0x3f800000u};
     const std::vector<std::uint32_t> code{0xbf800003u, 0x7e000200u, 0xf800180fu, 0u, 0xbf810000u};
     auto pixel = FrontendRequest(code, color);
@@ -442,8 +449,81 @@ void verifySpecializedModuleRelease() {
     require(shared.spirv.data() == again.spirv.data(), "specialized module release: a second result of a live module copied its words");
 }
 
+ShaderRecompiler::RecompileRequest spirvKeepPixel(std::uint32_t nop) {
+    using namespace ShaderRecompiler;
+    static const std::array<std::uint32_t, 1> color{0x3f800000u};
+    static std::map<std::uint32_t, std::vector<std::uint32_t>> programs;
+    auto& code = programs[nop];
+    code = {0xbf800000u, 0x7e000280u + nop, 0xf800180fu, 0u, 0xbf810000u};
+    auto pixel = FrontendRequest(code, color);
+    pixel.shader.stage = ShaderStage::Fragment;
+    pixel.context.compute.reset();
+    pixel.context.pixel = ShaderPixelStageInfo{};
+    pixel.context.pixel->wave32 = true;
+    pixel.context.pixel->targetOutputMode[0] = 9u;
+    pixel.context.waveSize = 32u;
+    pixel.useCache = true;
+    return pixel;
+}
+
+void verifySpirvKeep() {
+    using namespace ShaderRecompiler;
+    const bool off = std::getenv("APS5_NO_SPIRV_KEEP") != nullptr;
+    require((SpirvKeepBytes() == 0u) == off, "spirv keep: APS5_NO_SPIRV_KEEP did not decide whether modules are kept");
+    const auto pixel = spirvKeepPixel(7u);
+    const auto start = SpecializationCounts();
+    SharedSpirv::Weak released;
+    std::uint64_t specializationId = 0;
+    std::vector<std::uint32_t> words;
+    {
+        const auto first = Recompile(pixel);
+        require(first.specializationId != 0u, "spirv keep: the pixel fixture was not specialized");
+        released = first.spirv.Weaken();
+        specializationId = first.specializationId;
+        words = first.spirv.Copy();
+    }
+    const auto built = SpecializationCounts();
+    require(built.first == start.first + 1u && built.respecialized == start.respecialized, "spirv keep: the first compile was not counted as a first specialization");
+    require(released.Expired() == off, off ? "spirv keep: a module no result uses was kept with APS5_NO_SPIRV_KEEP" : "spirv keep: a module no result uses expired though modules are kept");
+    const auto again = Recompile(pixel);
+    const auto served = SpecializationCounts();
+    require(again.specializationId == specializationId && std::ranges::equal(again.spirv.Words(), words), "spirv keep: a second compile changed the module identity or words");
+    if (off) {
+        require(served.respecialized == built.respecialized + 1u && served.keptEntries == 0u && served.keptBytes == 0u, "spirv keep: with APS5_NO_SPIRV_KEEP a dropped module was not specialized again");
+    } else {
+        require(served.respecialized == built.respecialized && served.served > built.served && served.first == built.first, "spirv keep: a kept module was specialized again");
+        require(served.keptEntries != 0u && served.keptBytes >= words.size() * sizeof(std::uint32_t), "spirv keep: the kept module was not counted");
+        const auto bytes = served.keptBytes;
+        SetSpirvKeepBytes(1u);
+        require(SpecializationCounts().keptEntries == 0u && SpecializationCounts().keptEvictions > served.keptEvictions, "spirv keep: shrinking the budget kept modules");
+        SetSpirvKeepBytes(bytes);
+    }
+}
+
+void verifySpirvKeepBounded() {
+    using namespace ShaderRecompiler;
+    const SpirvKeepDisabled disabled;
+    const auto older = spirvKeepPixel(11u);
+    const auto newer = spirvKeepPixel(13u);
+    SetSpirvKeepBytes(~std::uint64_t{0});
+    const auto olderBytes = Recompile(older).spirv.size() * sizeof(std::uint32_t);
+    const auto newerBytes = Recompile(newer).spirv.size() * sizeof(std::uint32_t);
+    SetSpirvKeepBytes(0u);
+    const auto budget = std::max(olderBytes, newerBytes);
+    SetSpirvKeepBytes(budget);
+    SharedSpirv::Weak olderWords, newerWords;
+    olderWords = Recompile(older).spirv.Weaken();
+    require(!olderWords.Expired(), "spirv keep bounded: a module within the budget was not kept");
+    const auto before = SpecializationCounts();
+    newerWords = Recompile(newer).spirv.Weaken();
+    const auto after = SpecializationCounts();
+    require(after.keptBytes <= budget, "spirv keep bounded: the kept modules exceed the budget");
+    require(after.keptEvictions > before.keptEvictions && olderWords.Expired() && !newerWords.Expired(), "spirv keep bounded: the least recently used module was not the one released");
+}
+
 void verifyLayerSpecializationRelease() {
     using namespace ShaderRecompiler;
+    const SpirvKeepDisabled disabled;
     const std::array<std::uint32_t, 10> code{
         0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0x7e080280u,
         0xf80000cfu, 0x03020100u, 0xf80008d4u, 0x00040000u, 0xbf810000u
@@ -10849,6 +10929,12 @@ int main(int argc, char** argv) {
             std::cout << "The result memo ends within its byte budget when results are inserted during a trim\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--spirv-keep") {
+            verifySpirvKeep();
+            verifySpirvKeepBounded();
+            std::cout << "Specialized modules stay alive without a result when kept, and are specialized again when APS5_NO_SPIRV_KEEP is set\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--layout-pair") {
             verifyLayoutPair();
             std::cout << "Both push-constant layouts of a pixel shader compile from one program unchanged\n";
@@ -10958,6 +11044,8 @@ int main(int argc, char** argv) {
         verifyImageTables();
         verifySpecializedModuleRelease();
         verifyLayerSpecializationRelease();
+        verifySpirvKeep();
+        verifySpirvKeepBounded();
         verifyImageTableRegistration();
         verifyScalarAddressRule();
         verifyPointerImageTable();

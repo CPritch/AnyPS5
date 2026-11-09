@@ -68,6 +68,11 @@ public:
         return hash;
     }
 
+    static void BuildTarget(const SpirvTarget& target, std::vector<std::uint64_t>& key) {
+        key.clear();
+        append(key, target);
+    }
+
     static void SealFeatureDigest(SpirvTarget& target) {
         target.featureDigest = digestFeatures(target.supportedCapabilities, target.supportedExtensions);
         target.featureDigestSpans = featureSpans(target);

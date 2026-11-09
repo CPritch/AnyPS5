@@ -56,6 +56,7 @@
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <bit>
 #include <ControlFlow/RequestSerializer.hpp>
 
 namespace ShaderRecompiler {
@@ -903,8 +904,7 @@ std::vector<std::uint32_t> specializeWords(const CompiledShaderArtifact& artifac
     return materialized;
 }
 
-SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
-    auto materialized = specializeWords(artifact, classes, constants, target);
+SpecializedSpirv describeSpecializedModule(std::vector<std::uint32_t> materialized, std::span<const PipelineSpecializationConstant> constants) {
     auto module = std::make_shared<SpecializedModule>();
     std::map<std::uint32_t, std::uint32_t> supplied;
     for (const auto& constant : constants) supplied.emplace(constant.id, constant.value);
@@ -934,12 +934,236 @@ SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, 
     return {std::move(module), std::move(spirv)};
 }
 
+SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    return describeSpecializedModule(specializeWords(artifact, classes, constants, target), constants);
+}
+
+SpecializedSpirv loadedSpecializedModule(ShaderDiskCache::SpecializedEntry entry, std::span<const PipelineSpecializationConstant> constants) {
+    auto module = std::make_shared<SpecializedModule>();
+    module->specialization = std::move(entry.specialization);
+    module->bindings = std::move(entry.bindings);
+    module->pushData = entry.pushData;
+    auto spirv = InternSpirv(std::move(entry.spirv));
+    module->hash = spirv.ContentHash();
+    module->spirv = spirv.Weaken();
+    module->specializationId = constants.empty() ? 0u : nextVariantId();
+    return {std::move(module), std::move(spirv)};
+}
+
+struct SpecializationCounters {
+    std::atomic<std::uint64_t> first{0};
+    std::atomic<std::uint64_t> firstNs{0};
+    std::atomic<std::uint64_t> respecialized{0};
+    std::atomic<std::uint64_t> respecializedNs{0};
+    std::atomic<std::uint64_t> served{0};
+    std::atomic<std::uint64_t> diskHits{0};
+    std::atomic<std::uint64_t> diskMisses{0};
+    std::atomic<std::uint64_t> diskLoadNs{0};
+    std::atomic<std::uint64_t> diskBytes{0};
+    std::atomic<std::uint64_t> verified{0};
+};
+
+SpecializationCounters& specializationCounters() {
+    static SpecializationCounters counters;
+    return counters;
+}
+
+std::uint64_t elapsedNs(std::chrono::steady_clock::time_point started) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+}
+
+std::atomic<std::uint64_t>& spirvKeepBudgetBytes() {
+    static std::atomic<std::uint64_t> budget{[] {
+        if (std::getenv("APS5_NO_SPIRV_KEEP") != nullptr) return std::uint64_t{0};
+        const char* value = std::getenv("APS5_SPIRV_KEEP_MB");
+        const std::uint64_t megabytes = value == nullptr || *value == '\0' ? 128u : std::strtoull(value, nullptr, 10);
+        return megabytes << 20u;
+    }()};
+    return budget;
+}
+
+class SpirvKeep {
+public:
+    void Touch(const SpecializedModule* key, const SharedSpirv& spirv) {
+        const auto budget = spirvKeepBudgetBytes().load(std::memory_order_relaxed);
+        if (budget == 0u || spirv.empty()) return;
+        std::vector<SharedSpirv> released;
+        {
+            std::lock_guard lock(mutex);
+            const auto found = index.find(key);
+            if (found != index.end()) {
+                order.splice(order.begin(), order, found->second);
+                return;
+            }
+            const auto bytes = spirv.size() * sizeof(std::uint32_t);
+            order.push_front({key, spirv, bytes});
+            index.emplace(key, order.begin());
+            held += bytes;
+            while (held > budget && !order.empty()) {
+                auto& oldest = order.back();
+                held -= oldest.bytes;
+                index.erase(oldest.key);
+                released.push_back(std::move(oldest.spirv));
+                order.pop_back();
+                ++evictions;
+            }
+        }
+    }
+
+    void Trim() {
+        const auto budget = spirvKeepBudgetBytes().load(std::memory_order_relaxed);
+        std::vector<SharedSpirv> released;
+        std::lock_guard lock(mutex);
+        while (held > budget && !order.empty()) {
+            auto& oldest = order.back();
+            held -= oldest.bytes;
+            index.erase(oldest.key);
+            released.push_back(std::move(oldest.spirv));
+            order.pop_back();
+            ++evictions;
+        }
+    }
+
+    void Totals(SpecializationTotals& totals) {
+        std::lock_guard lock(mutex);
+        totals.keptEntries = order.size();
+        totals.keptBytes = held;
+        totals.keptEvictions = evictions;
+    }
+
+private:
+    struct Entry {
+        const SpecializedModule* key;
+        SharedSpirv spirv;
+        std::uint64_t bytes;
+    };
+
+    std::mutex mutex;
+    std::list<Entry> order;
+    std::unordered_map<const SpecializedModule*, std::list<Entry>::iterator> index;
+    std::uint64_t held = 0;
+    std::uint64_t evictions = 0;
+};
+
+SpirvKeep& spirvKeep() {
+    static SpirvKeep keep;
+    return keep;
+}
+
+bool specializationPersistence() {
+    static const bool enabled = std::getenv("APS5_NO_SPEC_PERSIST") == nullptr;
+    return enabled && ShaderDiskCache::Enabled() && !DebugProbeActive();
+}
+
+std::uint64_t specializationVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_SPEC_PERSIST");
+        return text == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(text, nullptr, 10));
+    }();
+    return every;
+}
+
+std::string hexHash(const SpirvContentHash& hash) {
+    char text[33];
+    std::snprintf(text, sizeof(text), "%016llx%016llx", static_cast<unsigned long long>(hash.high), static_cast<unsigned long long>(hash.low));
+    return text;
+}
+
+std::uint64_t loadSpecialization(std::span<const std::byte> key, ShaderDiskCache::SpecializedEntry& entry) {
+    auto& counters = specializationCounters();
+    const auto started = std::chrono::steady_clock::now();
+    std::uint64_t bytes = 0;
+    const bool loaded = ShaderDiskCache::LoadSpecialization(key, entry, &bytes);
+    counters.diskLoadNs.fetch_add(elapsedNs(started), std::memory_order_relaxed);
+    counters.diskBytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (!loaded) {
+        counters.diskMisses.fetch_add(1, std::memory_order_relaxed);
+        return 0u;
+    }
+    return counters.diskHits.fetch_add(1, std::memory_order_relaxed) + 1u;
+}
+
+void storeSpecialization(std::vector<std::byte> key, const SpecializedModule& module, const SharedSpirv& spirv) {
+    auto entry = std::make_shared<ShaderDiskCache::SpecializedEntry>();
+    entry->spirv = spirv;
+    entry->specialization = module.specialization;
+    entry->bindings = module.bindings;
+    entry->pushData = module.pushData;
+    entry->hash = module.hash;
+    ShaderDiskCache::StoreSpecialization(std::move(key), std::move(entry));
+}
+
+void verifySpecialization(const SpecializedModule& loaded, const SpecializedModule& rebuilt, std::span<const std::byte> key) {
+    const auto checked = specializationCounters().verified.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (loaded.hash != rebuilt.hash || loaded.specialization != rebuilt.specialization || loaded.bindings != rebuilt.bindings || loaded.pushData != rebuilt.pushData) {
+        std::fprintf(stderr, "[spec-persist] APS5_VERIFY_SPEC_PERSIST: shader disk cache entry %s differs from specializing its key again (check %llu): module %s against %s, %zu against %zu constants, %zu against %zu bindings, push data %d against %d\n",
+                     ShaderDiskCache::EntryName(key).c_str(), static_cast<unsigned long long>(checked), hexHash(loaded.hash).c_str(), hexHash(rebuilt.hash).c_str(),
+                     loaded.specialization.size(), rebuilt.specialization.size(), loaded.bindings.size(), rebuilt.bindings.size(), loaded.pushData ? 1 : 0, rebuilt.pushData ? 1 : 0);
+        std::fflush(stderr);
+        std::abort();
+    }
+    if (std::has_single_bit(checked)) std::fprintf(stderr, "[spec-persist] APS5_VERIFY_SPEC_PERSIST: %llu disk hits specialized again and matched (every %llu)\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(specializationVerifyEvery()));
+}
+
+bool verifyDue(std::uint64_t hit) {
+    const auto every = specializationVerifyEvery();
+    return every != 0u && hit % every == 0u;
+}
+
+SpecializedSpirv persistedSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    auto& counters = specializationCounters();
+    std::vector<std::byte> key;
+    const bool persisted = specializationPersistence();
+    if (persisted) {
+        ShaderDiskCache::BuildSpecializationKey(artifact, classes, constants, target, key);
+        ShaderDiskCache::SpecializedEntry entry;
+        if (const auto hit = loadSpecialization(key, entry); hit != 0u) {
+            auto loaded = loadedSpecializedModule(std::move(entry), constants);
+            if (verifyDue(hit)) verifySpecialization(*loaded.module, *buildSpecializedModule(artifact, classes, constants, target).module, key);
+            return loaded;
+        }
+    }
+    const auto started = std::chrono::steady_clock::now();
+    auto specialized = buildSpecializedModule(artifact, classes, constants, target);
+    counters.first.fetch_add(1, std::memory_order_relaxed);
+    counters.firstNs.fetch_add(elapsedNs(started), std::memory_order_relaxed);
+    if (persisted) storeSpecialization(std::move(key), *specialized.module, specialized.spirv);
+    return specialized;
+}
+
 SharedSpirv specializedWords(const SpecializedModule& module, const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     std::lock_guard lock(module.mutex);
-    if (auto spirv = module.spirv.Lock(); !spirv.empty()) return spirv;
+    auto& counters = specializationCounters();
+    if (auto spirv = module.spirv.Lock(); !spirv.empty()) {
+        counters.served.fetch_add(1, std::memory_order_relaxed);
+        spirvKeep().Touch(&module, spirv);
+        return spirv;
+    }
+    std::vector<std::byte> key;
+    const bool persisted = specializationPersistence();
+    if (persisted) {
+        ShaderDiskCache::BuildSpecializationKey(artifact, classes, constants, target, key);
+        ShaderDiskCache::SpecializedEntry entry;
+        if (const auto hit = loadSpecialization(key, entry); hit != 0u) {
+            const auto loaded = loadedSpecializedModule(std::move(entry), constants);
+            if (verifyDue(hit)) verifySpecialization(*loaded.module, *buildSpecializedModule(artifact, classes, constants, target).module, key);
+            if (loaded.module->hash == module.hash) {
+                module.spirv = loaded.spirv.Weaken();
+                spirvKeep().Touch(&module, loaded.spirv);
+                return loaded.spirv;
+            }
+            static std::atomic<unsigned> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 8u) std::fprintf(stderr, "[spec-persist] shader disk cache entry %s holds module %s, this process built %s from the same key; specializing again\n", ShaderDiskCache::EntryName(key).c_str(), hexHash(loaded.module->hash).c_str(), hexHash(module.hash).c_str());
+        }
+    }
+    const auto started = std::chrono::steady_clock::now();
     auto spirv = InternSpirv(specializeWords(artifact, classes, constants, target));
     if (spirv.ContentHash() != module.hash) throw std::runtime_error("ShaderRecompiler: a specialized module built again from its key differs from its first build");
     module.spirv = spirv.Weaken();
+    counters.respecialized.fetch_add(1, std::memory_order_relaxed);
+    counters.respecializedNs.fetch_add(elapsedNs(started), std::memory_order_relaxed);
+    if (persisted) storeSpecialization(std::move(key), module, spirv);
+    spirvKeep().Touch(&module, spirv);
     return spirv;
 }
 
@@ -972,7 +1196,12 @@ struct RegistrationModuleEntry {
 
 SharedSpirv lockedWords(const SpecializedModule& module) {
     std::lock_guard lock(module.mutex);
-    return module.spirv.Lock();
+    auto spirv = module.spirv.Lock();
+    if (!spirv.empty()) {
+        specializationCounters().served.fetch_add(1, std::memory_order_relaxed);
+        spirvKeep().Touch(&module, spirv);
+    }
+    return spirv;
 }
 
 SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<SpecializedSpirv()>& specialize) {
@@ -1086,7 +1315,8 @@ SpecializedSpirv specializeModule(const CompiledShaderArtifact& artifact, std::s
     SharedSpirv built;
     std::call_once(entry->ready, [&] {
         try {
-            auto specialized = buildSpecializedModule(artifact, classes, constants, target);
+            auto specialized = persistedSpecializedModule(artifact, classes, constants, target);
+            spirvKeep().Touch(specialized.module.get(), specialized.spirv);
             entry->module = std::move(specialized.module);
             built = std::move(specialized.spirv);
         } catch (...) {
@@ -1368,7 +1598,10 @@ void attachSubstitutes(CompiledVariant& variant) {
 }
 
 SharedSpirv InternSpirv(std::vector<std::uint32_t> words) {
-    SharedSpirv spirv(std::move(words));
+    return InternSpirv(SharedSpirv(std::move(words)));
+}
+
+SharedSpirv InternSpirv(SharedSpirv spirv) {
     const auto hash = spirv.ContentHash();
     static std::mutex mutex;
     static std::unordered_map<std::uint64_t, std::vector<SharedSpirv::Weak>> interned;
@@ -2237,6 +2470,37 @@ std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request
 void SetResultMemoBudget(std::uint64_t bytes) {
     resultMemoBudgetBytes().store(bytes, std::memory_order_relaxed);
     if (bytes != 0 && resultMemoCounters().heldBytes.load(std::memory_order_relaxed) > bytes) trimResultMemo(bytes);
+}
+
+SpecializationTotals SpecializationCounts() {
+    const auto& counters = specializationCounters();
+    SpecializationTotals totals;
+    totals.first = counters.first.load(std::memory_order_relaxed);
+    totals.firstNs = counters.firstNs.load(std::memory_order_relaxed);
+    totals.respecialized = counters.respecialized.load(std::memory_order_relaxed);
+    totals.respecializedNs = counters.respecializedNs.load(std::memory_order_relaxed);
+    totals.served = counters.served.load(std::memory_order_relaxed);
+    totals.diskHits = counters.diskHits.load(std::memory_order_relaxed);
+    totals.diskMisses = counters.diskMisses.load(std::memory_order_relaxed);
+    totals.diskLoadNs = counters.diskLoadNs.load(std::memory_order_relaxed);
+    totals.diskBytes = counters.diskBytes.load(std::memory_order_relaxed);
+    totals.verified = counters.verified.load(std::memory_order_relaxed);
+    if (totals.diskHits != 0u || totals.diskMisses != 0u) {
+        const auto disk = ShaderDiskCache::Totals();
+        totals.diskWrites = disk.specializationWrites;
+        totals.diskRejected = disk.specializationLoadFailures;
+    }
+    spirvKeep().Totals(totals);
+    return totals;
+}
+
+void SetSpirvKeepBytes(std::uint64_t bytes) {
+    spirvKeepBudgetBytes().store(bytes, std::memory_order_relaxed);
+    spirvKeep().Trim();
+}
+
+std::uint64_t SpirvKeepBytes() {
+    return spirvKeepBudgetBytes().load(std::memory_order_relaxed);
 }
 
 void SetResultMemoTrimHook(std::function<void()> hook) {
