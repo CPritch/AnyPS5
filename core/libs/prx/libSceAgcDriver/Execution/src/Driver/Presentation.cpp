@@ -159,6 +159,13 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         field("spec_respecialized", delta(specialization.respecialized, previousSpecialization.respecialized));
         field("spec_respecialized_us", micros(specialization.respecializedNs, previousSpecialization.respecializedNs));
         field("spec_served", delta(specialization.served, previousSpecialization.served));
+        field("spec_disk_hits", delta(specialization.diskHits, previousSpecialization.diskHits));
+        field("spec_disk_misses", delta(specialization.diskMisses, previousSpecialization.diskMisses));
+        field("spec_disk_writes", delta(specialization.diskWrites, previousSpecialization.diskWrites));
+        field("spec_disk_rejected", delta(specialization.diskRejected, previousSpecialization.diskRejected));
+        field("spec_disk_load_us", micros(specialization.diskLoadNs, previousSpecialization.diskLoadNs));
+        field("spec_disk_bytes", delta(specialization.diskBytes, previousSpecialization.diskBytes));
+        field("spec_disk_verified", delta(specialization.verified, previousSpecialization.verified));
         field("spirv_kept_entries", specialization.keptEntries);
         field("spirv_kept_bytes", specialization.keptBytes);
         field("spirv_kept_evictions", delta(specialization.keptEvictions, previousSpecialization.keptEvictions));

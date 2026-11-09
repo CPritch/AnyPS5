@@ -844,6 +844,7 @@ private:
 };
 
 [[nodiscard]] SharedSpirv InternSpirv(std::vector<std::uint32_t> words);
+[[nodiscard]] SharedSpirv InternSpirv(SharedSpirv spirv);
 
 struct VertexInput {
     std::uint32_t location;
@@ -999,6 +1000,13 @@ struct SpecializationTotals {
     std::uint64_t respecialized = 0;
     std::uint64_t respecializedNs = 0;
     std::uint64_t served = 0;
+    std::uint64_t diskHits = 0;
+    std::uint64_t diskMisses = 0;
+    std::uint64_t diskWrites = 0;
+    std::uint64_t diskRejected = 0;
+    std::uint64_t diskLoadNs = 0;
+    std::uint64_t diskBytes = 0;
+    std::uint64_t verified = 0;
     std::uint64_t keptEntries = 0;
     std::uint64_t keptBytes = 0;
     std::uint64_t keptEvictions = 0;
