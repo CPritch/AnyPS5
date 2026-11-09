@@ -5,6 +5,11 @@
 #include "SpirvInstructionOperands.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <map>
 #include <memory>
@@ -73,10 +78,23 @@ using SpirvInstructions::Opcode;
 using SpirvInstructions::Result;
 using SpirvInstructions::VisitIdOperands;
 
-Instruction Make(spv::Op op, std::initializer_list<std::uint32_t> operands) {
-    Instruction result{(static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | op};
+Instruction Make(spv::Op op, std::initializer_list<std::uint32_t> operands, WordArena* arena = nullptr) {
+    if (arena == nullptr) {
+        Instruction result{(static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | op};
+        result.insert(result.end(), operands);
+        return result;
+    }
+    Instruction result(ArenaAllocator<std::uint32_t>{arena});
+    result.reserve(operands.size() + 1u);
+    result.push_back((static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | op);
     result.insert(result.end(), operands);
     return result;
+}
+
+template<typename T>
+void clearItem(T& item) {
+    if constexpr (requires { item.clear(); }) item.clear();
+    else item = T{};
 }
 
 bool PureInstruction(const Instruction& instruction) {
@@ -279,6 +297,18 @@ public:
         present.assign(bound, 0u);
         count = 0;
     }
+    void Recycle(std::size_t bound) {
+        if (items.size() != bound) {
+            Reset(bound);
+            return;
+        }
+        for (std::size_t id = 0; id < bound; ++id) {
+            if (present[id] == 0u) continue;
+            clearItem(items[id]);
+            present[id] = 0u;
+        }
+        count = 0;
+    }
     bool contains(std::uint32_t id) const { return id < present.size() && present[id] != 0u; }
     const T* find(std::uint32_t id) const { return contains(id) ? &items[id] : nullptr; }
     const T& at(std::uint32_t id) const {
@@ -300,7 +330,7 @@ public:
     T& operator[](std::uint32_t id) {
         check(id);
         if (present[id] == 0u) {
-            items[id] = T{};
+            clearItem(items[id]);
             present[id] = 1u;
             ++count;
         }
@@ -361,9 +391,19 @@ private:
 
 class Specialization {
 public:
-    explicit Specialization(std::span<const std::uint32_t> words) : arena(words.size()) {
+    Specialization(std::span<const std::uint32_t> words, bool scratch) : scratch(scratch), arena(words.size()) {
         if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid prepared SPIR-V header");
         header.assign(words.begin(), words.begin() + 5);
+        if (scratch) {
+            std::size_t total = 0;
+            for (std::size_t cursor = 5; cursor < words.size();) {
+                const auto count = words[cursor] >> 16u;
+                if (count == 0u || count > words.size() - cursor) break;
+                ++total;
+                cursor += count;
+            }
+            instructions.reserve(total);
+        }
         bound = header[3];
         types.Reset(bound);
         values.Reset(bound);
@@ -431,6 +471,12 @@ public:
         removeUnusedConstants();
         orderPhis();
         std::vector<std::uint32_t> words = header;
+        if (scratch) {
+            std::size_t total = words.size();
+            for (const auto& constant : constants) total += constant.size();
+            for (const auto& instruction : instructions) total += instruction.size();
+            words.reserve(total);
+        }
         bool inserted = false;
         for (const auto& instruction : instructions) {
             if (instruction.empty()) continue;
@@ -445,6 +491,10 @@ public:
     }
 
 private:
+    Instruction make(spv::Op op, std::initializer_list<std::uint32_t> operands) {
+        return Make(op, operands, scratch ? &arena : nullptr);
+    }
+
     std::optional<std::uint32_t> value(std::uint32_t id) const {
         const auto* found = values.find(id);
         return found != nullptr ? std::optional(*found) : std::nullopt;
@@ -510,14 +560,20 @@ private:
     bool fold() {
         bool changed = false;
         bool function = false;
-        IdTable<std::pair<std::uint32_t, std::uint32_t>> extracts;
-        extracts.Reset(bound);
-        IdTable<std::uint32_t> bitcasts;
-        bitcasts.Reset(bound);
+        IdTable<std::pair<std::uint32_t, std::uint32_t>> localExtracts;
+        auto& extracts = scratch ? foldExtracts : localExtracts;
+        if (scratch) extracts.Recycle(bound);
+        else extracts.Reset(bound);
+        IdTable<std::uint32_t> localBitcasts;
+        auto& bitcasts = scratch ? foldBitcasts : localBitcasts;
+        if (scratch) bitcasts.Recycle(bound);
+        else bitcasts.Reset(bound);
         std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> blockBitcasts;
         std::map<std::array<std::uint32_t, 3>, std::uint32_t> blockNanTests;
-        IdTable<std::pair<std::uint32_t, std::uint32_t>> constPointers;
-        constPointers.Reset(bound);
+        IdTable<std::pair<std::uint32_t, std::uint32_t>> localConstPointers;
+        auto& constPointers = scratch ? foldConstPointers : localConstPointers;
+        if (scratch) constPointers.Recycle(bound);
+        else constPointers.Reset(bound);
         for (auto& instruction : instructions) {
             if (instruction.empty()) continue;
             auto op = Opcode(instruction);
@@ -533,34 +589,34 @@ private:
             }
             if (op == spv::OpSelect && instruction.size() == 6u) {
                 if (const auto condition = value(instruction[3])) {
-                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[*condition != 0u ? 4u : 5u]});
+                    instruction = make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[*condition != 0u ? 4u : 5u]});
                     changed = true;
                 } else if (instruction[4] == instruction[5]) {
-                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
+                    instruction = make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
                     changed = true;
                 }
             }
             if (op == spv::OpLogicalAnd && instruction.size() == 5u) {
                 if (const auto left = value(instruction[3]); left && *left != 0u) {
-                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
+                    instruction = make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
                     changed = true;
                 } else if (const auto right = value(instruction[4]); right && *right != 0u) {
-                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[3]});
+                    instruction = make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[3]});
                     changed = true;
                 }
             }
             if (op == spv::OpLogicalOr && instruction.size() == 5u) {
                 if (const auto left = value(instruction[3]); left && *left == 0u) {
-                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
+                    instruction = make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[4]});
                     changed = true;
                 } else if (const auto right = value(instruction[4]); right && *right == 0u) {
-                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[3]});
+                    instruction = make(spv::OpCopyObject, {instruction[1], instruction[2], instruction[3]});
                     changed = true;
                 }
             }
             if (op == spv::OpVectorExtractDynamic && instruction.size() == 5u) {
                 if (const auto index = value(instruction[4])) {
-                    instruction = Make(spv::OpCompositeExtract, {instruction[1], instruction[2], instruction[3], *index});
+                    instruction = make(spv::OpCompositeExtract, {instruction[1], instruction[2], instruction[3], *index});
                     changed = true;
                 }
             }
@@ -568,7 +624,7 @@ private:
                 const auto* chained = bitcasts.find(instruction[3]);
                 const auto source = chained != nullptr && sameType(*chained, instruction[1]) ? *chained : instruction[3];
                 if (sameType(source, instruction[1])) {
-                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], source});
+                    instruction = make(spv::OpCopyObject, {instruction[1], instruction[2], source});
                     changed = true;
                 } else {
                     const auto [found, inserted] = decoratedResults.contains(instruction[2])
@@ -577,7 +633,7 @@ private:
                     if (inserted) {
                         bitcasts.emplace(instruction[2], instruction[3]);
                     } else {
-                        instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], found->second});
+                        instruction = make(spv::OpCopyObject, {instruction[1], instruction[2], found->second});
                         changed = true;
                     }
                 }
@@ -586,7 +642,7 @@ private:
             if (nanTest && !decoratedResults.contains(instruction[2])) {
                 const auto [found, inserted] = blockNanTests.try_emplace(std::array<std::uint32_t, 3>{op, instruction[1], instruction[3]}, instruction[2]);
                 if (!inserted) {
-                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], found->second});
+                    instruction = make(spv::OpCopyObject, {instruction[1], instruction[2], found->second});
                     changed = true;
                 }
             }
@@ -602,14 +658,14 @@ private:
                 if (shuffle) {
                     const auto source = first->first;
                     bool identity = resultTypes.contains(source) && resultTypes.at(source) == instruction[1];
-                    Instruction replacement = Make(spv::OpVectorShuffle, {instruction[1], instruction[2], source, source});
+                    Instruction replacement = make(spv::OpVectorShuffle, {instruction[1], instruction[2], source, source});
                     for (std::size_t index = 3; index < instruction.size(); ++index) {
                         const auto channel = extracts.at(instruction[index]).second;
                         replacement.push_back(channel);
                         identity &= channel == index - 3u;
                     }
                     replacement[0] = (static_cast<std::uint32_t>(replacement.size()) << 16u) | spv::OpVectorShuffle;
-                    instruction = identity ? Make(spv::OpCopyObject, {instruction[1], instruction[2], source}) : std::move(replacement);
+                    instruction = identity ? make(spv::OpCopyObject, {instruction[1], instruction[2], source}) : std::move(replacement);
                     changed = true;
                 }
             }
@@ -621,7 +677,7 @@ private:
             values[instruction[2]] = bits;
             const auto [existing, created] = canonical.emplace(std::pair{instruction[1], bits}, instruction[2]);
             if (!created) aliases.emplace(instruction[2], existing->second);
-            constants.push_back(type.boolean ? Make(bits != 0u ? spv::OpConstantTrue : spv::OpConstantFalse, {instruction[1], instruction[2]}) : Make(spv::OpConstant, {instruction[1], instruction[2], bits}));
+            constants.push_back(type.boolean ? make(bits != 0u ? spv::OpConstantTrue : spv::OpConstantFalse, {instruction[1], instruction[2]}) : make(spv::OpConstant, {instruction[1], instruction[2], bits}));
             instruction.clear();
             changed = true;
         }
@@ -629,8 +685,10 @@ private:
     }
 
     bool prune() {
-        IdTable<std::vector<std::size_t>> blocks;
-        blocks.Reset(bound);
+        IdTable<std::vector<std::size_t>> localBlocks;
+        auto& blocks = scratch ? pruneBlocks : localBlocks;
+        if (scratch) blocks.Recycle(bound);
+        else blocks.Reset(bound);
         std::vector<std::uint32_t> entries;
         std::uint32_t block = 0;
         bool entry = false;
@@ -665,7 +723,8 @@ private:
             }
             return true;
         };
-        IdSet loopHeaders;
+        IdSet localLoopHeaders;
+        auto& loopHeaders = scratch ? pruneLoopHeaders : localLoopHeaders;
         loopHeaders.Reset(bound);
         std::map<std::uint32_t, std::uint32_t> continueHeaders;
         for (const auto& [label, indices] : blocks) {
@@ -675,8 +734,10 @@ private:
                 continueHeaders.emplace(instructions[index].at(2), label);
             }
         }
-        IdTable<std::vector<std::uint32_t>> edges;
-        edges.Reset(bound);
+        IdTable<std::vector<std::uint32_t>> localEdges;
+        auto& edges = scratch ? pruneEdges : localEdges;
+        if (scratch) edges.Recycle(bound);
+        else edges.Reset(bound);
         for (const auto& [label, indices] : blocks) {
             auto& terminal = instructions[indices.back()];
             auto op = Opcode(terminal);
@@ -700,8 +761,8 @@ private:
                     retainMerge = !linearSelection(target, instruction.at(1));
                     if (!retainMerge) instruction.clear();
                 }
-                const auto replacement = !retainMerge ? Make(spv::OpBranch, {target}) : op == spv::OpSwitch ? Make(spv::OpSwitch, {terminal.at(1), target}) :
-                    header.at(1) >= 0x00010600u ? terminal : Make(spv::OpBranchConditional, {terminal.at(1), target, target});
+                const auto replacement = !retainMerge ? make(spv::OpBranch, {target}) : op == spv::OpSwitch ? make(spv::OpSwitch, {terminal.at(1), target}) :
+                    header.at(1) >= 0x00010600u ? terminal : make(spv::OpBranchConditional, {terminal.at(1), target, target});
                 if (terminal != replacement) {
                     terminal = replacement;
                     changed = true;
@@ -718,7 +779,8 @@ private:
                 for (std::size_t index = 3; index + stride <= terminal.size(); index += stride) successors.push_back(terminal[index + stride - 1u]);
             }
         }
-        IdSet live;
+        IdSet localLive;
+        auto& live = scratch ? pruneLive : localLive;
         live.Reset(bound);
         auto pending = entries;
         while (!pending.empty()) {
@@ -735,7 +797,7 @@ private:
         };
         for (const auto& [label, indices] : blocks) {
             if (const auto header = backEdge(label)) {
-                const auto branch = Make(spv::OpBranch, {header});
+                const auto branch = make(spv::OpBranch, {header});
                 if (indices.size() == 2u && instructions[indices.back()] == branch) continue;
                 for (std::size_t index = 1; index < indices.size(); ++index) {
                     auto& instruction = instructions[indices[index]];
@@ -753,14 +815,14 @@ private:
                     if (const auto result = Result(instruction)) removed.insert(result);
                     instruction.clear();
                 }
-                instructions[indices.back()] = Make(spv::OpUnreachable, {});
+                instructions[indices.back()] = make(spv::OpUnreachable, {});
                 changed = true;
                 continue;
             }
             for (const auto index : indices) {
                 auto& instruction = instructions[index];
                 if (instruction.empty() || Opcode(instruction) != spv::OpPhi) continue;
-                Instruction phi(instruction.begin(), instruction.begin() + 3);
+                Instruction phi(instruction.begin(), instruction.begin() + 3, scratch ? ArenaAllocator<std::uint32_t>{&arena} : ArenaAllocator<std::uint32_t>{});
                 for (std::size_t operand = 3; operand + 1u < instruction.size(); operand += 2u) {
                     const auto parent = instruction[operand + 1u];
                     if (live.contains(parent) && std::ranges::find(edges.at(parent), label) != edges.at(parent).end()) phi.insert(phi.end(), {instruction[operand], parent});
@@ -769,7 +831,7 @@ private:
                 if (phi.size() == 3u) throw std::runtime_error("reachable prepared phi has no predecessor");
                 if (phi == instruction && phi.size() != 5u) continue;
                 phi[0] = (static_cast<std::uint32_t>(phi.size()) << 16u) | spv::OpPhi;
-                instruction = phi.size() == 5u ? Make(spv::OpCopyObject, {phi[1], phi[2], phi[3]}) : std::move(phi);
+                instruction = phi.size() == 5u ? make(spv::OpCopyObject, {phi[1], phi[2], phi[3]}) : std::move(phi);
                 changed = true;
             }
         }
@@ -863,8 +925,10 @@ private:
     }
 
     bool propagateCopies() {
-        IdTable<std::uint32_t> copies;
-        copies.Reset(bound);
+        IdTable<std::uint32_t> localCopies;
+        auto& copies = scratch ? copyTable : localCopies;
+        if (scratch) copies.Recycle(bound);
+        else copies.Reset(bound);
         for (const auto& instruction : instructions) {
             if (Opcode(instruction) != spv::OpCopyObject) continue;
             if (instruction.size() != 4u) throw std::runtime_error("invalid prepared copy instruction");
@@ -953,6 +1017,7 @@ private:
         }
     }
 
+    bool scratch;
     std::vector<std::uint32_t> header;
     WordArena arena;
     std::vector<Instruction> instructions;
@@ -968,12 +1033,65 @@ private:
     IdTable<std::vector<std::uint32_t>> composites;
     IdTable<std::uint32_t> privateTables;
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> canonical;
+    IdTable<std::pair<std::uint32_t, std::uint32_t>> foldExtracts;
+    IdTable<std::uint32_t> foldBitcasts;
+    IdTable<std::pair<std::uint32_t, std::uint32_t>> foldConstPointers;
+    IdTable<std::vector<std::size_t>> pruneBlocks;
+    IdTable<std::vector<std::uint32_t>> pruneEdges;
+    IdSet pruneLoopHeaders;
+    IdSet pruneLive;
+    IdTable<std::uint32_t> copyTable;
 };
+
+bool scratchTables() {
+    static const bool enabled = std::getenv("APS5_NO_SPEC_SCRATCH") == nullptr;
+    return enabled;
+}
+
+bool verifyScratch() {
+    static const bool enabled = std::getenv("APS5_VERIFY_SPEC_SCRATCH") != nullptr;
+    return enabled;
+}
+
+struct ScratchVerification {
+    std::atomic<std::uint64_t> checked{0};
+    std::atomic<std::uint64_t> scratchNs{0};
+    std::atomic<std::uint64_t> freshNs{0};
+};
+
+ScratchVerification& scratchVerification() {
+    static ScratchVerification verification;
+    return verification;
+}
+
+std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point started) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+}
 
 }
 
 std::vector<std::uint32_t> SpecializeSpirv(std::span<const std::uint32_t> words) {
-    return Specialization(words).Run();
+    if (!verifyScratch()) return Specialization(words, scratchTables()).Run();
+    auto& verification = scratchVerification();
+    const auto checked = verification.checked.fetch_add(1, std::memory_order_relaxed) + 1u;
+    const auto run = [&](bool reused) {
+        const auto started = std::chrono::steady_clock::now();
+        auto result = Specialization(words, reused).Run();
+        (reused ? verification.scratchNs : verification.freshNs).fetch_add(nanosecondsSince(started), std::memory_order_relaxed);
+        return result;
+    };
+    const bool reusedFirst = checked % 2u != 0u;
+    auto first = run(reusedFirst);
+    auto second = run(!reusedFirst);
+    auto specialized = std::move(reusedFirst ? first : second);
+    const auto& fresh = reusedFirst ? second : first;
+    if (specialized != fresh) {
+        std::fprintf(stderr, "[spec-scratch] APS5_VERIFY_SPEC_SCRATCH: module %llu (%zu words in) specializes to %zu words with reused tables and %zu words without\n", static_cast<unsigned long long>(checked), words.size(), specialized.size(), fresh.size());
+        std::fflush(stderr);
+        std::abort();
+    }
+    if (std::has_single_bit(checked)) std::fprintf(stderr, "[spec-scratch] APS5_VERIFY_SPEC_SCRATCH: %llu modules specialized alike with and without reused tables (%.3f ms reused against %.3f ms fresh, each run first on alternate modules)\n", static_cast<unsigned long long>(checked), verification.scratchNs.load(std::memory_order_relaxed) / 1e6, verification.freshNs.load(std::memory_order_relaxed) / 1e6);
+    return specialized;
 }
 
 }

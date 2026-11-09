@@ -76,6 +76,8 @@ if(BUILD_TESTING)
         set_tests_properties(agc_shader_bindless agc_shader_selected_records_image_limit agc_shader_selected_records_pair_limit agc_shader_selected_records_direct_image_limit agc_shader_selected_records_direct_pair_limit agc_shader_srt_read_patching agc_shader_type_zero_image_materialization agc_shader_frontend_pair agc_shader_frontend_pair_off agc_shader_layout_pair agc_shader_layout_pair_off agc_shader_result_memo_budget agc_shader_result_memo_budget_threads agc_shader_result_memo_budget_masked agc_shader_entry_lane_proof_budget PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     agc_add_default_test(agc_shader_memory_tests)
+    add_test(NAME agc_shader_memory_spec_scratch_verify COMMAND agc_shader_memory_tests)
+    set_tests_properties(agc_shader_memory_spec_scratch_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FAST_F16=0;APS5_FAST_F32=0;APS5_A2C_FALLBACK=0;APS5_DRAW_PIPELINE=0;APS5_PIPELINE_DISPATCH=0;APS5_VERIFY_SPEC_SCRATCH=1" FAIL_REGULAR_EXPRESSION "with reused tables and [0-9]+ words without" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()
 
 if(BUILD_TESTING)
