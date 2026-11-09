@@ -33,6 +33,8 @@ constexpr std::array<Entry, VerifyCountSize> Entries{{
     {"vf_journal_reconcile_unsettled", "APS5_VERIFY_JOURNAL_RECONCILE"},
     {"vf_journal_reconcile_survivals", "APS5_VERIFY_JOURNAL_RECONCILE"},
     {"vf_journal_reconcile_skipped", "APS5_VERIFY_JOURNAL_RECONCILE"},
+    {"vf_region_check_checked", "APS5_VERIFY_REGION_CHECK"},
+    {"vf_region_check_skipped", "APS5_VERIFY_REGION_CHECK"},
 }};
 
 std::array<std::atomic<std::uint64_t>, VerifyCountSize> totals{};

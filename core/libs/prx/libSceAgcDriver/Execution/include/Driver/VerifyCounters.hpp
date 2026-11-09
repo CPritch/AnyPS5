@@ -29,9 +29,11 @@ enum class VerifyCount : std::size_t {
     JournalReconcileUnsettled,
     JournalReconcileSurvivals,
     JournalReconcileSkipped,
+    RegionCheckChecked,
+    RegionCheckSkipped,
 };
 
-constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::JournalReconcileSkipped) + 1;
+constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::RegionCheckSkipped) + 1;
 
 using VerifyCounts = std::array<std::uint64_t, VerifyCountSize>;
 

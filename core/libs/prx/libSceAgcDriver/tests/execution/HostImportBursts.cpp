@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
@@ -77,7 +78,7 @@ bool JournalExpected() {
 }
 
 std::string Counts(const Graphics::ImportChurnCounts& before, const Graphics::ImportChurnCounts& after) {
-    return " (journal " + std::to_string(after.journalRefreshes - before.journalRefreshes) + ", full " + std::to_string(after.fullRefreshes - before.fullRefreshes) + ", unseeded " + std::to_string(after.rcUnseeded - before.rcUnseeded) + ", reseeded " + std::to_string(after.reseeded - before.reseeded) + ", waiter retires " + std::to_string(after.retireWaiter - before.retireWaiter) + ", survived " + std::to_string(after.proofsSurvived - before.proofsSurvived) + ")";
+    return " (journal " + std::to_string(after.journalRefreshes - before.journalRefreshes) + ", full " + std::to_string(after.fullRefreshes - before.fullRefreshes) + ", unseeded " + std::to_string(after.rcUnseeded - before.rcUnseeded) + ", reseeded " + std::to_string(after.reseeded - before.reseeded) + ", waiter retires " + std::to_string(after.retireWaiter - before.retireWaiter) + ", survived " + std::to_string(after.proofsSurvived - before.proofsSurvived) + ", region checks " + std::to_string(after.regionChecks - before.regionChecks) + ", region skips " + std::to_string(after.regionSkips - before.regionSkips) + ")";
 }
 
 enum class Outcome : std::uint8_t { NoDevice, NoImport, Passed };
@@ -93,6 +94,7 @@ Outcome BurstsStayOnTheJournal() {
     const bool journal = JournalExpected();
     const bool reseed = journal && Enabled("APS5_NO_JOURNAL_RESEED");
     const bool regionProofs = Enabled("APS5_NO_REGION_PROOFS");
+    const bool regionCheck = regionProofs && Enabled("APS5_NO_IMPORT_JOURNAL") && Enabled("APS5_NO_ALLOCATION_JOURNAL") && Enabled("APS5_NO_REGION_CHECK");
 
     Add(arena, 0, HalfWindow);
     if (!Fill(*device, first) || serial(first) == 0) return Outcome::NoImport;
@@ -154,7 +156,31 @@ Outcome BurstsStayOnTheJournal() {
     Require(survived == regionProofs, regionProofs ? "host import bursts: a retire burst elsewhere broke the proof over " + Hex(first) + Counts(before, after) : "host import bursts: with APS5_NO_REGION_PROOFS a proof survived a retire burst");
     auto old = stale;
     Require(Graphics::HostImportsUnchangedOver(context, old, burstRegion, true) == Graphics::ImportsProofCheck::Changed, "host import bursts: a proof over a retired piece survived its retire");
-    if (journal) Require(after.journalRefreshes - before.journalRefreshes >= BurstPieces && after.fullRefreshes == before.fullRefreshes, "host import bursts: the retire burst left the journal path" + Counts(before, after));
+    if (regionCheck) {
+        Require(after.regionSkips - before.regionSkips >= BurstPieces && after.fullRefreshes == before.fullRefreshes, "host import bursts: a proof over a region the burst did not touch reconciled the imports" + Counts(before, after));
+    } else {
+        Require(after.regionSkips == before.regionSkips, "host import bursts: a proof skipped its reconcile with the region check off" + Counts(before, after));
+        if (journal) Require(after.journalRefreshes - before.journalRefreshes >= BurstPieces && after.fullRefreshes == before.fullRefreshes, "host import bursts: the retire burst left the journal path" + Counts(before, after));
+    }
+
+    Require(reconciled(first) == kept, "host import bursts: the reconcile after the burst dropped the import at " + Hex(first));
+    auto nearby = Graphics::HostImportsIdentity(context);
+    Require(nearby.device != VK_NULL_HANDLE, "host import bursts: the table is not reconciled after the burst");
+    before = Graphics::ImportChurnTotals();
+    Add(arena, HalfWindow + 3 * MiB, Piece);
+    const auto nearbyCheck = Graphics::HostImportsUnchangedOver(context, nearby, keptRegion, true);
+    after = Graphics::ImportChurnTotals();
+    Require(nearbyCheck != Graphics::ImportsProofCheck::Changed && serial(first) == kept, "host import bursts: a registration in the import's window apart from its run broke the proof over " + Hex(first) + Counts(before, after));
+    Require(after.regionSkips == before.regionSkips && after.reconciles > before.reconciles, "host import bursts: a proof skipped the reconcile although the registry changed beside its region's import" + Counts(before, after));
+    Remove(arena, HalfWindow + 3 * MiB);
+    if (std::getenv("APS5_VERIFY_REGION_CHECK") != nullptr) {
+        using AgcDriver::DriverDetail::VerifyCount;
+        const auto totals = AgcDriver::DriverDetail::VerifyTotals();
+        const auto checked = totals[static_cast<std::size_t>(VerifyCount::RegionCheckChecked)];
+        const auto skipped = totals[static_cast<std::size_t>(VerifyCount::RegionCheckSkipped)];
+        std::printf("host import bursts: region check verify: %llu imports checked, %llu skipped\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(skipped));
+        Require(regionCheck ? checked != 0 : checked == 0 && skipped == 0, "host import bursts: APS5_VERIFY_REGION_CHECK did not count the imports it checked");
+    }
 
     Remove(arena, 0);
     Remove(arena, HalfWindow + MiB);

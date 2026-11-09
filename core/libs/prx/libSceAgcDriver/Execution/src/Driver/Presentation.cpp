@@ -175,6 +175,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         field("import_pin_wait_journal", delta(churn.pinWaitJournal, previousChurn.pinWaitJournal));
         field("import_pin_wait_fallbacks", delta(churn.pinWaitFallbacks, previousChurn.pinWaitFallbacks));
         field("import_pin_wait_reseeds", delta(churn.pinWaitReseeds, previousChurn.pinWaitReseeds));
+        field("import_region_checks", delta(churn.regionChecks, previousChurn.regionChecks));
+        field("import_region_skips", delta(churn.regionSkips, previousChurn.regionSkips));
         const auto specialization = ShaderRecompiler::SpecializationCounts();
         field("spec_first", delta(specialization.first, previousSpecialization.first));
         field("spec_first_us", micros(specialization.firstNs, previousSpecialization.firstNs));
