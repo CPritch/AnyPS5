@@ -21,9 +21,11 @@ enum class VerifyCount : std::size_t {
     HolderNoteUnnamed,
     UnlockedImportChecked,
     UnlockedImportSkipped,
+    EarlyImportBarrierChecked,
+    EarlyImportBarrierSkipped,
 };
 
-constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::UnlockedImportSkipped) + 1;
+constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::EarlyImportBarrierSkipped) + 1;
 
 using VerifyCounts = std::array<std::uint64_t, VerifyCountSize>;
 

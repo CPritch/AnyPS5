@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
@@ -91,6 +92,21 @@ void RequirePath(const Graphics::ImportChurnCounts& before, Today today, const s
 
 enum class Outcome : std::uint8_t { NoDevice, NoImport, Passed };
 
+bool EarlyBarrierExpected() {
+    return std::getenv("APS5_NO_EARLY_IMPORT_BARRIER") == nullptr;
+}
+
+void RequireEarlyBarrierVerifyCounts() {
+    if (std::getenv("APS5_VERIFY_EARLY_IMPORT_BARRIER") == nullptr) return;
+    using AgcDriver::DriverDetail::VerifyCount;
+    const auto totals = AgcDriver::DriverDetail::VerifyTotals();
+    const auto checked = totals[static_cast<std::size_t>(VerifyCount::EarlyImportBarrierChecked)];
+    const auto skipped = totals[static_cast<std::size_t>(VerifyCount::EarlyImportBarrierSkipped)];
+    std::printf("host import reconcile: early Import barrier verify: %llu checked, %llu skipped\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(skipped));
+    if (EarlyBarrierExpected()) Require(checked != 0 && skipped != 0, "host import reconcile: APS5_VERIFY_EARLY_IMPORT_BARRIER checked no early barrier against its refresh, or did not count the aborted one as skipped");
+    else Require(checked == 0 && skipped == 0, "host import reconcile: APS5_VERIFY_EARLY_IMPORT_BARRIER counted with the early barrier off");
+}
+
 Outcome ReconcileFollowsTheChanges() {
     Arena arena;
     auto device = OpenVulkanTestDevice();
@@ -124,6 +140,33 @@ Outcome ReconcileFollowsTheChanges() {
     GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(first + MiB), ProbeBytes);
     Require(Graphics::HostImportsReconciledUnchanged(context, proof) && serial(first) == kept, "host import reconcile: invalidating pages under an unchanged range dropped the import at " + Hex(first));
     RequirePath(before, Today::Refreshes, "pages invalidated under the import");
+
+    before = Graphics::ImportChurnTotals();
+    Add(arena, HalfWindow + 3 * MiB, Piece);
+    std::uint8_t abortedAt = 0;
+    std::thread resolver([&] {
+        AgcDriver::GuestMemory::ArmEarlyResolve();
+        try {
+            static_cast<void>(reconciled(first));
+        } catch (const AgcDriver::GuestMemory::EarlyResolveAbort& abort) {
+            abortedAt = abort.kind;
+        }
+        AgcDriver::GuestMemory::DisarmEarlyResolve();
+    });
+    resolver.join();
+    const auto armed = Graphics::ImportChurnTotals();
+    Require(abortedAt == static_cast<std::uint8_t>(AgcDriver::GuestMemory::BarrierKind::Import), "host import reconcile: an armed early resolve that had to reconcile the imports did not abort at the Import barrier");
+    Require(armed.rcAborted == before.rcAborted + 1 && armed.reconciles == before.reconciles + 1, "host import reconcile: the aborted reconcile was not counted as aborted");
+    Require(armed.journalRefreshes == before.journalRefreshes && armed.fullRefreshes == before.fullRefreshes, "host import reconcile: an aborted reconcile refreshed the imports");
+    if (EarlyBarrierExpected()) {
+        Require(armed.earlyBarrierAborts == before.earlyBarrierAborts + 1 && armed.fullLeases == before.fullLeases, "host import reconcile: the armed reconcile took its lease before it reached the Import barrier");
+    } else {
+        Require(armed.earlyBarrierAborts == before.earlyBarrierAborts, "host import reconcile: the early Import barrier ran with APS5_NO_EARLY_IMPORT_BARRIER set");
+    }
+    Require(reconciled(first) == kept, "host import reconcile: the reconcile after an aborted one dropped the import at " + Hex(first));
+    Remove(arena, HalfWindow + 3 * MiB);
+    Require(reconciled(first) == kept, "host import reconcile: removing a registration apart from its run dropped the import at " + Hex(first));
+    proof = Graphics::HostImportsIdentity(context);
 
     Add(arena, Window, HalfWindow);
     Require(reconciled(first) == kept, "host import reconcile: a registration in another window dropped the import at " + Hex(first));
@@ -203,6 +246,7 @@ int main() {
             std::printf("skipped, the device does not import guest memory\n");
             return VulkanTestSkipped;
         }
+        RequireEarlyBarrierVerifyCounts();
         std::puts("host import reconcile tests passed");
         return 0;
     } catch (const std::exception& error) {

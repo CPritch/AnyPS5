@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/AdaptiveStaging.hpp"
@@ -382,6 +383,7 @@ struct ImportChurn {
     std::atomic<std::uint64_t> proofWalks{0};
     std::atomic<std::uint64_t> lockWaits{0};
     std::atomic<std::uint64_t> lockWaitNs{0};
+    std::atomic<std::uint64_t> earlyBarrierAborts{0};
 };
 
 ImportChurn& Churn() {
@@ -2722,6 +2724,56 @@ bool regionProofsEnabled() {
     return enabled;
 }
 
+bool earlyImportBarrierEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_EARLY_IMPORT_BARRIER") == nullptr;
+    return enabled;
+}
+
+bool verifyEarlyImportBarrier() {
+    static const bool enabled = std::getenv("APS5_VERIFY_EARLY_IMPORT_BARRIER") != nullptr;
+    return enabled;
+}
+
+thread_local bool importBarrierOwed = false;
+
+void importBarrierBeforeLease(const void* site) {
+    if (!earlyImportBarrierEnabled()) return;
+    try {
+        GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::Import, site);
+    } catch (...) {
+        Churn().earlyBarrierAborts.fetch_add(1, std::memory_order_relaxed);
+        if (verifyEarlyImportBarrier()) DriverDetail::CountVerify(DriverDetail::VerifyCount::EarlyImportBarrierSkipped);
+        throw;
+    }
+    if (verifyEarlyImportBarrier()) importBarrierOwed = true;
+}
+
+void importBarrierReached() {
+    if (!std::exchange(importBarrierOwed, false)) return;
+    DriverDetail::CountVerify(DriverDetail::VerifyCount::EarlyImportBarrierChecked);
+}
+
+class ImportBarrierCheck {
+public:
+    ImportBarrierCheck() : saved(std::exchange(importBarrierOwed, false)), unwinding(std::uncaught_exceptions()) {}
+    ~ImportBarrierCheck() {
+        const bool owed = std::exchange(importBarrierOwed, saved);
+        if (!owed) return;
+        if (std::uncaught_exceptions() > unwinding) {
+            DriverDetail::CountVerify(DriverDetail::VerifyCount::EarlyImportBarrierSkipped);
+            return;
+        }
+        std::fprintf(stderr, "FATAL: APS5_VERIFY_EARLY_IMPORT_BARRIER: an import reconcile raised the Import barrier before taking its lease, but its refresh reached no Import barrier\n");
+        std::abort();
+    }
+    ImportBarrierCheck(const ImportBarrierCheck&) = delete;
+    ImportBarrierCheck& operator=(const ImportBarrierCheck&) = delete;
+
+private:
+    bool saved;
+    int unwinding;
+};
+
 thread_local bool inReconcile = false;
 
 void mergeSpans(std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& more) {
@@ -2754,6 +2806,7 @@ void verifyTableInvariant(HostImports& state, bool journaled);
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, const JournalChanges* journal = nullptr) {
     if (state.device != context.device) {
         GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::Import, __builtin_return_address(0));
+        importBarrierReached();
 #ifdef _WIN32
         drainSettles(state);
 #endif
@@ -2798,6 +2851,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     const auto generation = journal != nullptr ? journal->through : GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
     GuestMemory::ResolveBarrier(GuestMemory::BarrierKind::Import, __builtin_return_address(0));
+    importBarrierReached();
     std::optional<ChurnTimer> timed;
     if (journal == nullptr) {
         timed.emplace(Churn().fullRefreshes, Churn().fullRefreshNs);
@@ -3211,6 +3265,7 @@ JournalReconcile journalReconcile(const Context& context, HostImports& state) {
     GuestAllocations::Lease lease;
     GuestAllocations::Lease whole;
     const auto select = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, std::vector<std::pair<std::uint64_t, std::uint64_t>>& cover) { importCover(state, spans, window, cover); };
+    importBarrierBeforeLease(__builtin_return_address(0));
     if (!GuestAllocations::GuestAllocationsAcquireChanged_nid_no_patch(state.journalFrom, select, &changed, &through, &lease, verifying ? &whole : nullptr)) return GuestAllocations::GuestAllocationsMutationWaiting_nid_postfix() ? JournalReconcile::Waiting : JournalReconcile::Unproven;
     if (verifying) verifyJournalCovers(state, changed, whole, through);
     const JournalChanges journal{through, &changed, window, budget, verifying ? &whole : nullptr};
@@ -3225,6 +3280,7 @@ JournalReconcile journalReconcile(const Context& context, HostImports& state) {
 
 void reconcileImports(const Context& context, HostImports& state) {
     if (!importsStale(context, state)) return;
+    const ImportBarrierCheck barrierCheck;
     const ChurnTimer timed(Churn().reconciles, Churn().reconcileNs);
     struct Path {
         std::atomic<std::uint64_t>* counter = &Churn().rcAborted;
@@ -3238,6 +3294,7 @@ void reconcileImports(const Context& context, HostImports& state) {
         Path& operator=(const Path&) = delete;
     } path;
     const auto full = [&](std::atomic<std::uint64_t>& reason) {
+        importBarrierBeforeLease(__builtin_return_address(0));
         GuestAllocations::Lease lease;
         {
             const ChurnTimer leased(Churn().fullLeases, Churn().fullLeaseNs);
@@ -5172,6 +5229,8 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
             return entry;
         }
     }
+    const ImportBarrierCheck barrierCheck;
+    if (importsStale(context, state)) importBarrierBeforeLease(__builtin_return_address(0));
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
     return importAccess(context, state, address, address + bytes, lease, requester);
@@ -7166,7 +7225,11 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
-        if (importsStale(context, state)) refreshImports(context, state, reconcileRanges());
+        if (importsStale(context, state)) {
+            const ImportBarrierCheck barrierCheck;
+            importBarrierBeforeLease(__builtin_return_address(0));
+            refreshImports(context, state, reconcileRanges());
+        }
         importsRefreshed = true;
         for (const auto& region : regions) {
             if (!region.pending || region.mirror != nullptr || region.direct != nullptr || sparseHeapCandidate(region)) continue;
@@ -7181,7 +7244,11 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
         // pointer instead of trusting it.
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
-        if (importsStale(context, state)) refreshImports(context, state, reconcileRanges());
+        if (importsStale(context, state)) {
+            const ImportBarrierCheck barrierCheck;
+            importBarrierBeforeLease(__builtin_return_address(0));
+            refreshImports(context, state, reconcileRanges());
+        }
         importsRefreshed = true;
         if (state.epoch != space->importsEpoch) {
             Spaces().dissolvedImports.fetch_add(1, std::memory_order_relaxed);
@@ -7222,7 +7289,11 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             std::lock_guard lock(state.mutex);
             // Imports are made on demand for the registered range around each region.
             if (!importsRefreshed) {
-                if (importsStale(context, state)) refreshImports(context, state, reconcileRanges());
+                if (importsStale(context, state)) {
+                    const ImportBarrierCheck barrierCheck;
+                    importBarrierBeforeLease(__builtin_return_address(0));
+                    refreshImports(context, state, reconcileRanges());
+                }
                 importsRefreshed = true;
             }
             // An import taken by UploadPrepare (or at the lease) is still the registry's unless one
@@ -8371,6 +8442,8 @@ bool GuestBufferMemory::SpaceImportsCurrent() {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     if (importsStale(context, state)) {
+        const ImportBarrierCheck barrierCheck;
+        importBarrierBeforeLease(__builtin_return_address(0));
         if (space->keptThrough.load(std::memory_order_acquire) != space->generation) refreshImports(context, state, GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix());
         else refreshImports(context, state, space->lease);
     }
@@ -8678,6 +8751,7 @@ ImportChurnCounts ImportChurnTotals() {
     counts.proofWalks = churn.proofWalks.load(std::memory_order_relaxed);
     counts.lockWaits = churn.lockWaits.load(std::memory_order_relaxed);
     counts.lockWaitNs = churn.lockWaitNs.load(std::memory_order_relaxed);
+    counts.earlyBarrierAborts = churn.earlyBarrierAborts.load(std::memory_order_relaxed);
     const auto unlocked = GuestMemory::UnlockedImportTotals();
     counts.trackerUnlocked = unlocked.unlocked;
     counts.trackerUnlockedNs = unlocked.unlockedNs;

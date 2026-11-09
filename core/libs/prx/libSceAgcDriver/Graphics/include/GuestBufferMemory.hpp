@@ -258,6 +258,7 @@ struct ImportChurnCounts {
     std::uint64_t trackerRedos = 0;
     std::uint64_t windowWaits = 0;
     std::uint64_t windowWaitNs = 0;
+    std::uint64_t earlyBarrierAborts = 0;
 };
 bool ImportChurnCounted();
 ImportChurnCounts ImportChurnTotals();

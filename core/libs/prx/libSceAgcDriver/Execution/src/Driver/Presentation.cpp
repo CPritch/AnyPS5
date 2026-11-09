@@ -171,6 +171,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         field("import_tracker_redos", delta(churn.trackerRedos, previousChurn.trackerRedos));
         field("import_window_waits", delta(churn.windowWaits, previousChurn.windowWaits));
         field("import_window_wait_us", micros(churn.windowWaitNs, previousChurn.windowWaitNs));
+        field("import_early_barrier_aborts", delta(churn.earlyBarrierAborts, previousChurn.earlyBarrierAborts));
         const auto specialization = ShaderRecompiler::SpecializationCounts();
         field("spec_first", delta(specialization.first, previousSpecialization.first));
         field("spec_first_us", micros(specialization.firstNs, previousSpecialization.firstNs));
