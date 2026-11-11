@@ -136,7 +136,14 @@ namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission"};
 
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> CommitKindNames{"other", "draw", "indirect", "colormeta", "dispatch", "sampledump", "dmafill", "dmawrite", "dmacopy", "store", "endofpipe", "seal", "submitend", "completion", "bufferfill"};
+
 std::atomic<unsigned> runningCommitters{0};
+std::atomic<std::uint64_t> drawKeys{0};
+std::atomic<std::uint64_t> drawKeysSameAsPrevious{0};
+std::atomic<std::uint64_t> drawKeysSeenRecently{0};
+std::atomic<std::uint64_t> drawShapesSameAsPrevious{0};
+std::atomic<std::uint64_t> drawShapesSeenRecently{0};
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
@@ -1864,21 +1871,73 @@ bool ItemsThroughFinisher() {
     return enabled;
 }
 
+DrawPipeline::CommitKind CommitKindOf(DrawPipeline::ItemKind kind) {
+    using Item = DrawPipeline::ItemKind;
+    using Commit = DrawPipeline::CommitKind;
+    switch (kind) {
+    case Item::Draw: return Commit::Draw;
+    case Item::IndirectDraw: return Commit::IndirectDraw;
+    case Item::Dispatch:
+    case Item::DispatchMiss:
+    case Item::DispatchNoRecipe: return Commit::Dispatch;
+    case Item::Fill: return Commit::DmaFill;
+    case Item::Copy: return Commit::DmaCopy;
+    case Item::Store: return Commit::Store;
+    case Item::Seal: return Commit::Seal;
+    case Item::Completion: return Commit::Completion;
+    case Item::Dump: return Commit::SampleDump;
+    default: return Commit::Other;
+    }
+}
+
 }
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, ItemKind kind, Prepare prepare, Early early) {
+    const auto itemKind = draw && kind == ItemKind::Other ? ItemKind::Draw : kind;
+    enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, itemKind, std::move(early), false, CommitKindOf(itemKind)}, std::move(prepare));
+}
+
+void DrawPipeline::Enqueue(CommitKind commitKind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, ItemKind kind, Prepare prepare, Early early) {
+    enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, draw && kind == ItemKind::Other ? ItemKind::Draw : kind, std::move(early), false, commitKind}, std::move(prepare));
+}
+
+void DrawPipeline::NoteDrawKey(std::uint64_t key, std::uint64_t shape) {
+    constexpr std::size_t RecentSlots = 4096;
+    thread_local std::array<std::uint64_t, RecentSlots> recent{};
+    thread_local std::uint64_t previous = 0;
+    thread_local std::array<std::uint64_t, RecentSlots> recentShapes{};
+    thread_local std::uint64_t previousShape = 0;
+    const auto shapeSlot = static_cast<std::size_t>((shape ^ (shape >> 29u)) % RecentSlots);
+    const auto slot = static_cast<std::size_t>((key ^ (key >> 29u)) % RecentSlots);
+    drawKeys.fetch_add(1, std::memory_order_relaxed);
+    if (key == previous) drawKeysSameAsPrevious.fetch_add(1, std::memory_order_relaxed);
+    if (recent[slot] == key) drawKeysSeenRecently.fetch_add(1, std::memory_order_relaxed);
+    if (shape == previousShape) drawShapesSameAsPrevious.fetch_add(1, std::memory_order_relaxed);
+    if (recentShapes[shapeSlot] == shape) drawShapesSeenRecently.fetch_add(1, std::memory_order_relaxed);
+    recent[slot] = key;
+    previous = key;
+    recentShapes[shapeSlot] = shape;
+    previousShape = shape;
+}
+
+void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes) {
+    const auto end = address + bytes.size();
+    enqueue({std::move(commit), {{address, end}}, address, std::move(bytes), {}, false, ItemKind::Store, {}, true, CommitKind::Store}, {});
+}
+
+void DrawPipeline::enqueue(Item item, Prepare prepare) {
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
-        const bool forward = ItemsThroughFinisher() && DrawFinisher::Overlap() && !draw && reads.empty();
+        const bool forward = ItemsThroughFinisher() && DrawFinisher::Overlap() && !item.draw && item.reads.empty();
         DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Enqueue, !forward);
         if (forward) {
             DrawFinisher::Pending held;
             held.unknown = false;
-            held.writes = writes;
-            if (labelAddress != 0 && !labelBytes.empty()) held.writes.emplace_back(labelAddress, labelAddress + labelBytes.size());
-            held.labelAddress = labelAddress;
-            held.labelBytes = labelBytes;
-            DrawFinisher::Get().Enqueue([this, commit = std::move(commit), writes = std::move(writes), labelAddress, labelBytes = std::move(labelBytes), kind]() mutable {
-                Enqueue(std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), {}, false, kind);
+            held.writes = item.writes;
+            if (item.labelAddress != 0 && !item.labelBytes.empty()) held.writes.emplace_back(item.labelAddress, item.labelAddress + item.labelBytes.size());
+            held.labelAddress = item.labelAddress;
+            held.labelBytes = item.labelBytes;
+            DrawFinisher::Get().Enqueue([this, commit = std::move(item.commit), writes = std::move(item.writes), labelAddress = item.labelAddress, labelBytes = std::move(item.labelBytes), kind = item.kind, store = item.store, commitKind = item.commitKind]() mutable {
+                enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), {}, false, kind, {}, store, commitKind}, {});
             }, std::move(held));
             return;
         }
@@ -1896,7 +1955,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     rethrowFailure();
     if (closing) {
         lock.unlock();
-        commit();
+        item.commit();
         return;
     }
     if (items.size() >= Depth()) {
@@ -1913,9 +1972,9 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
-    heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
-    countWrites(writes, true);
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, draw && kind == ItemKind::Other ? ItemKind::Draw : kind, std::move(early)});
+    heldReadRanges.fetch_add(item.reads.size(), std::memory_order_relaxed);
+    countWrites(item.writes, true);
+    items.push_back(std::move(item));
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] {
@@ -2008,6 +2067,18 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     reportedDecodeDrains = decodeDrainCount;
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     if (PrepareThreads() != 0) AgcDriver::ProfilePrint_nid_no_patch("%s with %u threads\n", Graphics::DrawAheadReport().c_str(), PrepareThreads());
+    std::string kindText;
+    for (std::size_t i = 0; i < commitKindCommits.size(); ++i) {
+        const auto count = commitKindCommits[i].exchange(0, std::memory_order_relaxed);
+        const auto ns = commitKindNs[i].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        char item[64];
+        std::snprintf(item, sizeof(item), " %s %llu (%.1f us)", CommitKindNames[i], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e3 / static_cast<double>(count));
+        kindText += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
+    const auto vk = Graphics::TakeVkDrawCounts();
+    AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSeenRecently.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSeenRecently.exchange(0, std::memory_order_relaxed)));
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};
     drainWaitNs = {};
@@ -2178,6 +2249,9 @@ void DrawPipeline::run() {
                 countWrites(items.front().writes, false);
                 if (PendingWriteIndexed()) retiredWrites.Note(retiredNow, items.front().writes);
             }
+            const auto commitKindIndex = static_cast<std::size_t>(items.front().commitKind);
+            commitKindCommits[commitKindIndex].fetch_add(1, std::memory_order_relaxed);
+            commitKindNs[commitKindIndex].fetch_add(spent, std::memory_order_relaxed);
             retired.push_back(std::move(items.front()));
             items.pop_front();
             if (!unlockedWatch) retiredItems.store(retiredNow, std::memory_order_release);
@@ -2276,6 +2350,7 @@ void DrawPipeline::ReleaseRetired() {
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
+    reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain(QueueWaits::Site::FinisherPipelineDrain);
@@ -2318,6 +2393,7 @@ void DrawPipeline::WaitWrittenAny(std::span<const Range> ranges, DrainReason rea
     }
     if (finisherBusy) DrawFinisher::Get().WaitPendingWritten(ranges);
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
+    reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     const auto overlapping = [&](const Range& write) {
         return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < write.second && write.first < range.second; });
     };
@@ -2398,6 +2474,10 @@ void DrawPipeline::ReleaseRunningReads() {
     if (!items.empty()) items.front().reads.clear();
 }
 
+std::uint64_t DrawPipeline::DrainRequestsByReason(DrainReason reason) {
+    return Queue0().reasonRequests[static_cast<std::size_t>(reason)].load(std::memory_order_relaxed);
+}
+
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > 8) return std::nullopt;
     if (DrawFinisher::Overlap()) {
@@ -2417,6 +2497,25 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
         return value;
     }
     return std::nullopt;
+}
+
+DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out) {
+    const auto end = address + bytes;
+    if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return QueuedWrite::Unknown;
+    auto answer = QueuedWrite::None;
+    std::lock_guard lock(mutex);
+    for (auto item = items.rbegin(); item != items.rend(); ++item) {
+        if (std::none_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; })) continue;
+        if (!item->store) return QueuedWrite::Unknown;
+        if (out.empty()) {
+            answer = QueuedWrite::Stored;
+            continue;
+        }
+        if (out.size() != bytes || address < item->labelAddress || end > item->labelAddress + item->labelBytes.size()) return QueuedWrite::Unknown;
+        std::memcpy(out.data(), item->labelBytes.data() + (address - item->labelAddress), bytes);
+        return QueuedWrite::Stored;
+    }
+    return answer;
 }
 
 void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {

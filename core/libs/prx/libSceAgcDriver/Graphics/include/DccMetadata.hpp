@@ -74,6 +74,8 @@ DccKeys TextureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
 struct DccKeyProof {
     DccKeys keys = DccKeys::Uncompressed;
     std::uint64_t generation = 0;
+    std::uint64_t pendingNote = 0;
+    std::uint64_t pendingRecorder = 0;
 };
 // TextureClearKeys with the scan skipped while the key range is unchanged since `proof` was taken
 // (CollectWrites over the keys, then UnchangedSince its generation), so a surface's keys are scanned
@@ -86,6 +88,8 @@ struct DccKeyProof {
 DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, DccKeyProof& proof);
 enum class KeyProofOutcome : std::uint8_t { None, Proved, Stable, Unwatched, Memoized, PendingWriter, SnapshotPending, Fills, Count };
 KeyProofOutcome& LastKeyProofOutcome();
+DccKeyProof PendingKeyProof(const GuestTextureResource& resource, std::uint64_t guestBytes, DccKeys keys);
+bool PendingKeyProofHolds(const GuestTextureResource& resource, std::uint64_t guestBytes, const DccKeyProof& proof);
 bool KeyFastPath();
 bool SingleKeysReadable(const GuestTextureResource& resource);
 bool ReadSingleElement(const GuestTextureResource& resource, std::span<std::byte> element);

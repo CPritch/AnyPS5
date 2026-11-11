@@ -165,13 +165,13 @@ Arithmetic CountArithmetic(std::span<const std::uint32_t> spirv) {
             if (spirv[offset + 2u] == 32u) single = spirv[offset + 1u];
         }
         if (opcode == spv::OpTypeVector && words >= 4u && half && spirv[offset + 2u] == *half && spirv[offset + 3u] == 2u) pair = spirv[offset + 1u];
-        const bool arithmetic = opcode == spv::OpFAdd || opcode == spv::OpFSub || opcode == spv::OpFMul || (opcode == spv::OpExtInst && words >= 5u && spirv[offset + 4u] == GLSLstd450Fma);
+        const bool arithmetic = opcode == spv::OpFAdd || opcode == spv::OpFSub || opcode == spv::OpFMul || opcode == spv::OpFmaKHR || (opcode == spv::OpExtInst && words >= 5u && spirv[offset + 4u] == GLSLstd450Fma);
         if (arithmetic && words >= 3u) {
             const std::uint32_t type = spirv[offset + 1u];
             if (pair && type == *pair) {
                 if (opcode == spv::OpFAdd) ++counts.f16x2Add;
                 if (opcode == spv::OpFMul) ++counts.f16x2Mul;
-                if (opcode == spv::OpExtInst) ++counts.f16x2Fma;
+                if (opcode == spv::OpExtInst || opcode == spv::OpFmaKHR) ++counts.f16x2Fma;
             }
             if (single && type == *single) ++counts.f32;
         }
@@ -203,6 +203,7 @@ int main() {
             return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end();
         };
         const bool nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
+        const bool exactNativeFma = supports(spv::CapabilityFMAKHR);
         const char* switchText = std::getenv("APS5_FAST_F16");
         const bool switchOn = switchText == nullptr || std::strcmp(switchText, "0") != 0;
         Require(target.fastFloat16 == (switchOn && nativeFloat16), std::string("fast f16: the device target has the switch ") + (target.fastFloat16 ? "on" : "off") + " with APS5_FAST_F16 " + (switchText == nullptr ? "unset" : switchText));
@@ -243,7 +244,7 @@ int main() {
 
         const Arithmetic cachedFast = CountArithmetic(compile(fastTarget, Modes[0], true).spirv.Words());
         const Arithmetic cachedExact = CountArithmetic(compile(exactTarget, Modes[0], true).spirv.Words());
-        Require(cachedFast.f16x2Fma != 0u && cachedExact.f16x2Fma == 0u, "fast f16: the cached builds with and without the switch share a module (" + Describe(cachedFast) + "; " + Describe(cachedExact) + ")");
+        Require(cachedFast.f16x2Fma != 0u && (exactNativeFma || cachedExact.f16x2Fma == 0u), "fast f16: the cached builds with and without the switch share a module (" + Describe(cachedFast) + "; " + Describe(cachedExact) + ")");
 
         std::uint64_t compared = 0u;
         std::uint64_t neighbours = 0u;
@@ -255,7 +256,7 @@ int main() {
             if (!mode.compared) continue;
             const auto exact = compile(exactTarget, mode, false);
             const Arithmetic exactCounts = CountArithmetic(exact.spirv.Words());
-            Require(exactCounts.f16x2Add == AddCount && exactCounts.f16x2Mul == MulCount && exactCounts.f16x2Fma == 0u && exactCounts.f32 != 0u,
+            Require(exactCounts.f16x2Add == AddCount && exactCounts.f16x2Mul == MulCount && (exactNativeFma ? exactCounts.f16x2Fma == 0u || exactCounts.f16x2Fma == FmaCount : exactCounts.f16x2Fma == 0u && exactCounts.f32 != 0u),
                 std::string("fast f16: ") + mode.name + " without the switch has " + Describe(exactCounts));
             for (std::uint32_t batch = 0; batch < Batches; ++batch) {
                 for (auto& word : Input) word = OrdinaryHalf() | (OrdinaryHalf() << 16u);

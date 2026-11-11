@@ -96,6 +96,8 @@ public:
     static bool UnlockedWriteWatch();
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class ItemKind : std::uint8_t { Other, Draw, IndirectDraw, Dispatch, DispatchMiss, DispatchNoRecipe, Label, Fill, Copy, Store, Pass, Seal, Completion, Dump, Count };
+    enum class QueuedWrite : std::uint8_t { None, Stored, Unknown };
+    enum class CommitKind : std::uint8_t { Other, Draw, IndirectDraw, ColorMetadata, Dispatch, SampleDump, DmaFill, DmaWrite, DmaCopy, Store, EndOfPipe, Seal, SubmitEnd, Completion, BufferFill, Count };
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
@@ -110,6 +112,9 @@ public:
     static bool PreparesAhead();
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {});
+    void Enqueue(CommitKind commitKind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {});
+    void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
+    static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
     static unsigned ResolveSplit();
     enum class EarlyEvent : std::uint8_t { Used, StaleProof, StalePending, StaleImports, StaleDevice, StaleSubmit, StaleRedo, StaleNoted, StaleTemplate, OverlapAfter, ResolverFailed, DeclinedWriters, MultisampleFound, MultisampleMissed, VerifyMatched, VerifyDiffered, Unoffered, KeptRecipe, KeptTessellation, KeptEpoch, KeptReadsWritten, KeptDepthColour, KeptPredictor, KeptCurrentTemplate, KeptDescribed, IdleSubmitAfterEmit, NextMissing, NextNotDraw, NextNoHook, LateOffered, AcrossSeal, AcrossLabels, UsedAcrossLabels, StaleScoped, StaleScopedTemplate, PostedTwoAhead, Count };
     static void NoteEarly(EarlyEvent event);
@@ -185,6 +190,7 @@ public:
     void Stop();
     void ReleaseRetired();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
+    static std::uint64_t DrainRequestsByReason(DrainReason reason);
     bool Busy() const;
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
@@ -199,6 +205,7 @@ public:
     static void SkipCommittingReads(bool skip);
     static std::uint64_t HeldReadQueries();
     void ReleaseRunningReads();
+    QueuedWrite StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out);
 
     static bool MetadataPassesPipelined();
     static void CountPipelinedMetadataPass();
@@ -213,8 +220,11 @@ private:
         bool draw = false;
         ItemKind kind = ItemKind::Other;
         Early early;
+        bool store = false;
+        CommitKind commitKind = CommitKind::Other;
     };
     DrawPipeline() = default;
+    void enqueue(Item item, Prepare prepare);
     void run();
     void prepareAhead();
     void queuePrepare(Prepare prepare);
@@ -272,6 +282,9 @@ private:
     std::array<std::uint64_t, 5> drawRuns{}, drawRunDraws{};
     std::uint64_t drawRun = 0;
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainReason::Count)> reasonRequests{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> commitKindCommits{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> commitKindNs{};
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     std::mutex prepareMutex;

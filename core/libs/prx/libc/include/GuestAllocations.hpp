@@ -80,6 +80,7 @@ bool GuestAllocationsAcquireChanged_nid_no_patch(std::uint64_t since, const std:
 bool GuestAllocationsLeaseCurrent_nid_no_patch(const Lease& lease, std::uint64_t* generation);
 bool GuestAllocationsLeaseGeneration_nid_no_patch(const Lease& lease, std::uint64_t* generation);
 std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t address, bool next);
+void GuestAllocationsLookupEach_nid_postfix(const std::uintptr_t* addresses, std::size_t count, std::shared_ptr<const Range>* ranges);
 // Changes whenever a mutation ends, so callers can cache facts about guest mappings between changes.
 std::uint64_t GuestAllocationsGeneration_nid_postfix();
 bool GuestAllocationsChangedSince_nid_postfix(std::uint64_t generation, std::uintptr_t address, std::size_t bytes);

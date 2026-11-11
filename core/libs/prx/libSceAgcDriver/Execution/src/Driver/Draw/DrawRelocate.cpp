@@ -348,6 +348,7 @@ void Driver::tagUserValueWords(DispatchVariant& variant, const DrawProgram& prog
 }
 
 void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied, const PoolRelocation* pool) {
+    variant.userWordsWalked = use.asBase | use.asValue;
     std::uint64_t relocatable = eligible && drawRelocationEnabled() ? use.asBase & ~(use.asValue | use.asBufferBase) : 0;
     if (pool != nullptr && eligible && drawRelocationEnabled()) relocatable |= pool->words;
     if (hiddenWords != 0) relocatable &= hiddenWords >= 64 ? 0 : ~((std::uint64_t {1} << hiddenWords) - 1);
@@ -571,6 +572,7 @@ void SeedFromDonor(DispatchVariant& copy, const DispatchVariant& variant, bool s
     copy.runs.assign(variant.runs.begin(), variant.runs.end());
     copy.runBases.assign(variant.runBases.begin(), variant.runBases.end());
     copy.relocatableWords = variant.relocatableWords;
+    copy.userWordsWalked = variant.userWordsWalked;
     copy.valueWords = variant.valueWords;
     copy.valueSlots.assign(variant.valueSlots.begin(), variant.valueSlots.end());
     copy.calleeWords = variant.calleeWords;
@@ -628,11 +630,11 @@ const char* DifferingField(const DispatchVariant& a, const DispatchVariant& b) {
     if (a.runs != b.runs) return "runs";
     if (a.runBases != b.runBases) return "run bases";
     if (a.words != b.words) return "words";
-    if (a.relocatableWords != b.relocatableWords || a.valueWords != b.valueWords || a.calleeWords != b.calleeWords) return "tagged words";
+    if (a.relocatableWords != b.relocatableWords || a.userWordsWalked != b.userWordsWalked || a.valueWords != b.valueWords || a.calleeWords != b.calleeWords) return "tagged words";
     if (a.valueSlots != b.valueSlots) return "value slots";
     if (a.calleeReads != b.calleeReads) return "callee reads";
     if (a.forgetSerial != b.forgetSerial || a.pushOffset != b.pushOffset || a.flatBinding != b.flatBinding || a.userDataMask != b.userDataMask) return "scalars";
-    if (a.compiled != b.compiled || a.shader != b.shader || a.vertexInfo != b.vertexInfo || a.registeredViews != b.registeredViews || a.memory != b.memory) return "shared state";
+    if (a.compiled != b.compiled || a.shader != b.shader || a.vertexInfo != b.vertexInfo || a.registeredViews != b.registeredViews || a.memory != b.memory || a.donor != b.donor) return "shared state";
     if (a.meshIndexDescriptor != b.meshIndexDescriptor) return "mesh index descriptor";
     if (a.dataPositions != b.dataPositions || a.dataSlots != b.dataSlots) return "data positions";
     if (a.shaderDataPatches != b.shaderDataPatches) return "shader data patches";
@@ -692,6 +694,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
         relocated = std::make_shared<DrawEntry>();
         relocated->decode = donor->decode;
     }
+    relocated->donor = donor->donor != nullptr ? donor->donor : donor;
     relocated->stages.resize(donor->stages.size());
     thread_local RelocationMoveSet set;
     for (std::size_t i = 0; i < donor->stages.size(); ++i) {
@@ -716,10 +719,12 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->runs = variant->runs;
             copy->runBases = variant->runBases;
             copy->relocatableWords = variant->relocatableWords;
+            copy->userWordsWalked = variant->userWordsWalked;
             copy->valueWords = variant->valueWords;
             copy->valueSlots = variant->valueSlots;
             copy->calleeWords = variant->calleeWords;
             copy->calleeReads = variant->calleeReads;
+            copy->donor = variant->donor != nullptr ? variant->donor : variant;
             copy->words = variant->words;
             copy->forgetSerial = variant->forgetSerial;
             copy->compiled = variant->compiled;
@@ -765,6 +770,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
                     const bool sameDonor = SameOwner(slot->tag, variant);
                     slot->tag.reset();
                     SeedFromDonor(*slot->object, *variant, sameDonor);
+                    slot->object->donor = variant->donor != nullptr ? variant->donor : variant;
                     ApplyIndexedMoves(*slot->object, *variant, set);
                     slot->tag = variant;
                     copy = slot->object;
@@ -893,14 +899,7 @@ void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     const auto base = variant.compiled;
     const auto baseInfo = variant.vertexInfo;
     auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
-    for (const auto& [slot, value] : variant.shaderDataPatches) {
-        const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
-        if (at + sizeof(std::uint32_t) <= rebased->pushConstants.size()) std::memcpy(rebased->pushConstants.data() + at, &value, sizeof(value));
-        for (std::size_t index = 0; index < rebased->bindings.size(); ++index) {
-            const auto& binding = std::as_const(rebased->bindings)[index];
-            if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData && slot < binding.guestDescriptor.size()) rebased->bindings.Patch(index).guestDescriptor[slot] = value;
-        }
-    }
+    for (const auto& [slot, value] : variant.shaderDataPatches) patchForwardedWord(*rebased, slot, value);
     for (const auto& [binding, word, value] : variant.descriptorPatches) {
         if (binding < rebased->bindings.size() && word < std::as_const(rebased->bindings)[binding].guestDescriptor.size()) rebased->bindings.Patch(binding).guestDescriptor[word] = value;
     }
@@ -923,6 +922,15 @@ void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     variant.shaderDataPatches.clear();
     variant.rebasedWords.clear();
     variant.descriptorPatches.clear();
+}
+
+void Driver::patchForwardedWord(ShaderRecompiler::RecompileResult& result, std::uint32_t slot, std::uint32_t value) {
+    const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
+    if (at + sizeof(std::uint32_t) <= result.pushConstants.size()) std::memcpy(result.pushConstants.data() + at, &value, sizeof(value));
+    for (std::size_t index = 0; index < result.bindings.size(); ++index) {
+        const auto& binding = std::as_const(result.bindings)[index];
+        if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData && slot < binding.guestDescriptor.size()) result.bindings.Patch(index).guestDescriptor[slot] = value;
+    }
 }
 
 void Driver::reportDrawRelocation() {
