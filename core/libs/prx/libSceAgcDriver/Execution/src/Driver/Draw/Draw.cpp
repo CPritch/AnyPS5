@@ -357,6 +357,7 @@ struct DrawTail {
     bool verifyHit = false;
     bool stageEntries = false;
     bool patchedStages = false;
+    bool rebasedStages = false;
     const Submission* submission = nullptr;
     std::shared_ptr<const ShaderRegistry> shaders;
     std::uint32_t submissionQueue = 0;
@@ -1098,6 +1099,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decode = std::move(current);
     }
     tail.patchedStages = std::any_of(stageData.begin(), stageData.end(), [](const StageDataHit& hit) { return hit.compiled != nullptr; });
+    tail.rebasedStages = rebasedStages;
     tail.relocatedDecode = relocatedDecode;
     std::uint64_t stageDataVerified = 0;
     const auto target = graphics.hasColorTarget ? graphics.color.address : 0;
@@ -1251,6 +1253,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     auto& verifyHit = tail.verifyHit;
     const bool stageEntries = tail.stageEntries;
     const bool patchedStages = tail.patchedStages;
+    const bool rebasedStages = tail.rebasedStages;
     std::uint64_t stageDataVerified = 0;
     Submission handedOff{};
     if (tail.queue == nullptr) {
@@ -1777,7 +1780,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
 
     auto& recipeStages = tail.recipeStages;
-    if (registerKey && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes()) {
+    if (registerKey && !drawParameters.indirect && !patchedStages && !rebasedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? (matched[i] != nullptr && matched[i]->donor != nullptr ? matched[i]->donor : matched[i]) : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();

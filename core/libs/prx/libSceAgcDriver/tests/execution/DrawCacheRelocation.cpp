@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCompilePool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -56,6 +58,7 @@ alignas(256) constexpr std::array<std::uint32_t, 16> ForwardedPixelCode{
 alignas(256) constexpr std::array<std::uint32_t, 4> FetchVertexCode{0xbe8a2108u, 0xf80008cfu, 0x0b0a0908u, 0xbf810000u};
 // buffer_load_dword v0 through the V# in user words 0-3, exported as red and alpha.
 alignas(256) constexpr std::array<std::uint32_t, 8> BoundPixelCode{0xe0300000u, 0x80000000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 8> RecipeBoundPixelCode = BoundPixelCode;
 // The same load through that V# with 16 added to its base word.
 alignas(256) constexpr std::array<std::uint32_t, 12> OffsetPixelCode{0x80049000u, 0xbe850301u, 0xbe860302u, 0xbe870303u, 0xe0300000u, 0x80010000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
 // The same load through the V# that s_load_dwordx4 reads from the table user words 0-1 point to.
@@ -81,6 +84,7 @@ alignas(8) Header RecipeVertexHeader{};
 alignas(8) Header TriangleVertexHeader{};
 alignas(8) Header ForwardedPixelHeader{};
 alignas(8) Header BoundPixelHeader{};
+alignas(8) Header RecipeBoundPixelHeader{};
 alignas(8) Header OffsetPixelHeader{};
 alignas(8) Header TablePixelHeader{};
 
@@ -538,6 +542,7 @@ public:
     TiledTarget& operator=(const TiledTarget&) = delete;
 
     const void* Data() const { return block; }
+    std::uint8_t* Bytes() const { return block; }
 
 private:
     std::uint8_t* block = nullptr;
@@ -566,6 +571,66 @@ void RelocatedDrawsReuseTheirRecipe(bool libraries) {
     const auto hits = counters.hits - start.hits;
     Require(hits == moved.size() - 4, mode + ": draws whose data moved again made " + std::to_string(hits) + " draw-cache hits, expected " + std::to_string(moved.size() - 4));
     Require(recipeHits == hits, mode + ": " + std::to_string(recipeHits) + " of " + std::to_string(hits) + " draws served by a relocated entry were recorded from the cached draw's recipe, expected all");
+}
+
+void RebasedDrawsKeepOutOfTheDonorRecipe(bool libraries) {
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(RecipeBoundPixelHeader, RecipeBoundPixelCode.data(), sizeof(RecipeBoundPixelCode), 1);
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries, a tiled target";
+    static const TiledTarget target;
+    static const TiledTarget pool;
+    std::vector<std::uint8_t> pixels(TiledTargetBytes);
+    constexpr std::size_t BufferStride = 256;
+    const auto buffer = [&](std::size_t index) { return reinterpret_cast<float*>(pool.Bytes() + index * BufferStride); };
+    const auto draw = [&](std::size_t index, float value) {
+        std::fill_n(buffer(index), 16, value);
+        const auto sharp = ConstantSharp(buffer(index));
+        auto commands = DrawFrom({}, TriangleVertexCode.data(), RecipeBoundPixelCode.data(), {}, sharp, target.Data(), RenderTargetAttrib3);
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(target.Data()), TiledTargetBytes, nullptr, "test read-back");
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::Read(reinterpret_cast<std::uintptr_t>(target.Data()), std::as_writable_bytes(std::span(pixels)), 1);
+        return AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    };
+    const auto red = [&](std::uint8_t expected) {
+        std::size_t drawn = 0;
+        for (std::size_t at = 0; at < TiledTargetBytes; at += 4) {
+            if (pixels[at] == 0 && pixels[at + 1] == 0 && pixels[at + 2] == 0 && pixels[at + 3] == 0) continue;
+            if (pixels[at] != expected) return false;
+            ++drawn;
+        }
+        return drawn != 0;
+    };
+    AgcDriver::Graphics::SetAsyncCompileForTest(false);
+    constexpr std::size_t donor = 0;
+    const auto start = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    AgcDriver::DriverDetail::DrawEntryCounters counters{};
+    for (const std::size_t index : {donor, std::size_t {1}, std::size_t {2}, donor}) counters = draw(index, 1.0f);
+    Require(counters.hits == start.hits && counters.inserts > start.inserts && red(255), mode + ": the draws that teach the moved buffer made " + std::to_string(counters.hits - start.hits) + " hits and " + std::to_string(counters.inserts - start.inserts) + " inserts, expected no hits and some inserts");
+    auto recipes = AgcDriver::VulkanDevice::DrawRecipeHits();
+    auto before = counters;
+    counters = draw(donor, 1.0f);
+    counters = draw(donor, 1.0f);
+    auto served = AgcDriver::VulkanDevice::DrawRecipeHits() - recipes;
+    Require(counters.hits == before.hits + 2 && red(255), mode + ": the donor draw repeated did not reuse the cached draw with its own buffer (" + std::to_string(counters.hits - before.hits) + " hits)");
+    Require(served != 0, mode + ": the donor draw repeated was not recorded from its recipe");
+    before = counters;
+    recipes = AgcDriver::VulkanDevice::DrawRecipeHits();
+    counters = draw(4, 0.25f);
+    served = AgcDriver::VulkanDevice::DrawRecipeHits() - recipes;
+    Require(counters.hits == before.hits + 1, mode + ": a draw whose V# moved to a buffer with another value did not reuse the cached draw (" + std::to_string(counters.hits - before.hits) + " hits)");
+    Require(red(64), mode + ": a relocated draw whose V# the pool relocation rebased did not bind the buffer its V# moved to");
+    Require(served == 0, mode + ": a relocated draw whose V# the pool relocation rebased was recorded from the donor's recipe");
+    before = counters;
+    recipes = AgcDriver::VulkanDevice::DrawRecipeHits();
+    counters = draw(donor, 1.0f);
+    counters = draw(donor, 1.0f);
+    served = AgcDriver::VulkanDevice::DrawRecipeHits() - recipes;
+    Require(counters.hits == before.hits + 2 && red(255), mode + ": the donor draw repeated after the rebased draw did not draw its own buffer's value");
+    Require(served != 0, mode + ": the donor draw repeated after the rebased draw was not recorded from its recipe");
+    AgcDriver::Graphics::SetAsyncCompileForTest(true);
 }
 
 void UnrelocatedAliasesStayOut(bool libraries) {
@@ -668,6 +733,7 @@ int main(int argc, char** argv) {
             MovedConstantBufferHitsTheCache(libraries, BoundPixelHeader, BoundPixelCode.data(), sizeof(BoundPixelCode), true);
             MovedConstantBufferHitsTheCache(libraries, OffsetPixelHeader, OffsetPixelCode.data(), sizeof(OffsetPixelCode), false);
             MovedTableBufferHitsTheCache(libraries);
+            RebasedDrawsKeepOutOfTheDonorRecipe(libraries);
             AgcDriverShutdown_nid_postfix();
             std::cout << "Draws whose guest pool addresses moved reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
             return 0;
