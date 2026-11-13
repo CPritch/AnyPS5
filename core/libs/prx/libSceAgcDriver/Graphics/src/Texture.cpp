@@ -2650,6 +2650,9 @@ std::string StorageTexture::TakeCommitterRefreshText() {
         writerWaits.clear();
     }
     std::sort(waits.begin(), waits.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    static std::uint64_t landedReported = 0;
+    const auto landed = LandedKeyProofs();
+    text += "; DCC key proofs over landed key stores " + std::to_string(landed - std::exchange(landedReported, landed));
     text += "; image layout records: " + std::to_string(layoutRecordCounts[0].exchange(0, std::memory_order_relaxed)) + " written, " + std::to_string(layoutRecordCounts[1].exchange(0, std::memory_order_relaxed)) + " unchanged";
     text += "; readback stores before a label: memo skips " + std::to_string(labelReadbackCounts[0].exchange(0, std::memory_order_relaxed)) + ", scans " + std::to_string(labelReadbackCounts[1].exchange(0, std::memory_order_relaxed)) + " flushing " + std::to_string(labelReadbackCounts[2].exchange(0, std::memory_order_relaxed)) + " ranges, " + std::to_string(labelReadbackCounts[3].exchange(0, std::memory_order_relaxed)) + " stored";
     text += "; committer image stores waiting for other writers by reason (count/ms; pending writes over the range: stores, shader writers [top programs], other, in the open batch):";

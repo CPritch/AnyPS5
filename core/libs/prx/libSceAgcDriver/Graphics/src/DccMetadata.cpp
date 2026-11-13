@@ -96,6 +96,7 @@ struct ProofCounters {
     std::atomic<std::uint64_t> rangeProved{0};
     std::atomic<std::uint64_t> rangeScanned{0};
     std::atomic<std::uint64_t> storeProofs{0};
+    std::atomic<std::uint64_t> landedProofs{0};
 };
 
 ProofCounters& Proofs() {
@@ -806,7 +807,15 @@ DccKeyProof PendingKeyProof(const GuestTextureResource& resource, std::uint64_t 
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return {};
     const auto info = recorder->DescribePendingWrite(resource.dccAddress, count);
-    if (!info.has_value() || info->signaled) return {};
+    if (!info.has_value()) return {};
+    if (info->signaled) {
+        static const bool landed = std::getenv("APS5_NO_LANDED_KEY_PROOF") == nullptr;
+        if (!landed) return {};
+        const auto collected = GuestMemory::CollectWrites(resource.dccAddress, count);
+        if (collected == 0) return {};
+        Proofs().landedProofs.fetch_add(1, std::memory_order_relaxed);
+        return {keys, collected};
+    }
     const auto note = recorder->NewestWriteNote(resource.dccAddress, count);
     if (note == 0) return {};
     const auto collected = GuestMemory::CollectWrites(resource.dccAddress, count);
@@ -822,6 +831,10 @@ bool PendingKeyProofHolds(const GuestTextureResource& resource, std::uint64_t gu
     if (recorder == nullptr || recorder->Id() != proof.pendingRecorder || recorder->NewestWriteNote(resource.dccAddress, count) != proof.pendingNote) return false;
     const auto info = recorder->DescribePendingWrite(resource.dccAddress, count);
     return info.has_value() && !info->signaled;
+}
+
+std::uint64_t LandedKeyProofs() {
+    return Proofs().landedProofs.load(std::memory_order_relaxed);
 }
 
 DccKeyProofCounts KeyProofCounts() {

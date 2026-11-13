@@ -10277,6 +10277,24 @@ bool pendingKeyRefreshTests(const Device& device, Recorder& recorder) {
         const auto retired = proved();
         image->Refresh();
         Require(proved() == retired, "the proof over the pending uncompressed key fill held after its batch retired");
+        {
+            const auto commands = recorder.Commands();
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, resource.dccAddress - import->base, keyCount, 0xffffffffu);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+            recorder.NotePendingWrite(resource.dccAddress + keyCount / 2, keyCount / 2);
+            recorder.NotePendingFill(resource.dccAddress, keyCount / 2, 0xff);
+        }
+        texels[0] = 0x33;
+        image->Refresh();
+        recorder.Submit();
+        WaitUntilSignaled([&] { return recorder.DescribePendingWrite(resource.dccAddress, keyCount); }, "the batch of the key fill did not signal");
+        const auto landedFills = LandedKeyProofs();
+        const auto unretired = proved();
+        image->Refresh();
+        image->Refresh();
+        Require(LandedKeyProofs() > landedFills, "a key query answered from a key fill that landed but was not retired took no proof");
+        Require(proved() == unretired + 1, "a refresh of the unchanged target over its landed but unretired key fill was not answered from the proof");
+        recorder.Sync();
     }
     recorder.Sync();
     return true;

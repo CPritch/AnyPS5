@@ -90,6 +90,7 @@ enum class KeyProofOutcome : std::uint8_t { None, Proved, Stable, Unwatched, Mem
 KeyProofOutcome& LastKeyProofOutcome();
 DccKeyProof PendingKeyProof(const GuestTextureResource& resource, std::uint64_t guestBytes, DccKeys keys);
 bool PendingKeyProofHolds(const GuestTextureResource& resource, std::uint64_t guestBytes, const DccKeyProof& proof);
+std::uint64_t LandedKeyProofs();
 bool KeyFastPath();
 bool SingleKeysReadable(const GuestTextureResource& resource);
 bool ReadSingleElement(const GuestTextureResource& resource, std::span<std::byte> element);
