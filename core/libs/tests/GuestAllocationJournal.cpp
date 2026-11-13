@@ -515,6 +515,8 @@ void leasesKnowTheirGeneration(bool journal) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (!retiring() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     check(retiring(), "the mutation never waited for the leased range");
+    check(GuestAllocationsRetiring_nid_postfix(reinterpret_cast<std::uintptr_t>(pinned), 65536) && GuestAllocationsRetiring_nid_postfix(reinterpret_cast<std::uintptr_t>(pinned) + 4096, 1), "a range waiting in the pin waiter is not reported retiring");
+    check(!GuestAllocationsRetiring_nid_postfix(reinterpret_cast<std::uintptr_t>(later), 65536) && !GuestAllocationsRetiring_nid_postfix(reinterpret_cast<std::uintptr_t>(pinned) + 65536, 4096), "a range beside the one waiting in the pin waiter is reported retiring");
     {
         const auto waiting = GuestAllocationsAcquire_nid_postfix();
         bool unsettled = false;
@@ -523,6 +525,7 @@ void leasesKnowTheirGeneration(bool journal) {
     }
     lease.reset();
     mutator.join();
+    check(!GuestAllocationsRetiring_nid_postfix(reinterpret_cast<std::uintptr_t>(pinned), 65536), "a range is still reported retiring after its mutation ended");
     Mutation mutation;
     mutation.Remove(later);
 }
