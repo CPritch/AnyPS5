@@ -42,6 +42,26 @@ function(anyps5_apply_initial_exec_tls)
     endforeach()
 endfunction()
 
+option(ANYPS5_O2 "Compile and link the targets in ANYPS5_O2_TARGETS with -O2 instead of the Release build's -O3 on Linux" ON)
+set(ANYPS5_O2_TARGETS "libSceAgcDriver;shader_recompiler_agc_driver" CACHE STRING
+        "Targets ANYPS5_O2 compiles with -O2 in Release builds; a shared library or executable among them also links with -O2, which sets the level of its link-time optimization")
+
+function(anyps5_apply_o2)
+    if(NOT ANYPS5_O2 OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
+        return()
+    endif()
+    foreach(target IN LISTS ANYPS5_O2_TARGETS)
+        if(NOT TARGET ${target})
+            message(FATAL_ERROR "ANYPS5_O2_TARGETS: no target ${target}")
+        endif()
+        target_compile_options(${target} PRIVATE $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:-O2>)
+        get_target_property(type ${target} TYPE)
+        if(type STREQUAL "SHARED_LIBRARY" OR type STREQUAL "MODULE_LIBRARY" OR type STREQUAL "EXECUTABLE")
+            target_link_options(${target} PRIVATE $<$<CONFIG:Release>:-O2>)
+        endif()
+    endforeach()
+endfunction()
+
 set(ANYPS5_LTO_EXCLUDED_TARGETS libc libkernel guest_http_client_tests guest_user_context_tests)
 
 function(anyps5_exclude_targets_from_lto directory)

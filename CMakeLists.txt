@@ -863,5 +863,6 @@ if(ANYPS5_LTO_ACTIVE)
     anyps5_exclude_targets_from_lto("${CMAKE_SOURCE_DIR}")
 endif()
 anyps5_apply_initial_exec_tls()
+anyps5_apply_o2()
 
 anyps5_apply_pgo()
