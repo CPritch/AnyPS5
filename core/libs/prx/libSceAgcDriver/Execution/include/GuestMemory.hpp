@@ -330,6 +330,7 @@ enum class HotThread : std::uint8_t { None = 0, Worker, Finisher, Committer, Cou
 void CountGpuLockWaits(HotThread thread);
 HotThread CurrentHotThread();
 std::string TakeHotLockWaitText();
+std::string TakeTrackerGenerationText();
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).
 void NoteLockedGpuWait(double ms);

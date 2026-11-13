@@ -267,6 +267,7 @@ std::string QueueWaits::Text() {
     text += "; CPU-access GPU waits of the hot threads (largest):" + Graphics::Recorder::TakeHotHookSyncText();
     text += "; GPU waits of the hot threads by source and caller (largest):" + Graphics::Recorder::TakeHotWaitSiteText();
     text += "; GPU lock waits (count, waited):" + GuestMemory::TakeHotLockWaitText();
+    text += "; tracker generation reads:" + GuestMemory::TakeTrackerGenerationText();
     text += TakePatchMemoText();
     if (DrawPipeline::ResolveSplit() != 0) {
         const auto take = [](std::atomic<std::uint64_t>& value) { return std::to_string(value.exchange(0, std::memory_order_relaxed)); };

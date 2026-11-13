@@ -621,6 +621,31 @@ void CheckUnwatch() {
     Require(!UnchangedSince(base, Block, adjacent), "unwatch hid a CPU edit in unrelated memory");
 }
 
+void CheckTrackerGenerationReads() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    CollectWritesUncached(base, 2 * Block);
+    const auto settled = TrackerGeneration();
+    Require(settled == WriteGeneration() && settled == PublishedTrackerGeneration(), "a settled tracker generation read differs from the published generation");
+    const auto stored = MarkWritten(base + 64, 4);
+    Require(stored != 0 && TrackerGeneration() >= stored && TrackerGeneration() == WriteGeneration(), "a tracker generation read after a driver store is older than the store");
+    std::atomic<bool> stop{false};
+    std::thread walker([&] {
+        while (!stop.load(std::memory_order_acquire)) CollectWritesUncached(base, 2 * Block);
+    });
+    std::size_t stale = 0;
+    for (std::uint32_t round = 0; round < 20000; ++round) {
+        const auto read = TrackerGeneration();
+        static_cast<volatile std::uint8_t*>(memory)[Block + (round % 4096) * 16] = static_cast<std::uint8_t>(round);
+        CollectWritesUncached(base + Block, Block);
+        if (NewestStamp(base + Block, Block) <= read) ++stale;
+    }
+    stop.store(true, std::memory_order_release);
+    walker.join();
+    Require(stale == 0, "a CPU store made after a tracker generation read was stamped " + std::to_string(stale) + " times with a generation not newer than the read");
+}
+
 void CheckNewestStamp() {
     void* memory = AllocateWatched(4 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -2620,6 +2645,7 @@ int main(int argc, char** argv) {
         CheckGpuWriteNotListed();
         CheckUnwatch();
         CheckNewestStamp();
+        CheckTrackerGenerationReads();
         CheckPartlyWatchedStore();
 #ifndef _WIN32
         CheckWatchOverlaps();

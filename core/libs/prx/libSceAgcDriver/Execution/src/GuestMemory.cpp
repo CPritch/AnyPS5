@@ -3225,12 +3225,40 @@ std::uint64_t ThreadTrackerWaitNs() {
     return threadTrackerWaitNs;
 }
 
+namespace {
+
+std::array<std::atomic<std::uint64_t>, 2> trackerGenerationReads{};
+
+bool trackerGenerationCounted() {
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    return counted;
+}
+
+bool unlockedTrackerGeneration() {
+    static const bool enabled = std::getenv("APS5_NO_UNLOCKED_TRACKER_GENERATION") == nullptr;
+    return enabled;
+}
+
+}
+
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();
     // Under the mutex: a collect bumps the generation before its walk, and a walk still running
     // when the value is read absorbs stores made after it with a stamp not newer than the value.
+    if (unlockedTrackerGeneration()) {
+        const auto current = tracker.generation.load(std::memory_order_acquire);
+        if (tracker.stable.load(std::memory_order_acquire) == current) {
+            if (trackerGenerationCounted()) trackerGenerationReads[0].fetch_add(1, std::memory_order_relaxed);
+            return current;
+        }
+    }
+    if (trackerGenerationCounted()) trackerGenerationReads[1].fetch_add(1, std::memory_order_relaxed);
     const auto lock = lockTracker(tracker);
     return tracker.generation;
+}
+
+std::string TakeTrackerGenerationText() {
+    return " " + std::to_string(trackerGenerationReads[0].exchange(0, std::memory_order_relaxed)) + " without the lock, " + std::to_string(trackerGenerationReads[1].exchange(0, std::memory_order_relaxed)) + " under it";
 }
 
 void AdvanceTrackerGenerationForTest(std::uint64_t generation) {
