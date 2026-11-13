@@ -26,6 +26,22 @@ if(ANYPS5_LTO AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID M
     endif()
 endif()
 
+option(ANYPS5_INITIAL_EXEC_TLS "Reach the thread-local variables of the libraries every title loads at start with the initial-exec model on Linux" ON)
+set(ANYPS5_INITIAL_EXEC_TLS_TARGETS "libSceAgcDriver;shader_recompiler_agc_driver" CACHE STRING
+        "Library targets ANYPS5_INITIAL_EXEC_TLS compiles with -ftls-model=initial-exec")
+
+function(anyps5_apply_initial_exec_tls)
+    if(NOT ANYPS5_INITIAL_EXEC_TLS OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
+        return()
+    endif()
+    foreach(target IN LISTS ANYPS5_INITIAL_EXEC_TLS_TARGETS)
+        if(NOT TARGET ${target})
+            message(FATAL_ERROR "ANYPS5_INITIAL_EXEC_TLS_TARGETS: no target ${target}")
+        endif()
+        target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-ftls-model=initial-exec>)
+    endforeach()
+endfunction()
+
 set(ANYPS5_LTO_EXCLUDED_TARGETS libc libkernel guest_http_client_tests guest_user_context_tests)
 
 function(anyps5_exclude_targets_from_lto directory)
