@@ -669,9 +669,8 @@ void readableLeaseCachedDuringPinWaits() {
     auto again = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
     auto after = counts();
     check(!holds(*starting, first) && holds(*starting, second) && holds(*starting, kept), "a lease taken while a pin wait starts does not hide the retiring range and show the others");
-    check(after.retiringBuilds == before.retiringBuilds + 1, "the first lease of a pin wait was not built");
-    if (cached) check(starting->Snapshot() == again->Snapshot() && after.retiringHits == before.retiringHits + 1, "a second lease during an unchanged pin wait was built again instead of served from the cache");
-    else check(starting->Snapshot() != again->Snapshot() && after.retiringHits == before.retiringHits, "with APS5_NO_RETIRING_LEASE_CACHE=1 a lease during a pin wait was served from a cache");
+    if (cached) check(after.retiringBuilds == before.retiringBuilds + 1 && starting->Snapshot() == again->Snapshot() && after.retiringHits == before.retiringHits + 1, "a second lease during an unchanged pin wait was built again instead of served from the cache");
+    else check(after.retiringBuilds == before.retiringBuilds + 2 && starting->Snapshot() != again->Snapshot() && after.retiringHits == before.retiringHits, "with APS5_NO_RETIRING_LEASE_CACHE=1 a lease during a pin wait was served from a cache");
     {
         Mutation mutation;
         mutation.Add(added, 65536, true, true, true);
@@ -706,11 +705,13 @@ void readableLeaseCachedDuringPinWaits() {
     secondPin.reset();
     waitUntil([&] { return secondDone.load(); }, "the second mutation did not finish: a lease cached during the first pin wait still pins its range");
     secondMutator.join();
-    before = counts();
-    const auto settled = GuestAllocationsAcquire_nid_postfix();
-    const auto settledAgain = GuestAllocationsAcquire_nid_postfix();
-    after = counts();
-    check(settled.Snapshot() == settledAgain.Snapshot() && after.retiringBuilds == before.retiringBuilds && after.retiringHits == before.retiringHits && !holds(settled, second), "once no range is retiring the settled lease cache does not serve leases again");
+    {
+        before = counts();
+        const auto settled = GuestAllocationsAcquire_nid_postfix();
+        const auto settledAgain = GuestAllocationsAcquire_nid_postfix();
+        after = counts();
+        check(settled.Snapshot() == settledAgain.Snapshot() && after.retiringBuilds == before.retiringBuilds && after.retiringHits == before.retiringHits && !holds(settled, second), "once no range is retiring the settled lease cache does not serve leases again");
+    }
     check(ended() == endedBefore + 2, "the two ended pin waits were not counted by length");
     Mutation mutation;
     mutation.Remove(added);
