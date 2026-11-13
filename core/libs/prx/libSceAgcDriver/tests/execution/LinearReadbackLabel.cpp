@@ -250,8 +250,10 @@ void ReadOccasionalAfterLabel(std::uint8_t* block) {
     SubmitAndWait(Commands(RewriteStoreCode, TiledThreads, userData, label), label, "occasional readback label");
     Require(StorageTexture::OccasionalLabelStores() == stored + 1u, "occasional readback label: a second write with no flip between was chosen for its label");
     StorageTexture::NoteFlip();
+    const auto skips = StorageTexture::LabelStoreMemoSkips();
     SubmitAndWait(Commands(RewriteStoreCode, TiledThreads, userData, label), label, "occasional readback label");
     Require(StorageTexture::OccasionalLabelStores() == stored + 1u, "occasional readback label: an image written on consecutive flips was chosen for its label");
+    Require(StorageTexture::LabelStoreMemoSkips() > skips, "occasional readback label: a label after a write on consecutive flips scanned the pending images although none needed a store");
     for (std::uint64_t flip = 0; flip <= StorageTexture::OccasionalWriteFlips; ++flip) StorageTexture::NoteFlip();
     SubmitAndWait(Commands(AgainStoreCode, TiledThreads, userData, label), label, "occasional readback label");
     Require(CountHolding(texels, bytes, WrittenAgain) == TiledThreads, "occasional readback label: a write after a long gap was not stored before its label");

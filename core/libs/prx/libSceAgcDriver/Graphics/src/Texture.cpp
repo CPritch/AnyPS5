@@ -4772,6 +4772,13 @@ std::optional<StorageTexture::WriteRecord> StorageTexture::LastWrite(std::uint64
 namespace {
 std::atomic<std::uint64_t> flipSerial{0};
 std::atomic<std::uint64_t> occasionalLabelStores{0};
+std::atomic<std::uint64_t> occasionalMarks{0};
+std::atomic<std::uint64_t> labelStoreMemoSkips{0};
+
+bool OccasionalLabelMemo() {
+    static const bool enabled = std::getenv("APS5_NO_OCCASIONAL_LABEL_MEMO") == nullptr;
+    return enabled;
+}
 }
 
 void StorageTexture::NoteFlip() {
@@ -4780,6 +4787,10 @@ void StorageTexture::NoteFlip() {
 
 std::uint64_t StorageTexture::OccasionalLabelStores() {
     return occasionalLabelStores.load(std::memory_order_relaxed);
+}
+
+std::uint64_t StorageTexture::LabelStoreMemoSkips() {
+    return labelStoreMemoSkips.load(std::memory_order_relaxed);
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
@@ -4807,7 +4818,8 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     ++writes;
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (const auto flip = flipSerial.load(std::memory_order_relaxed); writes == 1u || flip != writtenFlip) {
-        writtenOccasionally = writes == 1u || flip - writtenFlip > OccasionalWriteFlips;
+        if (writes != 1u && flip - writtenFlip <= OccasionalWriteFlips) writtenOccasionally.store(false, std::memory_order_relaxed);
+        else if (!writtenOccasionally.exchange(true, std::memory_order_acq_rel)) occasionalMarks.fetch_add(1, std::memory_order_acq_rel);
         writtenFlip = flip;
     }
     std::optional<MapImportGate::PublishHold> publication;
@@ -6013,9 +6025,12 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     if (disabled) return;
     static const bool memo = std::getenv("APS5_NO_LABEL_STORE_MEMO") == nullptr;
     static std::uint64_t cleanAt = ~std::uint64_t{0};
+    static std::uint64_t cleanMarks = ~std::uint64_t{0};
+    const bool occasionalMemo = OccasionalLabelMemo();
     const auto qualifies = [](const StorageTexture* texture) { return texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes; };
     const auto occasionalCandidate = [](const StorageTexture* texture) { return texture->descriptor.tileMode != TextureTileMode::kLinear && texture->guestBytes > SmallStoreBytes && texture->guestBytes <= OccasionalStoreBytes; };
     std::uint64_t seenAt = 0;
+    std::uint64_t seenMarks = 0;
     auto& pending = Pending();
     static const bool gpuOrdered = std::getenv("APS5_NO_FLUSH_GPU_ORDERED") == nullptr;
     struct OrderedScope {
@@ -6027,11 +6042,13 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     std::vector<std::pair<std::uint64_t, std::size_t>> occasional;
     {
         std::lock_guard lock(pending.mutex);
-        if (memo && pendingAdds == cleanAt) {
+        if (memo && pendingAdds == cleanAt && (!occasionalMemo || occasionalMarks.load(std::memory_order_acquire) == cleanMarks)) {
             if (counted) labelReadbackCounts[0].fetch_add(1, std::memory_order_relaxed);
+            labelStoreMemoSkips.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         seenAt = pendingAdds;
+        seenMarks = occasionalMarks.load(std::memory_order_acquire);
 #if defined(__APPLE__)
         const bool trap = LabelTrapsEnabled();
         if (trap) labelTrapsSet.store(true, std::memory_order_relaxed);
@@ -6072,7 +6089,10 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     }
     if (!memo) return;
     std::lock_guard lock(pending.mutex);
-    if (std::none_of(pending.textures.begin(), pending.textures.end(), [&](const StorageTexture* texture) { return qualifies(texture) || occasionalCandidate(texture); })) cleanAt = seenAt;
+    if (std::none_of(pending.textures.begin(), pending.textures.end(), [&](const StorageTexture* texture) { return qualifies(texture) || (occasionalCandidate(texture) && (!occasionalMemo || texture->writtenOccasionally.load(std::memory_order_acquire))); })) {
+        cleanAt = seenAt;
+        cleanMarks = seenMarks;
+    }
 }
 
 std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {

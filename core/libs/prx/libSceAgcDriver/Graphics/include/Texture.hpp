@@ -531,6 +531,7 @@ public:
     static std::uint64_t UntrackedCompares();
     static std::uint64_t GuestSnapshots();
     static std::uint64_t OccasionalLabelStores();
+    static std::uint64_t LabelStoreMemoSkips();
     std::uint64_t GuestBytes() const;
     std::uint64_t BudgetBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
