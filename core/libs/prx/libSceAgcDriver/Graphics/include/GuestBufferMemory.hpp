@@ -267,6 +267,7 @@ struct ImportChurnCounts {
 };
 bool ImportChurnCounted();
 ImportChurnCounts ImportChurnTotals();
+std::string TakeTailBundleText();
 void NoteRevalidateFull(std::uint64_t ns);
 void NoteImportProofWalk();
 void SetMapImportHookForTest(void (*hook)());

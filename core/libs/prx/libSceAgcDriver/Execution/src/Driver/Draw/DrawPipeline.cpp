@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -2086,6 +2087,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     drains = {};
     drainWaitNs = {};
     AgcDriver::ProfilePrint_nid_no_patch("[waits] queue 0 (10 s): %s\n", QueueWaits::Text().c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[tail] (10 s):%s\n", Graphics::TakeTailBundleText().c_str());
 }
 
 

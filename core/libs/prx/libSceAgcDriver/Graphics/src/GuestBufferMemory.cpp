@@ -8800,6 +8800,20 @@ ImportsProofCheck HostImportsUnchangedOver(const Context& context, HostImportsPr
     return ImportsProofCheck::Survived;
 }
 
+std::string TakeTailBundleText() {
+    static ImportChurnCounts seen = ImportChurnTotals();
+    static std::uint64_t seenNotes = GuestMemory::EarlyHolderNotes();
+    const auto now = ImportChurnTotals();
+    const auto notes = GuestMemory::EarlyHolderNotes();
+    const auto delta = [](std::uint64_t current, std::uint64_t before) { return static_cast<unsigned long long>(current - before); };
+    const auto micros = [](std::uint64_t current, std::uint64_t before) { return static_cast<unsigned long long>((current - before) / 1000u); };
+    char text[768];
+    std::snprintf(text, sizeof(text), " imports hashed and made outside the tracker lock %llu (%llu us outside it), hashed again under it %llu, tracker walks that waited for such an import %llu (%llu us); import reconciles aborted at the Import barrier before their lease %llu; journal reconciles during a pin wait %llu, pin-wait fallbacks to a full reconcile %llu, journal reseeds from a pin-wait lease %llu; template import proofs region-checked %llu, their reconciles skipped %llu; GPU-lock holders named as they took the lock %llu", delta(now.trackerUnlocked, seen.trackerUnlocked), micros(now.trackerUnlockedNs, seen.trackerUnlockedNs), delta(now.trackerRedos, seen.trackerRedos), delta(now.windowWaits, seen.windowWaits), micros(now.windowWaitNs, seen.windowWaitNs), delta(now.earlyBarrierAborts, seen.earlyBarrierAborts), delta(now.pinWaitJournal, seen.pinWaitJournal), delta(now.pinWaitFallbacks, seen.pinWaitFallbacks), delta(now.pinWaitReseeds, seen.pinWaitReseeds), delta(now.regionChecks, seen.regionChecks), delta(now.regionSkips, seen.regionSkips), delta(notes, seenNotes));
+    seen = now;
+    seenNotes = notes;
+    return text;
+}
+
 bool ImportChurnCounted() {
     static const bool counted = std::getenv("APS5_LONG_WAIT_LOG") != nullptr;
     return counted;

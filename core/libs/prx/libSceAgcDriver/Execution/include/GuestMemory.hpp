@@ -343,6 +343,7 @@ void TagGpuLockSite(GpuLockSite site);
 enum class HotThread : std::uint8_t { None = 0, Worker, Finisher, Committer, Count };
 void CountGpuLockWaits(HotThread thread);
 void SetGpuLockWaitedHookForTest(void (*hook)());
+std::uint64_t EarlyHolderNotes();
 HotThread CurrentHotThread();
 std::string TakeHotLockWaitText();
 std::string TakeTrackerGenerationText();

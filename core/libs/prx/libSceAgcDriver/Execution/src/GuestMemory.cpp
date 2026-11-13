@@ -3821,6 +3821,7 @@ void NoteGpuHolder(const void* site) {
 }
 
 std::atomic<void (*)()> gpuLockWaitedHookForTest{nullptr};
+std::atomic<std::uint64_t> earlyHolderNotes{0};
 
 bool earlyHolderNote() {
     static const bool enabled = std::getenv("APS5_NO_EARLY_HOLDER_NOTE") == nullptr;
@@ -3878,6 +3879,10 @@ void CountGpuLockWaits(HotThread thread) {
 
 void SetGpuLockWaitedHookForTest(void (*hook)()) {
     gpuLockWaitedHookForTest.store(hook, std::memory_order_release);
+}
+
+std::uint64_t EarlyHolderNotes() {
+    return earlyHolderNotes.load(std::memory_order_relaxed);
 }
 
 HotThread CurrentHotThread() {
@@ -4252,6 +4257,7 @@ void GpuMutexType::lock() {
                 LockCountingWaiters(mutex);
                 if (GpuHoldersCounted() && earlyHolderNote()) {
                     NoteGpuHolder(__builtin_return_address(0));
+                    earlyHolderNotes.fetch_add(1, std::memory_order_relaxed);
                     noted = true;
                 }
                 if (const auto hook = gpuLockWaitedHookForTest.load(std::memory_order_acquire)) hook();
