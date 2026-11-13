@@ -2409,7 +2409,7 @@ bool drawStagingEnabled() {
     return !disabled;
 }
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, const DrawPlan& plan, DrawOutcome& outcome, DrawTimer& timer, const AheadUse& ahead) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawPlan& plan, DrawOutcome& outcome, DrawTimer& timer, const AheadUse& ahead) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -2428,7 +2428,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     if (address == AddressStages::Storing) reuse = AddressDrawReuse::NotReadOnly;
     else if (address == AddressStages::ReadOnly && !resolved.cacheable) reuse = AddressDrawReuse::NotSpaceOnly;
     if (resolved.cacheable) {
-        resolved.contentKey = plan.contentKey;
+        static const bool movedKey = std::getenv("APS5_NO_MOVED_PLAN_KEY") == nullptr;
+        if (movedKey && !VerifyDrawPlan()) resolved.contentKey = std::move(plan.contentKey);
+        else resolved.contentKey = plan.contentKey;
         std::shared_ptr<ShaderResources> cached;
         bool fromHint = false;
         if (ahead.ahead != nullptr && ahead.ahead->looked) {
@@ -4101,7 +4103,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     static const bool deferInputReads = std::getenv("APS5_NO_DEFERRED_INPUT_READS") == nullptr;
     std::optional<AgcDriver::DriverDetail::DrawPipeline::LaneSerial> laneSerial;
     laneSerial.emplace();
-    const auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer, prepared.ahead);
+    auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer, prepared.ahead);
     if (plan.nothing) return false;
     inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing, deferInputReads && !redoingWhole ? &prepared.deferredReads : nullptr);
     if (inputs.nothing) {
