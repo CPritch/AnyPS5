@@ -4023,7 +4023,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             if (on) GuestMemory::BeginResolveLockTrace();
         }
         ~ResolveTraceScope() {
-            if (!on) return;
+            if (on) [[unlikely]] finish();
+        }
+        [[gnu::cold, gnu::noinline]] void finish() {
             const auto trace = GuestMemory::EndResolveLockTrace();
             auto& split = DrawSplit();
             split.traced.fetch_add(1, std::memory_order_relaxed);

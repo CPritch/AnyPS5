@@ -297,6 +297,7 @@ public:
     static const char* MoveRefusalName(MoveRefusal refusal);
     std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof) const;
     static std::size_t MaxDrawSnapshotBytes();
+    static void SetMaxDrawSnapshotBytesForTest(std::optional<std::size_t> bytes);
     static std::size_t DrawUploadLimit();
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU

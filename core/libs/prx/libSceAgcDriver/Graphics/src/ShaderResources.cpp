@@ -4525,12 +4525,12 @@ bool ShaderResources::EpochProofs() {
 
 namespace {
 void noteEpochProof(bool reused, bool verified, bool failed) {
+    static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+    if (!report) return;
     static std::atomic<std::uint64_t> reuses{0}, proofs{0}, checks{0}, failures{0};
     if (verified) checks.fetch_add(1, std::memory_order_relaxed);
     if (failed) failures.fetch_add(1, std::memory_order_relaxed);
     const auto count = (reused ? reuses : proofs).fetch_add(1, std::memory_order_relaxed) + 1u;
-    static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
-    if (!report) return;
     if (count % 262144u == 0u || (count & (count - 1u)) == 0u) std::fprintf(stderr, "[epoch-proofs] resource proofs: %llu reused the epoch's, %llu proved; verify: %llu checked, %llu failed; storage refreshes reused %llu\n", static_cast<unsigned long long>(reuses.load()), static_cast<unsigned long long>(proofs.load()), static_cast<unsigned long long>(checks.load()), static_cast<unsigned long long>(failures.load()), static_cast<unsigned long long>(StorageTexture::epochRefreshes.load()));
 }
 }
@@ -7840,10 +7840,25 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedD
     return moved;
 }
 
+namespace {
+
+std::atomic<bool> drawSnapshotCapForced{false};
+std::atomic<std::size_t> forcedDrawSnapshotBytes{0};
+
+}
+
 std::size_t ShaderResources::MaxDrawSnapshotBytes() {
-    const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
-    const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
-    return static_cast<std::size_t>(mib * 1024ull * 1024ull);
+    static const std::size_t configured = [] {
+        const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
+        const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
+        return static_cast<std::size_t>(mib * 1024ull * 1024ull);
+    }();
+    return drawSnapshotCapForced.load(std::memory_order_acquire) ? forcedDrawSnapshotBytes.load(std::memory_order_relaxed) : configured;
+}
+
+void ShaderResources::SetMaxDrawSnapshotBytesForTest(std::optional<std::size_t> bytes) {
+    forcedDrawSnapshotBytes.store(bytes.value_or(0), std::memory_order_relaxed);
+    drawSnapshotCapForced.store(bytes.has_value(), std::memory_order_release);
 }
 
 std::size_t ShaderResources::DrawUploadLimit() {

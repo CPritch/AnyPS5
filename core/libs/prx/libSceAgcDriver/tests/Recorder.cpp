@@ -5453,28 +5453,10 @@ void drawSnapshotEpochTests(const Device& device) {
 void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
-    const char* previous = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
-    const std::string saved = previous != nullptr ? previous : "";
-#ifdef _WIN32
-    Require(_putenv_s("APS5_DRAW_SNAPSHOT_MAX_MIB", "1") == 0, "cannot set snapshot cap");
-#else
-    Require(setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", "1", 1) == 0, "cannot set snapshot cap");
-#endif
+    ShaderResources::SetMaxDrawSnapshotBytesForTest(std::size_t{1} << 20);
     struct RestoreCap {
-        const char* previous;
-        std::string saved;
-        ~RestoreCap() {
-#ifdef _WIN32
-            _putenv_s("APS5_DRAW_SNAPSHOT_MAX_MIB", saved.c_str());
-#else
-            if (previous != nullptr) {
-                setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", saved.c_str(), 1);
-            } else {
-                unsetenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
-            }
-#endif
-        }
-    } restore{previous, saved};
+        ~RestoreCap() { ShaderResources::SetMaxDrawSnapshotBytesForTest(std::nullopt); }
+    } restore;
     constexpr std::size_t bytes = 3 * 1024 * 1024;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
@@ -5554,19 +5536,11 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         Require(inPlace[0] == std::byte{0x33} && std::all_of(inPlace, inPlace + largeBytes, [](std::byte value) { return value == std::byte{0x33}; }), "in-place bound input did not observe CPU write");
         std::memset(block, 0x11, bytes);
         snapshotRecorder.Sync();
-#ifdef _WIN32
-        Require(_putenv_s("APS5_DRAW_SNAPSHOT_MAX_MIB", "64") == 0, "cannot raise snapshot cap");
-#else
-        Require(setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", "64", 1) == 0, "cannot raise snapshot cap");
-#endif
+        ShaderResources::SetMaxDrawSnapshotBytesForTest(std::size_t{64} << 20);
         const auto again = resources.PrepareDrawBindings(snapshotRecorder);
         Require(again != nullptr && again->snapshots.size() == 1 && again->snapshots[0].address == smallAddress, "built resources read the draw snapshot cap again instead of keeping the one they were built with");
         snapshotRecorder.Sync();
-#ifdef _WIN32
-        Require(_putenv_s("APS5_DRAW_SNAPSHOT_MAX_MIB", "1") == 0, "cannot restore snapshot cap");
-#else
-        Require(setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", "1", 1) == 0, "cannot restore snapshot cap");
-#endif
+        ShaderResources::SetMaxDrawSnapshotBytesForTest(std::size_t{1} << 20);
     }
     const auto firstAddress = address + 4096;
     constexpr std::size_t firstBytes = 600 * 1024;

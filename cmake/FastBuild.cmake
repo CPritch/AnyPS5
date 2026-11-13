@@ -1,9 +1,13 @@
 option(ANYPS5_NO_SEMANTIC_INTERPOSITION "Compile the project's own targets with -fno-semantic-interposition on Linux" ON)
+option(ANYPS5_NO_STACK_PROTECTOR "Compile the project's own targets without the stack protector on Linux" ON)
 set(ANYPS5_MARCH "native" CACHE STRING "Value of -march for the project's own targets on Linux; empty leaves the compiler default")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
     if(ANYPS5_NO_SEMANTIC_INTERPOSITION)
         add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fno-semantic-interposition>)
+    endif()
+    if(ANYPS5_NO_STACK_PROTECTOR)
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fno-stack-protector>)
     endif()
     if(ANYPS5_MARCH)
         add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-march=${ANYPS5_MARCH}> $<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off>)
@@ -21,6 +25,42 @@ if(ANYPS5_LTO AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID M
         message(WARNING "ANYPS5_LTO is on but link-time optimization is not supported: ${ANYPS5_IPO_OUTPUT}")
     endif()
 endif()
+
+option(ANYPS5_INITIAL_EXEC_TLS "Reach the thread-local variables of the libraries every title loads at start with the initial-exec model on Linux" ON)
+set(ANYPS5_INITIAL_EXEC_TLS_TARGETS "libSceAgcDriver;shader_recompiler_agc_driver" CACHE STRING
+        "Library targets ANYPS5_INITIAL_EXEC_TLS compiles with -ftls-model=initial-exec")
+
+function(anyps5_apply_initial_exec_tls)
+    if(NOT ANYPS5_INITIAL_EXEC_TLS OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
+        return()
+    endif()
+    foreach(target IN LISTS ANYPS5_INITIAL_EXEC_TLS_TARGETS)
+        if(NOT TARGET ${target})
+            message(FATAL_ERROR "ANYPS5_INITIAL_EXEC_TLS_TARGETS: no target ${target}")
+        endif()
+        target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-ftls-model=initial-exec>)
+    endforeach()
+endfunction()
+
+option(ANYPS5_O2 "Compile and link the targets in ANYPS5_O2_TARGETS with -O2 instead of the Release build's -O3 on Linux" ON)
+set(ANYPS5_O2_TARGETS "libSceAgcDriver;shader_recompiler_agc_driver" CACHE STRING
+        "Targets ANYPS5_O2 compiles with -O2 in Release builds; a shared library or executable among them also links with -O2, which sets the level of its link-time optimization")
+
+function(anyps5_apply_o2)
+    if(NOT ANYPS5_O2 OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
+        return()
+    endif()
+    foreach(target IN LISTS ANYPS5_O2_TARGETS)
+        if(NOT TARGET ${target})
+            message(FATAL_ERROR "ANYPS5_O2_TARGETS: no target ${target}")
+        endif()
+        target_compile_options(${target} PRIVATE $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:-O2>)
+        get_target_property(type ${target} TYPE)
+        if(type STREQUAL "SHARED_LIBRARY" OR type STREQUAL "MODULE_LIBRARY" OR type STREQUAL "EXECUTABLE")
+            target_link_options(${target} PRIVATE $<$<CONFIG:Release>:-O2>)
+        endif()
+    endforeach()
+endfunction()
 
 set(ANYPS5_LTO_EXCLUDED_TARGETS libc libkernel guest_http_client_tests guest_user_context_tests)
 
