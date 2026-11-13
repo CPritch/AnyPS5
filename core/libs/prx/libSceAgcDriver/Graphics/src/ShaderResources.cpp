@@ -8574,9 +8574,22 @@ bool guardRegionsClear(std::uint64_t address, std::size_t bytes, std::uint64_t d
 
 }
 
+namespace {
+
+std::array<std::atomic<std::uint64_t>, 3> guardCheckCounts{};
+std::atomic<std::uint64_t> guardFullChecks{0};
+
+bool GuardChecksCounted() {
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    return counted;
+}
+
+}
+
 void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
     static const bool memo = std::getenv("APS5_NO_GUARD_CHECK_MEMO") == nullptr;
     static const bool movedMemo = std::getenv("APS5_NO_MOVED_GUARD_MEMO") == nullptr;
+    static const bool plainMemo = std::getenv("APS5_NO_PLAIN_GUARD_MEMO") == nullptr;
     const bool remembered = memo && (moved.empty() || movedMemo);
     const auto depthGeneration = remembered ? DepthGuardGeneration() : 0;
     const auto colorGeneration = remembered ? MultisampleGuardGeneration() : 0;
@@ -8591,12 +8604,16 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
         RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
         RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
     };
-    if (remembered && guardsCheckedDepth.load(std::memory_order_acquire) == depthGeneration && guardsCheckedColor.load(std::memory_order_acquire) == colorGeneration && guardsCheckedMoved.load(std::memory_order_acquire) == movedSignature) {
+    const bool plainChecked = remembered && plainMemo && guardsPlainDepth.load(std::memory_order_acquire) == depthGeneration && guardsPlainColor.load(std::memory_order_acquire) == colorGeneration;
+    if (plainChecked || (remembered && guardsCheckedDepth.load(std::memory_order_acquire) == depthGeneration && guardsCheckedColor.load(std::memory_order_acquire) == colorGeneration && guardsCheckedMoved.load(std::memory_order_acquire) == movedSignature)) {
         for (const auto& entry : moved) {
             if (entry.allocation < allocations.size() && allocations[entry.allocation].guest && !guardRegionsClear(entry.address, entry.size, depthGeneration, colorGeneration)) check(entry.address, entry.size);
         }
+        if (GuardChecksCounted()) guardCheckCounts[plainChecked ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    if (GuardChecksCounted()) guardCheckCounts[0].fetch_add(1, std::memory_order_relaxed);
+    guardFullChecks.fetch_add(1, std::memory_order_relaxed);
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         if (!item.guest) continue;
@@ -8609,7 +8626,20 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
         guardsCheckedMoved.store(movedSignature, std::memory_order_relaxed);
         guardsCheckedColor.store(colorGeneration, std::memory_order_relaxed);
         guardsCheckedDepth.store(depthGeneration, std::memory_order_release);
+        if (plainMemo && moved.empty()) {
+            guardsPlainColor.store(colorGeneration, std::memory_order_relaxed);
+            guardsPlainDepth.store(depthGeneration, std::memory_order_release);
+        }
     }
+}
+
+std::uint64_t ShaderResources::GuardFullChecks() {
+    return guardFullChecks.load(std::memory_order_relaxed);
+}
+
+std::string ShaderResources::TakeGuardCheckText() {
+    const auto take = [](std::atomic<std::uint64_t>& value) { return std::to_string(value.exchange(0, std::memory_order_relaxed)); };
+    return "; guest buffer guard checks: " + take(guardCheckCounts[0]) + " full, " + take(guardCheckCounts[1]) + " by the plain memo, " + take(guardCheckCounts[2]) + " by the moved memo";
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {

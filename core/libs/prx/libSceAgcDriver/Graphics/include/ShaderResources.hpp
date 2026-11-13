@@ -432,6 +432,8 @@ public:
     static ProofReuse LastProofReuse();
     static std::string TakeCommitterProofText();
     static std::string TakeCommitterMovedText();
+    static std::string TakeGuardCheckText();
+    static std::uint64_t GuardFullChecks();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
@@ -857,6 +859,8 @@ private:
     mutable std::atomic<std::uint64_t> guardsCheckedDepth{~std::uint64_t{0}};
     mutable std::atomic<std::uint64_t> guardsCheckedColor{~std::uint64_t{0}};
     mutable std::atomic<std::uint64_t> guardsCheckedMoved{~std::uint64_t{0}};
+    mutable std::atomic<std::uint64_t> guardsPlainDepth{~std::uint64_t{0}};
+    mutable std::atomic<std::uint64_t> guardsPlainColor{~std::uint64_t{0}};
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     std::vector<ShaderRecompiler::RegisteredImageView> registeredImageViews;

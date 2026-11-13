@@ -4267,6 +4267,25 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         Require(!recorder.PendingReadOverlaps(element, 16), "the build's read refuses after its batch ran");
         recorder.Sync();
     }
+    {
+        auto guardContext = context;
+        DescriptorCache cache(guardContext);
+        guardContext.descriptorCache = &cache;
+        Recorder guardRecorder(guardContext);
+        guardRecorder.Activate();
+        ShaderResources resources(guardContext, compute);
+        resources.RequireGuestBuffers();
+        const auto checked = ShaderResources::GuardFullChecks();
+        const ShaderResources::MovedBuffer moved{0, element + 256, 256, {}};
+        for (int round = 0; round < 2; ++round) {
+            static_cast<void>(resources.PrepareDrawBindings(guardRecorder, std::span(&moved, 1)));
+            resources.RequireGuestBuffers();
+        }
+        Require(ShaderResources::GuardFullChecks() == checked, "a template's guard checks of its own buffers and of a moved buffer, alternating with no guard change, were not served by its memo");
+        guardRecorder.Submit();
+        device.WaitQueue();
+        guardRecorder.Sync();
+    }
     std::weak_ptr<ShaderResources::DrawBindings> snapshotLifetime;
     {
         auto snapshotContext = context;

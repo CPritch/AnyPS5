@@ -5247,6 +5247,7 @@ std::string TakeDrawSplitText() {
     }
     result += ShaderResources::TakeCommitterProofText();
     result += ShaderResources::TakeCommitterMovedText();
+    result += ShaderResources::TakeGuardCheckText();
     result += Recorder::TakeSnapshotAgreementText();
     constexpr std::array<const char*, static_cast<std::size_t>(StaleViewSite::Count)> staleSites{"input pending writes", "input labels and queued stores", "moved-buffer pending writes"};
     result += "; resolve's checks against the view at the previous draw's resolve end plus its declared writes and targets (agree/only the view pending/only live pending):";
