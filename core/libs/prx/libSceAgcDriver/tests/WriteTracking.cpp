@@ -622,24 +622,27 @@ void CheckUnwatch() {
 }
 
 void CheckTrackerGenerationReads() {
-    void* memory = AllocateWatched(2 * Block);
+    constexpr std::size_t Span = 512 * Block;
+    void* memory = AllocateWatched(Span);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
-    std::memset(memory, 0x11, 2 * Block);
-    CollectWritesUncached(base, 2 * Block);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    for (std::size_t offset = 0; offset < Span; offset += 4096) bytes[offset] = 0x11;
+    CollectWritesUncached(base, Span);
     const auto settled = TrackerGeneration();
     Require(settled == WriteGeneration() && settled == PublishedTrackerGeneration(), "a settled tracker generation read differs from the published generation");
     const auto stored = MarkWritten(base + 64, 4);
     Require(stored != 0 && TrackerGeneration() >= stored && TrackerGeneration() == WriteGeneration(), "a tracker generation read after a driver store is older than the store");
     std::atomic<bool> stop{false};
     std::thread walker([&] {
-        while (!stop.load(std::memory_order_acquire)) CollectWritesUncached(base, 2 * Block);
+        while (!stop.load(std::memory_order_acquire)) CollectWritesUncached(base, Span);
     });
+    const auto last = base + Span - Block;
     std::size_t stale = 0;
-    for (std::uint32_t round = 0; round < 20000; ++round) {
+    for (std::uint32_t round = 0; round < 4000; ++round) {
         const auto read = round % 2 == 0 ? TrackerGeneration() : PublishedTrackerGeneration();
-        static_cast<volatile std::uint8_t*>(memory)[Block + (round % 4096) * 16] = static_cast<std::uint8_t>(round);
-        CollectWritesUncached(base + Block, Block);
-        if (NewestStamp(base + Block, Block) <= read) ++stale;
+        bytes[Span - 4096 + (round % 64) * 16] = static_cast<std::uint8_t>(round);
+        CollectWritesUncached(last, Block);
+        if (NewestStamp(last, Block) <= read) ++stale;
     }
     stop.store(true, std::memory_order_release);
     walker.join();
