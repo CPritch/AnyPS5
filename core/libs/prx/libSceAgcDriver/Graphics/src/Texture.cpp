@@ -84,7 +84,7 @@ std::atomic<std::uint64_t>& eightBitWrites() {
     return writes;
 }
 
-std::array<std::atomic<std::uint64_t>, 2> layoutRecordCounts{};
+std::array<std::atomic<std::uint64_t>, 3> layoutRecordCounts{};
 
 // APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
 struct TextureProfile {
@@ -2653,7 +2653,7 @@ std::string StorageTexture::TakeCommitterRefreshText() {
     static std::uint64_t landedReported = 0;
     const auto landed = LandedKeyProofs();
     text += "; DCC key proofs over landed key stores " + std::to_string(landed - std::exchange(landedReported, landed));
-    text += "; image layout records: " + std::to_string(layoutRecordCounts[0].exchange(0, std::memory_order_relaxed)) + " written, " + std::to_string(layoutRecordCounts[1].exchange(0, std::memory_order_relaxed)) + " unchanged";
+    text += "; image layout records: " + std::to_string(layoutRecordCounts[0].exchange(0, std::memory_order_relaxed)) + " written, " + std::to_string(layoutRecordCounts[1].exchange(0, std::memory_order_relaxed)) + " unchanged; pending-since stamps taken while a walk ran " + std::to_string(layoutRecordCounts[2].exchange(0, std::memory_order_relaxed));
     text += "; readback stores before a label: memo skips " + std::to_string(labelReadbackCounts[0].exchange(0, std::memory_order_relaxed)) + ", scans " + std::to_string(labelReadbackCounts[1].exchange(0, std::memory_order_relaxed)) + " flushing " + std::to_string(labelReadbackCounts[2].exchange(0, std::memory_order_relaxed)) + " ranges, " + std::to_string(labelReadbackCounts[3].exchange(0, std::memory_order_relaxed)) + " stored";
     text += "; committer image stores waiting for other writers by reason (count/ms; pending writes over the range: stores, shader writers [top programs], other, in the open batch):";
     for (std::size_t i = 0; i < waits.size() && i < 4; ++i) {
@@ -4872,7 +4872,9 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         }
         layerPending.SetRange(first, count, true);
     }
-    const auto pendingSince = GuestMemory::TrackerGeneration();
+    static const bool publishedSince = std::getenv("APS5_NO_PUBLISHED_PENDING_SINCE") == nullptr;
+    const auto pendingSince = publishedSince ? GuestMemory::PublishedTrackerGeneration() : GuestMemory::TrackerGeneration();
+    if (publishedSince && LayoutRecordsCounted() && pendingSince != GuestMemory::WriteGeneration()) layoutRecordCounts[2].fetch_add(1, std::memory_order_relaxed);
     for (std::uint32_t layer = first; layer < first + count; ++layer) {
         if (!keptForCpu(layer)) layerPendingSince[layer] = pendingSince;
     }

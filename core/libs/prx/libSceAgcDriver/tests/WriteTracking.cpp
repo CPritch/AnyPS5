@@ -636,14 +636,14 @@ void CheckTrackerGenerationReads() {
     });
     std::size_t stale = 0;
     for (std::uint32_t round = 0; round < 20000; ++round) {
-        const auto read = TrackerGeneration();
+        const auto read = round % 2 == 0 ? TrackerGeneration() : PublishedTrackerGeneration();
         static_cast<volatile std::uint8_t*>(memory)[Block + (round % 4096) * 16] = static_cast<std::uint8_t>(round);
         CollectWritesUncached(base + Block, Block);
         if (NewestStamp(base + Block, Block) <= read) ++stale;
     }
     stop.store(true, std::memory_order_release);
     walker.join();
-    Require(stale == 0, "a CPU store made after a tracker generation read was stamped " + std::to_string(stale) + " times with a generation not newer than the read");
+    Require(stale == 0, "a CPU store made after a tracker or published generation read was stamped " + std::to_string(stale) + " times with a generation not newer than the read");
 }
 
 void CheckNewestStamp() {
