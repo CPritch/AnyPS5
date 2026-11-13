@@ -3951,7 +3951,16 @@ void LastRecordIndices(std::span<const void* const> logged, std::span<const void
 
 bool ShaderResources::keepsTemplateRecords() const {
     static const bool always = std::getenv("APS5_KEEP_TEMPLATE_RECORDS") != nullptr;
-    return always || !(usesBda || (usesFaultBuffer && LoopGuardEnabled()));
+    static const bool addressTemplates = BdaTemplatesEnabled() && std::getenv("APS5_NO_BDA_TEMPLATE_RECORDS") == nullptr;
+    return always || !((usesBda && !addressTemplates) || (usesFaultBuffer && LoopGuardEnabled()));
+}
+
+namespace {
+std::atomic<std::uint64_t> bufferWordCompares{0};
+}
+
+std::uint64_t ShaderResources::BufferWordCompares() {
+    return bufferWordCompares.load(std::memory_order_relaxed);
 }
 
 // Turns the lookups' records into this object's per-texture validation records (see
@@ -7692,6 +7701,7 @@ std::optional<ShaderResources::MovedPlan> ShaderResources::PlanMovedBuffers(std:
                 const auto& item = allocations[index];
                 if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return std::nullopt;
                 const bool patched = std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == index; });
+                if (item.dataWords.empty() && !patched) bufferWordCompares.fetch_add(1, std::memory_order_relaxed);
                 const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
                 if (same) continue;
                 if (item.dataWords.empty() && patched) {

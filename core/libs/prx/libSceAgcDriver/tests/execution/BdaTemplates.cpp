@@ -309,8 +309,10 @@ void ReuseBindsTheDrawsWords(Fixture& fixture) {
     WriteFloat(data, 0x510, 0.0f);
     const auto first = DrawRead(fixture, data.At(0x100), data.At(0x400));
     const Counts counts;
+    const auto bufferCompares = ShaderResources::BufferWordCompares();
     const auto second = DrawRead(fixture, data.At(0x200), data.At(0x500));
     const auto third = DrawRead(fixture, data.At(0x100), data.At(0x400));
+    const auto comparedInBuffers = ShaderResources::BufferWordCompares() - bufferCompares;
     std::printf("three draws of one template with their own buffer and pointer words: %s, %s, %s; reused %llu (moved buffers %llu, new data words %llu), made %llu\n", Text(first).c_str(), Text(second).c_str(), Text(third).c_str(), static_cast<unsigned long long>(counts.Since(Count::Reused)), static_cast<unsigned long long>(counts.Since(Count::ReusedMovedBuffers)), static_cast<unsigned long long>(counts.Since(Count::ReusedMovedData)), static_cast<unsigned long long>(counts.Since(Count::Made)));
     ExpectColors(first, {255, 0, 255}, "the first draw");
     ExpectColors(second, {0, 255, 0}, "a draw reusing the template with another buffer, pointer and loaded words did not read through its own words");
@@ -322,6 +324,7 @@ void ReuseBindsTheDrawsWords(Fixture& fixture) {
     Expect(counts.Since(Count::Reused) == 2, "the two later draws did not both reuse the template");
     Expect(counts.Since(Count::ReusedMovedBuffers) == 1, "the reuse with another buffer did not bind it in place, or the reuse with the template's own buffer moved it");
     Expect(counts.Since(Count::ReusedMovedData) == 1, "the reuse with other loaded words did not bind them, or the reuse with the template's own words moved them");
+    Expect(comparedInBuffers == 0, "a reuse compared the draw's loaded words with the template's buffer instead of the words the template kept");
 }
 
 void ReuseReadsWritesIntoItsRanges(Fixture& fixture) {
