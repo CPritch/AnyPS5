@@ -4516,6 +4516,31 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
 #endif
 }
 
+Compare CopyMappedRuns(std::span<const CopyRun> runs) {
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
+    constexpr std::size_t Batch = 64;
+    std::array<GuestCopyRun, Batch> copies{};
+    for (std::size_t first = 0; first < runs.size(); first += Batch) {
+        const auto count = std::min(Batch, runs.size() - first);
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto& run = runs[first + index];
+            if (!run.out.empty() && (run.address == 0 || run.out.size() > std::numeric_limits<std::uintptr_t>::max() - run.address)) return Compare::Unmapped;
+            copies[index] = {run.out.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(run.address)), run.out.size()};
+        }
+        const int savedErrno = errno;
+        const bool copied = GuestCopyInUnsyncedRuns_nid_no_patch(copies.data(), count);
+        errno = savedErrno;
+        if (!copied) return Compare::Unmapped;
+    }
+    return Compare::Equal;
+#else
+    for (const auto& run : runs) {
+        if (CopyMapped(run.address, run.out) != Compare::Equal) return Compare::Unmapped;
+    }
+    return Compare::Equal;
+#endif
+}
+
 void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     if (Accessible(reinterpret_cast<const void*>(address), current.size(), true)) {

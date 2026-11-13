@@ -65,6 +65,18 @@ bool RebaseMovedFields(DispatchVariant& copy, const DispatchVariant& variant, st
                     first = next;
                 }
             }
+            static const bool batchedWords = std::getenv("APS5_NO_BATCHED_GUEST_COPIES") == nullptr;
+            constexpr std::size_t BatchWords = 64;
+            while (batchedWords && next - first >= 2) {
+                const auto count = std::min<std::size_t>(BatchWords, static_cast<std::size_t>(next - first));
+                std::array<std::uint32_t, BatchWords> live;
+                std::array<GuestMemory::CopyRun, BatchWords> runs;
+                for (std::size_t i = 0; i < count; ++i) runs[i] = {copy.runs[run].first + (first[i] - offset) * sizeof(std::uint32_t), std::as_writable_bytes(std::span(live).subspan(i, 1))};
+                if (GuestMemory::CopyMappedRuns(std::span(runs).first(count)) != GuestMemory::Compare::Equal) return false;
+                for (std::size_t i = 0; i < count; ++i, ++first) {
+                    if (!rebaseWord(*first, live[i])) return false;
+                }
+            }
             for (; first != next; ++first) {
                 std::uint32_t live = 0;
                 const auto address = copy.runs[run].first + (*first - offset) * sizeof(std::uint32_t);
@@ -249,6 +261,39 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
     mix(value & 3u);
     if (value == 0) {
         readable = false;
+        return hash;
+    }
+    static const bool batched = std::getenv("APS5_NO_BATCHED_GUEST_COPIES") == nullptr;
+    constexpr std::size_t BatchRuns = 16;
+    constexpr std::size_t BatchWords = 256;
+    std::size_t total = 0;
+    for (const auto& read : word.reads) total += read.second;
+    if (batched && word.reads.size() <= BatchRuns && total <= BatchWords) {
+        std::array<std::uint32_t, BatchWords> content;
+        std::array<GuestMemory::CopyRun, BatchRuns> runs;
+        std::size_t at = 0;
+        std::size_t used = 0;
+        for (const auto& [offset, words] : word.reads) {
+            const auto address = (static_cast<std::uint64_t>(word.high) << 32u) + AlignedWord(value) + static_cast<std::uint64_t>(offset);
+            runs[used++] = {address, std::as_writable_bytes(std::span(content).subspan(at, words))};
+            at += words;
+        }
+        if (GuestMemory::CopyMappedRuns(std::span(runs).first(used)) != GuestMemory::Compare::Equal) {
+            readable = false;
+            return hash;
+        }
+        std::uint32_t index = 0;
+        auto masked = word.masked.begin();
+        at = 0;
+        for (const auto& [offset, words] : word.reads) {
+            mix(static_cast<std::uint64_t>(offset));
+            mix(words);
+            for (std::size_t i = 0; i < words; ++i, ++index) {
+                while (masked != word.masked.end() && *masked < index) ++masked;
+                if (masked == word.masked.end() || *masked != index) mix(content[at + i]);
+            }
+            at += words;
+        }
         return hash;
     }
     std::array<std::uint32_t, MaxContentWords> content;

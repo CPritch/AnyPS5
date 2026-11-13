@@ -12,6 +12,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -96,6 +97,29 @@ void Check(std::string_view mode) {
         std::memset(range.Data(), 0x6c, 2 * Unit);
         Require(CopyMapped(range.Address(), out) == Compare::Equal, "a recommitted source cannot be copied");
         Require(std::all_of(out.begin(), out.end(), [](std::byte byte) { return byte == std::byte{0x6c}; }), "a recommitted source returned old bytes");
+        return;
+    }
+    if (mode == "runs") {
+        std::array<std::byte, 64> first{};
+        std::array<std::byte, 64> second{};
+        std::array<std::byte, 64> third{};
+        const auto filled = [](const auto& bytes, std::byte value) { return std::all_of(bytes.begin(), bytes.end(), [&](std::byte byte) { return byte == value; }); };
+        const std::array<CopyRun, 3> runs{{{range.Address(), first}, {range.Address() + Unit - 32u, second}, {range.Address() + Unit + 64u, third}}};
+        errno = E2BIG;
+        Require(CopyMappedRuns(runs) == Compare::Equal, "readable runs, one across an arena unit, cannot be copied together");
+        Require(filled(first, std::byte{0x5b}) && filled(second, std::byte{0x5b}) && filled(third, std::byte{0x5b}), "copied runs returned different bytes");
+        Require(errno == E2BIG, "a successful run copy changed errno");
+        Require(CopyMappedRuns({}) == Compare::Equal, "no runs require mapped memory");
+        std::array<std::uint32_t, 100> words{};
+        std::vector<CopyRun> many;
+        for (std::size_t index = 0; index < words.size(); ++index) many.push_back({range.Address() + index * 512u, std::as_writable_bytes(std::span(words).subspan(index, 1))});
+        Require(CopyMappedRuns(many) == Compare::Equal && std::all_of(words.begin(), words.end(), [](std::uint32_t word) { return word == 0x5b5b5b5bu; }), "more runs than one kernel call takes were not all copied");
+        const std::array<CopyRun, 1> null{{{0, first}}};
+        Require(CopyMappedRuns(null) == Compare::Unmapped, "a null run source was reported copied");
+        GuestArena::GuestArenaReset_nid_postfix(range.Data() + Unit, Unit);
+        const std::array<CopyRun, 2> partly{{{range.Address(), first}, {range.Address() + Unit + 64u, third}}};
+        Require(CopyMappedRuns(partly) == Compare::Unmapped, "runs with one in a reset unit were reported copied");
+        Require(errno == E2BIG, "a failed run copy changed errno");
         return;
     }
     Require(mode == "valid", "unknown mapped-copy fixture mode");

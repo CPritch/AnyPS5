@@ -17,6 +17,15 @@
 #include <string>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -32,6 +41,8 @@ alignas(256) std::array<std::uint32_t, 1024> FirstCallee{};
 alignas(256) std::array<std::uint32_t, 1024> SecondCallee{};
 alignas(256) std::array<std::uint32_t, 1024> OtherCallee{};
 alignas(256) std::array<std::uint32_t, 64> Buffer{};
+alignas(256) std::array<std::uint32_t, 64> FirstTable{};
+alignas(256) std::array<std::uint32_t, 64> SecondTable{};
 
 void Fill(std::array<std::uint32_t, 1024>& callee, std::uint32_t first) {
     callee.fill(0xbf810000u);
@@ -280,6 +291,56 @@ void MovedRecordCountsReachEveryDescriptor(bool sharedCount) {
     }
 }
 
+void TableWordsAreKeyedAcrossEveryRead() {
+    for (std::uint32_t index = 0; index < FirstTable.size(); ++index) FirstTable[index] = SecondTable[index] = 0x1000u + index;
+    Require(High(FirstTable.data()) == High(SecondTable.data()), "the two test tables do not share their high address word");
+    const RelocatableUserWord word{0u, {{0, 4u}, {64, 8u}, {160, 2u}}, false, High(FirstTable.data()), {5u}};
+    const auto key = [&](const std::array<std::uint32_t, 64>& table) {
+        bool readable = true;
+        const auto value = Driver::relocatedContentKey(word, Low(table.data()), readable);
+        Require(readable, "a table in mapped memory was reported unreadable");
+        return value;
+    };
+    const auto first = key(FirstTable);
+    Require(key(SecondTable) == first, "two tables with the same words at different addresses keyed differently");
+    SecondTable[19] ^= 1u;
+    Require(key(SecondTable) != first, "a changed word of the second read did not change the key");
+    SecondTable[19] ^= 1u;
+    SecondTable[40] ^= 1u;
+    Require(key(SecondTable) != first, "a changed word of the third read did not change the key");
+    SecondTable[40] ^= 1u;
+    SecondTable[17] ^= 1u;
+    Require(key(SecondTable) == first, "a masked word of the second read changed the key");
+    SecondTable[17] ^= 1u;
+    SecondTable[30] ^= 1u;
+    Require(key(SecondTable) == first, "a word outside every read changed the key");
+#ifdef _WIN32
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const std::size_t page = info.dwPageSize;
+    auto* mapped = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(mapped != nullptr, "cannot map the unreadable table");
+    DWORD previous = 0;
+    Require(VirtualProtect(mapped + page, page, PAGE_NOACCESS, &previous) != 0, "cannot protect the unreadable table's second page");
+#else
+    const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    void* map = mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(map != MAP_FAILED, "cannot map the unreadable table");
+    auto* mapped = static_cast<std::uint8_t*>(map);
+    Require(mprotect(mapped + page, page, PROT_NONE) == 0, "cannot protect the unreadable table's second page");
+#endif
+    const auto* table = mapped + page - 32;
+    const RelocatableUserWord straddling{0u, {{0, 4u}, {64, 8u}}, false, High(table), {}};
+    bool readable = true;
+    static_cast<void>(Driver::relocatedContentKey(straddling, Low(table), readable));
+    Require(!readable, "a table whose second read lies in an inaccessible page was reported readable");
+#ifdef _WIN32
+    VirtualFree(mapped, 0, MEM_RELEASE);
+#else
+    munmap(mapped, 2 * page);
+#endif
+}
+
 void BufferValueWordsKeyByNothing() {
     const RelocatableUserWord word{4u, {}, true, 0u};
     bool readable = true;
@@ -295,6 +356,7 @@ int main() {
         CalleeWordsAreKeyedByTheirCode();
         BufferValueWordsArePatchedInTheirBinding();
         BufferValueWordsKeyByNothing();
+        TableWordsAreKeyedAcrossEveryRead();
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;

@@ -14,6 +14,8 @@
 #include <limits>
 #include <optional>
 #include <cerrno>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -41,6 +43,7 @@
 #endif
 #include <unistd.h>
 #ifdef __linux__
+#include <pthread.h>
 #include <sys/uio.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>
@@ -84,6 +87,30 @@ std::size_t HostPageSize() {
     return size;
 }
 
+#ifdef __linux__
+bool BatchedGuestCopies() {
+    static const bool enabled = std::getenv("APS5_NO_BATCHED_GUEST_COPIES") == nullptr;
+    return enabled;
+}
+
+std::atomic<pid_t> cachedPid{0};
+
+pid_t SelfPid() {
+    if (!BatchedGuestCopies()) return getpid();
+    static const bool registered = [] {
+        pthread_atfork(nullptr, nullptr, [] { cachedPid.store(0, std::memory_order_relaxed); });
+        return true;
+    }();
+    static_cast<void>(registered);
+    auto pid = cachedPid.load(std::memory_order_relaxed);
+    if (pid == 0) {
+        pid = getpid();
+        cachedPid.store(pid, std::memory_order_relaxed);
+    }
+    return pid;
+}
+#endif
+
 bool CopyGuestBytes(void* destination, const void* source, std::size_t bytes, bool prepare = true) {
     if (prepare) GuestArena::GuestArenaPrepareHostRead_nid_no_patch(source, bytes);
 #ifdef _WIN32
@@ -93,7 +120,7 @@ bool CopyGuestBytes(void* destination, const void* source, std::size_t bytes, bo
     iovec local{destination, bytes};
     iovec remote{const_cast<void*>(source), bytes};
     const int saved = errno;
-    const auto copied = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    const auto copied = process_vm_readv(SelfPid(), &local, 1, &remote, 1, 0);
     if (copied < 0 && errno != EFAULT) throw std::runtime_error("guest path: process_vm_readv failed with errno " + std::to_string(errno));
     errno = saved;
     return copied >= 0 && static_cast<std::size_t>(copied) == bytes;
@@ -865,6 +892,41 @@ extern "C" bool GuestCopyInUnsynced_nid_no_patch(void* destination, const void* 
     const auto start = reinterpret_cast<std::uintptr_t>(source);
     if (start == 0 || bytes > UINTPTR_MAX - start) return false;
     return CopyGuestBytes(destination, source, bytes, false);
+}
+
+extern "C" bool GuestCopyInUnsyncedRuns_nid_no_patch(const GuestCopyRun* runs, std::size_t count) {
+#ifdef __linux__
+    if (BatchedGuestCopies()) {
+        constexpr std::size_t Batch = 64;
+        std::array<iovec, Batch> local{};
+        std::array<iovec, Batch> remote{};
+        for (std::size_t first = 0; first < count;) {
+            std::size_t used = 0;
+            std::size_t total = 0;
+            for (; first < count && used < Batch; ++first) {
+                const auto& run = runs[first];
+                if (run.bytes == 0) continue;
+                const auto start = reinterpret_cast<std::uintptr_t>(run.source);
+                if (start == 0 || run.bytes > UINTPTR_MAX - start) return false;
+                local[used] = {run.destination, run.bytes};
+                remote[used] = {const_cast<void*>(run.source), run.bytes};
+                total += run.bytes;
+                ++used;
+            }
+            if (used == 0) continue;
+            const int saved = errno;
+            const auto copied = process_vm_readv(SelfPid(), local.data(), used, remote.data(), used, 0);
+            if (copied < 0 && errno != EFAULT) throw std::runtime_error("guest path: process_vm_readv failed with errno " + std::to_string(errno));
+            errno = saved;
+            if (copied < 0 || static_cast<std::size_t>(copied) != total) return false;
+        }
+        return true;
+    }
+#endif
+    for (std::size_t index = 0; index < count; ++index) {
+        if (!GuestCopyInUnsynced_nid_no_patch(runs[index].destination, runs[index].source, runs[index].bytes)) return false;
+    }
+    return true;
 }
 
 extern "C" bool GuestCopyIn_nid_no_patch(void* destination, const void* source, std::size_t bytes) {
