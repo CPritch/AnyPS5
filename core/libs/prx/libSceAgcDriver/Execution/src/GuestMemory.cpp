@@ -562,9 +562,13 @@ void ReportAliasWatch() {
 
 class TimedAccess {
 public:
-    TimedAccess(MemoryCounterKind kind, std::uint64_t bytes) : kind(kind), bytes(bytes), start(MemoryProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    const bool profiled;
+    TimedAccess(MemoryCounterKind kind, std::uint64_t bytes) : profiled(MemoryProfiled()), kind(kind), bytes(bytes), start(profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
     ~TimedAccess() {
-        if (!MemoryProfiled()) return;
+        if (profiled) [[unlikely]] finish();
+    }
+private:
+    [[gnu::cold, gnu::noinline]] void finish() const {
         const auto now = std::chrono::steady_clock::now();
         CounterFor(kind).Add(bytes, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), SharedMemoryCounters());
         auto& state = Profile();
