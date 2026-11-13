@@ -453,10 +453,23 @@ std::array<std::array<std::uint64_t, 3>, MemoryCounterCount> FoldMemoryCounters(
     return totals;
 }
 
+namespace {
+
+bool DeferredCallerOffsets() {
+    static const bool deferred = std::getenv("APS5_NO_DEFERRED_CALLER_OFFSETS") == nullptr;
+    return deferred;
+}
+
+unsigned long long CallerOffset(unsigned long long caller) {
+    return DeferredCallerOffsets() ? ModuleOffset(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(caller))) : caller;
+}
+
+}
+
 void CountCaller(std::array<std::pair<unsigned long long, std::uint64_t>, 16>& callers, std::uint32_t& sampled, std::uint32_t every, const void* returnAddress) {
     if (++sampled % every != 0) return;
     auto& state = Profile();
-    const auto offset = ModuleOffset(returnAddress);
+    const auto offset = DeferredCallerOffsets() ? static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(returnAddress)) : ModuleOffset(returnAddress);
     std::lock_guard lock(state.callersMutex);
     for (auto& [caller, count] : callers) {
         if (caller == offset || count == 0) {
@@ -545,6 +558,16 @@ void CountWriteCaller(const void* returnAddress) {
     CountCaller(Profile().writeCallers, sampled, 16, returnAddress);
 }
 
+std::vector<std::pair<unsigned long long, std::uint64_t>> ReadCallerOffsets() {
+    auto& state = Profile();
+    std::lock_guard lock(state.callersMutex);
+    std::vector<std::pair<unsigned long long, std::uint64_t>> callers;
+    for (const auto& [caller, count] : state.callers) {
+        if (count != 0) callers.emplace_back(CallerOffset(caller), count);
+    }
+    return callers;
+}
+
 bool MemoryProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
@@ -583,11 +606,11 @@ public:
             std::lock_guard lock(state.callersMutex);
             AgcDriver::ProfilePrint_nid_no_patch(" | read callers:");
             for (const auto& [caller, count] : state.callers) {
-                if (count != 0) AgcDriver::ProfilePrint_nid_no_patch(" +0x%llx=%llu", caller, static_cast<unsigned long long>(count));
+                if (count != 0) AgcDriver::ProfilePrint_nid_no_patch(" +0x%llx=%llu", CallerOffset(caller), static_cast<unsigned long long>(count));
             }
             AgcDriver::ProfilePrint_nid_no_patch(" | write callers:");
             for (const auto& [caller, count] : state.writeCallers) {
-                if (count != 0) AgcDriver::ProfilePrint_nid_no_patch(" +0x%llx=%llu", caller, static_cast<unsigned long long>(count));
+                if (count != 0) AgcDriver::ProfilePrint_nid_no_patch(" +0x%llx=%llu", CallerOffset(caller), static_cast<unsigned long long>(count));
             }
         }
         AgcDriver::ProfilePrint_nid_no_patch(" | read sites:");

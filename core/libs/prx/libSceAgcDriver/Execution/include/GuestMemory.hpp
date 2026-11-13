@@ -340,6 +340,7 @@ std::uint64_t ThreadCollectedBytes();
 // A code address (a return address) as an offset into its module, in the form of the [guestmem]
 // callers (symbolized with nm against the driver's image). Takes the loader lock: for reports only.
 unsigned long long CodeOffset(const void* address);
+std::vector<std::pair<unsigned long long, std::uint64_t>> ReadCallerOffsets();
 
 // Deferred GPU writes. The graphics layer keeps the results of storage images on the GPU until guest
 // memory is read; it registers a hook that stores every pending result overlapping a range, which
