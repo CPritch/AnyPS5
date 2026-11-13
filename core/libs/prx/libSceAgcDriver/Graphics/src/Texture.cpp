@@ -84,6 +84,8 @@ std::atomic<std::uint64_t>& eightBitWrites() {
     return writes;
 }
 
+std::array<std::atomic<std::uint64_t>, 2> layoutRecordCounts{};
+
 // APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
 struct TextureProfile {
     double allocate = 0, read = 0, gpu = 0, view = 0;
@@ -2648,6 +2650,7 @@ std::string StorageTexture::TakeCommitterRefreshText() {
         writerWaits.clear();
     }
     std::sort(waits.begin(), waits.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    text += "; image layout records: " + std::to_string(layoutRecordCounts[0].exchange(0, std::memory_order_relaxed)) + " written, " + std::to_string(layoutRecordCounts[1].exchange(0, std::memory_order_relaxed)) + " unchanged";
     text += "; readback stores before a label: memo skips " + std::to_string(labelReadbackCounts[0].exchange(0, std::memory_order_relaxed)) + ", scans " + std::to_string(labelReadbackCounts[1].exchange(0, std::memory_order_relaxed)) + " flushing " + std::to_string(labelReadbackCounts[2].exchange(0, std::memory_order_relaxed)) + " ranges, " + std::to_string(labelReadbackCounts[3].exchange(0, std::memory_order_relaxed)) + " stored";
     text += "; committer image stores waiting for other writers by reason (count/ms; pending writes over the range: stores, shader writers [top programs], other, in the open batch):";
     for (std::size_t i = 0; i < waits.size() && i < 4; ++i) {
@@ -4738,7 +4741,18 @@ struct WriteRecords {
     std::mutex mutex;
     std::unordered_map<std::uint64_t, StorageTexture::WriteRecord> byAddress;
     std::uint64_t serial = 0;
+    std::atomic<std::uint64_t> changes{1};
 };
+
+bool MarkPendingMemos() {
+    static const bool enabled = std::getenv("APS5_NO_MARK_PENDING_MEMOS") == nullptr;
+    return enabled;
+}
+
+bool LayoutRecordsCounted() {
+    static const bool counted = std::getenv("APS5_COMMIT_STATS") != nullptr;
+    return counted;
+}
 
 WriteRecords& LayoutWrites() {
     static WriteRecords records;
@@ -4770,11 +4784,23 @@ std::uint64_t StorageTexture::OccasionalLabelStores() {
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     if (count != 0) GuestMemory::ForgetKnownZero(layerBegin(first), static_cast<std::size_t>(layerBegin(first + count - 1) + layerBytes(first + count - 1) - layerBegin(first)));
-    {
-        auto& records = LayoutWrites();
+    if (auto& records = LayoutWrites(); !MarkPendingMemos() || layoutRecordedAt != records.changes.load(std::memory_order_acquire)) {
         std::lock_guard lock(records.mutex);
-        if (records.byAddress.size() >= 65536u) records.byAddress.clear();
-        records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
+        if (records.byAddress.size() >= 65536u) {
+            records.byAddress.clear();
+            records.changes.fetch_add(1, std::memory_order_acq_rel);
+        }
+        const WriteRecord record{descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
+        const auto [entry, inserted] = records.byAddress.try_emplace(descriptor.baseAddress, record);
+        if (!inserted) {
+            const auto& held = entry->second;
+            if (held.width != record.width || held.height != record.height || held.tileMode != record.tileMode || held.dimension != record.dimension || held.format != record.format) records.changes.fetch_add(1, std::memory_order_acq_rel);
+            entry->second = record;
+        }
+        layoutRecordedAt = records.changes.load(std::memory_order_relaxed);
+        if (LayoutRecordsCounted()) layoutRecordCounts[0].fetch_add(1, std::memory_order_relaxed);
+    } else if (LayoutRecordsCounted()) {
+        layoutRecordCounts[1].fetch_add(1, std::memory_order_relaxed);
     }
     GuestMemory::NoteGpuPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
@@ -4872,7 +4898,11 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         static_cast<void>(hooked);
     }
     ++version;
-    if (const auto format = ResolveTextureFormat(descriptor.format); format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_UNORM) eightBitWrites().fetch_add(1, std::memory_order_release);
+    if (eightBitFormat < 0 || !MarkPendingMemos()) {
+        const auto format = ResolveTextureFormat(descriptor.format);
+        eightBitFormat = format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_UNORM ? 1 : 0;
+    }
+    if (eightBitFormat != 0) eightBitWrites().fetch_add(1, std::memory_order_release);
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
         static const bool newlyPendingBumps = std::getenv("APS5_NO_NEWLY_PENDING_BUMP") == nullptr;

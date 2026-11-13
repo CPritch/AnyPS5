@@ -869,6 +869,8 @@ private:
     std::vector<std::uint64_t> storeNotes;
     std::uint64_t writtenFlip = 0;
     std::atomic<bool> writtenOccasionally{false};
+    std::uint64_t layoutRecordedAt = 0;
+    std::int8_t eightBitFormat = -1;
     std::uint64_t version = 0;
     std::uint64_t writes = 0;
     std::uint64_t storeSerial = 0;

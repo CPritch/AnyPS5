@@ -57,6 +57,7 @@ constexpr std::uint32_t Depth = 62;
 constexpr std::uint32_t Sized = 59;
 constexpr std::uint32_t Tied = 58;
 constexpr std::uint32_t Proved = 56;
+constexpr std::uint32_t Rewritten = 57;
 
 alignas(256) std::array<std::uint32_t, Records> Keys{};
 alignas(256) std::array<std::uint32_t, Lanes * 4> Output{};
@@ -325,6 +326,23 @@ void RunWritten(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
     Expect(before, 1, 2, 0, "two dispatches of two variants, the narrow one written last");
 }
 
+void RunRewritten(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
+    Prepare(block);
+    SetRecord(block, 0, block.Texels(Rewritten), Wide);
+    SetRecord(block, 1, block.Texels(Rewritten), Narrow);
+    const auto result = Compile(device, block);
+    Store(device, block.Texels(Rewritten), Wide);
+    Store(device, block.Texels(Rewritten), Narrow);
+    Store(device, block.Texels(Rewritten), Wide);
+    std::vector<float> stored(Wide);
+    for (std::uint32_t x = 0; x < Wide; ++x) stored[x] = -4.0f - static_cast<float>(x);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto before = AgcDriver::Graphics::ImageTableReuses();
+    Require(Dispatch(device, result, 1) == Row(stored.data(), Wide), "image table variants: the narrow variant did not borrow the wide one written again after it");
+    Require(Dispatch(device, result, 0) == Row(stored.data(), Wide), "image table variants: the wide variant written again last sampled the wrong texels");
+    Expect(before, 1, 2, 0, "two dispatches of two variants, the wide one written, then the narrow one, then the wide one again");
+}
+
 void RunFetch(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
     Prepare(block);
     SetRecord(block, 0, block.Texels(Sized), Wide);
@@ -449,6 +467,7 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
     RunProof(device, block);
     RunLargest(device, block);
     RunWritten(device, block);
+    RunRewritten(device, block);
     RunFetch(device, block);
     RunSize(device, block);
     RunDepth(device, block);
