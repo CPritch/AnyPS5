@@ -4558,14 +4558,22 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         const auto end = static_cast<std::uint64_t>(address) + bytes;
         auto& imports = Imports();
         const bool cut = waiterHoldCutEnabled();
-        const auto importOverlaps = [&] {
+        const auto overlappingImports = [&] {
+            std::vector<std::uint64_t> bases;
             std::lock_guard importsLock(imports.mutex);
-            return std::any_of(imports.imports.begin(), imports.imports.end(), [&](const auto& entry) { return holdsRangeOver(entry.second, address, end); });
+            for (const auto& [base, entry] : imports.imports) {
+                if (holdsRangeOver(entry, address, end)) bases.push_back(base);
+            }
+            return bases;
         };
+        std::vector<std::uint64_t> overlapping;
         GuestAllocations::Lease importLease;
-        if (cut && importOverlaps()) {
-            importLease = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
-            Waiter().leasesBeforeLock.fetch_add(1, std::memory_order_relaxed);
+        if (cut) {
+            overlapping = overlappingImports();
+            if (!overlapping.empty()) {
+                importLease = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
+                Waiter().leasesBeforeLock.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         std::unique_lock lock(GuestMemory::GpuMutex());
         const auto lockedAt = std::chrono::steady_clock::now();
@@ -4614,19 +4622,16 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         if (recorder != nullptr) GuestBufferMemory::ReleaseRetainedSpaces(recorder->Id(), recorder->CompletedThrough());
 
         if (releaseParkedImports(imports, address, end)) retiredImport = true;
-        if (importOverlaps()) {
+        if (!cut) overlapping = overlappingImports();
+        if (!overlapping.empty()) {
             if (recorder != nullptr && !recorder->Idle()) drainRecorder();
             if (importLease.empty()) importLease = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
             {
                 std::lock_guard importsLock(imports.mutex);
-                for (auto it = imports.imports.begin(); it != imports.imports.end();) {
-                    if (!holdsRangeOver(it->second, address, end)) {
-                        ++it;
-                        continue;
-                    }
-                    const auto next = std::next(it);
+                for (const auto base : overlapping) {
+                    const auto it = imports.imports.find(base);
+                    if (it == imports.imports.end() || !holdsRangeOver(it->second, address, end)) continue;
                     retireImport(imports.device, imports, it, importLease, RetireCause::Waiter, false);
-                    it = next;
                     retiredImport = true;
                 }
             }

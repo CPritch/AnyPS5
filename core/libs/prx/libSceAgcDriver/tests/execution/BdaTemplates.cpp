@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -120,6 +121,7 @@ public:
     GuestBlock& operator=(const GuestBlock&) = delete;
 
     void Map(bool writable) const { GuestAllocations::Mutation().Add(block, BlockBytes, true, writable, true); }
+    void Reprotect(bool writable) const { GuestAllocations::Mutation().Protect(block, BlockBytes, true, writable, true, [] {}); }
     std::uint64_t At(std::size_t offset) const { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(block + offset)); }
     std::uint8_t* Bytes(std::size_t offset) const { return block + offset; }
 
@@ -456,6 +458,32 @@ void MirroredSpacesRefreshPerReuse(Fixture& fixture) {
     Expect(since(Count::ReusedMovedData) == 1, "the reuse after the CPU rewrote the word its program loads did not bind the new word, or a reuse whose loaded word equals the template's moved it");
 }
 
+void PinWaiterRetiresTheReprotectedImport(Fixture& fixture) {
+    const auto& data = fixture.data;
+    WriteFloat(data, 0x100, 0.0f);
+    WriteFloat(data, 0x400, 1.0f);
+    WriteFloat(data, 0x410, 0.0f);
+    ExpectColors(DrawRead(fixture, data.At(0x100), data.At(0x400)), {0, 255, 0}, "the draw that imports the allocation about to be reprotected");
+    const Counts counts;
+    const auto waiterBefore = AgcDriver::Graphics::PinWaiterTotals();
+    data.Reprotect(true);
+    const auto waiterAfter = AgcDriver::Graphics::PinWaiterTotals();
+    std::printf("the pin waiter for the reprotect: rounds %llu, GPU lock held %llu us, submits %llu, submits skipped %llu, import leases taken before the GPU lock %llu\n", static_cast<unsigned long long>(waiterAfter.rounds - waiterBefore.rounds), static_cast<unsigned long long>((waiterAfter.heldNs - waiterBefore.heldNs) / 1000), static_cast<unsigned long long>(waiterAfter.submits - waiterBefore.submits), static_cast<unsigned long long>(waiterAfter.submitsSkipped - waiterBefore.submitsSkipped), static_cast<unsigned long long>(waiterAfter.leasesBeforeLock - waiterBefore.leasesBeforeLock));
+    if (!fixture.off) {
+        Expect(waiterAfter.rounds > waiterBefore.rounds, "the reprotect of an imported allocation did not go through the pin waiter");
+        const bool cut = std::getenv("APS5_NO_WAITER_HOLD_CUT") == nullptr;
+        Expect((waiterAfter.leasesBeforeLock > waiterBefore.leasesBeforeLock) == cut, cut ? "the pin waiter did not take the import lease before the GPU lock for an imported range" : "with APS5_NO_WAITER_HOLD_CUT=1 the pin waiter took an import lease before the GPU lock");
+    }
+    WriteFloat(data, 0x100, 1.0f);
+    WriteFloat(data, 0x400, 0.0f);
+    WriteFloat(data, 0x410, 0.0f);
+    const auto after = DrawRead(fixture, data.At(0x100), data.At(0x400));
+    const auto since = [&](Count count) { return static_cast<unsigned long long>(counts.Since(count)); };
+    std::printf("a draw after the allocation holding the template's buffer was reprotected: %s; reused %llu, refused for the space %llu, for its imports %llu, made %llu\n", Text(after).c_str(), since(Count::Reused), since(Count::RefusedSpace), since(Count::RefusedImports), since(Count::Made));
+    ExpectColors(after, {255, 0, 0}, "a draw after the allocation holding the template's buffer was reprotected (its import retired and the space dropped by the pin waiter)");
+    if (!fixture.off) Expect(since(Count::Reused) == 0 && since(Count::Made) == 1 && since(Count::RefusedSpace) + since(Count::RefusedImports) == 1, "the template whose import the pin waiter retired was not refused once for its space and rebuilt");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -491,6 +519,7 @@ int main(int argc, char** argv) {
             ReuseRepatchesBufferOffsets(fixture, fixture.imageCode, "shader data words");
         }
         if (only == "--verify-drop") ReuseSurvivesASpaceDropBeforeItsVerify(fixture);
+        if (only == "--waiter") PinWaiterRetiresTheReprotectedImport(fixture);
         std::printf("%s\n", ShaderResources::TakeAddressTemplateText().c_str());
         AgcDriverShutdown_nid_postfix();
         std::puts(fixture.off ? "BDA templates: with APS5_NO_BDA_TEMPLATES=1 every address-based draw builds its own resources" : "BDA templates: a reused address-based draw template binds each draw's words and refuses a moved space or a buffer outside it");
