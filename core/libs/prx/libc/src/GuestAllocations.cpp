@@ -74,6 +74,9 @@ struct Registry {
     std::map<std::uintptr_t, std::uintptr_t> registeredImages;
     std::shared_ptr<const Lease::Ranges> readableLease;
     std::shared_ptr<const Lease::Ranges> allLease;
+    std::uint64_t leaseStamp = 1;
+    std::shared_ptr<const Lease::Ranges> retiringLease;
+    std::uint64_t retiringLeaseStamp = 0;
     std::uint64_t backingSerials = 0;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> retiring;
     std::size_t unlockedMutations = 0;
@@ -101,7 +104,37 @@ bool verifyLeasePatch() {
     return enabled;
 }
 
+bool retiringLeaseCacheEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_RETIRING_LEASE_CACHE") == nullptr;
+    return enabled;
+}
+
+bool verifyRetiringLease() {
+    static const bool enabled = std::getenv("APS5_VERIFY_RETIRING_LEASE") != nullptr;
+    return enabled;
+}
+
+struct LeaseCounters {
+    std::atomic<std::uint64_t> readableBuilds{0};
+    std::atomic<std::uint64_t> retiringBuilds{0};
+    std::atomic<std::uint64_t> retiringHits{0};
+    std::atomic<std::uint64_t> retiringChecked{0};
+    std::atomic<std::uint64_t> pinWaits{0};
+    std::atomic<std::uint64_t> pinWaitNs{0};
+    std::array<std::atomic<std::uint64_t>, 3> pinWaitsByLength{};
+};
+
+LeaseCounters& leaseCounters() {
+    static LeaseCounters counters;
+    return counters;
+}
+
+void noteLeaseChange() {
+    ++registry().leaseStamp;
+}
+
 void noteRangeDirty(std::uint64_t address, std::uint64_t bytes) {
+    noteLeaseChange();
     auto& index = registry().leaseIndex;
     if (!index.valid) return;
     if (index.dirtyCount == LeaseIndexDirtyLimit) {
@@ -172,6 +205,7 @@ void renewBacking(std::uintptr_t address, std::size_t bytes, std::vector<std::pa
         auto renewed = *it->second;
         renewed.backingSerial = freshBacking();
         it->second = std::make_shared<const Range>(renewed);
+        noteLeaseChange();
         renewedSpans.emplace_back(renewed.address, renewed.address + std::max<std::uint64_t>(renewed.bytes, 1));
     }
 }
@@ -454,6 +488,7 @@ void* GuestAllocationsBegin_nid_postfix() {
     if (!leasePatchEnabled()) {
         registry().readableLease.reset();
         registry().allLease.reset();
+        noteLeaseChange();
     }
     return state;
 }
@@ -487,9 +522,12 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     const auto ended = publishChanges(state->journaled, whole, std::move(snapshot));
     std::shared_ptr<const Lease::Ranges> retiredReadable;
     std::shared_ptr<const Lease::Ranges> retiredAll;
+    std::shared_ptr<const Lease::Ranges> retiredRetiring;
     if (!unchanged) {
         retiredReadable = std::move(registry().readableLease);
         retiredAll = std::move(registry().allLease);
+        retiredRetiring = std::move(registry().retiringLease);
+        noteLeaseChange();
     }
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
@@ -516,6 +554,7 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     delete state;
     retiredReadable.reset();
     retiredAll.reset();
+    retiredRetiring.reset();
     if (!weak.empty()) observer(weak, ended);
     if (noted) gpuMapObserverCalls.fetch_sub(1);
 }
@@ -571,6 +610,36 @@ bool GuestAllocationsChangesSince_nid_no_patch(std::uint64_t since, std::vector<
 bool GuestAllocationsMutationWaiting_nid_postfix() {
     std::lock_guard lock(registry().mutex);
     return !settledLocked();
+}
+
+std::shared_ptr<const Range> GuestAllocationsReadableAtOrBelow_nid_postfix(std::uintptr_t address) {
+    std::lock_guard lock(registry().mutex);
+    const auto& ranges = registry().ranges;
+    const bool retiring = !registry().retiring.empty();
+    for (auto it = ranges.upper_bound(address); it != ranges.begin();) {
+        --it;
+        const auto& range = it->second;
+        if (range->bytes == 0 || !range->readable || (retiring && isRetiring(*range))) continue;
+        return range;
+    }
+    return nullptr;
+}
+
+std::uint64_t GuestAllocationsLeaseStamp_nid_postfix() {
+    std::lock_guard lock(registry().mutex);
+    return registry().leaseStamp;
+}
+
+LeaseCounts GuestAllocationsLeaseCounts_nid_postfix() {
+    const auto& counters = leaseCounters();
+    const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    return {load(counters.readableBuilds), load(counters.retiringBuilds), load(counters.retiringHits), load(counters.pinWaits), load(counters.pinWaitNs), load(counters.pinWaitsByLength[0]), load(counters.pinWaitsByLength[1]), load(counters.pinWaitsByLength[2])};
+}
+
+bool GuestAllocationsRetiring_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    std::lock_guard lock(registry().mutex);
+    const std::uint64_t end = address + std::max<std::size_t>(bytes, 1);
+    return std::any_of(registry().retiring.begin(), registry().retiring.end(), [&](const auto& span) { return span.first < end && address < span.second; });
 }
 
 bool GuestAllocationsAnyGpuRange_nid_postfix(std::uintptr_t address, std::size_t bytes) {
@@ -647,6 +716,7 @@ void registerImage(const void* image) {
     require(registered, "guest image has no committed pages");
     state.ranges.swap(replacement);
     state.leaseIndex.valid = false;
+    noteLeaseChange();
     state.wholeChangePending = true;
     state.registeredImages.emplace(reinterpret_cast<std::uintptr_t>(image), cursor);
 }
@@ -752,6 +822,7 @@ std::uintptr_t registerImagePages(const ImagePages& collected) {
     }
     state.ranges.swap(replacement);
     state.leaseIndex.valid = false;
+    noteLeaseChange();
     state.wholeChangePending = true;
     return static_cast<std::uintptr_t>(std::prev(pages.end())->first + pageSize);
 }
@@ -839,6 +910,7 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     int syncedRounds = 0;
     int fruitlessRounds = 0;
     bool marked = false;
+    std::chrono::steady_clock::time_point markedAt{};
     const auto unmark = [&] {
         if (!marked) return;
         if (!state->lock.owns_lock()) state->lock.lock();
@@ -847,7 +919,12 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         retiring.erase(std::find(retiring.begin(), retiring.end(), std::pair<std::uintptr_t, std::uintptr_t>{address, end}));
         registry().readableLease.reset();
         registry().allLease.reset();
+        noteLeaseChange();
         marked = false;
+        const auto waited = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - markedAt).count());
+        auto& counters = leaseCounters();
+        counters.pinWaitNs.fetch_add(waited, std::memory_order_relaxed);
+        counters.pinWaitsByLength[waited < 1'000'000 ? 0 : waited < 10'000'000 ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
     };
     struct Unmark {
         const decltype(unmark)& release;
@@ -865,14 +942,28 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         auto& unlocked = registry().unlocked;
         unlocked.erase(std::find(unlocked.begin(), unlocked.end(), state));
     };
+    const auto retiringLeasePins = [&] {
+        const auto& cached = registry().retiringLease;
+        if (cached == nullptr) return false;
+        auto at = std::upper_bound(cached->begin(), cached->end(), address, [](std::uint64_t value, const auto& range) { return value < range->address; });
+        if (at != cached->begin()) --at;
+        for (; at != cached->end() && ((*at)->address < end || (*at)->address == address); ++at) {
+            if ((*at)->address + (*at)->bytes > address || (*at)->address == address) return true;
+        }
+        return false;
+    };
     for (;;) {
-        if (registry().readableLease != nullptr || registry().allLease != nullptr) {
+        const bool retiringHeld = retiringLeasePins();
+        if (registry().readableLease != nullptr || registry().allLease != nullptr || retiringHeld) {
             auto droppedReadable = std::move(registry().readableLease);
             auto droppedAll = std::move(registry().allLease);
+            std::shared_ptr<const Lease::Ranges> droppedRetiring;
+            if (retiringHeld) droppedRetiring = std::move(registry().retiringLease);
             if (leasePatchEnabled() && cacheDrops++ < 2 && state != nullptr && state->lock.owns_lock()) {
                 release();
                 droppedReadable.reset();
                 droppedAll.reset();
+                droppedRetiring.reset();
                 retake();
                 continue;
             }
@@ -898,7 +989,10 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         }
         if (!marked && state != nullptr && state->lock.owns_lock()) {
             registry().retiring.emplace_back(address, end);
+            noteLeaseChange();
             marked = true;
+            markedAt = std::chrono::steady_clock::now();
+            leaseCounters().pinWaits.fetch_add(1, std::memory_order_relaxed);
         }
         if (std::chrono::steady_clock::now() >= deadline) PinnedFailure(address, bytes, ("waited " + std::to_string(pinWait().count()) + " ms for the lease (APS5_PIN_WAIT_MS)").c_str());
         const auto waiter = pinWaiter.load(std::memory_order_acquire);
@@ -1241,19 +1335,44 @@ static void noteSnapshot(const std::shared_ptr<const Lease::Ranges>& ranges) {
     registered.snapshotGenerations[registered.snapshotNext++ % registered.snapshotGenerations.size()] = {ranges, generation.load(std::memory_order_acquire), !settled};
 }
 
-static Lease acquireReadableLocked() {
-    if (auto shared = registry().readableLease) {
-        verifyCachedLease(*shared, true);
-        return Lease(std::move(shared));
-    }
-    const bool retiring = !registry().retiring.empty();
+static std::shared_ptr<Lease::Ranges> buildReadableLocked(bool retiring) {
     const auto& index = currentLeaseIndex();
     auto ranges = std::make_shared<Lease::Ranges>();
     ranges->reserve(index.size());
     for (const auto& entry : index) {
         if (entry.readable && (!retiring || !isRetiring(*entry.node->second))) ranges->push_back(entry.node->second);
     }
-    if (!retiring) registry().readableLease = ranges;
+    return ranges;
+}
+
+static void verifyRetiringCached(const Lease::Ranges& cached) {
+    leaseCounters().retiringChecked.fetch_add(1, std::memory_order_relaxed);
+    const auto built = buildReadableLocked(true);
+    if (*built == cached) return;
+    std::fprintf(stderr, "FATAL: APS5_VERIFY_RETIRING_LEASE: the readable lease cached during a pin wait (%zu ranges, stamp %llu) differs from one built now (%zu ranges)\n", cached.size(), static_cast<unsigned long long>(registry().retiringLeaseStamp), built->size());
+    std::abort();
+}
+
+static Lease acquireReadableLocked() {
+    if (auto shared = registry().readableLease) {
+        verifyCachedLease(*shared, true);
+        return Lease(std::move(shared));
+    }
+    const bool retiring = !registry().retiring.empty();
+    auto& counters = leaseCounters();
+    if (retiring && retiringLeaseCacheEnabled() && registry().retiringLease != nullptr && registry().retiringLeaseStamp == registry().leaseStamp) {
+        counters.retiringHits.fetch_add(1, std::memory_order_relaxed);
+        if (verifyRetiringLease()) verifyRetiringCached(*registry().retiringLease);
+        return Lease(registry().retiringLease);
+    }
+    auto ranges = buildReadableLocked(retiring);
+    (retiring ? counters.retiringBuilds : counters.readableBuilds).fetch_add(1, std::memory_order_relaxed);
+    if (!retiring) {
+        registry().readableLease = ranges;
+    } else if (retiringLeaseCacheEnabled()) {
+        registry().retiringLease = ranges;
+        registry().retiringLeaseStamp = registry().leaseStamp;
+    }
     noteSnapshot(ranges);
     return Lease(std::move(ranges));
 }

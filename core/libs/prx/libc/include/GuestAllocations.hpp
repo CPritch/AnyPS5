@@ -53,6 +53,17 @@ private:
 };
 using Mapped = std::vector<std::weak_ptr<const Range>>;
 
+struct LeaseCounts {
+    std::uint64_t readableBuilds = 0;
+    std::uint64_t retiringBuilds = 0;
+    std::uint64_t retiringHits = 0;
+    std::uint64_t pinWaits = 0;
+    std::uint64_t pinWaitNs = 0;
+    std::uint64_t pinWaitsUnderMs = 0;
+    std::uint64_t pinWaitsUnderTenMs = 0;
+    std::uint64_t pinWaitsLonger = 0;
+};
+
 extern "C" {
 void* GuestAllocationsBegin_nid_postfix();
 void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation);
@@ -87,6 +98,10 @@ bool GuestAllocationsChangedSince_nid_postfix(std::uint64_t generation, std::uin
 bool GuestAllocationsChangesSince_nid_no_patch(std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>* spans, std::uint64_t* through);
 bool GuestAllocationsAnyGpuRange_nid_postfix(std::uintptr_t address, std::size_t bytes);
 bool GuestAllocationsMutationWaiting_nid_postfix();
+bool GuestAllocationsRetiring_nid_postfix(std::uintptr_t address, std::size_t bytes);
+std::shared_ptr<const Range> GuestAllocationsReadableAtOrBelow_nid_postfix(std::uintptr_t address);
+std::uint64_t GuestAllocationsLeaseStamp_nid_postfix();
+LeaseCounts GuestAllocationsLeaseCounts_nid_postfix();
 // Precise invalidation for such caches: the callback runs, after the generation changed, for every
 // range whose mapping or protection changed (registry mutations and guest heap decommits).
 void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));

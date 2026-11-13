@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -571,6 +572,148 @@ void settledLeaseNeverShowsHalfAMutation() {
 
 }
 
+std::shared_ptr<const Range> leasedAtOrBelow(std::uintptr_t address) {
+    const auto lease = GuestAllocationsAcquire_nid_postfix();
+    auto found = std::upper_bound(lease.begin(), lease.end(), address, [](std::uint64_t value, const auto& range) { return value < range->address; });
+    if (found == lease.begin()) return nullptr;
+    return *--found;
+}
+
+void waitUntil(const std::function<bool()>& condition, const char* what) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!condition() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    check(condition(), what);
+}
+
+bool retiringAt(const void* pointer) {
+    return GuestAllocationsRetiring_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), 1);
+}
+
+void lookupAgreesWithTheLease() {
+    auto* base = arena() + Granule;
+    auto* unreadable = base + 2 * 65536;
+    auto* upper = base + 4 * 65536;
+    auto* pinned = base + 6 * 65536;
+    {
+        Mutation mutation;
+        mutation.Add(base, 65536, true, true, true);
+        mutation.Add(unreadable, 65536, false, false, false);
+        mutation.Add(upper, 65536, true, false, true);
+        mutation.Add(pinned, 65536, true, true, true);
+    }
+    const auto start = reinterpret_cast<std::uintptr_t>(base);
+    std::vector<std::uintptr_t> probes{start - 1, start};
+    for (std::uintptr_t offset = 0; offset <= 8 * 65536; offset += 16384) probes.push_back(start + offset + 4095);
+    for (std::uintptr_t offset = 65536; offset <= 8 * 65536; offset += 65536) {
+        probes.push_back(start + offset - 1);
+        probes.push_back(start + offset);
+    }
+    const auto agree = [&](const char* what) {
+        for (const auto probe : probes) check(GuestAllocationsReadableAtOrBelow_nid_postfix(probe) == leasedAtOrBelow(probe), what);
+    };
+    agree("the registry lookup and a readable lease find different ranges at or below an address");
+    check(GuestAllocationsReadableAtOrBelow_nid_postfix(reinterpret_cast<std::uintptr_t>(unreadable) + 100) == GuestAllocationsReadableAtOrBelow_nid_postfix(start), "the lookup inside an unreadable range does not fall back to the readable range below it");
+    auto held = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
+    std::thread mutator([&] {
+        Mutation mutation;
+        mutation.RequireUnpinned(pinned, 65536);
+        mutation.Remove(pinned);
+    });
+    waitUntil([&] { return retiringAt(pinned); }, "the mutation never waited for the leased range");
+    agree("the registry lookup and a readable lease find different ranges while a range is retiring");
+    check(GuestAllocationsReadableAtOrBelow_nid_postfix(reinterpret_cast<std::uintptr_t>(pinned) + 100) == GuestAllocationsReadableAtOrBelow_nid_postfix(reinterpret_cast<std::uintptr_t>(upper)), "the lookup inside a retiring range does not fall back to the range below it");
+    held.reset();
+    mutator.join();
+    agree("the registry lookup and a readable lease find different ranges after a removal");
+    Mutation mutation;
+    mutation.Remove(base);
+    mutation.Remove(unreadable);
+    mutation.Remove(upper);
+}
+
+bool holds(const Lease& lease, const void* pointer) {
+    return !rangeAt(lease, pointer).expired();
+}
+
+void readableLeaseCachedDuringPinWaits() {
+    const bool cached = std::getenv("APS5_NO_RETIRING_LEASE_CACHE") == nullptr;
+    auto* first = arena() + Granule;
+    auto* second = first + 2 * 65536;
+    auto* added = first + 4 * 65536;
+    auto* kept = first + 6 * 65536;
+    {
+        Mutation mutation;
+        mutation.Add(first, 65536, true, true, true);
+        mutation.Add(second, 65536, true, true, true);
+        mutation.Add(kept, 65536, true, true, true);
+    }
+    const auto counts = [] { return GuestAllocationsLeaseCounts_nid_postfix(); };
+    const auto ended = [&] { const auto now = counts(); return now.pinWaitsUnderMs + now.pinWaitsUnderTenMs + now.pinWaitsLonger; };
+    const auto endedBefore = ended();
+    auto firstPin = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
+    std::atomic<bool> firstDone{false};
+    const auto pinWaitsBefore = counts().pinWaits;
+    std::thread firstMutator([&] {
+        Mutation mutation;
+        mutation.RequireUnpinned(first, 65536);
+        mutation.Remove(first);
+        firstDone = true;
+    });
+    waitUntil([&] { return retiringAt(first); }, "the first mutation never waited for its leased range");
+    check(counts().pinWaits == pinWaitsBefore + 1, "a pin wait starting was not counted");
+    auto before = counts();
+    auto starting = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
+    auto again = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
+    auto after = counts();
+    check(!holds(*starting, first) && holds(*starting, second) && holds(*starting, kept), "a lease taken while a pin wait starts does not hide the retiring range and show the others");
+    check(after.retiringBuilds == before.retiringBuilds + 1, "the first lease of a pin wait was not built");
+    if (cached) check(starting->Snapshot() == again->Snapshot() && after.retiringHits == before.retiringHits + 1, "a second lease during an unchanged pin wait was built again instead of served from the cache");
+    else check(starting->Snapshot() != again->Snapshot() && after.retiringHits == before.retiringHits, "with APS5_NO_RETIRING_LEASE_CACHE=1 a lease during a pin wait was served from a cache");
+    {
+        Mutation mutation;
+        mutation.Add(added, 65536, true, true, true);
+    }
+    auto mapped = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
+    check(mapped->Snapshot() != starting->Snapshot() && holds(*mapped, added) && !holds(*mapped, first), "a lease after a new map during the pin wait does not show the new range");
+    starting.reset();
+    again.reset();
+    mapped.reset();
+    auto secondPin = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
+    auto cachedBeforeSecond = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
+    check(holds(*cachedBeforeSecond, second), "the lease cached before the second pin wait does not hold the range it will wait on");
+    const auto cachedSnapshot = cachedBeforeSecond->Snapshot().get();
+    std::atomic<bool> secondDone{false};
+    std::thread secondMutator([&] {
+        Mutation mutation;
+        mutation.RequireUnpinned(second, 65536);
+        mutation.Remove(second);
+        secondDone = true;
+    });
+    waitUntil([&] { return retiringAt(second); }, "the second mutation never waited for its leased range");
+    auto retiringTwo = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
+    check(retiringTwo->Snapshot().get() != cachedSnapshot && !holds(*retiringTwo, first) && !holds(*retiringTwo, second) && holds(*retiringTwo, added), "a lease after a second range started retiring still shows it or misses a live range");
+    retiringTwo.reset();
+    cachedBeforeSecond.reset();
+    firstPin.reset();
+    waitUntil([&] { return firstDone.load(); }, "the first mutation did not finish once its range was released while the pin-wait cache held other ranges");
+    firstMutator.join();
+    auto finished = std::make_unique<Lease>(GuestAllocationsAcquire_nid_postfix());
+    check(!holds(*finished, first) && !holds(*finished, second) && holds(*finished, added) && holds(*finished, kept), "a lease after a range finished retiring shows a removed or retiring range, or misses a live one");
+    finished.reset();
+    secondPin.reset();
+    waitUntil([&] { return secondDone.load(); }, "the second mutation did not finish: a lease cached during the first pin wait still pins its range");
+    secondMutator.join();
+    before = counts();
+    const auto settled = GuestAllocationsAcquire_nid_postfix();
+    const auto settledAgain = GuestAllocationsAcquire_nid_postfix();
+    after = counts();
+    check(settled.Snapshot() == settledAgain.Snapshot() && after.retiringBuilds == before.retiringBuilds && after.retiringHits == before.retiringHits && !holds(settled, second), "once no range is retiring the settled lease cache does not serve leases again");
+    check(ended() == endedBefore + 2, "the two ended pin waits were not counted by length");
+    Mutation mutation;
+    mutation.Remove(added);
+    mutation.Remove(kept);
+}
+
 int main() {
     const bool journal = std::getenv("APS5_NO_ALLOCATION_JOURNAL") == nullptr;
     std::memset(arena(), 0, 4096);
@@ -586,6 +729,8 @@ int main() {
     unpublishedChangesAreNeverJournalCovered(journal);
     leasesKnowTheirGeneration(journal);
     settledLeaseNeverShowsHalfAMutation();
+    lookupAgreesWithTheLease();
+    readableLeaseCachedDuringPinWaits();
     std::puts("guest allocation journal tests passed");
     return 0;
 }
