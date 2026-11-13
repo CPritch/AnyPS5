@@ -1903,6 +1903,8 @@ void DrawPipeline::Enqueue(CommitKind commitKind, Commit commit, std::vector<Ran
 }
 
 void DrawPipeline::NoteDrawKey(std::uint64_t key, std::uint64_t shape) {
+    static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_COMMIT_STATS") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_NO_STATS_ONLY_DRAW_KEYS") != nullptr;
+    if (!counted) return;
     constexpr std::size_t RecentSlots = 4096;
     thread_local std::array<std::uint64_t, RecentSlots> recent{};
     thread_local std::uint64_t previous = 0;

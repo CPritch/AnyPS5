@@ -54,12 +54,12 @@ public:
     StderrCapture(const StderrCapture&) = delete;
     StderrCapture& operator=(const StderrCapture&) = delete;
 
-    std::string ReadReport() const {
+    std::string ReadReport(std::string_view prefix = "[draw] pipelined ") const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         do {
             std::ifstream file(path, std::ios::binary);
             const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-            const auto begin = text.find("[draw] pipelined ");
+            const auto begin = text.find(prefix);
             if (begin != std::string::npos) {
                 const auto end = text.find('\n', begin);
                 if (end != std::string::npos) return text.substr(begin, end - begin);
@@ -92,6 +92,9 @@ void TestReport() {
         pipeline.Enqueue([&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, true);
         Check(DrawPipeline::HeldReads(0x1000, 4), "queued read range was not held");
         for (unsigned i = 0; i < 3; ++i) pipeline.NoteDecodeDrain();
+        DrawPipeline::NoteDrawKey(7, 1);
+        DrawPipeline::NoteDrawKey(7, 1);
+        DrawPipeline::NoteDrawKey(9, 2);
         std::this_thread::sleep_until(reportAfter);
         pipeline.Enqueue([] {}, {}, 0, {}, {}, true);
     } catch (...) {
@@ -108,6 +111,9 @@ void TestReport() {
     Check(Count(report, " decode drains") == 1, "pipeline decode-drain counters were printed more than once");
     Check(report.find("; drains:") != std::string::npos, "pipeline drain counters were lost");
     Check(report.find("packet drains by opcode:") != std::string::npos, "pipeline opcode counters were lost");
+    const auto keys = capture.ReadReport("[vkdraw] ");
+    std::cout << keys << '\n';
+    Check(keys.find("draw keys 3, same as the previous draw 1, seen within the last 4096 draws 1; draw shapes (state without per-draw user words) same as the previous 1, seen within the last 4096 1") != std::string::npos, "the draw key counters were not counted under the stats switch");
 }
 
 }
