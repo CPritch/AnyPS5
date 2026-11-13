@@ -1252,6 +1252,9 @@ void ChainFault(int hostSignal, siginfo_t* info, void* context) {
 }
 
 void DeliverFault(int hostSignal, siginfo_t* info, void* context) {
+#if defined(__x86_64__) && !defined(ANYPS5_ENABLE_ASAN)
+    if ((hostSignal == SIGSEGV || hostSignal == SIGBUS) && info->si_code > 0 && GuestArena::GuestArenaRecoverHostRead_nid_no_patch(context, reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
+#endif
     auto& host = static_cast<ucontext_t*>(context)->uc_mcontext;
     Fault fault{};
     const bool deliverable = info->si_code > 0 && Classify(hostSignal, host, fault);

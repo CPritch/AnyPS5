@@ -122,6 +122,22 @@ void Check(std::string_view mode) {
         Require(errno == E2BIG, "a failed run copy changed errno");
         return;
     }
+    if (mode == "guarded") {
+#if defined(__linux__) && defined(__x86_64__) && !defined(ANYPS5_ENABLE_ASAN)
+        Require(GuestArena::GuestArenaReadRecoveryInstalled_nid_no_patch(), "the guarded speculative copy has no fault recovery installed");
+        std::array<std::byte, 100> bytes{};
+        Require(GuestArena::GuestArenaGuardedCopy_nid_no_patch(range.Address() + Unit - 37u, bytes.data(), bytes.size()), "a guarded copy of readable bytes across an arena unit failed");
+        Require(std::all_of(bytes.begin(), bytes.end(), [](std::byte byte) { return byte == std::byte{0x5b}; }), "a guarded copy returned different bytes");
+        GuestArena::GuestArenaReset_nid_postfix(range.Data() + Unit, Unit);
+        for (const std::size_t before : {1u, 15u, 16u, 37u}) {
+            Require(!GuestArena::GuestArenaGuardedCopy_nid_no_patch(range.Address() + Unit - before, bytes.data(), bytes.size()), "a guarded copy into a reset unit was reported copied");
+        }
+        Require(!GuestArena::GuestArenaGuardedCopy_nid_no_patch(range.Address() + Unit, bytes.data(), 1u), "a guarded one-byte copy of a reset unit was reported copied");
+        Require(GuestArena::GuestArenaGuardedCopy_nid_no_patch(range.Address() + Unit - 64u, bytes.data(), 64u), "a guarded copy ending at a reset unit failed");
+        Require(CopyMapped(range.Address() + Unit - 16u, out) == Compare::Unmapped, "a speculative copy into a reset unit was reported copied");
+#endif
+        return;
+    }
     Require(mode == "valid", "unknown mapped-copy fixture mode");
     errno = E2BIG;
     Require(CopyMapped(range.Address() + Unit - 128u, out) == Compare::Equal, "a readable source crossing an arena unit cannot be copied");

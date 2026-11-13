@@ -95,6 +95,13 @@ bool BatchedGuestCopies() {
 
 std::atomic<pid_t> cachedPid{0};
 
+#if defined(__x86_64__) && !defined(ANYPS5_ENABLE_ASAN)
+bool GuardedGuestCopies() {
+    static const bool enabled = std::getenv("APS5_NO_GUARDED_GUEST_COPIES") == nullptr;
+    return enabled && GuestArena::GuestArenaReadRecoveryInstalled_nid_no_patch();
+}
+#endif
+
 pid_t SelfPid() {
     if (!BatchedGuestCopies()) return getpid();
     static const bool registered = [] {
@@ -891,10 +898,23 @@ extern "C" bool GuestCopyInUnsynced_nid_no_patch(void* destination, const void* 
     if (bytes == 0) return true;
     const auto start = reinterpret_cast<std::uintptr_t>(source);
     if (start == 0 || bytes > UINTPTR_MAX - start) return false;
+#if defined(__linux__) && defined(__x86_64__) && !defined(ANYPS5_ENABLE_ASAN)
+    if (GuardedGuestCopies()) return GuestArena::GuestArenaGuardedCopy_nid_no_patch(start, destination, bytes);
+#endif
     return CopyGuestBytes(destination, source, bytes, false);
 }
 
 extern "C" bool GuestCopyInUnsyncedRuns_nid_no_patch(const GuestCopyRun* runs, std::size_t count) {
+#if defined(__linux__) && defined(__x86_64__) && !defined(ANYPS5_ENABLE_ASAN)
+    if (GuardedGuestCopies()) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto start = reinterpret_cast<std::uintptr_t>(runs[index].source);
+            if (runs[index].bytes != 0 && (start == 0 || runs[index].bytes > UINTPTR_MAX - start)) return false;
+            if (!GuestArena::GuestArenaGuardedCopy_nid_no_patch(start, runs[index].destination, runs[index].bytes)) return false;
+        }
+        return true;
+    }
+#endif
 #ifdef __linux__
     if (BatchedGuestCopies()) {
         constexpr std::size_t Batch = 64;

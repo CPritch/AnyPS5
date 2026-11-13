@@ -46,6 +46,12 @@ void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t byt
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule);
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaSetAccessObserver_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));
+#if defined(__linux__) && defined(__x86_64__) && !defined(ANYPS5_ENABLE_ASAN)
+bool GuestArenaGuardedCopy_nid_no_patch(std::uintptr_t source, void* destination, std::size_t bytes);
+bool GuestArenaRecoverHostRead_nid_no_patch(void* signalContext, std::uintptr_t faultAddress);
+void GuestArenaNoteReadRecovery_nid_no_patch();
+bool GuestArenaReadRecoveryInstalled_nid_no_patch();
+#endif
 #ifdef _WIN32
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address);

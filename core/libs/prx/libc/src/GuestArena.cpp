@@ -8,6 +8,7 @@
 #ifndef _WIN32
 #include <cerrno>
 #include <fstream>
+#include <ucontext.h>
 #include <sstream>
 #include <string>
 #include <sys/mman.h>
@@ -493,6 +494,79 @@ std::invalid_argument OutsideArena(const char* operation, const void* pointer, s
 }
 
 }
+
+#if defined(__linux__) && defined(__x86_64__) && !defined(ANYPS5_ENABLE_ASAN)
+extern "C" {
+int GuestArenaGuardedCopyLinux(std::uintptr_t source, void* destination, std::size_t bytes);
+extern const char GuestArenaGuardedCopyWideLoad[];
+extern const char GuestArenaGuardedCopyByteLoad[];
+extern const char GuestArenaGuardedReadFailed[];
+}
+
+asm(".text\n"
+    ".p2align 4\n"
+    ".globl GuestArenaGuardedCopyLinux\n"
+    ".hidden GuestArenaGuardedCopyLinux\n"
+    ".globl GuestArenaGuardedCopyWideLoad\n"
+    ".hidden GuestArenaGuardedCopyWideLoad\n"
+    ".globl GuestArenaGuardedCopyByteLoad\n"
+    ".hidden GuestArenaGuardedCopyByteLoad\n"
+    ".globl GuestArenaGuardedReadFailed\n"
+    ".hidden GuestArenaGuardedReadFailed\n"
+    ".type GuestArenaGuardedCopyLinux, @function\n"
+    "GuestArenaGuardedCopyLinux:\n"
+    "    leaq (%rdi,%rdx), %r9\n"
+    "    subq %rdi, %rsi\n"
+    "    jmp 2f\n"
+    "GuestArenaGuardedCopyWideLoad:\n"
+    "1:  movdqu (%rdi), %xmm0\n"
+    "    movdqu %xmm0, (%rdi,%rsi)\n"
+    "    addq $16, %rdi\n"
+    "2:  leaq 16(%rdi), %rax\n"
+    "    cmpq %r9, %rax\n"
+    "    jbe 1b\n"
+    "    jmp 4f\n"
+    "GuestArenaGuardedCopyByteLoad:\n"
+    "3:  movzbl (%rdi), %eax\n"
+    "    movb %al, (%rdi,%rsi)\n"
+    "    incq %rdi\n"
+    "4:  cmpq %r9, %rdi\n"
+    "    jb 3b\n"
+    "    xorl %eax, %eax\n"
+    "    ret\n"
+    "GuestArenaGuardedReadFailed:\n"
+    "    movl $-1, %eax\n"
+    "    ret\n"
+    ".size GuestArenaGuardedCopyLinux, .-GuestArenaGuardedCopyLinux\n");
+
+namespace {
+std::atomic<bool> readRecoveryInstalled{false};
+}
+
+bool GuestArenaGuardedCopy_nid_no_patch(std::uintptr_t source, void* destination, std::size_t bytes) {
+    if (bytes == 0) return true;
+    if (source == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - source) return false;
+    return GuestArenaGuardedCopyLinux(source, destination, bytes) == 0;
+}
+
+bool GuestArenaRecoverHostRead_nid_no_patch(void* signalContext, std::uintptr_t faultAddress) {
+    if (signalContext == nullptr) return false;
+    auto& registers = static_cast<ucontext_t*>(signalContext)->uc_mcontext.gregs;
+    const auto* at = reinterpret_cast<const char*>(registers[REG_RIP]);
+    if (at != GuestArenaGuardedCopyWideLoad && at != GuestArenaGuardedCopyByteLoad) return false;
+    if (faultAddress < static_cast<std::uintptr_t>(registers[REG_RDI]) || faultAddress >= static_cast<std::uintptr_t>(registers[REG_R9])) return false;
+    registers[REG_RIP] = reinterpret_cast<greg_t>(GuestArenaGuardedReadFailed);
+    return true;
+}
+
+void GuestArenaNoteReadRecovery_nid_no_patch() {
+    readRecoveryInstalled.store(true, std::memory_order_release);
+}
+
+bool GuestArenaReadRecoveryInstalled_nid_no_patch() {
+    return readRecoveryInstalled.load(std::memory_order_acquire);
+}
+#endif
 
 #ifdef _WIN32
 extern "C" {

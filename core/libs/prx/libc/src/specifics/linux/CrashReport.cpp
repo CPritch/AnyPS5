@@ -1,5 +1,6 @@
 #if defined(__linux__) && defined(__x86_64__)
 #include "prx/libc/include/CallTrace.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/LogFile.hpp"
 
 #include <atomic>
@@ -268,6 +269,9 @@ void ReportCallTrace() {
 }
 
 void OnFatalSignal(int signal, siginfo_t* info, void* context) {
+#ifndef ANYPS5_ENABLE_ASAN
+    if ((signal == SIGSEGV || signal == SIGBUS) && info != nullptr && info->si_code > 0 && GuestArena::GuestArenaRecoverHostRead_nid_no_patch(context, reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
+#endif
     const int savedErrno = errno;
     if (!g_reporting.exchange(true, std::memory_order_acq_rel)) {
         Report(signal, info, static_cast<const ucontext_t*>(context));
@@ -325,6 +329,9 @@ const bool g_installed = [] {
             constexpr char message[] = "[libc] crash report: cannot install signal handler\n";
             write(STDERR_FILENO, message, sizeof(message) - 1);
         }
+#ifndef ANYPS5_ENABLE_ASAN
+        else if (FatalSignals[slot] == SIGSEGV) GuestArena::GuestArenaNoteReadRecovery_nid_no_patch();
+#endif
     }
     return true;
 }();
