@@ -4230,12 +4230,46 @@ std::shared_ptr<ImageMirror> findMirror(const Context& context, std::uint64_t be
     return mirror;
 }
 
-std::shared_ptr<const GuestAllocations::Range> fixedImageRange(std::uint64_t begin, std::uint64_t end) {
+std::atomic<std::uint64_t> fixedImageLookups{0};
+
+bool fixedImageLookupEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_FIXED_IMAGE_LOOKUP") == nullptr;
+    return enabled;
+}
+
+bool verifyFixedImageLookup() {
+    static const bool enabled = std::getenv("APS5_VERIFY_FIXED_IMAGE_LOOKUP") != nullptr;
+    return enabled;
+}
+
+std::shared_ptr<const GuestAllocations::Range> leasedAtOrBelow(std::uint64_t begin) {
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     auto found = std::upper_bound(lease.begin(), lease.end(), begin, [](std::uint64_t address, const auto& range) { return address < range->address; });
     if (found == lease.begin()) return nullptr;
-    const auto& range = *--found;
-    if (!range->readable || range->writable || range->releasable || end > range->address + range->bytes) return nullptr;
+    return *--found;
+}
+
+std::shared_ptr<const GuestAllocations::Range> fixedImageRange(std::uint64_t begin, std::uint64_t end) {
+    std::shared_ptr<const GuestAllocations::Range> range;
+    if (fixedImageLookupEnabled()) {
+        const auto stamp = verifyFixedImageLookup() ? GuestAllocations::GuestAllocationsLeaseStamp_nid_postfix() : 0;
+        range = GuestAllocations::GuestAllocationsReadableAtOrBelow_nid_postfix(static_cast<std::uintptr_t>(begin));
+        fixedImageLookups.fetch_add(1, std::memory_order_relaxed);
+        if (verifyFixedImageLookup()) {
+            const auto leased = leasedAtOrBelow(begin);
+            if (GuestAllocations::GuestAllocationsLeaseStamp_nid_postfix() != stamp) {
+                DriverDetail::CountVerify(DriverDetail::VerifyCount::FixedImageLookupSkipped);
+            } else if (leased != range) {
+                std::fprintf(stderr, "FATAL: APS5_VERIFY_FIXED_IMAGE_LOOKUP: the registry lookup at 0x%llx found %s 0x%llx+0x%llx, a readable lease %s 0x%llx+0x%llx\n", static_cast<unsigned long long>(begin), range != nullptr ? "the range" : "no range", static_cast<unsigned long long>(range != nullptr ? range->address : 0), static_cast<unsigned long long>(range != nullptr ? range->bytes : 0), leased != nullptr ? "the range" : "no range", static_cast<unsigned long long>(leased != nullptr ? leased->address : 0), static_cast<unsigned long long>(leased != nullptr ? leased->bytes : 0));
+                std::abort();
+            } else {
+                DriverDetail::CountVerify(DriverDetail::VerifyCount::FixedImageLookupChecked);
+            }
+        }
+    } else {
+        range = leasedAtOrBelow(begin);
+    }
+    if (range == nullptr || !range->readable || range->writable || range->releasable || end > range->address + range->bytes) return nullptr;
     return range;
 }
 
@@ -4434,6 +4468,24 @@ bool dropCachedSpace() {
     return true;
 }
 
+struct WaiterCounters {
+    std::atomic<std::uint64_t> rounds{0};
+    std::atomic<std::uint64_t> heldNs{0};
+    std::atomic<std::uint64_t> submits{0};
+    std::atomic<std::uint64_t> submitsSkipped{0};
+    std::atomic<std::uint64_t> leasesBeforeLock{0};
+};
+
+WaiterCounters& Waiter() {
+    static WaiterCounters counters;
+    return counters;
+}
+
+bool waiterHoldCutEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_WAITER_HOLD_CUT") == nullptr;
+    return enabled;
+}
+
 bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     const auto start = std::chrono::steady_clock::now();
     bool synced = false;
@@ -4503,13 +4555,32 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         }
         if (retiredImport && recorder != nullptr) recorder->FlushDeferredReleases();
     } else {
+        const auto end = static_cast<std::uint64_t>(address) + bytes;
+        auto& imports = Imports();
+        const bool cut = waiterHoldCutEnabled();
+        const auto importOverlaps = [&] {
+            std::lock_guard importsLock(imports.mutex);
+            return std::any_of(imports.imports.begin(), imports.imports.end(), [&](const auto& entry) { return holdsRangeOver(entry.second, address, end); });
+        };
+        GuestAllocations::Lease importLease;
+        if (cut && importOverlaps()) {
+            importLease = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
+            Waiter().leasesBeforeLock.fetch_add(1, std::memory_order_relaxed);
+        }
         std::unique_lock lock(GuestMemory::GpuMutex());
+        const auto lockedAt = std::chrono::steady_clock::now();
+        const auto unlockedBefore = Recorder::ThreadUnlockedWaitNs();
+        std::uint64_t yieldedNs = 0;
         auto& state = Leases();
         auto* recorder = Recorder::Active();
         const auto target = state.newestLeaseSerial;
+        const auto submit = [&] {
+            recorder->Submit();
+            Waiter().submits.fetch_add(1, std::memory_order_relaxed);
+        };
         const auto drainRecorder = [&] {
             Recorder::CountSync(4);
-            recorder->Submit();
+            submit();
             if (!recorder->FinishUpToUnlocked(recorder->Submissions())) recorder->Sync();
             recorder = Recorder::Active();
             synced = true;
@@ -4517,7 +4588,8 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         };
         if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
             Recorder::CountSync(4);
-            recorder->Submit();
+            if (!cut || target > recorder->Submissions()) submit();
+            else Waiter().submitsSkipped.fetch_add(1, std::memory_order_relaxed);
             const auto* leasing = recorder;
             if (!recorder->FinishUpToUnlocked(target)) recorder->FinishUpTo(target);
             recorder = Recorder::Active();
@@ -4528,9 +4600,11 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         } else {
             static const bool locked = std::getenv("APS5_NO_LEASE_WAIT_UNLOCKED") != nullptr;
             if (!locked && GuestMemory::GpuMutex().DepthOnThisThread() == 1) {
+                const auto yieldedAt = std::chrono::steady_clock::now();
                 lock.unlock();
                 std::this_thread::yield();
                 lock.lock();
+                yieldedNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - yieldedAt).count());
                 recorder = Recorder::Active();
             } else {
                 std::this_thread::yield();
@@ -4539,22 +4613,10 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         if (recorder != nullptr) recorder->FlushDeferredReleases();
         if (recorder != nullptr) GuestBufferMemory::ReleaseRetainedSpaces(recorder->Id(), recorder->CompletedThrough());
 
-        const auto end = static_cast<std::uint64_t>(address) + bytes;
-        auto& imports = Imports();
         if (releaseParkedImports(imports, address, end)) retiredImport = true;
-        bool overlapsImport = false;
-        {
-            std::lock_guard importsLock(imports.mutex);
-            for (const auto& [base, entry] : imports.imports) {
-                if (holdsRangeOver(entry, address, end)) {
-                    overlapsImport = true;
-                    break;
-                }
-            }
-        }
-        if (overlapsImport) {
+        if (importOverlaps()) {
             if (recorder != nullptr && !recorder->Idle()) drainRecorder();
-            const auto lease = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
+            if (importLease.empty()) importLease = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
             {
                 std::lock_guard importsLock(imports.mutex);
                 for (auto it = imports.imports.begin(); it != imports.imports.end();) {
@@ -4563,7 +4625,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
                         continue;
                     }
                     const auto next = std::next(it);
-                    retireImport(imports.device, imports, it, lease, RetireCause::Waiter, false);
+                    retireImport(imports.device, imports, it, importLease, RetireCause::Waiter, false);
                     it = next;
                     retiredImport = true;
                 }
@@ -4573,6 +4635,11 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
 #ifdef _WIN32
         if (releaseSettleRetired(imports, address, end)) retiredImport = true;
 #endif
+        const auto held = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - lockedAt).count());
+        const auto unlocked = Recorder::ThreadUnlockedWaitNs() - unlockedBefore + yieldedNs;
+        Waiter().rounds.fetch_add(1, std::memory_order_relaxed);
+        Waiter().heldNs.fetch_add(held > unlocked ? held - unlocked : 0, std::memory_order_relaxed);
+        if (!cut) importLease.clear();
     }
     auto& state = Leases();
     std::lock_guard lock(state.mutex);
@@ -8800,17 +8867,35 @@ ImportsProofCheck HostImportsUnchangedOver(const Context& context, HostImportsPr
     return ImportsProofCheck::Survived;
 }
 
+PinWaiterCounts PinWaiterTotals() {
+    const auto& counters = Waiter();
+    return {counters.rounds.load(std::memory_order_relaxed), counters.heldNs.load(std::memory_order_relaxed), counters.submits.load(std::memory_order_relaxed), counters.submitsSkipped.load(std::memory_order_relaxed), counters.leasesBeforeLock.load(std::memory_order_relaxed)};
+}
+
 std::string TakeTailBundleText() {
     static ImportChurnCounts seen = ImportChurnTotals();
     static std::uint64_t seenNotes = GuestMemory::EarlyHolderNotes();
+    static std::uint64_t seenLookups = fixedImageLookups.load(std::memory_order_relaxed);
+    static GuestAllocations::LeaseCounts seenLeases = GuestAllocations::GuestAllocationsLeaseCounts_nid_postfix();
+    static PinWaiterCounts seenWaiter = PinWaiterTotals();
     const auto now = ImportChurnTotals();
     const auto notes = GuestMemory::EarlyHolderNotes();
+    const auto lookups = fixedImageLookups.load(std::memory_order_relaxed);
+    const auto leases = GuestAllocations::GuestAllocationsLeaseCounts_nid_postfix();
+    const auto waiter = PinWaiterTotals();
     const auto delta = [](std::uint64_t current, std::uint64_t before) { return static_cast<unsigned long long>(current - before); };
     const auto micros = [](std::uint64_t current, std::uint64_t before) { return static_cast<unsigned long long>((current - before) / 1000u); };
-    char text[768];
-    std::snprintf(text, sizeof(text), " imports hashed and made outside the tracker lock %llu (%llu us outside it), hashed again under it %llu, tracker walks that waited for such an import %llu (%llu us); import reconciles aborted at the Import barrier before their lease %llu; journal reconciles during a pin wait %llu, pin-wait fallbacks to a full reconcile %llu, journal reseeds from a pin-wait lease %llu; template import proofs region-checked %llu, their reconciles skipped %llu; GPU-lock holders named as they took the lock %llu", delta(now.trackerUnlocked, seen.trackerUnlocked), micros(now.trackerUnlockedNs, seen.trackerUnlockedNs), delta(now.trackerRedos, seen.trackerRedos), delta(now.windowWaits, seen.windowWaits), micros(now.windowWaitNs, seen.windowWaitNs), delta(now.earlyBarrierAborts, seen.earlyBarrierAborts), delta(now.pinWaitJournal, seen.pinWaitJournal), delta(now.pinWaitFallbacks, seen.pinWaitFallbacks), delta(now.pinWaitReseeds, seen.pinWaitReseeds), delta(now.regionChecks, seen.regionChecks), delta(now.regionSkips, seen.regionSkips), delta(notes, seenNotes));
+    char text[1536];
+    std::snprintf(text, sizeof(text), " imports hashed and made outside the tracker lock %llu (%llu us outside it), hashed again under it %llu, tracker walks that waited for such an import %llu (%llu us); import reconciles aborted at the Import barrier before their lease %llu; journal reconciles during a pin wait %llu, pin-wait fallbacks to a full reconcile %llu, journal reseeds from a pin-wait lease %llu; template import proofs region-checked %llu, their reconciles skipped %llu; GPU-lock holders named as they took the lock %llu; fixed image ranges looked up without a lease %llu; readable leases built %llu, built during a pin wait %llu, served from the pin-wait cache %llu; pin waits started %llu, ended after %llu us (under 1 ms %llu, 1-10 ms %llu, longer %llu); pin waiter rounds %llu, GPU lock held in them %llu us, recorder submits in them %llu, submits skipped (the lease batch already submitted) %llu, import leases taken before the GPU lock %llu",
+                  delta(now.trackerUnlocked, seen.trackerUnlocked), micros(now.trackerUnlockedNs, seen.trackerUnlockedNs), delta(now.trackerRedos, seen.trackerRedos), delta(now.windowWaits, seen.windowWaits), micros(now.windowWaitNs, seen.windowWaitNs), delta(now.earlyBarrierAborts, seen.earlyBarrierAborts), delta(now.pinWaitJournal, seen.pinWaitJournal), delta(now.pinWaitFallbacks, seen.pinWaitFallbacks), delta(now.pinWaitReseeds, seen.pinWaitReseeds), delta(now.regionChecks, seen.regionChecks), delta(now.regionSkips, seen.regionSkips), delta(notes, seenNotes),
+                  delta(lookups, seenLookups), delta(leases.readableBuilds + leases.retiringBuilds, seenLeases.readableBuilds + seenLeases.retiringBuilds), delta(leases.retiringBuilds, seenLeases.retiringBuilds), delta(leases.retiringHits, seenLeases.retiringHits),
+                  delta(leases.pinWaits, seenLeases.pinWaits), micros(leases.pinWaitNs, seenLeases.pinWaitNs), delta(leases.pinWaitsUnderMs, seenLeases.pinWaitsUnderMs), delta(leases.pinWaitsUnderTenMs, seenLeases.pinWaitsUnderTenMs), delta(leases.pinWaitsLonger, seenLeases.pinWaitsLonger),
+                  delta(waiter.rounds, seenWaiter.rounds), micros(waiter.heldNs, seenWaiter.heldNs), delta(waiter.submits, seenWaiter.submits), delta(waiter.submitsSkipped, seenWaiter.submitsSkipped), delta(waiter.leasesBeforeLock, seenWaiter.leasesBeforeLock));
     seen = now;
     seenNotes = notes;
+    seenLookups = lookups;
+    seenLeases = leases;
+    seenWaiter = waiter;
     return text;
 }
 

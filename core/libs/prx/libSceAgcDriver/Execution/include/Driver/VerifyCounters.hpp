@@ -31,9 +31,11 @@ enum class VerifyCount : std::size_t {
     JournalReconcileSkipped,
     RegionCheckChecked,
     RegionCheckSkipped,
+    FixedImageLookupChecked,
+    FixedImageLookupSkipped,
 };
 
-constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::RegionCheckSkipped) + 1;
+constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::FixedImageLookupSkipped) + 1;
 
 using VerifyCounts = std::array<std::uint64_t, VerifyCountSize>;
 

@@ -266,6 +266,14 @@ struct ImportChurnCounts {
     std::uint64_t regionSkips = 0;
 };
 bool ImportChurnCounted();
+struct PinWaiterCounts {
+    std::uint64_t rounds = 0;
+    std::uint64_t heldNs = 0;
+    std::uint64_t submits = 0;
+    std::uint64_t submitsSkipped = 0;
+    std::uint64_t leasesBeforeLock = 0;
+};
+PinWaiterCounts PinWaiterTotals();
 ImportChurnCounts ImportChurnTotals();
 std::string TakeTailBundleText();
 void NoteRevalidateFull(std::uint64_t ns);

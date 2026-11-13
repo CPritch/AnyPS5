@@ -311,6 +311,7 @@ public:
     // front only; tolerates batches another thread finished meanwhile. Later batches stay in flight.
     void FinishUpTo(std::uint64_t serial);
     bool FinishUpToUnlocked(std::uint64_t serial);
+    static std::uint64_t ThreadUnlockedWaitNs();
     // Submits and waits for every batch, running completions in order.
     void Sync();
     void CountSamples();

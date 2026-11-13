@@ -5855,6 +5855,14 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     return true;
 }
 
+namespace {
+thread_local std::uint64_t unlockedWaitNs = 0;
+}
+
+std::uint64_t Recorder::ThreadUnlockedWaitNs() {
+    return unlockedWaitNs;
+}
+
 bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     static const bool enabled = std::getenv("APS5_NO_LEASE_WAIT_UNLOCKED") == nullptr;
@@ -5866,6 +5874,7 @@ bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
     const auto semaphore = timeline;
     const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
     VkResult result = VK_SUCCESS;
+    const auto unlockedAt = std::chrono::steady_clock::now();
     {
         const UnlockedWaiter waiter{myId};
         mutex.unlock();
@@ -5873,6 +5882,7 @@ bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
     mutex.lock();
+    unlockedWaitNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - unlockedAt).count());
     Check(result, "vkWaitSemaphoresKHR recorder");
     if (RecorderAlive(myId)) FinishUpTo(serial);
     return true;
