@@ -155,10 +155,17 @@ inline bool LookalikeCommit() {
     return enabled;
 }
 
+inline bool LookalikeResolve() {
+    static const bool enabled = std::getenv("APS5_NO_LOOKALIKE_RESOLVE") == nullptr;
+    return enabled;
+}
+
 inline bool VerifyLookalike() {
     static const bool enabled = std::getenv("APS5_VERIFY_LOOKALIKE") != nullptr;
     return enabled;
 }
+
+void NoteLookalikeVerified(bool same, const char* what);
 
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
 std::uint64_t& DeviceProcLookups();

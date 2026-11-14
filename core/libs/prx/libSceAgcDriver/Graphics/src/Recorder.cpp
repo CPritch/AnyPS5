@@ -3958,6 +3958,24 @@ bool Recorder::keepOnceFirst(const void* object) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     ensureOpen();
     const auto serial = submissions + 1;
+    auto* recent = LookalikeCommit() ? &keptRecently[(reinterpret_cast<std::uintptr_t>(object) >> 6u) % keptRecently.size()] : nullptr;
+    if (recent != nullptr && recent->serial == serial && recent->object == object) {
+        if (VerifyLookalike()) {
+            bool held = false;
+            if (!keptOnce.empty() && keptOnceSerial == serial) {
+                const auto mask = keptOnce.size() - 1;
+                for (auto at = static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(object) >> 4u) * 0x9e3779b97f4a7c15ull >> 20u) & mask; keptOnce[at].serial == serial; at = (at + 1) & mask) {
+                    if (keptOnce[at].object == object) {
+                        held = true;
+                        break;
+                    }
+                }
+            }
+            NoteLookalikeVerified(held, "an object kept once in the batch");
+        }
+        return false;
+    }
+    if (recent != nullptr) *recent = {object, serial};
     if (keptOnce.empty()) keptOnce.resize(4096);
     if (serial != keptOnceSerial) {
         keptOnceSerial = serial;

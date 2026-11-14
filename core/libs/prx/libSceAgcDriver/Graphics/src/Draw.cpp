@@ -3601,8 +3601,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (drawBindings != nullptr) {
             const auto set = drawBindings->allocation.set;
             const auto fragmentSet = drawBindings->fragmentAllocation.set;
-            if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
-            if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+            static_assert(ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet == 1u);
+            if (LookalikeCommit() && set != VK_NULL_HANDLE && fragmentSet != VK_NULL_HANDLE) {
+                const std::array<VkDescriptorSet, 2> both{set, fragmentSet};
+                context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 2, both.data(), 0, nullptr);
+            } else {
+                if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
+                if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+            }
         } else {
             resources.BindDrawUse(commands, record.pipeline->Layout(), drawUse.get());
         }
@@ -3845,6 +3851,21 @@ struct HeldSpaceEnd {
     ~HeldSpaceEnd() { releaseHeldSpace(prepared); }
 };
 
+}
+
+void NoteLookalikeVerified(bool same, const char* what) {
+    static std::atomic<std::uint64_t> checked{0}, differing{0};
+    static std::atomic<std::int64_t> last{0};
+    if (!same && differing.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[lookalike] APS5_VERIFY_LOOKALIKE: %s differs from the slow path's\n", what);
+    checked.fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto previous = last.load(std::memory_order_relaxed);
+    if (now - previous < 10 || !last.compare_exchange_strong(previous, now)) return;
+    std::fprintf(stderr, "[lookalike] verified %llu fast answers, %llu differing\n", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()));
+}
+
+namespace {
+
 bool ShapeMemoEnabled() {
     static const bool enabled = std::getenv("APS5_NO_SHAPE_MEMO") == nullptr;
     return enabled;
@@ -3927,6 +3948,32 @@ bool sameChoice(const ShapeChoice& choice, const VertexInputLayout& input, const
 std::shared_ptr<Pipeline> shapePipeline(const Context& context, std::uint64_t shape, const VertexInputLayout& input, const PipelineSetLayouts& layouts, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, std::uint32_t fragmentOutputs) {
     const auto* entry = findShape(context, shape);
     if (entry == nullptr) return nullptr;
+    if (LookalikeResolve()) {
+        if (entry->choices.empty()) return nullptr;
+        thread_local std::vector<std::uint64_t>* stagesSlot = nullptr;
+        auto& stages = ShaderRecompiler::ThreadOwned(stagesSlot);
+        stages.clear();
+        for (const auto& shader : shaders) {
+            const auto identity = shader.program->Identity();
+            if (identity.Empty()) return nullptr;
+            stages.insert(stages.end(), {static_cast<std::uint64_t>(shader.stage), identity.low, identity.high, static_cast<std::uint64_t>(KeyedPushOffset(shader))});
+        }
+        stages.push_back(PushConstantStages(shaders));
+        const auto sameBinding = [](const VkVertexInputBindingDescription& a, const VkVertexInputBindingDescription& b) { return a.binding == b.binding && a.stride == b.stride && a.inputRate == b.inputRate; };
+        const auto sameAttribute = [](const VkVertexInputAttributeDescription& a, const VkVertexInputAttributeDescription& b) { return a.location == b.location && a.binding == b.binding && a.format == b.format && a.offset == b.offset; };
+        for (const auto& choice : entry->choices) {
+            if (choice.attachmentLayout != attachmentLayout || choice.fragmentOutputs != fragmentOutputs || choice.stages != stages) continue;
+            if (!std::ranges::equal(choice.mainKey, layouts.mainKey) || !std::ranges::equal(choice.fragmentKey, layouts.fragmentKey) || !std::ranges::equal(choice.bindings, input.bindings, sameBinding) || !std::ranges::equal(choice.attributes, input.attributes, sameAttribute)) continue;
+            const bool same = !VerifyLookalike() || sameChoice(choice, input, layouts, shaders, attachmentLayout, fragmentOutputs);
+            if (VerifyLookalike()) NoteLookalikeVerified(same, "the shape memo's choice");
+            return TouchCachedPipeline(context, choice.hash, choice.pipeline);
+        }
+        if (VerifyLookalike()) {
+            const bool none = std::ranges::none_of(entry->choices, [&](const ShapeChoice& choice) { return sameChoice(choice, input, layouts, shaders, attachmentLayout, fragmentOutputs); });
+            NoteLookalikeVerified(none, "the shape memo's missing choice");
+        }
+        return nullptr;
+    }
     for (const auto& choice : entry->choices) {
         if (!sameChoice(choice, input, layouts, shaders, attachmentLayout, fragmentOutputs)) continue;
         const auto hash = choice.hash;
@@ -5438,6 +5485,18 @@ bool DrawPacketReadsOverlap(const DrawPacket& packet, std::span<const std::pair<
     return resources != nullptr && resources->DescribedRangesOverlap(ranges);
 }
 
+void PrefetchDrawPacket(const DrawPacket& packet) {
+    const auto* base = reinterpret_cast<const char*>(&packet);
+    const auto maskedBegin = offsetof(DrawPacket, prepared) + offsetof(PreparedDraw, masked);
+    const auto maskedEnd = maskedBegin + sizeof(std::optional<State>);
+    for (std::size_t at = 0; at < maskedBegin + 8; at += 64) __builtin_prefetch(base + at);
+    for (std::size_t at = (maskedEnd - 8) & ~std::size_t{63}; at < sizeof(DrawPacket); at += 64) __builtin_prefetch(base + at);
+}
+
+void PrefetchDrawTemplate(const DrawPacket& packet) {
+    if (packet.prepared.resolved.resources != nullptr) packet.prepared.resolved.resources->PrefetchEarly();
+}
+
 const void* DrawPacketTemplate(const DrawPacket& packet) {
     return packet.prepared.resolved.resources.get();
 }
@@ -5611,6 +5670,20 @@ void EmitDraw(const Context& context, DrawPacket& packet) {
     } addressUseEnd{prepared.resolved.addressUse};
     const HeldSpaceEnd heldSpaceEnd{prepared};
     if (packet.ready && prepared.resolved.resources != nullptr) prepared.resolved.resources->PrefetchBindings(prepared.resolved.moved);
+    if (LookalikeCommit() && packet.ready) {
+        if (const auto* bound = prepared.pipeline.get(); bound != nullptr) {
+            __builtin_prefetch(bound);
+            __builtin_prefetch(reinterpret_cast<const char*>(bound) + 64);
+            __builtin_prefetch(reinterpret_cast<const char*>(bound) + 128);
+        }
+        __builtin_prefetch(prepared.framebuffer.get());
+        __builtin_prefetch(prepared.inputs.vertexHandles.data());
+        __builtin_prefetch(prepared.inputs.vertexOffsets.data());
+        __builtin_prefetch(prepared.inputs.vertexBuffers.data());
+        for (const auto& shader : shaders) {
+            if (shader.program != nullptr) __builtin_prefetch(shader.program->pushConstants.data());
+        }
+    }
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     std::optional<GuestMemory::PrecollectedScope> precollected;
     if (prepared.ahead.ahead != nullptr && !prepared.ahead.verify && !prepared.ahead.ahead->walks.walks.empty()) precollected.emplace(&prepared.ahead.ahead->walks);

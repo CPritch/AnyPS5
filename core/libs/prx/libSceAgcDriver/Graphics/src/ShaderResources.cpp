@@ -8221,6 +8221,36 @@ const ShaderResources::DrawBindings* ShaderResources::BindingsForEmit(Recorder& 
     return item;
 }
 
+void ShaderResources::PrefetchEarly() const {
+    static const bool enabled = std::getenv("APS5_NO_BINDING_PREFETCH") == nullptr;
+    if (!enabled) return;
+    __builtin_prefetch(&usesBda);
+    __builtin_prefetch(&_layout);
+    __builtin_prefetch(&_set);
+    __builtin_prefetch(&fragment);
+    __builtin_prefetch(&tableBindings);
+    __builtin_prefetch(&allocations);
+    __builtin_prefetch(&descriptorWrites);
+    __builtin_prefetch(&drawWritePlan);
+    __builtin_prefetch(reinterpret_cast<const char*>(&drawWritePlan) + 64);
+    __builtin_prefetch(&drawPoolSizes);
+    __builtin_prefetch(&writeOnlyRanges);
+    __builtin_prefetch(&reusable);
+    __builtin_prefetch(&guardsCheckedDepth);
+    __builtin_prefetch(&guardsPlainColor);
+    __builtin_prefetch(&provedEpoch);
+    __builtin_prefetch(&dataPatches);
+    __builtin_prefetch(&maxDrawSnapshotBytes);
+    __builtin_prefetch(&context.descriptorCache);
+    __builtin_prefetch(&context.functions);
+    __builtin_prefetch(&context.device);
+    guestMemory.PrefetchMembers();
+    if (auto* own = ownBindingsSlot; own != nullptr && !own->empty()) {
+        const auto* next = reinterpret_cast<const char*>(own->back());
+        for (std::size_t line = 0; line * 64 < sizeof(DrawBindings); ++line) __builtin_prefetch(next + line * 64, 1);
+    }
+}
+
 void ShaderResources::PrefetchBindings(std::span<const MovedBuffer> moved) const {
     static const bool enabled = std::getenv("APS5_NO_BINDING_PREFETCH") == nullptr;
     if (!enabled) return;
@@ -8228,6 +8258,32 @@ void ShaderResources::PrefetchBindings(std::span<const MovedBuffer> moved) const
         const auto* at = static_cast<const char*>(begin);
         for (std::size_t line = 0; line * 64 < bytes && line < most; ++line) __builtin_prefetch(at + line * 64);
     };
+    if (LookalikeCommit()) {
+        lines(moved.data(), moved.size_bytes(), 4);
+        lines(allocations.data(), allocations.size() * sizeof(allocations[0]), 8);
+        lines(descriptorWrites.data(), descriptorWrites.size() * sizeof(VkWriteDescriptorSet), 6);
+        lines(descriptorBuffers.data(), descriptorBuffers.size() * sizeof(VkDescriptorBufferInfo), 3);
+        lines(drawWritePlan.allocationSlots.data(), drawWritePlan.allocationSlots.size() * sizeof(drawWritePlan.allocationSlots[0]), 3);
+        lines(drawWritePlan.writeSets.data(), drawWritePlan.writeSets.size(), 1);
+        lines(drawWritePlan.writeBuffers.data(), drawWritePlan.writeBuffers.size() * sizeof(std::ptrdiff_t), 1);
+        lines(drawPoolSizes[0].data(), drawPoolSizes[0].size() * sizeof(VkDescriptorPoolSize), 1);
+        lines(drawPoolSizes[1].data(), drawPoolSizes[1].size() * sizeof(VkDescriptorPoolSize), 1);
+        lines(dataPatches.data(), dataPatches.size() * sizeof(dataPatches[0]), 1);
+        guestMemory.PrefetchRegions();
+        if (auto* own = ownBindingsSlot; own != nullptr && !own->empty()) {
+            const auto* next = own->back();
+            const auto* at = reinterpret_cast<const char*>(next);
+            for (std::size_t line = 0; line * 64 < sizeof(DrawBindings); ++line) __builtin_prefetch(at + line * 64, 1);
+            __builtin_prefetch(next->snapshots.data(), 1);
+            __builtin_prefetch(reinterpret_cast<const char*>(next->snapshots.data()) + 64, 1);
+            __builtin_prefetch(reinterpret_cast<const char*>(next->snapshots.data()) + 128, 1);
+            if (own->size() >= 2) {
+                const auto* after = reinterpret_cast<const char*>((*own)[own->size() - 2]);
+                for (std::size_t line = 0; line * 64 < sizeof(DrawBindings); ++line) __builtin_prefetch(after + line * 64, 1);
+            }
+        }
+        return;
+    }
     lines(moved.data(), moved.size_bytes(), 2);
     lines(allocations.data(), allocations.size() * sizeof(allocations[0]), 6);
     lines(descriptorWrites.data(), descriptorWrites.size() * sizeof(VkWriteDescriptorSet), 4);
@@ -8318,7 +8374,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     auto& fresh = ShaderRecompiler::ThreadOwned(freshSlot);
     fresh.clear();
     const bool lookalike = LookalikeCommit();
-    const auto keepOwned = [&](DrawBindings::Snapshot snapshot, const std::shared_ptr<Buffer>* held, bool uploadedNow) {
+    const auto keepOwned = [&](const DrawBindings::Snapshot& snapshot, const std::shared_ptr<Buffer>* held, bool uploadedNow) {
         if (ReuseCounted()) {
             fresh.resize(result->snapshots.size(), 0);
             fresh.push_back(uploadedNow ? 1 : 0);

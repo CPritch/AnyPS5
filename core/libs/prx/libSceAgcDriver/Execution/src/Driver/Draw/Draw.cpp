@@ -2266,6 +2266,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         auto staleCause = DrawPipeline::EarlyEvent::Used;
         const auto clock = [timed] { return timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
         if (early != nullptr && early->packet != nullptr) {
+            if (Graphics::LookalikeCommit()) Graphics::PrefetchDrawPacket(*early->packet);
             const auto checking = clock();
             struct CheckTimer {
                 bool timed;
@@ -2400,6 +2401,12 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
             DrawPipeline::OfferEarly(depth, Graphics::DrawPacketTemplate(*packet));
             if (timed) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Offer, offering);
         };
+        if (fromEarly && Graphics::LookalikeCommit()) {
+            Graphics::PrefetchDrawTemplate(*packet);
+            for (const auto& stage : stages) {
+                if (stage.program != nullptr) __builtin_prefetch(&stage.program->pushConstants);
+            }
+        }
         if (!idleOwed) offer();
         const auto emitting = clock();
         localDevice->EmitDraw(*packet);

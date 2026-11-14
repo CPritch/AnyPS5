@@ -1060,6 +1060,7 @@ private:
         std::uint64_t serial = 0;
     };
     std::vector<KeptOnceEntry> keptOnce;
+    std::array<KeptOnceEntry, 16> keptRecently{};
     std::size_t keptOnceCount = 0;
     std::uint64_t keptOnceSerial = 0;
     std::array<const void*, 4> keepBytesMemo{};

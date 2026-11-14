@@ -8709,6 +8709,18 @@ bool GuestBufferMemory::addressWritable(const Region& region) {
     return region.direct != nullptr && region.writable;
 }
 
+void GuestBufferMemory::PrefetchMembers() const {
+    __builtin_prefetch(&space);
+    __builtin_prefetch(&regions);
+    __builtin_prefetch(&uploaded);
+}
+
+void GuestBufferMemory::PrefetchRegions() const {
+    const auto* at = reinterpret_cast<const char*>(regions.data());
+    const auto bytes = regions.size() * sizeof(regions[0]);
+    for (std::size_t line = 0; line * 64 < bytes && line < 6; ++line) __builtin_prefetch(at + line * 64);
+}
+
 void GuestBufferMemory::InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& result) const {
     result.clear();
     if (!uploaded || committed) return;

@@ -93,6 +93,8 @@ bool DrawPacketReadsOverlap(const DrawPacket& packet, std::span<const std::pair<
 bool DrawPacketTemplateGone(const DrawPacket& packet);
 bool RevalidateDrawPacketTemplate(const DrawPacket& packet, std::span<const CompiledShader> shaders);
 const void* DrawPacketTemplate(const DrawPacket& packet);
+void PrefetchDrawPacket(const DrawPacket& packet);
+void PrefetchDrawTemplate(const DrawPacket& packet);
 struct ResolverHandoff {
     void* shapeMemo = nullptr;
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> snapshot;
