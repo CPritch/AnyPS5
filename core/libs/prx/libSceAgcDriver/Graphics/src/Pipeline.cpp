@@ -55,9 +55,6 @@ struct StateShadow {
     std::array<VkBool32, 4> enables{};
     VkCompareOp depthCompare = VK_COMPARE_OP_NEVER;
     std::array<VkStencilOpState, 2> stencil{};
-    bool colorMasksSet = false;
-    std::uint32_t colorMaskCount = 0;
-    std::array<VkColorComponentFlags, 8> colorMasks{};
 };
 
 thread_local StateShadow stateShadow;
@@ -1163,17 +1160,7 @@ void Pipeline::ContinueSecondChannel(VkCommandBuffer commands, const State& stat
 void Pipeline::setColorWriteMasks(VkCommandBuffer commands, const State& state, const State* masked, bool secondChannel) const {
     if (!context.dynamicColorWriteMask || state.blends.empty()) return;
     const auto masks = channelWriteMasks(state, masked != nullptr ? std::span(masked->blends) : std::span(state.blends), secondChannel);
-    const auto count = static_cast<std::uint32_t>(state.blends.size());
-    auto* shadow = LookalikeCommit() ? shadowFor(commands) : nullptr;
-    if (shadow != nullptr && count <= shadow->colorMasks.size()) {
-        if (shadow->colorMasksSet && shadow->colorMaskCount == count && std::equal(masks.begin(), masks.begin() + count, shadow->colorMasks.begin())) return;
-        shadow->colorMasksSet = true;
-        shadow->colorMaskCount = count;
-        std::copy(masks.begin(), masks.begin() + count, shadow->colorMasks.begin());
-    } else if (shadow != nullptr) {
-        shadow->colorMasksSet = false;
-    }
-    context.Resolved(&DeviceFunctions::cmdSetColorWriteMask, "vkCmdSetColorWriteMaskEXT")(commands, 0, count, masks.data());
+    context.Resolved(&DeviceFunctions::cmdSetColorWriteMask, "vkCmdSetColorWriteMaskEXT")(commands, 0, static_cast<std::uint32_t>(state.blends.size()), masks.data());
 }
 
 void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state, const State* masked) const {
