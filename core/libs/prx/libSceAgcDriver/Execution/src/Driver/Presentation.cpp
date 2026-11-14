@@ -177,6 +177,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         field("import_pin_wait_reseeds", delta(churn.pinWaitReseeds, previousChurn.pinWaitReseeds));
         field("import_region_checks", delta(churn.regionChecks, previousChurn.regionChecks));
         field("import_region_skips", delta(churn.regionSkips, previousChurn.regionSkips));
+        field("import_absorb_refusals", delta(churn.absorbRefusals, previousChurn.absorbRefusals));
+        field("import_absorb_witness_hits", delta(churn.absorbWitnessHits, previousChurn.absorbWitnessHits));
         const auto specialization = ShaderRecompiler::SpecializationCounts();
         field("spec_first", delta(specialization.first, previousSpecialization.first));
         field("spec_first_us", micros(specialization.firstNs, previousSpecialization.firstNs));

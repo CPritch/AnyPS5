@@ -389,6 +389,8 @@ struct ImportChurn {
     std::atomic<std::uint64_t> pinWaitReseeds{0};
     std::atomic<std::uint64_t> regionChecks{0};
     std::atomic<std::uint64_t> regionSkips{0};
+    std::atomic<std::uint64_t> absorbRefusals{0};
+    std::atomic<std::uint64_t> absorbWitnessHits{0};
 };
 
 ImportChurn& Churn() {
@@ -456,6 +458,15 @@ struct TableEvent {
 
 constexpr std::size_t TableEventCapacity = 4096;
 
+enum class AbsorbEntry : std::uint8_t { None, Import, Failed, FailedJoin, FailedBlock, Refusal, EvictingRefusal, SparseRunEnd, SparseRunJoin };
+
+struct AbsorbWitness {
+    std::uint64_t since = 0;
+    AbsorbEntry entry = AbsorbEntry::None;
+    std::pair<std::uint64_t, std::uint64_t> key{};
+    std::pair<std::uint64_t, std::uint64_t> extent{};
+};
+
 struct HostImports {
     ImportsMutex mutex;
     VkDevice device = VK_NULL_HANDLE;
@@ -479,6 +490,7 @@ struct HostImports {
     std::vector<RefreshedRange> refreshedRanges;
     std::uint64_t refreshedWindow = 0;
     std::uint64_t refreshedBudget = 0;
+    AbsorbWitness absorbWitness;
     std::set<std::uint64_t> pendingImports;
     std::uint64_t journalFrom = 0;
     std::vector<RefreshedRange> verifyRanges;
@@ -3164,39 +3176,115 @@ void verifyTableInvariant(HostImports& state, bool journaled) {
     }
 }
 
-bool absorbUnrelatedChanges(const Context& context, HostImports& state) {
-    if (!importJournalEnabled() || state.device != context.device || state.refreshedGeneration == 0 || !state.pendingImports.empty()) return false;
-    if (importWindow.load(std::memory_order_relaxed) != state.refreshedWindow || effectiveBudget(context, state) != state.refreshedBudget) return false;
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
-    std::uint64_t through = 0;
-    if (!GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(state.refreshedGeneration, &spans, &through)) return false;
+bool absorbWitnessEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_ABSORB_WITNESS") == nullptr;
+    return enabled;
+}
+
+bool verifyAbsorbWitness() {
+    static const bool enabled = std::getenv("APS5_VERIFY_ABSORB_WITNESS") != nullptr;
+    return enabled;
+}
+
+std::optional<std::pair<std::uint64_t, std::uint64_t>> absorbEntryExtent(const HostImports& state, AbsorbEntry entry, std::pair<std::uint64_t, std::uint64_t> key) {
+    const auto failure = [](const auto& map, std::uint64_t at) -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
+        const auto it = map.find(at);
+        if (it == map.end()) return std::nullopt;
+        return mappedExtent(it->second.base, it->second.bytes, it->second.ranges);
+    };
+    const auto block = [&](const auto& map) -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
+        if (!map.contains(key)) return std::nullopt;
+        return widened(key.first, key.first + key.second);
+    };
+    switch (entry) {
+    case AbsorbEntry::Import: {
+        const auto it = state.imports.find(key.first);
+        if (it == state.imports.end()) return std::nullopt;
+        return importExtent(it->second);
+    }
+    case AbsorbEntry::Failed: return failure(state.failed, key.first);
+    case AbsorbEntry::FailedJoin: return failure(state.failedJoins, key.first);
+    case AbsorbEntry::FailedBlock: return block(state.failedBlocks);
+    case AbsorbEntry::Refusal: return block(state.refusals);
+    case AbsorbEntry::EvictingRefusal: return block(state.evictingRefusals);
+    case AbsorbEntry::SparseRunEnd: {
+        const auto it = state.sparseRunEnds.find(key.first);
+        if (it == state.sparseRunEnds.end()) return std::nullopt;
+        return widened(key.first, std::max(it->second, key.first + 1));
+    }
+    case AbsorbEntry::SparseRunJoin:
+        if (!state.sparseRunJoins.contains(key.first)) return std::nullopt;
+        return widened(key.first, key.first + 1);
+    case AbsorbEntry::None: break;
+    }
+    return std::nullopt;
+}
+
+bool absorbWitnessHolds(const HostImports& state) {
+    const auto& witness = state.absorbWitness;
+    if (witness.entry == AbsorbEntry::None || witness.since != state.refreshedGeneration) return false;
+    const auto extent = absorbEntryExtent(state, witness.entry, witness.key);
+    return extent.has_value() && *extent == witness.extent;
+}
+
+AbsorbWitness absorbTouch(const HostImports& state, std::span<const std::pair<std::uint64_t, std::uint64_t>> spans) {
     const auto touched = [&](std::pair<std::uint64_t, std::uint64_t> extent) {
         const auto found = std::upper_bound(spans.begin(), spans.end(), extent.first, [](std::uint64_t value, const auto& span) { return value < span.second; });
         return found != spans.end() && found->first < extent.second;
     };
+    const auto witness = [&](AbsorbEntry entry, std::pair<std::uint64_t, std::uint64_t> key, std::pair<std::uint64_t, std::uint64_t> extent) { return AbsorbWitness{state.refreshedGeneration, entry, key, extent}; };
     for (const auto& [base, entry] : state.imports) {
-        if (touched(importExtent(entry))) return false;
+        if (const auto extent = importExtent(entry); touched(extent)) return witness(AbsorbEntry::Import, {base, 0}, extent);
     }
     for (const auto& [key, entry] : state.failed) {
-        if (touched(mappedExtent(entry.base, entry.bytes, entry.ranges))) return false;
+        if (const auto extent = mappedExtent(entry.base, entry.bytes, entry.ranges); touched(extent)) return witness(AbsorbEntry::Failed, {key, 0}, extent);
     }
     for (const auto& [key, entry] : state.failedJoins) {
-        if (touched(mappedExtent(entry.base, entry.bytes, entry.ranges))) return false;
+        if (const auto extent = mappedExtent(entry.base, entry.bytes, entry.ranges); touched(extent)) return witness(AbsorbEntry::FailedJoin, {key, 0}, extent);
     }
     for (const auto& [key, entry] : state.failedBlocks) {
-        if (touched(widened(key.first, key.first + key.second))) return false;
+        if (const auto extent = widened(key.first, key.first + key.second); touched(extent)) return witness(AbsorbEntry::FailedBlock, key, extent);
     }
     for (const auto& [key, entry] : state.refusals) {
-        if (touched(widened(key.first, key.first + key.second))) return false;
+        if (const auto extent = widened(key.first, key.first + key.second); touched(extent)) return witness(AbsorbEntry::Refusal, key, extent);
     }
     for (const auto& [key, entry] : state.evictingRefusals) {
-        if (touched(widened(key.first, key.first + key.second))) return false;
+        if (const auto extent = widened(key.first, key.first + key.second); touched(extent)) return witness(AbsorbEntry::EvictingRefusal, key, extent);
     }
     for (const auto& [key, end] : state.sparseRunEnds) {
-        if (touched(widened(key, std::max(end, key + 1)))) return false;
+        if (const auto extent = widened(key, std::max(end, key + 1)); touched(extent)) return witness(AbsorbEntry::SparseRunEnd, {key, 0}, extent);
     }
     for (const auto& [key, joins] : state.sparseRunJoins) {
-        if (touched(widened(key, key + 1))) return false;
+        if (const auto extent = widened(key, key + 1); touched(extent)) return witness(AbsorbEntry::SparseRunJoin, {key, 0}, extent);
+    }
+    return {};
+}
+
+bool absorbUnrelatedChanges(const Context& context, HostImports& state) {
+    if (!importJournalEnabled() || state.device != context.device || state.refreshedGeneration == 0 || !state.pendingImports.empty()) return false;
+    if (importWindow.load(std::memory_order_relaxed) != state.refreshedWindow || effectiveBudget(context, state) != state.refreshedBudget) return false;
+    const bool remembered = absorbWitnessEnabled() && absorbWitnessHolds(state);
+    if (remembered && !verifyAbsorbWitness()) {
+        Churn().absorbWitnessHits.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::uint64_t through = 0;
+    if (!GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(state.refreshedGeneration, &spans, &through)) return false;
+    const auto refusal = absorbTouch(state, spans);
+    if (remembered) {
+        if (refusal.entry == AbsorbEntry::None) {
+            std::fprintf(stderr, "FATAL: APS5_VERIFY_ABSORB_WITNESS: the import table reconciled at generation %llu refused to absorb the changes through %llu for a remembered entry (kind %u, 0x%llx+0x%llx, extent 0x%llx-0x%llx), but no entry is touched by them\n", static_cast<unsigned long long>(state.refreshedGeneration), static_cast<unsigned long long>(through), static_cast<unsigned>(state.absorbWitness.entry), static_cast<unsigned long long>(state.absorbWitness.key.first), static_cast<unsigned long long>(state.absorbWitness.key.second), static_cast<unsigned long long>(state.absorbWitness.extent.first), static_cast<unsigned long long>(state.absorbWitness.extent.second));
+            std::abort();
+        }
+        DriverDetail::CountVerify(DriverDetail::VerifyCount::AbsorbWitnessChecked);
+        Churn().absorbWitnessHits.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (refusal.entry != AbsorbEntry::None) {
+        state.absorbWitness = refusal;
+        Churn().absorbRefusals.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
     if (verifyImportJournal()) {
         for (const auto& [base, entry] : state.imports) verifyImportKept(context, state, entry, "absorb", base, base + entry.bytes);
@@ -8955,6 +9043,8 @@ ImportChurnCounts ImportChurnTotals() {
     counts.pinWaitReseeds = churn.pinWaitReseeds.load(std::memory_order_relaxed);
     counts.regionChecks = churn.regionChecks.load(std::memory_order_relaxed);
     counts.regionSkips = churn.regionSkips.load(std::memory_order_relaxed);
+    counts.absorbRefusals = churn.absorbRefusals.load(std::memory_order_relaxed);
+    counts.absorbWitnessHits = churn.absorbWitnessHits.load(std::memory_order_relaxed);
     const auto unlocked = GuestMemory::UnlockedImportTotals();
     counts.trackerUnlocked = unlocked.unlocked;
     counts.trackerUnlockedNs = unlocked.unlockedNs;

@@ -173,6 +173,34 @@ Outcome BurstsStayOnTheJournal() {
     Require(nearbyCheck != Graphics::ImportsProofCheck::Changed && serial(first) == kept, "host import bursts: a registration in the import's window apart from its run broke the proof over " + Hex(first) + Counts(before, after));
     Require(after.regionSkips == before.regionSkips && after.reconciles > before.reconciles, "host import bursts: a proof skipped the reconcile although the registry changed beside its region's import" + Counts(before, after));
     Remove(arena, HalfWindow + 3 * MiB);
+
+    const bool absorbs = Enabled("APS5_NO_IMPORT_JOURNAL") && Enabled("APS5_NO_ALLOCATION_JOURNAL");
+    const bool witness = absorbs && Enabled("APS5_NO_ABSORB_WITNESS");
+    before = Graphics::ImportChurnTotals();
+    const auto staleFirst = Graphics::HostImportsIdentity(context);
+    const auto staleAgain = Graphics::HostImportsIdentity(context);
+    Add(arena, 3 * Window, Piece);
+    const auto staleLater = Graphics::HostImportsIdentity(context);
+    after = Graphics::ImportChurnTotals();
+    const auto refusals = after.absorbRefusals - before.absorbRefusals;
+    const auto hits = after.absorbWitnessHits - before.absorbWitnessHits;
+    std::printf("host import bursts: three currency checks after a removal in the import's window: walks that refused %llu, refused by the remembered import %llu\n", static_cast<unsigned long long>(refusals), static_cast<unsigned long long>(hits));
+    Require(staleFirst.device == VK_NULL_HANDLE && staleAgain.device == VK_NULL_HANDLE && staleLater.device == VK_NULL_HANDLE, "host import bursts: the table absorbed a removal in the window of the import at " + Hex(first));
+    if (witness) {
+        Require(refusals == 1 && hits == 2, "host import bursts: the checks after the first did not refuse by the import the first walk found touched, before or after a later registration elsewhere" + Counts(before, after));
+    } else {
+        Require(hits == 0 && refusals == (absorbs ? 3u : 0u), absorbs ? "host import bursts: with APS5_NO_ABSORB_WITNESS every check should walk the table and refuse" : "host import bursts: without the journals a check walked the table to absorb" + Counts(before, after));
+    }
+    Require(reconciled(first) == kept, "host import bursts: the reconcile after the refused absorbs dropped the import at " + Hex(first));
+    Require(Graphics::HostImportsIdentity(context).device != VK_NULL_HANDLE, "host import bursts: the table is not current after the reconcile that followed the refused absorbs");
+    Remove(arena, 3 * Window);
+    if (std::getenv("APS5_VERIFY_ABSORB_WITNESS") != nullptr) {
+        using AgcDriver::DriverDetail::VerifyCount;
+        const auto checked = AgcDriver::DriverDetail::VerifyTotals()[static_cast<std::size_t>(VerifyCount::AbsorbWitnessChecked)];
+        std::printf("host import bursts: absorb witness verify: %llu refusals checked\n", static_cast<unsigned long long>(checked));
+        Require(witness ? checked >= 2 : checked == 0, "host import bursts: APS5_VERIFY_ABSORB_WITNESS did not check the refusals by the remembered import");
+    }
+
     if (std::getenv("APS5_VERIFY_REGION_CHECK") != nullptr) {
         using AgcDriver::DriverDetail::VerifyCount;
         const auto totals = AgcDriver::DriverDetail::VerifyTotals();
