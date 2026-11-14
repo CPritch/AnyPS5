@@ -4139,7 +4139,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
         proofLap(PartDepthPlanes);
-        surface.collected = GuestMemory::CollectWrites(address, bytes);
+        surface.collected = GuestMemory::CollectWritesWitnessed(witness, address, bytes);
         if (surface.collected == 0) {
             countCollectRefusal(false, address, bytes);
             return fail(FastFail::Collect);
@@ -4204,7 +4204,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             return fail(FastFail::Depth);
         }
         proofLap(PartDepthChecks);
-        if (GuestMemory::CollectWrites(address, bytes) == 0) {
+        if (GuestMemory::CollectWritesWitnessed(witness, address, bytes) == 0) {
             countCollectRefusal(true, address, bytes);
             return fail(FastFail::Collect);
         }

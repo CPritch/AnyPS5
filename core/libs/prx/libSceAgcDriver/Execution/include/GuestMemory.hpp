@@ -154,8 +154,10 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
 struct CollectWitness {
     std::uint64_t unwatched = 0;
     std::uint64_t mapping = 0;
+    std::uint64_t owner = 0;
 };
 CollectWitness WitnessBeforeCollects();
+std::uint64_t CollectWritesWitnessed(const CollectWitness& witness, std::uint64_t address, std::size_t bytes);
 bool UnchangedSinceAllCollected(std::span<const UnchangedQuery> queries, const CollectWitness& witness);
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 std::uint64_t WriteGeneration();

@@ -47,6 +47,8 @@ struct FakeWatch {
     bool timedOut = false;
     bool failWalks = false;
     std::size_t walks = 0;
+    bool tracksUnwatch = false;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> unwatched;
 };
 
 FakeWatch& Fake() {
@@ -66,11 +68,17 @@ bool GuestWriteWatchAvailable_nid_postfix() {
     return true;
 }
 
-bool GuestWriteWatchUnregister_nid_postfix(const void*, std::size_t) {
+bool GuestWriteWatchUnregister_nid_postfix(const void* address, std::size_t bytes) {
+    auto& fake = Fake();
+    const std::lock_guard lock(fake.mutex);
+    if (fake.tracksUnwatch) fake.unwatched.emplace_back(reinterpret_cast<std::uintptr_t>(address), reinterpret_cast<std::uintptr_t>(address) + bytes);
     return true;
 }
 
 bool GuestWriteWatchCovers_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    auto& fake = Fake();
+    const std::lock_guard lock(fake.mutex);
+    if (std::any_of(fake.unwatched.begin(), fake.unwatched.end(), [&](const auto& range) { return range.first < address + bytes && address < range.second; })) return false;
     return address >= Base && bytes <= Span && address - Base <= Span - bytes;
 }
 
@@ -137,6 +145,47 @@ void CheckMemoHitDuringWalk() {
     Require(!UnchangedSince(Base + Page, Page, memoized), "a memoized collect returned the generation a walk in progress then stamped a write with");
     BumpCollectEpoch();
     Require(CollectWrites(Base, Block) > memoized && !UnchangedSince(Base, Block, memoized), "a later epoch trusts the write stamped by the walk in progress");
+}
+
+void CheckCollectedQueriesWithoutLock() {
+    auto& fake = Fake();
+    const auto at = Base + 100 * Block;
+    BumpCollectEpoch();
+    auto witness = WitnessBeforeCollects();
+    const auto collected = CollectWritesWitnessed(witness, at, Block);
+    Require(collected != 0, "the witnessed range was not collected");
+    const std::array<UnchangedQuery, 1> queries{UnchangedQuery{at, Block, collected}};
+    Require(UnchangedSinceAllCollected(queries, witness), "an unchanged witnessed range read as changed");
+    MarkWritten(at + Page, 4);
+    Require(!UnchangedSinceAllCollected(queries, witness), "a store over a witnessed range read as unchanged");
+    BumpCollectEpoch();
+    witness = WitnessBeforeCollects();
+    const auto again = CollectWritesWitnessed(witness, at, Block);
+    Require(again != 0, "the written range was not collected again");
+    const std::array<UnchangedQuery, 1> fresh{UnchangedQuery{at, Block, again}};
+    Require(UnchangedSinceAllCollected(fresh, witness), "a range unchanged since its new collect read as changed");
+    {
+        const std::lock_guard lock(fake.mutex);
+        fake.tracksUnwatch = true;
+    }
+    Unwatch(at, Block);
+    Require(!UnchangedSinceAllCollected(fresh, witness), "a range unwatched after its witnessed collect read as unchanged");
+    witness = WitnessBeforeCollects();
+    Require(!UnchangedSinceAllCollected(fresh, witness), "a range unwatched before the witness, and not collected under it, read as unchanged");
+    Require(CollectWritesWitnessed(witness, at, Block) == 0, "an unwatched range was collected");
+    Require(!UnchangedSinceAllCollected(fresh, witness), "a range the witness failed to collect read as unchanged");
+    const std::array<UnchangedQuery, 1> stray{UnchangedQuery{Base + Span, Page, again}};
+    Require(!UnchangedSinceAllCollected(stray, witness), "an uncovered range with a nonzero generation read as unchanged");
+    const auto other = WitnessBeforeCollects();
+    const auto inside = CollectWritesWitnessed(other, Base + 101 * Block, Block);
+    Require(inside != 0, "a covered range was not collected");
+    const std::array<UnchangedQuery, 1> foreign{UnchangedQuery{Base + 101 * Block, Block, inside}};
+    Require(UnchangedSinceAllCollected(foreign, other), "a witnessed covered range read as changed");
+    {
+        const std::lock_guard lock(fake.mutex);
+        fake.tracksUnwatch = false;
+        fake.unwatched.clear();
+    }
 }
 
 void CheckRememberedQueries() {
@@ -364,6 +413,7 @@ int main(int argc, char** argv) {
 #else
         CheckMemoHitDuringWalk();
         CheckRememberedQueries();
+        CheckCollectedQueriesWithoutLock();
         CheckFailedWalkIsRetried();
 #endif
         if (argc == 2) {

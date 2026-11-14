@@ -1401,6 +1401,7 @@ struct WriteTracker {
     // walk of its range and re-upload at every use of the epoch.
     std::atomic<std::uint64_t> generation{1};
     std::atomic<std::uint64_t> stable{1};
+    std::atomic<bool> watchedPublished{false};
     std::vector<void*> pages;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> importing;
     std::condition_variable_any imported;
@@ -1438,6 +1439,7 @@ struct WriteTracker {
         if (watched) {
             leaves.resize(LeafCount);
             leafViews = std::make_unique<std::atomic<const Leaf*>[]>(LeafCount);
+            watchedPublished.store(true, std::memory_order_release);
         }
 #endif
     }
@@ -3264,22 +3266,58 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     return rememberedTrackerQuery(QueryUnchangedAll, queries, true, [&](WriteTracker& tracker) { return unchangedSinceAllLocked(tracker, queries); });
 }
 
-CollectWitness WitnessBeforeCollects() {
-    return {unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
-}
-
 namespace {
 
+struct WitnessedCollects {
+    std::uint64_t owner = 0;
+    std::uint64_t next = 0;
+    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+};
+
+WitnessedCollects& witnessedCollects() {
+    struct Slot {};
+    return ThreadScratch<WitnessedCollects, Slot>();
+}
+
+bool witnessedCollect(const WitnessedCollects& collected, std::size_t& cursor, const UnchangedQuery& query) {
+    const auto matches = [&](const std::pair<std::uint64_t, std::size_t>& range) { return range.first == query.address && range.second == query.bytes; };
+    for (std::size_t probe = 0; probe < collected.ranges.size(); ++probe) {
+        const auto index = (cursor + probe) % collected.ranges.size();
+        if (!matches(collected.ranges[index])) continue;
+        cursor = index + 1;
+        return true;
+    }
+    return false;
+}
+
 bool collectedUnchangedWithoutLock(const WriteTracker& tracker, std::span<const UnchangedQuery> queries, const CollectWitness& witness) {
-    if (queries.empty() || unwatchSerial.load(std::memory_order_acquire) != witness.unwatched) return false;
+    if (queries.empty() || !tracker.watchedPublished.load(std::memory_order_acquire) || unwatchSerial.load(std::memory_order_acquire) != witness.unwatched) return false;
+    const auto& collected = witnessedCollects();
+    if (witness.owner == 0 || collected.owner != witness.owner) return false;
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    std::size_t cursor = 0;
     for (const auto& query : queries) {
         if (query.generation == 0 || query.bytes == 0 || query.bytes > std::numeric_limits<std::uint64_t>::max() - query.address) return false;
+        if (!witnessedCollect(collected, cursor, query)) return false;
         if (!mappingHolds(witness.mapping, mapping, query.address, query.address + query.bytes)) return false;
     }
     return trackerStampsUnchanged(tracker, queries);
 }
 
+}
+
+CollectWitness WitnessBeforeCollects() {
+    auto& collected = witnessedCollects();
+    collected.owner = ++collected.next;
+    collected.ranges.clear();
+    return {unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), collected.owner};
+}
+
+std::uint64_t CollectWritesWitnessed(const CollectWitness& witness, std::uint64_t address, std::size_t bytes) {
+    const auto generation = CollectWrites(address, bytes);
+    auto& collected = witnessedCollects();
+    if (generation != 0 && witness.owner != 0 && collected.owner == witness.owner) collected.ranges.emplace_back(address, bytes);
+    return generation;
 }
 
 bool UnchangedSinceAllCollected(std::span<const UnchangedQuery> queries, const CollectWitness& witness) {
