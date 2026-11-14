@@ -86,6 +86,10 @@ public:
         bool twoAhead = false;
     };
     using Early = std::function<bool(const EarlyOffer&)>;
+    struct Warm {
+        void (*run)(const Warm&, unsigned);
+        std::array<const void*, 7> at;
+    };
     struct Watch {
         std::uint64_t retired = 0;
         std::size_t items = 0;
@@ -112,7 +116,7 @@ public:
     static bool PreparesAhead();
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {});
-    void Enqueue(CommitKind commitKind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {});
+    void Enqueue(CommitKind commitKind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, Prepare prepare = {}, Early early = {}, Warm warm = {});
     void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
     static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
     static unsigned ResolveSplit();
@@ -222,6 +226,7 @@ private:
         Early early;
         bool store = false;
         CommitKind commitKind = CommitKind::Other;
+        Warm warm{};
     };
     DrawPipeline() = default;
     void enqueue(Item item, Prepare prepare);
@@ -300,7 +305,7 @@ private:
         alignas(64) std::atomic<int> state{0};
         std::atomic<std::uint32_t> wake{0};
         std::atomic<std::uint32_t> sleeping{0};
-        void (*body)(void*) = nullptr;
+        alignas(64) void (*body)(void*) = nullptr;
         void (*finish)(void*, bool) = nullptr;
         void* context = nullptr;
         const void* target = nullptr;

@@ -13,6 +13,7 @@ namespace AgcDriver::DriverDetail {
 class DevicePointer {
 public:
     std::shared_ptr<VulkanDevice> Load() const;
+    bool Holds(const VulkanDevice* device) const { return current.load(std::memory_order_acquire) == device; }
     operator std::shared_ptr<VulkanDevice>() const;
     DevicePointer& operator=(std::shared_ptr<VulkanDevice> value);
     void Reset();
@@ -22,6 +23,7 @@ public:
 
 private:
     AtomicSharedPtr<VulkanDevice> pointer;
+    std::atomic<const VulkanDevice*> current{nullptr};
 };
 
 class DeviceUseGate {

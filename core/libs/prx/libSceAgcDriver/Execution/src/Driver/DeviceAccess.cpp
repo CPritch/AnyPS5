@@ -9,7 +9,9 @@ std::shared_ptr<VulkanDevice> DevicePointer::Load() const { return pointer.load(
 DevicePointer::operator std::shared_ptr<VulkanDevice>() const { return Load(); }
 
 DevicePointer& DevicePointer::operator=(std::shared_ptr<VulkanDevice> value) {
+    const auto* raw = value.get();
     pointer.store(std::move(value), std::memory_order_release);
+    current.store(raw, std::memory_order_release);
     return *this;
 }
 

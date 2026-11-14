@@ -455,6 +455,42 @@ struct EarlyDraw {
 
 namespace {
 
+void warmQueuedDraw(const DrawPipeline::Warm& warm, unsigned stage) {
+    const auto lines = [](const void* at, std::size_t bytes, int write) {
+        if (at == nullptr) return;
+        for (std::size_t offset = 0; offset < bytes; offset += 64) __builtin_prefetch(static_cast<const char*>(at) + offset, write);
+    };
+    const auto* early = static_cast<const EarlyDraw*>(warm.at[1]);
+    const auto* ahead = static_cast<const DrawAheadSlot*>(warm.at[2]);
+    const auto* state = static_cast<const Graphics::State*>(warm.at[3]);
+    if (stage == 1) {
+        lines(warm.at[0], 384, 0);
+        lines(early, sizeof(EarlyDraw), 1);
+        if (ahead != nullptr) {
+            __builtin_prefetch(&ahead->phase);
+            __builtin_prefetch(&ahead->result.looked);
+            __builtin_prefetch(&ahead->result.movedPlan);
+        }
+        if (state != nullptr) {
+            __builtin_prefetch(&state->stages);
+            __builtin_prefetch(&state->colors);
+            __builtin_prefetch(&state->depth);
+            __builtin_prefetch(&state->quadList);
+        }
+        for (const std::size_t index : {std::size_t{4}, std::size_t{5}}) {
+            if (const auto* program = static_cast<const ShaderRecompiler::RecompileResult*>(warm.at[index]); program != nullptr) __builtin_prefetch(&program->stencilReferences);
+        }
+        return;
+    }
+    if (ahead != nullptr && ahead->phase.load(std::memory_order_acquire) == DrawAheadSlot::Ready) {
+        if (const auto* found = ahead->result.found.get(); found != nullptr) found->PrefetchGate();
+    }
+    if (state != nullptr) {
+        for (const auto& color : state->colors) lines(&color, std::min<std::size_t>(sizeof(color), 128), 0);
+        if (state->depth) __builtin_prefetch(&*state->depth);
+    }
+}
+
 void noteFinisherHandOff(bool handed) {
     static std::atomic<std::uint64_t> handedOff{0}, kept{0};
     static std::atomic<std::int64_t> reportedAt{0};
@@ -1836,6 +1872,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             earlyDraw->depth.reserve(4);
             earlyDraw->reads.reserve(32);
         }
+        DrawPipeline::Warm warm{};
+        static const bool warms = std::getenv("APS5_NO_COMMIT_WARM") == nullptr;
+        if (warms && earlyDraw != nullptr) {
+            warm.run = &warmQueuedDraw;
+            warm.at = {nullptr, earlyDraw.get(), ahead.get(), &decode->state, stages.size() > 0 ? stages[0].program : nullptr, stages.size() > 1 ? stages[1].program : nullptr, nullptr};
+        }
         auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::span<const Graphics::CompiledShader>(stages), snapshots = std::span<const Graphics::GuestMemorySnapshot>(snapshots), recipe = std::move(recipe), recipeStages = &recipeStages, drawKey, recipeDonor, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, ahead, storage = std::move(tail.storage), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), early = std::move(earlyDraw), itemReads = reads](const DrawPipeline::EarlyOffer* offer) mutable {
             if (offer != nullptr && offer->preProof != nullptr) return preProveDraw(localDevice, stages, ahead.get(), epoch, *offer->preProof);
             if (offer != nullptr && offer->probe != nullptr) {
@@ -1855,6 +1897,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             return false;
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
+        if (warm.run != nullptr) warm.at[0] = held.get();
         DrawPipeline::Prepare prepare;
         if (ahead != nullptr) prepare = [held, ahead] { ahead->Prepare(); };
         DrawPipeline::Early earlyHook;
@@ -1866,12 +1909,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 std::vector<DrawPipeline::Range> reads;
                 DrawPipeline::Prepare prepare;
                 DrawPipeline::Early early;
+                DrawPipeline::Warm warm;
             };
-            DrawFinisher::DeferOrdered([deferred = std::make_shared<Deferred>(Deferred{[held] { (*held)(nullptr); }, std::move(writes), std::move(reads), std::move(prepare), std::move(earlyHook)})] {
-                DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, std::move(deferred->commit), std::move(deferred->writes), 0, {}, std::move(deferred->reads), true, DrawPipeline::ItemKind::Draw, std::move(deferred->prepare), std::move(deferred->early));
+            DrawFinisher::DeferOrdered([deferred = std::make_shared<Deferred>(Deferred{[held] { (*held)(nullptr); }, std::move(writes), std::move(reads), std::move(prepare), std::move(earlyHook), warm})] {
+                DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, std::move(deferred->commit), std::move(deferred->writes), 0, {}, std::move(deferred->reads), true, DrawPipeline::ItemKind::Draw, std::move(deferred->prepare), std::move(deferred->early), deferred->warm);
             });
         } else {
-            DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(prepare), std::move(earlyHook));
+            DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(prepare), std::move(earlyHook), warm);
         }
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
@@ -2208,7 +2252,7 @@ bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, 
     return true;
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const std::shared_ptr<DrawEntry>& recipeDonor, VulkanDevice::DrawTraceContext trace, std::uint64_t shape, DrawAheadSlot* ahead, EarlyDraw* early) {
+void Driver::commitDraw(const std::shared_ptr<VulkanDevice>& queuedDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const std::shared_ptr<DrawEntry>& recipeDonor, VulkanDevice::DrawTraceContext trace, std::uint64_t shape, DrawAheadSlot* ahead, EarlyDraw* early) {
     DelayStage(DelayedStage::Committer);
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     static const bool carryRegistered = (DrawPipeline::SetCarryRelease(&releaseCarriedJob), true);
@@ -2221,7 +2265,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         carriedPacket.reset();
         if (DrawSplitTimed()) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Join, joining);
         static const bool idleAfterEmit = std::getenv("APS5_NO_IDLE_SUBMIT_AFTER_EMIT") == nullptr;
-        idleOwed = submitDueAfterCommit(localDevice.get(), idleAfterEmit && early != nullptr && early->packet != nullptr);
+        idleOwed = submitDueAfterCommit(queuedDevice.get(), idleAfterEmit && early != nullptr && early->packet != nullptr);
         DrawPipeline::SettleCarriedBoundary();
     } else if (DrawPipeline::HoldCarried()) {
         struct Drop {
@@ -2231,13 +2275,18 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         releaseCarriedJob();
         if (DrawSplitTimed()) DrawPipeline::NoteCommitterPart(DrawPipeline::CommitterPart::Join, joining);
         static const bool idleAfterEmit = std::getenv("APS5_NO_IDLE_SUBMIT_AFTER_EMIT") == nullptr;
-        idleOwed = submitDueAfterCommit(localDevice.get(), idleAfterEmit && early != nullptr && early->packet != nullptr);
+        idleOwed = submitDueAfterCommit(queuedDevice.get(), idleAfterEmit && early != nullptr && early->packet != nullptr);
     }
     const auto prologue = DrawSplitTimed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto* prepared = ahead != nullptr && (early == nullptr || !early->claimed) ? ahead->Claim() : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+    std::shared_ptr<VulkanDevice> replacedDevice;
+    static const bool loadsDevice = std::getenv("APS5_NO_COMMIT_DEVICE_CHECK") != nullptr;
+    if (loadsDevice || !device.Holds(queuedDevice.get())) {
+        if (auto current = device.Load(); current != nullptr && current != queuedDevice) replacedDevice = std::move(current);
+    }
+    const auto& localDevice = replacedDevice != nullptr ? replacedDevice : queuedDevice;
     struct SubmitDue {
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;

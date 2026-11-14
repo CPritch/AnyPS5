@@ -280,6 +280,7 @@ public:
     void PrepareAheadDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, AheadDrawBindings& ahead) const;
     void PrefetchBindings(std::span<const MovedBuffer> moved) const;
     void PrefetchEarly() const;
+    void PrefetchGate() const;
     const DrawBindings* BindingsForEmit(Recorder& recorder, std::span<const MovedBuffer> moved, AheadDrawBindings* ahead, bool disturbed) const;
     struct MovedPlan {
         std::vector<MovedBuffer> moved;

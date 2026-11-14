@@ -8221,6 +8221,14 @@ const ShaderResources::DrawBindings* ShaderResources::BindingsForEmit(Recorder& 
     return item;
 }
 
+void ShaderResources::PrefetchGate() const {
+    __builtin_prefetch(&inResourceCache);
+    __builtin_prefetch(&provedEpoch);
+    __builtin_prefetch(&provedProof);
+    __builtin_prefetch(&provedPending);
+    __builtin_prefetch(&describedRanges);
+}
+
 void ShaderResources::PrefetchEarly() const {
     static const bool enabled = std::getenv("APS5_NO_BINDING_PREFETCH") == nullptr;
     if (!enabled) return;

@@ -95,7 +95,16 @@ constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::ItemKin
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::ItemKind::Count)> nextNotDrawKinds{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::ItemKind::Count) + 1> afterSealKinds{};
 thread_local bool skipCommittingReads = false;
-enum ResolveJobState : int { ResolveIdle, ResolvePosted, ResolveRunning, ResolveDone };
+enum ResolveJobState : int { ResolveIdle, ResolvePosted, ResolveRunning, ResolveDone, ResolveAwaited };
+
+std::chrono::nanoseconds ResolverPollWindow() {
+    static const std::chrono::nanoseconds window = [] {
+        if (std::getenv("APS5_NO_RESOLVER_POLL") != nullptr) return std::chrono::nanoseconds::zero();
+        const char* text = std::getenv("APS5_RESOLVER_POLL_NS");
+        return std::chrono::nanoseconds(text != nullptr ? std::clamp<long long>(std::strtoll(text, nullptr, 10), 0, 1000000) : 3000);
+    }();
+    return window;
+}
 std::atomic<std::uint64_t> earlyResolveNs{0}, earlyResolveCount{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::CommitterPart::Count)> committerPartNs{}, committerPartCount{};
 std::atomic<std::uint64_t> resolvesPosted{0}, resolvesRevoked{0}, resolvesDoneBeforeJoin{0}, resolvesWaited{0}, resolveWaitNs{0};
@@ -1310,8 +1319,16 @@ void DrawPipeline::PostResolve(void (*body)(void*), void (*finish)(void*, bool),
         pipeline.oldestLane = 0;
         pipeline.lanesInFlight = 1;
     }
-    lane.state.store(ResolvePosted, std::memory_order_release);
-    pipeline.wakeLane(lane);
+    if (ResolverPollWindow().count() == 0) {
+        lane.state.store(ResolvePosted, std::memory_order_release);
+        pipeline.wakeLane(lane);
+        return;
+    }
+    lane.state.store(ResolvePosted, std::memory_order_seq_cst);
+    if (lane.sleeping.load(std::memory_order_seq_cst) != 0) {
+        lane.wake.fetch_add(1, std::memory_order_seq_cst);
+        lane.wake.notify_one();
+    }
 }
 
 void DrawPipeline::JoinResolve() {
@@ -1342,7 +1359,11 @@ void DrawPipeline::joinLane(DrawPipeline& pipeline, ResolveLane& lane, bool revo
             resolvesDoneBeforeJoin.fetch_add(1, std::memory_order_relaxed);
         } else {
             const auto start = std::chrono::steady_clock::now();
-            while (lane.state.load(std::memory_order_acquire) != ResolveDone) SpinPause();
+            bool marked = ResolverPollWindow().count() == 0;
+            for (auto seen = lane.state.load(std::memory_order_acquire); seen != ResolveDone; seen = lane.state.load(std::memory_order_acquire)) {
+                if (!marked && seen == ResolveRunning) marked = lane.state.compare_exchange_strong(seen, ResolveAwaited, std::memory_order_acq_rel);
+                else SpinPause();
+            }
             resolvesWaited.fetch_add(1, std::memory_order_relaxed);
             lastJoinWaitNs += elapsedNs(start);
             resolveWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
@@ -1447,9 +1468,12 @@ void DrawPipeline::resolveAhead(unsigned laneIndex) {
     }();
     auto& lane = lanes[laneIndex];
     const bool twoLanes = ResolveLanes();
+    const auto pollWindow = ResolverPollWindow();
+    bool awaited = false;
     for (;;) {
         const auto preProofDue = [&] { return laneIndex == 0 && preProofState.load(std::memory_order_acquire) == PreProofPosted && preProofAfter.load(std::memory_order_acquire) == lastJobTarget && lastJobTemplate != nullptr; };
         const auto posted = [&] { return lane.state.load(std::memory_order_acquire) == ResolvePosted || resolverClosing.load(std::memory_order_relaxed) || preProofDue() || Graphics::SpentDrawPacketsWaiting(laneIndex); };
+        if (awaited && !SpinUntil(pollWindow, [&] { return lane.state.load(std::memory_order_acquire) == ResolvePosted || resolverClosing.load(std::memory_order_relaxed) || preProofDue(); })) awaited = false;
         if (spins && !SpinUntil(HandoffSpinWindow(), posted)) {
             std::this_thread::sleep_for(idleNap);
             continue;
@@ -1506,7 +1530,8 @@ void DrawPipeline::resolveAhead(unsigned laneIndex) {
         lastJobTarget = jobTarget;
         lastJobTemplate = std::exchange(resolvedTemplate, nullptr);
         if (timed) resolveBusyNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
-        lane.state.store(ResolveDone, std::memory_order_release);
+        if (pollWindow.count() == 0) lane.state.store(ResolveDone, std::memory_order_release);
+        else awaited = lane.state.exchange(ResolveDone, std::memory_order_acq_rel) == ResolveAwaited;
     }
 }
 
@@ -1904,8 +1929,8 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, itemKind, std::move(early), false, CommitKindOf(itemKind)}, std::move(prepare));
 }
 
-void DrawPipeline::Enqueue(CommitKind commitKind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, ItemKind kind, Prepare prepare, Early early) {
-    enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, draw && kind == ItemKind::Other ? ItemKind::Draw : kind, std::move(early), false, commitKind}, std::move(prepare));
+void DrawPipeline::Enqueue(CommitKind commitKind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, ItemKind kind, Prepare prepare, Early early, Warm warm) {
+    enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, draw && kind == ItemKind::Other ? ItemKind::Draw : kind, std::move(early), false, commitKind, warm}, std::move(prepare));
 }
 
 void DrawPipeline::NoteDrawKey(std::uint64_t key, std::uint64_t shape) {
@@ -2122,7 +2147,16 @@ void DrawPipeline::run() {
     bool isDraw = false;
     std::size_t kind = 0;
     bool taken = false;
+    static const bool warms = std::getenv("APS5_NO_COMMIT_WARM") == nullptr;
+    Warm warmNext{}, warmSecond{};
+    const Item* warmThird = nullptr;
     const auto take = [&] {
+        if (warms) {
+            const auto queued = items.size();
+            warmNext = queued > 1 ? items[1].warm : Warm{};
+            warmSecond = queued > 2 ? items[2].warm : Warm{};
+            warmThird = queued > 3 ? &items[3] : nullptr;
+        }
         takenItem = &items.front();
         commit = stopped ? nullptr : &items.front().commit;
         committingWrites = &items.front().writes;
@@ -2188,6 +2222,13 @@ void DrawPipeline::run() {
             take();
         }
         taken = false;
+        if (warms) {
+            if (warmThird != nullptr) {
+                for (std::size_t line = 0; line * 64 < sizeof(Item); ++line) __builtin_prefetch(reinterpret_cast<const char*>(warmThird) + line * 64);
+            }
+            if (warmSecond.run != nullptr) warmSecond.run(warmSecond, 1);
+            if (warmNext.run != nullptr) warmNext.run(warmNext, 2);
+        }
         if (PreProofEnabled()) settlePreProof(takenItem);
         const auto start = clock();
         if (counted) {
