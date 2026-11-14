@@ -69,6 +69,8 @@ std::atomic<std::uint64_t> earlyResolved{0}, earlyDeclined{0}, earlyFailed{0};
 std::atomic<bool> earlyStopped{false};
 struct PendingEarly {
     DrawPipeline::Early hook;
+    const DrawPipeline::Early* borrowed = nullptr;
+    bool Offered() const { return static_cast<bool>(hook) || (borrowed != nullptr && static_cast<bool>(*borrowed)); }
     const std::vector<DrawPipeline::Range>* writes = nullptr;
     bool late = false;
     const void* target = nullptr;
@@ -1671,11 +1673,12 @@ std::size_t DrawPipeline::EarlyIndex(const std::deque<Item>& items) {
 }
 
 void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentTemplate) {
-    if (!pendingEarly.hook && pendingEarly.late && committingPipeline != nullptr) {
+    if (!pendingEarly.Offered() && pendingEarly.late && committingPipeline != nullptr) {
         auto& pipeline = *committingPipeline;
         std::lock_guard lock(pipeline.mutex);
         if (const auto next = EarlyIndex(pipeline.items); next != 0) {
-            pendingEarly.hook = pipeline.items[next].early;
+            if (Graphics::LookalikeCommit()) pendingEarly.borrowed = &pipeline.items[next].early;
+            else pendingEarly.hook = pipeline.items[next].early;
             pendingEarly.writes = OfferWrites(pipeline.items, next);
             pendingEarly.target = &pipeline.items[next];
             pendingEarly.next = next;
@@ -1684,12 +1687,14 @@ void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentT
             if (next >= 2) NoteEarly(pendingEarly.writes == &runWrites && runWrites.size() > pipeline.items.front().writes.size() ? EarlyEvent::AcrossLabels : EarlyEvent::AcrossSeal);
         }
     }
-    if (!pendingEarly.hook) {
+    if (!pendingEarly.Offered()) {
         pendingEarly = {};
         offerSecondEarly(depth, currentTemplate);
         return;
     }
-    auto hook = std::move(pendingEarly.hook);
+    const auto* borrowed = pendingEarly.borrowed;
+    auto owned = std::move(pendingEarly.hook);
+    const auto& hook = borrowed != nullptr ? *borrowed : owned;
     const auto* writes = pendingEarly.writes;
     offerTarget = pendingEarly.target;
     offerNext = pendingEarly.next;
@@ -2143,7 +2148,8 @@ void DrawPipeline::run() {
         }
         if (const auto next = EarlyIndex(items); next != 0) {
             if (next == 1) arrangeSecond();
-            pendingEarly.hook = items[next].early;
+            if (Graphics::LookalikeCommit()) pendingEarly.borrowed = &items[next].early;
+            else pendingEarly.hook = items[next].early;
             pendingEarly.writes = OfferWrites(items, next);
             pendingEarly.target = &items[next];
             pendingEarly.next = next;
@@ -2202,7 +2208,7 @@ void DrawPipeline::run() {
             if (commit != nullptr) {
                 struct ClearEarly {
                     ~ClearEarly() {
-                        if (!pendingEarly.hook) {
+                        if (!pendingEarly.Offered()) {
                             pendingEarly = {};
                             return;
                         }
