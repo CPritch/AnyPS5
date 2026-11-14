@@ -1955,16 +1955,39 @@ ThreadCollectMemo& threadCollectMemo() {
     return *memo;
 }
 
+bool flatCollectMap() {
+    static const bool flat = std::getenv("APS5_NO_FLAT_COLLECT_MAP") == nullptr;
+    return flat;
+}
+
+bool flatCollectMapVerified() {
+    static const bool verified = flatCollectMap() && std::getenv("APS5_VERIFY_FLAT_COLLECT_MAP") != nullptr;
+    return verified;
+}
+
 struct EpochCollectMap {
+    using Range = std::pair<std::uintptr_t, std::uintptr_t>;
     std::uint64_t epoch = 0;
     std::uint64_t unwatched = 0;
     std::uint64_t mapping = 0;
     std::map<std::uintptr_t, std::uintptr_t> ranges;
+    std::vector<Range> flat;
+
+    bool Empty() const {
+        return flatCollectMap() ? flat.empty() : ranges.empty();
+    }
 
     bool Covers(std::uintptr_t begin, std::uintptr_t end) const {
         if (end <= begin) return false;
-        const auto next = ranges.upper_bound(begin);
-        return next != ranges.begin() && std::prev(next)->second >= end;
+        if (!flatCollectMap()) return mapCovers(begin, end);
+        const auto next = std::upper_bound(flat.begin(), flat.end(), begin, [](std::uintptr_t value, const Range& range) { return value < range.first; });
+        const bool covered = next != flat.begin() && std::prev(next)->second >= end;
+        if (flatCollectMapVerified() && covered != mapCovers(begin, end)) {
+            std::fprintf(stderr, "FATAL: APS5_VERIFY_FLAT_COLLECT_MAP: the flat collect map answered %d for 0x%llx-0x%llx and the ordered map %d\n", covered ? 1 : 0, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), covered ? 0 : 1);
+            std::fflush(stderr);
+            std::abort();
+        }
+        return covered;
     }
 
     bool Holds(std::uint64_t now, std::uintptr_t begin, std::uintptr_t end) {
@@ -1975,6 +1998,7 @@ struct EpochCollectMap {
 
     void Reset(std::uint64_t now) {
         ranges.clear();
+        flat.clear();
         mapping = now;
     }
 
@@ -1984,6 +2008,45 @@ struct EpochCollectMap {
     }
 
     void Record(std::uintptr_t begin, std::uintptr_t end) {
+        if (flatCollectMap()) recordFlat(begin, end);
+        if (!flatCollectMap() || flatCollectMapVerified()) recordMap(begin, end);
+    }
+
+private:
+    bool mapCovers(std::uintptr_t begin, std::uintptr_t end) const {
+        const auto next = ranges.upper_bound(begin);
+        return next != ranges.begin() && std::prev(next)->second >= end;
+    }
+
+    void recordFlat(std::uintptr_t begin, std::uintptr_t end) {
+        auto next = std::upper_bound(flat.begin(), flat.end(), begin, [](std::uintptr_t value, const Range& range) { return value < range.first; });
+        if (next != flat.begin()) {
+            const auto previous = std::prev(next);
+            if (previous->second >= begin) {
+                previous->second = std::max(end, previous->second);
+                auto last = next;
+                while (last != flat.end() && last->first <= previous->second) {
+                    previous->second = std::max(previous->second, last->second);
+                    ++last;
+                }
+                flat.erase(next, last);
+                return;
+            }
+        }
+        auto last = next;
+        while (last != flat.end() && last->first <= end) {
+            end = std::max(end, last->second);
+            ++last;
+        }
+        if (next == last) {
+            flat.insert(next, Range{begin, end});
+            return;
+        }
+        *next = Range{begin, end};
+        flat.erase(std::next(next), last);
+    }
+
+    void recordMap(std::uintptr_t begin, std::uintptr_t end) {
         auto next = ranges.upper_bound(begin);
         if (next != ranges.begin()) {
             const auto previous = std::prev(next);
@@ -2007,7 +2070,7 @@ struct EpochCollectMap {
 EpochCollectMap& epochCollectMap(std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t mapping) {
     struct Slot {};
     auto& map = ThreadScratch<EpochCollectMap, Slot>();
-    if (map.epoch != epoch || map.unwatched != unwatched || map.ranges.empty()) {
+    if (map.epoch != epoch || map.unwatched != unwatched || map.Empty()) {
         map.Reset(mapping);
         map.epoch = epoch;
         map.unwatched = unwatched;
@@ -2747,6 +2810,7 @@ void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
         bumpSubscriptions(address, bytes, WriteBumpSource::Unwatch);
     }
 #else
+    unwatchSerial.fetch_add(1, std::memory_order_acq_rel);
     if (GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), bytes)) {
         unwatchSerial.fetch_add(1, std::memory_order_release);
         bumpSubscriptions(address, bytes, WriteBumpSource::Unwatch);
@@ -3198,6 +3262,37 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     return rememberedTrackerQuery(QueryUnchangedAll, queries, true, [&](WriteTracker& tracker) { return unchangedSinceAllLocked(tracker, queries); });
+}
+
+CollectWitness WitnessBeforeCollects() {
+    return {unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
+}
+
+namespace {
+
+bool collectedUnchangedWithoutLock(const WriteTracker& tracker, std::span<const UnchangedQuery> queries, const CollectWitness& witness) {
+    if (queries.empty() || unwatchSerial.load(std::memory_order_acquire) != witness.unwatched) return false;
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    for (const auto& query : queries) {
+        if (query.generation == 0 || query.bytes == 0 || query.bytes > std::numeric_limits<std::uint64_t>::max() - query.address) return false;
+        if (!mappingHolds(witness.mapping, mapping, query.address, query.address + query.bytes)) return false;
+    }
+    return trackerStampsUnchanged(tracker, queries);
+}
+
+}
+
+bool UnchangedSinceAllCollected(std::span<const UnchangedQuery> queries, const CollectWitness& witness) {
+    static const bool enabled = std::getenv("APS5_NO_COLLECTED_UNCHANGED") == nullptr;
+    static const bool verified = std::getenv("APS5_VERIFY_COLLECTED_UNCHANGED") != nullptr;
+    auto& tracker = Tracker();
+    if (!enabled || !collectedUnchangedWithoutLock(tracker, queries, witness)) return UnchangedSinceAll(queries);
+    if (verified && !unchangedSinceAllLocked(tracker, queries) && trackerStampsUnchanged(tracker, queries)) {
+        std::fprintf(stderr, "FATAL: APS5_VERIFY_COLLECTED_UNCHANGED: %zu collected ranges answered unchanged without the tracker lock and changed under it\n", queries.size());
+        std::fflush(stderr);
+        std::abort();
+    }
+    return true;
 }
 
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {

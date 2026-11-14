@@ -185,6 +185,7 @@ struct TextureCache {
     std::list<CachedTexture> entries;
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
+    std::unordered_map<const Texture*, std::list<CachedTexture>::iterator> byTexture;
     std::vector<std::pair<std::vector<std::byte>, std::uint64_t>> spare;
     std::uint64_t spareBytes = 0;
     std::uint64_t bytes = 0;
@@ -314,6 +315,7 @@ void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     }
     if (it->texture.use_count() > 1) noteReleased(it->texture, ReleaseSite::EvictedHeld, it->address);
     cache.index.erase(it->key);
+    if (const auto found = cache.byTexture.find(it->texture.get()); found != cache.byTexture.end() && found->second == it) cache.byTexture.erase(found);
     cache.entries.erase(it);
     ++cache.erasures;
 }
@@ -899,11 +901,26 @@ bool auditedSnapshotEqual(std::uint64_t address, std::span<const std::byte> snap
     return equal;
 }
 
+std::list<CachedTexture>::iterator auditedEntry(TextureCache& cache, const Texture* texture) {
+    static const bool indexed = std::getenv("APS5_NO_ALIAS_AUDIT_INDEX") == nullptr;
+    static const bool verified = std::getenv("APS5_VERIFY_ALIAS_AUDIT_INDEX") != nullptr;
+    const auto scan = [&] { return std::find_if(cache.entries.begin(), cache.entries.end(), [&](const CachedTexture& cached) { return cached.texture.get() == texture; }); };
+    if (!indexed) return scan();
+    const auto found = cache.byTexture.find(texture);
+    const auto entry = found == cache.byTexture.end() ? cache.entries.end() : found->second;
+    if (verified && entry != scan()) {
+        std::fprintf(stderr, "FATAL: APS5_VERIFY_ALIAS_AUDIT_INDEX: the texture index found %s for texture %p, the cache scan %s\n", entry == cache.entries.end() ? "no entry" : "an entry", static_cast<const void*>(texture), scan() == cache.entries.end() ? "none" : "another entry");
+        std::fflush(stderr);
+        std::abort();
+    }
+    return entry;
+}
+
 bool auditAliasedSnapshot(const Texture* texture, std::uint64_t address, std::size_t bytes) {
     auto& cache = Textures();
     std::lock_guard lock(cache.mutex);
     const CacheHold held(sampledCacheHeld);
-    const auto entry = std::find_if(cache.entries.begin(), cache.entries.end(), [&](const CachedTexture& cached) { return cached.texture.get() == texture; });
+    const auto entry = auditedEntry(cache, texture);
     if (entry == cache.entries.end() || entry->source != nullptr || entry->bytes.size() != bytes) {
         GuestMemory::NoteAliasAudit(GuestMemory::AliasAudit::Unavailable);
         return true;
@@ -1398,6 +1415,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
+    cache.byTexture[cache.entries.front().texture.get()] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
     reportCacheCounts(cache, budget);
     reportTextureCounters();
@@ -4083,6 +4101,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         return false;
     };
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
+    const auto witness = GuestMemory::WitnessBeforeCollects();
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
     struct QueriesTag {};
@@ -4245,7 +4264,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
     proofLap(PartPendingScan);
-    if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
+    if (!GuestMemory::UnchangedSinceAllCollected(queries, witness)) return fail(FastFail::Changed);
     proofLap(PartUnchanged);
     if (const auto aliasSerial = GuestMemory::AliasSerial(); aliasSerial != 0) {
         for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
