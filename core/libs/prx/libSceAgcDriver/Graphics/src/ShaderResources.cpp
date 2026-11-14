@@ -6094,6 +6094,108 @@ bool BindingsCounted() {
 void CountBinding(BindingCount which, std::uint64_t amount = 1) {
     if (BindingsCounted()) bindingCounts[which].fetch_add(amount, std::memory_order_relaxed);
 }
+
+enum ReuseCount : std::size_t { ReuseCalls, ReuseSameAsPrevious, ReuseSeenInBatch, ReuseSetSame, ReuseSelectionSame, ReuseBytesSame, ReuseUploads, ReuseUploadBytes, ReuseUploadsSameBytes, ReuseUploadSameBytes, ReuseCheckNs, ReuseSetSameAsPrevious, ReuseBytesSameAsPrevious, ReuseCountTotal };
+std::array<std::atomic<std::uint64_t>, ReuseCountTotal> reuseCounts{};
+
+struct ReuseState {
+    const void* recorder = nullptr;
+    std::uint64_t batch = 0;
+    const void* fault = nullptr;
+    std::size_t writes = 0;
+    std::vector<VkDescriptorBufferInfo> buffers;
+    std::vector<std::array<std::uint64_t, 3>> selection;
+    std::vector<std::byte> bytes;
+};
+
+struct ReuseSeen {
+    const void* resources = nullptr;
+    std::unordered_map<const void*, ReuseState> byResources;
+};
+
+bool SameBuffers(std::span<const VkDescriptorBufferInfo> a, std::span<const VkDescriptorBufferInfo> b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t index = 0; index < a.size(); ++index) {
+        if (a[index].buffer != b[index].buffer || a[index].offset != b[index].offset || a[index].range != b[index].range) return false;
+    }
+    return true;
+}
+
+void CountReuse(const void* resources, const void* recorder, std::uint64_t batch, const void* fault, std::size_t writes, std::span<const VkDescriptorBufferInfo> buffers, std::span<const ShaderResources::DrawBindings::Snapshot> snapshots, std::span<const std::size_t> selected, std::span<const std::uint8_t> fresh) {
+    thread_local ReuseSeen seen;
+    reuseCounts[ReuseCalls].fetch_add(1, std::memory_order_relaxed);
+    const bool previous = seen.resources == resources;
+    seen.resources = resources;
+    if (previous) reuseCounts[ReuseSameAsPrevious].fetch_add(1, std::memory_order_relaxed);
+    if (seen.byResources.size() > 8192) seen.byResources.clear();
+    auto& last = seen.byResources[resources];
+    const auto began = std::chrono::steady_clock::now();
+    const bool inBatch = last.recorder == recorder && last.batch == batch;
+    bool setSame = false, selectionSame = false, bytesSame = false;
+    std::size_t uploads = 0, uploadBytes = 0, uploadsSame = 0, uploadSameBytes = 0;
+    if (inBatch) {
+        setSame = last.fault == fault && last.writes == writes && SameBuffers(buffers, last.buffers);
+        selectionSame = last.selection.size() == snapshots.size();
+        for (std::size_t index = 0; index < snapshots.size() && selectionSame; ++index) selectionSame = last.selection[index] == std::array<std::uint64_t, 3>{selected[index], snapshots[index].address, snapshots[index].bytes};
+        std::size_t at = 0;
+        bytesSame = selectionSame;
+        for (std::size_t index = 0; index < snapshots.size(); ++index) {
+            const auto mine = snapshots[index].Bytes();
+            const bool fits = index < last.selection.size() && last.selection[index] == std::array<std::uint64_t, 3>{selected[index], snapshots[index].address, snapshots[index].bytes} && at + mine.size() <= last.bytes.size();
+            const bool same = fits && std::memcmp(mine.data(), last.bytes.data() + at, mine.size()) == 0;
+            if (index < last.selection.size()) at += static_cast<std::size_t>(last.selection[index][2]);
+            bytesSame = bytesSame && same;
+            if (index < fresh.size() && fresh[index] != 0) {
+                ++uploads;
+                uploadBytes += mine.size();
+                if (same) {
+                    ++uploadsSame;
+                    uploadSameBytes += mine.size();
+                }
+            }
+        }
+    } else {
+        for (std::size_t index = 0; index < snapshots.size(); ++index) {
+            if (index < fresh.size() && fresh[index] != 0) {
+                ++uploads;
+                uploadBytes += snapshots[index].bytes;
+            }
+        }
+    }
+    reuseCounts[ReuseCheckNs].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count()), std::memory_order_relaxed);
+    if (inBatch) reuseCounts[ReuseSeenInBatch].fetch_add(1, std::memory_order_relaxed);
+    if (setSame) reuseCounts[ReuseSetSame].fetch_add(1, std::memory_order_relaxed);
+    if (selectionSame) reuseCounts[ReuseSelectionSame].fetch_add(1, std::memory_order_relaxed);
+    if (bytesSame) reuseCounts[ReuseBytesSame].fetch_add(1, std::memory_order_relaxed);
+    if (previous && setSame) reuseCounts[ReuseSetSameAsPrevious].fetch_add(1, std::memory_order_relaxed);
+    if (previous && bytesSame) reuseCounts[ReuseBytesSameAsPrevious].fetch_add(1, std::memory_order_relaxed);
+    reuseCounts[ReuseUploads].fetch_add(uploads, std::memory_order_relaxed);
+    reuseCounts[ReuseUploadBytes].fetch_add(uploadBytes, std::memory_order_relaxed);
+    reuseCounts[ReuseUploadsSameBytes].fetch_add(uploadsSame, std::memory_order_relaxed);
+    reuseCounts[ReuseUploadSameBytes].fetch_add(uploadSameBytes, std::memory_order_relaxed);
+    last.recorder = recorder;
+    last.batch = batch;
+    last.fault = fault;
+    last.writes = writes;
+    last.buffers.assign(buffers.begin(), buffers.end());
+    last.selection.clear();
+    last.bytes.clear();
+    for (std::size_t index = 0; index < snapshots.size(); ++index) {
+        last.selection.push_back({selected[index], snapshots[index].address, snapshots[index].bytes});
+        const auto mine = snapshots[index].Bytes();
+        last.bytes.insert(last.bytes.end(), mine.begin(), mine.end());
+    }
+}
+
+std::string ReuseText() {
+    std::array<std::uint64_t, ReuseCountTotal> counts{};
+    for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = reuseCounts[index].exchange(0, std::memory_order_relaxed);
+    char text[1024];
+    std::snprintf(text, sizeof(text), "; bindings reuse: calls %llu, same resources as the thread's previous call %llu, resources seen earlier in the batch %llu: descriptor buffers the same %llu (as the previous call %llu), snapshot selection the same %llu, selection and bytes the same %llu (as the previous call %llu); fresh uploads %llu of %llu bytes, bytes the same as that resources' last call %llu of %llu bytes; check %.0f ns a call",
+                  static_cast<unsigned long long>(counts[ReuseCalls]), static_cast<unsigned long long>(counts[ReuseSameAsPrevious]), static_cast<unsigned long long>(counts[ReuseSeenInBatch]), static_cast<unsigned long long>(counts[ReuseSetSame]), static_cast<unsigned long long>(counts[ReuseSetSameAsPrevious]), static_cast<unsigned long long>(counts[ReuseSelectionSame]), static_cast<unsigned long long>(counts[ReuseBytesSame]), static_cast<unsigned long long>(counts[ReuseBytesSameAsPrevious]), static_cast<unsigned long long>(counts[ReuseUploads]), static_cast<unsigned long long>(counts[ReuseUploadBytes]), static_cast<unsigned long long>(counts[ReuseUploadsSameBytes]), static_cast<unsigned long long>(counts[ReuseUploadSameBytes]),
+                  counts[ReuseCalls] == 0 ? 0.0 : static_cast<double>(counts[ReuseCheckNs]) / static_cast<double>(counts[ReuseCalls]));
+    return text;
+}
 }
 
 DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount) {
@@ -7882,7 +7984,7 @@ std::string TakeDrawBindingsText() {
     std::snprintf(text, sizeof(text), "; draw bindings %llu (%llu without snapshots), ns each: snapshots %.0f, set %.0f, writes %.0f, update %.0f, keep %.0f; per call: %.2f snapshots (%.2f reused unwritten, %.2f uploaded of %.0f bytes, %.2f large reused, %.2f large copied), %.2f descriptor writes, sets %llu recycled %llu allocated",
                   static_cast<unsigned long long>(calls), static_cast<unsigned long long>(counts[CountEmpty]), each(ns[PartSnapshots]), each(ns[PartSet]), each(ns[PartWrites]), each(ns[PartUpdate]), each(ns[PartKeep]), each(counts[CountSnapshots]), each(counts[CountReused]), each(counts[CountUploaded]),
                   counts[CountUploaded] == 0 ? 0.0 : static_cast<double>(counts[CountUploadedBytes]) / static_cast<double>(counts[CountUploaded]), each(counts[CountLargeReused]), each(counts[CountLargeNew]), each(counts[CountWrites]), static_cast<unsigned long long>(counts[CountRecycled]), static_cast<unsigned long long>(counts[CountAllocated]));
-    return text;
+    return text + ReuseText();
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
@@ -8187,7 +8289,14 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
         if (deferCopies) pendingCopies.push_back(pending);
         else copy(pending);
     };
-    const auto keep = [&](DrawBindings::Snapshot snapshot, const std::shared_ptr<Buffer>& owner) {
+    thread_local std::vector<std::uint8_t>* freshSlot = nullptr;
+    auto& fresh = ShaderRecompiler::ThreadOwned(freshSlot);
+    fresh.clear();
+    const auto keep = [&](DrawBindings::Snapshot snapshot, const std::shared_ptr<Buffer>& owner, bool uploadedNow) {
+        if (timed) {
+            fresh.resize(result->snapshots.size(), 0);
+            fresh.push_back(uploadedNow ? 1 : 0);
+        }
         if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
         if (!recorder.DrawUploadBatchKept(snapshot.buffer)) {
             Require(owner.get() == snapshot.buffer, "a draw snapshot is not owned by its bindings");
@@ -8202,7 +8311,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             auto slice = recorder.DrawUpload(override->size);
             upload({slice.bytes, reinterpret_cast<const std::byte*>(override->words.data()), override->size, index});
             selected.push_back(index);
-            keep({0, slice.buffer, slice.offset, override->size}, recorder.DrawUploadOwner(slice.buffer));
+            keep({0, slice.buffer, slice.offset, override->size}, recorder.DrawUploadOwner(slice.buffer), true);
             continue;
         }
         if (usesBda && !spaceReuse) {
@@ -8244,7 +8353,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
                     CountBinding(CountSnapshots);
                     CountBinding(CountReused);
                     selected.push_back(index);
-                    keep({begin, pending->buffer, pending->offset, bytes}, batchKept ? recorder.DrawUploadOwner(pending->buffer) : *owner);
+                    keep({begin, pending->buffer, pending->offset, bytes}, batchKept ? recorder.DrawUploadOwner(pending->buffer) : *owner, false);
                     totalSnapshotBytes += bytes;
                     continue;
                 }
@@ -8264,8 +8373,10 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
         Buffer* raw = buffer.get();
+        bool uploadedNow = false;
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
+            uploadedNow = uploaded;
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
                 upload({slice.bytes, reinterpret_cast<const std::byte*>(begin), bytes, Unpatched});
@@ -8293,7 +8404,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, uploaded ? recorder.DrawUploadOwner(raw) : buffer, offset);
         }
         selected.push_back(index);
-        keep({begin, raw, offset, bytes}, buffer != nullptr ? buffer : recorder.DrawUploadOwner(raw));
+        keep({begin, raw, offset, bytes}, buffer != nullptr ? buffer : recorder.DrawUploadOwner(raw), uploadedNow);
         totalSnapshotBytes += bytes;
         if (CaptureTrace::Enabled()) CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
@@ -8409,6 +8520,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             for (const auto slot : plan.allocationSlots[allocation]) buffers[slot] = range;
         }
         CountBinding(CountWrites, writes.size());
+        if (timed) CountReuse(this, &recorder, recorder.OpenSerial(), faultRecord, writes.size(), buffers, result->snapshots, selected, fresh);
         part(PartWrites);
         context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
         part(PartUpdate);
@@ -8441,6 +8553,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     CountBinding(CountWrites, writes.size());
+    if (timed) CountReuse(this, &recorder, recorder.OpenSerial(), faultRecord, writes.size(), buffers, result->snapshots, selected, fresh);
     part(PartWrites);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     part(PartUpdate);

@@ -85,6 +85,7 @@ std::atomic<std::uint64_t>& eightBitWrites() {
 }
 
 std::array<std::atomic<std::uint64_t>, 3> layoutRecordCounts{};
+std::array<std::atomic<std::uint64_t>, 6> layerMarkCounts{};
 
 // APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
 struct TextureProfile {
@@ -1814,6 +1815,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         trackedLayerBytes = blockUnits ? 65536 : guestBytes / trackedLayers;
         layerGeneration.assign(trackedLayers, 0);
         layerPendingSince.assign(trackedLayers, 0);
+        pendingSinceWhole = false;
         unwatchHash.assign(trackedLayers, {});
         pendingMiss.assign(trackedLayers, BaselineMiss::None);
         layerPending.assign(trackedLayers, false);
@@ -2654,6 +2656,7 @@ std::string StorageTexture::TakeCommitterRefreshText() {
     const auto landed = LandedKeyProofs();
     text += "; DCC key proofs over landed key stores " + std::to_string(landed - std::exchange(landedReported, landed));
     text += "; image layout records: " + std::to_string(layoutRecordCounts[0].exchange(0, std::memory_order_relaxed)) + " written, " + std::to_string(layoutRecordCounts[1].exchange(0, std::memory_order_relaxed)) + " unchanged; pending-since stamps taken while a walk ran " + std::to_string(layoutRecordCounts[2].exchange(0, std::memory_order_relaxed));
+    text += "; layer marks " + std::to_string(layerMarkCounts[0].exchange(0, std::memory_order_relaxed)) + " (all units already pending " + std::to_string(layerMarkCounts[1].exchange(0, std::memory_order_relaxed)) + ", pending-since stamps unchanged " + std::to_string(layerMarkCounts[2].exchange(0, std::memory_order_relaxed)) + ", units " + std::to_string(layerMarkCounts[3].exchange(0, std::memory_order_relaxed)) + ", stamp memo skips " + std::to_string(layerMarkCounts[4].exchange(0, std::memory_order_relaxed)) + ", kept-unit walks " + std::to_string(layerMarkCounts[5].exchange(0, std::memory_order_relaxed)) + ")";
     text += "; readback stores before a label: memo skips " + std::to_string(labelReadbackCounts[0].exchange(0, std::memory_order_relaxed)) + ", scans " + std::to_string(labelReadbackCounts[1].exchange(0, std::memory_order_relaxed)) + " flushing " + std::to_string(labelReadbackCounts[2].exchange(0, std::memory_order_relaxed)) + " ranges, " + std::to_string(labelReadbackCounts[3].exchange(0, std::memory_order_relaxed)) + " stored";
     text += "; committer image stores waiting for other writers by reason (count/ms; pending writes over the range: stores, shader writers [top programs], other, in the open batch):";
     for (std::size_t i = 0; i < waits.size() && i < 4; ++i) {
@@ -4828,6 +4831,10 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     std::optional<MapImportGate::PublishHold> publication;
     if (!layerPending.Any()) publication.emplace(descriptor.baseAddress, guestBytes);
     const bool newlyPending = !layerPending.AllIn(first, count);
+    if (LayoutRecordsCounted()) {
+        layerMarkCounts[0].fetch_add(1, std::memory_order_relaxed);
+        if (!newlyPending) layerMarkCounts[1].fetch_add(1, std::memory_order_relaxed);
+    }
     if (newlyPending) {
         std::vector<bool> unsaved;
         bool anyUnsaved = false;
@@ -4875,9 +4882,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     static const bool publishedSince = std::getenv("APS5_NO_PUBLISHED_PENDING_SINCE") == nullptr;
     const auto pendingSince = publishedSince ? GuestMemory::PublishedTrackerGeneration() : GuestMemory::TrackerGeneration();
     if (publishedSince && LayoutRecordsCounted() && pendingSince != GuestMemory::WriteGeneration()) layoutRecordCounts[2].fetch_add(1, std::memory_order_relaxed);
-    for (std::uint32_t layer = first; layer < first + count; ++layer) {
-        if (!keptForCpu(layer)) layerPendingSince[layer] = pendingSince;
-    }
+    stampPendingSince(first, count, pendingSince);
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
     // this image's content). An alias written since keeps its own newer results pending.
@@ -5722,6 +5727,68 @@ void StorageTexture::forgetKeptAtUnwatch(std::uint32_t unit) {
 bool StorageTexture::keptAtUnwatchHolds(std::uint64_t from, std::uint32_t unit) const {
     const auto found = keptAtUnwatch.find(from);
     return found != keptAtUnwatch.end() && layerOriginal[unit] && found->second == layerGeneration[unit];
+}
+
+namespace {
+bool PendingSinceFill() {
+    static const bool enabled = std::getenv("APS5_NO_PENDING_SINCE_FILL") == nullptr;
+    return enabled;
+}
+
+bool VerifyPendingSinceFill() {
+    static const bool enabled = std::getenv("APS5_VERIFY_PENDING_SINCE_FILL") != nullptr;
+    return enabled;
+}
+}
+
+void StorageTexture::stampPendingSince(std::uint32_t first, std::uint32_t count, std::uint64_t pendingSince) {
+    const auto end = first + count;
+    if (LayoutRecordsCounted()) {
+        bool unchanged = true;
+        for (auto layer = first; layer < end && unchanged; ++layer) unchanged = layerPendingSince[layer] == pendingSince || keptForCpu(layer);
+        if (unchanged) layerMarkCounts[2].fetch_add(1, std::memory_order_relaxed);
+        layerMarkCounts[3].fetch_add(count, std::memory_order_relaxed);
+    }
+    if (!PendingSinceFill()) {
+        for (auto layer = first; layer < end; ++layer) {
+            if (!keptForCpu(layer)) layerPendingSince[layer] = pendingSince;
+        }
+        return;
+    }
+    const bool verify = VerifyPendingSinceFill();
+    thread_local std::vector<std::uint64_t> before;
+    if (verify) before.assign(layerPendingSince.begin() + first, layerPendingSince.begin() + end);
+    if (keptAtUnwatch.empty()) {
+        if (pendingSinceWhole && pendingSinceFilled == pendingSince) {
+            if (LayoutRecordsCounted()) layerMarkCounts[4].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            std::fill(layerPendingSince.begin() + first, layerPendingSince.begin() + end, pendingSince);
+            if (first == 0 && count == trackedLayers) {
+                pendingSinceWhole = true;
+                pendingSinceFilled = pendingSince;
+            } else if (pendingSinceFilled != pendingSince) {
+                pendingSinceWhole = false;
+            }
+        }
+    } else {
+        if (LayoutRecordsCounted()) layerMarkCounts[5].fetch_add(1, std::memory_order_relaxed);
+        pendingSinceWhole = false;
+        auto it = keptAtUnwatch.lower_bound(layerBegin(first));
+        for (auto layer = first; layer < end; ++layer) {
+            const auto unitEnd = layerBegin(layer) + layerBytes(layer);
+            bool kept = false;
+            for (; it != keptAtUnwatch.end() && it->first < unitEnd; ++it) kept = kept || it->second == layerGeneration[layer];
+            if (!kept) layerPendingSince[layer] = pendingSince;
+        }
+    }
+    if (!verify) return;
+    for (auto layer = first; layer < end; ++layer) {
+        const auto expected = keptForCpu(layer) ? before[layer - first] : pendingSince;
+        if (layerPendingSince[layer] == expected) continue;
+        std::fprintf(stderr, "[verify] FATAL APS5_VERIFY_PENDING_SINCE_FILL: image 0x%llx unit %u of %u+%u holds pending-since %llu, the per-unit loop gives %llu (kept-unit entries %zu)\n", static_cast<unsigned long long>(descriptor.baseAddress), layer, first, count, static_cast<unsigned long long>(layerPendingSince[layer]), static_cast<unsigned long long>(expected), keptAtUnwatch.size());
+        std::fflush(stderr);
+        std::abort();
+    }
 }
 
 bool StorageTexture::keptForCpu(std::uint32_t unit) const {

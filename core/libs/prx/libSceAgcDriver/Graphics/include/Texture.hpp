@@ -587,6 +587,7 @@ private:
     void forgetKeptAtUnwatch(std::uint32_t unit);
     bool keptAtUnwatchHolds(std::uint64_t from, std::uint32_t unit) const;
     bool keptForCpu(std::uint32_t unit) const;
+    void stampPendingSince(std::uint32_t first, std::uint32_t count, std::uint64_t pendingSince);
     // Drops the saved guest bytes of the units over [address, address + bytes) (another image's fill
     // or copy supersedes them there); the other units' bytes stay valid.
     void forgetSavedOver(std::uint64_t address, std::size_t bytes);
@@ -818,6 +819,8 @@ private:
     std::uint64_t trackedLayerBytes = 0;
     std::vector<std::uint64_t> layerGeneration;
     std::vector<std::uint64_t> layerPendingSince;
+    std::uint64_t pendingSinceFilled = 0;
+    bool pendingSinceWhole = false;
     std::vector<std::uint64_t> completionKept;
     UnitFlags layerPending;
     mutable std::vector<std::uint64_t> unitsReliedAt;
