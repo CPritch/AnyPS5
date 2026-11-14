@@ -3954,7 +3954,8 @@ std::shared_ptr<Pipeline> shapePipeline(const Context& context, std::uint64_t sh
         auto& stages = ShaderRecompiler::ThreadOwned(stagesSlot);
         stages.clear();
         for (const auto& shader : shaders) {
-            const auto identity = shader.program->Identity();
+            const auto identity = shader.program->RememberedIdentity();
+            if (VerifyLookalike()) NoteLookalikeVerified(identity == shader.program->Identity(), "a stage's remembered pipeline identity");
             if (identity.Empty()) return nullptr;
             stages.insert(stages.end(), {static_cast<std::uint64_t>(shader.stage), identity.low, identity.high, static_cast<std::uint64_t>(KeyedPushOffset(shader))});
         }
@@ -3966,7 +3967,26 @@ std::shared_ptr<Pipeline> shapePipeline(const Context& context, std::uint64_t sh
             if (!std::ranges::equal(choice.mainKey, layouts.mainKey) || !std::ranges::equal(choice.fragmentKey, layouts.fragmentKey) || !std::ranges::equal(choice.bindings, input.bindings, sameBinding) || !std::ranges::equal(choice.attributes, input.attributes, sameAttribute)) continue;
             const bool same = !VerifyLookalike() || sameChoice(choice, input, layouts, shaders, attachmentLayout, fragmentOutputs);
             if (VerifyLookalike()) NoteLookalikeVerified(same, "the shape memo's choice");
-            return TouchCachedPipeline(context, choice.hash, choice.pipeline);
+            struct Touched {
+                std::uint64_t hash = 0;
+                VkDevice device = VK_NULL_HANDLE;
+                const void* pool = nullptr;
+                std::weak_ptr<Pipeline> pipeline;
+                unsigned streak = 0;
+            };
+            constexpr unsigned TouchStreak = 64;
+            thread_local Touched* touchedSlot = nullptr;
+            auto& touched = ShaderRecompiler::ThreadOwned(touchedSlot);
+            if (touched.streak != 0 && touched.streak < TouchStreak && touched.hash == choice.hash && touched.device == context.device && touched.pool == context.bufferPool.get() && !touched.pipeline.owner_before(choice.pipeline) && !choice.pipeline.owner_before(touched.pipeline)) {
+                if (auto held = touched.pipeline.lock(); held != nullptr) {
+                    ++touched.streak;
+                    if (VerifyLookalike()) NoteLookalikeVerified(TouchCachedPipeline(context, choice.hash, choice.pipeline) == held, "the pipeline touched for the previous draw");
+                    return held;
+                }
+            }
+            auto pipeline = TouchCachedPipeline(context, choice.hash, choice.pipeline);
+            touched = {choice.hash, context.device, context.bufferPool.get(), pipeline, pipeline != nullptr ? 1u : 0u};
+            return pipeline;
         }
         if (VerifyLookalike()) {
             const bool none = std::ranges::none_of(entry->choices, [&](const ShapeChoice& choice) { return sameChoice(choice, input, layouts, shaders, attachmentLayout, fragmentOutputs); });
@@ -4011,7 +4031,7 @@ void rememberShape(const Context& context, std::uint64_t shape, std::span<const 
     choice.attachmentLayout = attachmentLayout;
     choice.fragmentOutputs = fragmentOutputs;
     for (const auto& shader : shaders) {
-        const auto identity = shader.program->Identity();
+        const auto identity = LookalikeResolve() ? shader.program->RememberedIdentity() : shader.program->Identity();
         if (identity.Empty()) return;
         choice.stages.insert(choice.stages.end(), {static_cast<std::uint64_t>(shader.stage), identity.low, identity.high, KeyedPushOffset(shader)});
     }

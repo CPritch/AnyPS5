@@ -6276,6 +6276,16 @@ bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const Stor
     return pending.textures.AnyOverlapping(address, bytes, [&](const StorageTexture* texture) { return texture != except; });
 }
 
+bool PendingStorageOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (ranges.empty()) return false;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    for (const auto& [begin, end] : ranges) {
+        if (end > begin && pending.textures.AnyOverlapping(begin, static_cast<std::size_t>(end - begin), [](const StorageTexture*) { return true; })) return true;
+    }
+    return false;
+}
+
 std::uint64_t StorageTexture::StampKeepingNewerResults(std::uint64_t address, std::size_t bytes, std::uint64_t recorded, const std::function<std::uint64_t()>& stamp) {
     struct Candidate {
         std::shared_ptr<StorageTexture> texture;

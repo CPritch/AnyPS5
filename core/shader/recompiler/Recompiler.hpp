@@ -1091,9 +1091,22 @@ struct ResultKeyMemo {
     }
 };
 
+struct ResultIdentityMemo {
+    mutable std::atomic<std::uint64_t> low{0};
+    mutable std::atomic<std::uint64_t> high{0};
+    ResultIdentityMemo() = default;
+    ResultIdentityMemo(const ResultIdentityMemo&) {}
+    ResultIdentityMemo& operator=(const ResultIdentityMemo&) {
+        low.store(0, std::memory_order_relaxed);
+        high.store(0, std::memory_order_relaxed);
+        return *this;
+    }
+};
+
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     mutable std::int8_t writesGuestBuffersMemo = -1;
     ResultKeyMemo drawKeyMemo;
+    ResultIdentityMemo identityMemo;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     CowVector<std::uint32_t> shaderDataUserWords;
@@ -1114,6 +1127,15 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
         mix(bindings.size());
         for (const auto& binding : bindings) mix(binding.descriptorSet | (static_cast<std::uint64_t>(binding.binding) << 16u) | (static_cast<std::uint64_t>(binding.kind) << 40u) | (static_cast<std::uint64_t>(binding.count) << 48u));
         if (identity.Empty()) identity.low = 1;
+        return identity;
+    }
+    [[nodiscard]] PipelineIdentity RememberedIdentity() const {
+        if (const auto low = identityMemo.low.load(std::memory_order_acquire); low != 0) return {low, identityMemo.high.load(std::memory_order_relaxed)};
+        const auto identity = Identity();
+        if (identity.low != 0) {
+            identityMemo.high.store(identity.high, std::memory_order_relaxed);
+            identityMemo.low.store(identity.low, std::memory_order_release);
+        }
         return identity;
     }
 };

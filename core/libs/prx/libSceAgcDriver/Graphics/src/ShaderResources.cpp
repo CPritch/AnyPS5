@@ -7877,14 +7877,37 @@ std::optional<ShaderResources::MovedPlan> ShaderResources::PlanMovedBuffers(std:
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::CheckMovedPlan(MovedPlan plan, Recorder& recorder) const {
     const bool counted = CommitterProofCounted();
     const auto checkStart = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto usable = bdaTemplate || std::all_of(plan.checks.begin(), plan.checks.end(), [&](const std::pair<std::uint64_t, std::size_t>& check) {
-        const auto [begin, bytes] = check;
-        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) || guestMemory.WritesOverlap(begin, bytes)) return false;
-        const bool pending = recorder.PendingWriteOverlaps(begin, bytes);
-        Recorder::CountSnapshotAgreement(pending, begin, bytes);
-        CountStaleView(StaleViewSite::MovedPending, pending, begin, bytes);
-        return !(pending || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes));
-    });
+    const auto checkEach = [&] {
+        return std::all_of(plan.checks.begin(), plan.checks.end(), [&](const std::pair<std::uint64_t, std::size_t>& check) {
+            const auto [begin, bytes] = check;
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) || guestMemory.WritesOverlap(begin, bytes)) return false;
+            const bool pending = recorder.PendingWriteOverlaps(begin, bytes);
+            Recorder::CountSnapshotAgreement(pending, begin, bytes);
+            CountStaleView(StaleViewSite::MovedPending, pending, begin, bytes);
+            return !(pending || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes));
+        });
+    };
+    const auto checkTogether = [&] {
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* rangesSlot = nullptr;
+        auto& ranges = ShaderRecompiler::ThreadOwned(rangesSlot);
+        ranges.clear();
+        for (const auto& [begin, bytes] : plan.checks) {
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes) || guestMemory.WritesOverlap(begin, bytes)) return false;
+            const bool pending = recorder.PendingWriteOverlaps(begin, bytes);
+            Recorder::CountSnapshotAgreement(pending, begin, bytes);
+            CountStaleView(StaleViewSite::MovedPending, pending, begin, bytes);
+            if (pending) return false;
+            if (bytes != 0) ranges.emplace_back(begin, begin + bytes);
+        }
+        return !PendingStorageOverlaps(ranges) && !AnyShadowedOverlaps(ranges);
+    };
+    bool usable = bdaTemplate;
+    if (!usable && LookalikeResolve()) {
+        usable = checkTogether();
+        if (VerifyLookalike()) NoteLookalikeVerified(usable == checkEach(), "a moved plan's checks made together");
+    } else if (!usable) {
+        usable = checkEach();
+    }
     if (counted) {
         auto& split = CommitterMoved();
         split.checkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - checkStart).count()), std::memory_order_relaxed);

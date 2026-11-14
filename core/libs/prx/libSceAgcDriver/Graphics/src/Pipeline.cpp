@@ -928,6 +928,15 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     bool resident = true;
     for (const auto& owner : owners) resident = resident && owner != nullptr;
     const auto depthReleases = attachments > colorAttachments ? DepthSurfacesReleased() : 0u;
+    const CachedFramebuffer* repeated = nullptr;
+    if (resident && LookalikeResolve() && !framebuffers.empty()) {
+        const auto& last = framebuffers.back();
+        bool same = last.extent.width == extent.width && last.extent.height == extent.height && last.layers == layers && last.depthReleases == depthReleases && std::equal(last.views.begin(), last.views.end(), targets.begin(), targets.end());
+        for (std::size_t i = 0; i < owners.size() && same; ++i) same = last.owned[i] == (owners[i] != nullptr) && !last.owners[i].owner_before(owners[i]) && !owners[i].owner_before(last.owners[i]);
+        if (same && !VerifyLookalike()) return last.framebuffer;
+        if (same) repeated = &last;
+    }
+    const auto* repeatedFramebuffer = repeated != nullptr ? repeated->framebuffer.get() : nullptr;
     if (resident) {
         // Entries whose views are gone can never match again and go as soon as no recorded draw holds
         // them (Kept keeps its framebuffer until the batch completes).
@@ -947,8 +956,10 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
             for (std::size_t i = 0; i < owners.size() && same; ++i) same = it->owned[i] == (owners[i] != nullptr) && it->owners[i].lock().get() == owners[i].get();
             if (!same) continue;
             std::rotate(it, std::next(it), framebuffers.end());
+            if (repeatedFramebuffer != nullptr) NoteLookalikeVerified(framebuffers.back().framebuffer.get() == repeatedFramebuffer, "a pipeline's most recent framebuffer");
             return framebuffers.back().framebuffer;
         }
+        if (repeatedFramebuffer != nullptr) NoteLookalikeVerified(false, "a pipeline's most recent framebuffer");
     }
     std::vector<VkImageView> boundViews;
     for (std::size_t i = 0; i < targets.size(); ++i) {
