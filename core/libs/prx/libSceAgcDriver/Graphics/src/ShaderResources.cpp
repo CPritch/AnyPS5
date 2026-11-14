@@ -6095,6 +6095,11 @@ void CountBinding(BindingCount which, std::uint64_t amount = 1) {
     if (BindingsCounted()) bindingCounts[which].fetch_add(amount, std::memory_order_relaxed);
 }
 
+bool ReuseCounted() {
+    static const bool counted = std::getenv("APS5_BINDINGS_REUSE_STATS") != nullptr;
+    return counted;
+}
+
 enum ReuseCount : std::size_t { ReuseCalls, ReuseSameAsPrevious, ReuseSeenInBatch, ReuseSetSame, ReuseSelectionSame, ReuseBytesSame, ReuseUploads, ReuseUploadBytes, ReuseUploadsSameBytes, ReuseUploadSameBytes, ReuseCheckNs, ReuseSetSameAsPrevious, ReuseBytesSameAsPrevious, ReuseCountTotal };
 std::array<std::atomic<std::uint64_t>, ReuseCountTotal> reuseCounts{};
 
@@ -6188,6 +6193,7 @@ void CountReuse(const void* resources, const void* recorder, std::uint64_t batch
 }
 
 std::string ReuseText() {
+    if (!ReuseCounted()) return {};
     std::array<std::uint64_t, ReuseCountTotal> counts{};
     for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = reuseCounts[index].exchange(0, std::memory_order_relaxed);
     char text[1024];
@@ -8293,7 +8299,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     auto& fresh = ShaderRecompiler::ThreadOwned(freshSlot);
     fresh.clear();
     const auto keep = [&](DrawBindings::Snapshot snapshot, const std::shared_ptr<Buffer>& owner, bool uploadedNow) {
-        if (timed) {
+        if (ReuseCounted()) {
             fresh.resize(result->snapshots.size(), 0);
             fresh.push_back(uploadedNow ? 1 : 0);
         }
@@ -8520,7 +8526,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             for (const auto slot : plan.allocationSlots[allocation]) buffers[slot] = range;
         }
         CountBinding(CountWrites, writes.size());
-        if (timed) CountReuse(this, &recorder, recorder.OpenSerial(), faultRecord, writes.size(), buffers, result->snapshots, selected, fresh);
+        if (ReuseCounted()) CountReuse(this, &recorder, recorder.OpenSerial(), faultRecord, writes.size(), buffers, result->snapshots, selected, fresh);
         part(PartWrites);
         context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
         part(PartUpdate);
@@ -8553,7 +8559,7 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     CountBinding(CountWrites, writes.size());
-    if (timed) CountReuse(this, &recorder, recorder.OpenSerial(), faultRecord, writes.size(), buffers, result->snapshots, selected, fresh);
+    if (ReuseCounted()) CountReuse(this, &recorder, recorder.OpenSerial(), faultRecord, writes.size(), buffers, result->snapshots, selected, fresh);
     part(PartWrites);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     part(PartUpdate);

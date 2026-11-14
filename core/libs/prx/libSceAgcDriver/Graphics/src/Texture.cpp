@@ -5745,7 +5745,7 @@ void StorageTexture::stampPendingSince(std::uint32_t first, std::uint32_t count,
     const auto end = first + count;
     if (LayoutRecordsCounted()) {
         bool unchanged = true;
-        for (auto layer = first; layer < end && unchanged; ++layer) unchanged = layerPendingSince[layer] == pendingSince || keptForCpu(layer);
+        for (auto layer = first; layer < end && unchanged; ++layer) unchanged = layerPendingSince[layer] == pendingSince || (!keptAtUnwatch.empty() && keptForCpu(layer));
         if (unchanged) layerMarkCounts[2].fetch_add(1, std::memory_order_relaxed);
         layerMarkCounts[3].fetch_add(count, std::memory_order_relaxed);
     }
