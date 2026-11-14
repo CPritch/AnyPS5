@@ -150,6 +150,16 @@ struct DeviceFunctions {
     PFN_vkGetFenceStatus getFenceStatus = nullptr;
 };
 
+inline bool LookalikeCommit() {
+    static const bool enabled = std::getenv("APS5_NO_LOOKALIKE_COMMIT") == nullptr;
+    return enabled;
+}
+
+inline bool VerifyLookalike() {
+    static const bool enabled = std::getenv("APS5_VERIFY_LOOKALIKE") != nullptr;
+    return enabled;
+}
+
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
 std::uint64_t& DeviceProcLookups();
 

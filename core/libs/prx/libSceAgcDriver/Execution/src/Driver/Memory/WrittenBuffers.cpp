@@ -226,9 +226,14 @@ void DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawColorRanges(const Graphics::State& graphics) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    DrawColorRanges(graphics, ranges);
+    return ranges;
+}
+
+void DrawColorRanges(const Graphics::State& graphics, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    ranges.clear();
     if (graphics.hasColorTarget) appendColorRanges(ranges, graphics.color, ExactDrawWrites());
     for (const auto& color : graphics.colors) appendColorRanges(ranges, color, ExactDrawWrites());
-    return ranges;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawDepthRanges(const Graphics::State& graphics) {

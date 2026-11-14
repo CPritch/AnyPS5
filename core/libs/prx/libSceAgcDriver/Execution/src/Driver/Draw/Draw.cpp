@@ -2103,7 +2103,15 @@ bool Driver::resolveDrawEarly(const std::shared_ptr<VulkanDevice>& localDevice, 
         return std::any_of(first.begin(), first.end(), [&](const auto& a) { return std::any_of(second.begin(), second.end(), [&](const auto& b) { return a.first < b.second && b.first < a.second; }); });
     };
     if (overlaps(writes, itemReads) || overlaps(depth, itemReads)) return keep(E::KeptReadsWritten);
-    if (!depth.empty() && overlaps(depth, DrawColorRanges(graphics))) return keep(E::KeptDepthColour);
+    if (!depth.empty()) {
+        if (Graphics::LookalikeCommit()) {
+            thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> colourRanges;
+            DrawColorRanges(graphics, colourRanges);
+            if (overlaps(depth, colourRanges)) return keep(E::KeptDepthColour);
+        } else if (overlaps(depth, DrawColorRanges(graphics))) {
+            return keep(E::KeptDepthColour);
+        }
+    }
     const auto* result = ahead != nullptr && ahead->phase.load(std::memory_order_acquire) == DrawAheadSlot::Ready ? &ahead->result : nullptr;
     if (early.twoAhead && ahead != nullptr && result == nullptr) return keep(E::KeptPredictor);
     const bool multisampled = std::any_of(graphics.colors.begin(), graphics.colors.end(), [](const Graphics::ColorTarget& color) { return color.samples > 1; }) || (graphics.depth && graphics.depth->samples > 1);

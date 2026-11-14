@@ -4189,7 +4189,7 @@ void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stam
     unwrittenStamp = stamp;
 }
 
-std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset) {
+Buffer* Recorder::FindUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset, const std::shared_ptr<Buffer>** owner) {
     if (GuestMemory::OnResolverThread()) {
         auto& lane = laneDraws[threadLane];
         if (lane.stamp != stamp) {
@@ -4198,20 +4198,21 @@ std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, s
             lane.stamp = stamp;
         }
         const auto found = lane.snapshots.find(address);
-        if (found == lane.snapshots.end() || found->second.bytes != bytes) return {};
+        if (found == lane.snapshots.end() || found->second.bytes != bytes) return nullptr;
         if (offset != nullptr) *offset = found->second.offset;
-        return found->second.buffer;
+        if (owner != nullptr) *owner = &found->second.buffer;
+        return found->second.buffer.get();
     }
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     retireUnwrittenSnapshots(stamp);
     const auto found = unwrittenSnapshots.find(address);
-    if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return {};
+    if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return nullptr;
     const bool survived = found->second.generation != stamp[0];
     if (survived) {
         if (!GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
             unwrittenBytes -= found->second.bytes;
             unwrittenSnapshots.erase(found);
-            return {};
+            return nullptr;
         }
         found->second.generation = stamp[0];
     }
@@ -4225,7 +4226,14 @@ std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, s
         if ((total & 0x3ffffu) == 0) std::fprintf(stderr, "[snapshot-survival] same stamp %llu reused, %llu differing from guest memory; survived a tracker bump %llu reused, %llu differing\n", static_cast<unsigned long long>(checked[0].load()), static_cast<unsigned long long>(differing[0].load()), static_cast<unsigned long long>(checked[1].load()), static_cast<unsigned long long>(differing[1].load()));
     }
     if (offset != nullptr) *offset = found->second.offset;
-    return found->second.buffer;
+    if (owner != nullptr) *owner = &found->second.buffer;
+    return found->second.buffer.get();
+}
+
+std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset) {
+    const std::shared_ptr<Buffer>* owner = nullptr;
+    if (FindUnwrittenDrawSnapshot(address, bytes, stamp, offset, &owner) == nullptr) return {};
+    return *owner;
 }
 
 void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset) {

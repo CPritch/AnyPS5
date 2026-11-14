@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include <algorithm>
 
@@ -6,6 +7,7 @@ namespace AgcDriver::Graphics {
 void GuestRangeSet::Insert(std::uint64_t begin, std::uint64_t end) {
     if (begin >= end) return;
     auto first = std::lower_bound(ranges.begin(), ranges.end(), begin, [](const auto& range, std::uint64_t value) { return range.second < value; });
+    if (LookalikeCommit() && first != ranges.end() && first->first <= begin && end <= first->second && (first + 1 == ranges.end() || (first + 1)->first > first->second)) return;
     auto last = first;
     while (last != ranges.end() && last->first <= end) {
         begin = std::min(begin, last->first);

@@ -8317,18 +8317,21 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
     thread_local std::vector<std::uint8_t>* freshSlot = nullptr;
     auto& fresh = ShaderRecompiler::ThreadOwned(freshSlot);
     fresh.clear();
-    const auto keep = [&](DrawBindings::Snapshot snapshot, const std::shared_ptr<Buffer>& owner, bool uploadedNow) {
+    const bool lookalike = LookalikeCommit();
+    const auto keepOwned = [&](DrawBindings::Snapshot snapshot, const std::shared_ptr<Buffer>* held, bool uploadedNow) {
         if (ReuseCounted()) {
             fresh.resize(result->snapshots.size(), 0);
             fresh.push_back(uploadedNow ? 1 : 0);
         }
         if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
         if (!recorder.DrawUploadBatchKept(snapshot.buffer)) {
+            const auto& owner = held != nullptr ? *held : recorder.DrawUploadOwner(snapshot.buffer);
             Require(owner.get() == snapshot.buffer, "a draw snapshot is not owned by its bindings");
             if (std::find(result->owners.begin(), result->owners.end(), owner) == result->owners.end()) result->owners.push_back(owner);
         }
         result->snapshots.push_back(snapshot);
     };
+    const auto keep = [&](DrawBindings::Snapshot snapshot, const std::shared_ptr<Buffer>& owner, bool uploadedNow) { keepOwned(snapshot, &owner, uploadedNow); };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -8336,7 +8339,8 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             auto slice = recorder.DrawUpload(override->size);
             upload({slice.bytes, reinterpret_cast<const std::byte*>(override->words.data()), override->size, index});
             selected.push_back(index);
-            keep({0, slice.buffer, slice.offset, override->size}, recorder.DrawUploadOwner(slice.buffer), true);
+            if (lookalike) keepOwned({0, slice.buffer, slice.offset, override->size}, nullptr, true);
+            else keep({0, slice.buffer, slice.offset, override->size}, recorder.DrawUploadOwner(slice.buffer), true);
             continue;
         }
         if (usesBda && !spaceReuse) {
@@ -8384,7 +8388,20 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
                 }
             }
         }
-        auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
+        static const bool verifySnapshotsNow = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
+        if (lookalike && !verifySnapshotsNow) {
+            const std::shared_ptr<Buffer>* held = nullptr;
+            if (auto* found = recorder.FindUnwrittenDrawSnapshot(begin, bytes, stamp, &offset, &held); found != nullptr) {
+                CountBinding(CountSnapshots);
+                CountBinding(CountReused);
+                selected.push_back(index);
+                keepOwned({begin, found, offset, bytes}, held, false);
+                totalSnapshotBytes += bytes;
+                if (CaptureTrace::Enabled()) CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+                continue;
+            }
+        }
+        auto buffer = lookalike && !verifySnapshotsNow ? std::shared_ptr<Buffer>{} : recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
         CountBinding(CountSnapshots);
         if (buffer != nullptr) CountBinding(CountReused);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
@@ -8429,7 +8446,8 @@ bool ShaderResources::prepareDrawBindings(DrawBindings& bound, Recorder& recorde
             else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, uploaded ? recorder.DrawUploadOwner(raw) : buffer, offset);
         }
         selected.push_back(index);
-        keep({begin, raw, offset, bytes}, buffer != nullptr ? buffer : recorder.DrawUploadOwner(raw), uploadedNow);
+        if (lookalike) keepOwned({begin, raw, offset, bytes}, buffer != nullptr ? &buffer : nullptr, uploadedNow);
+        else keep({begin, raw, offset, bytes}, buffer != nullptr ? buffer : recorder.DrawUploadOwner(raw), uploadedNow);
         totalSnapshotBytes += bytes;
         if (CaptureTrace::Enabled()) CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
