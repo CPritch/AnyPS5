@@ -929,7 +929,7 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     for (const auto& owner : owners) resident = resident && owner != nullptr;
     const auto depthReleases = attachments > colorAttachments ? DepthSurfacesReleased() : 0u;
     const CachedFramebuffer* repeated = nullptr;
-    if (resident && LookalikeResolve() && !framebuffers.empty()) {
+    if (resident && LookalikeResolve() && framebuffers.size() == 1) {
         const auto& last = framebuffers.back();
         bool same = last.extent.width == extent.width && last.extent.height == extent.height && last.layers == layers && last.depthReleases == depthReleases && std::equal(last.views.begin(), last.views.end(), targets.begin(), targets.end());
         for (std::size_t i = 0; i < owners.size() && same; ++i) same = last.owned[i] == (owners[i] != nullptr) && !last.owners[i].owner_before(owners[i]) && !owners[i].owner_before(last.owners[i]);
