@@ -262,8 +262,6 @@ struct ImportChurnCounts {
     std::uint64_t pinWaitJournal = 0;
     std::uint64_t pinWaitFallbacks = 0;
     std::uint64_t pinWaitReseeds = 0;
-    std::uint64_t regionChecks = 0;
-    std::uint64_t regionSkips = 0;
     std::uint64_t absorbRefusals = 0;
     std::uint64_t absorbWitnessHits = 0;
 };

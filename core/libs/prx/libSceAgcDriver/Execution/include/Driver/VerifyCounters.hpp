@@ -29,8 +29,6 @@ enum class VerifyCount : std::size_t {
     JournalReconcileUnsettled,
     JournalReconcileSurvivals,
     JournalReconcileSkipped,
-    RegionCheckChecked,
-    RegionCheckSkipped,
     FixedImageLookupChecked,
     FixedImageLookupSkipped,
     AbsorbWitnessChecked,

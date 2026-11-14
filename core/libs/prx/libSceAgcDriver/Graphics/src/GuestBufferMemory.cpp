@@ -387,8 +387,6 @@ struct ImportChurn {
     std::atomic<std::uint64_t> pinWaitJournal{0};
     std::atomic<std::uint64_t> pinWaitFallbacks{0};
     std::atomic<std::uint64_t> pinWaitReseeds{0};
-    std::atomic<std::uint64_t> regionChecks{0};
-    std::atomic<std::uint64_t> regionSkips{0};
     std::atomic<std::uint64_t> absorbRefusals{0};
     std::atomic<std::uint64_t> absorbWitnessHits{0};
 };
@@ -8858,66 +8856,6 @@ HostImportsProof HostImportsIdentity(const Context& context) {
     return {state.device, state.epoch, state.proofGeneration, state.inserted};
 }
 
-namespace {
-
-bool regionCheckEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_REGION_CHECK") == nullptr;
-    return enabled;
-}
-
-bool verifyRegionCheck() {
-    static const bool enabled = std::getenv("APS5_VERIFY_REGION_CHECK") != nullptr;
-    return enabled;
-}
-
-template<typename Visit>
-bool forImportsOver(HostImports& state, std::uint64_t low, std::uint64_t high, const Visit& visit) {
-    auto it = state.imports.upper_bound(low);
-    if (it != state.imports.begin()) --it;
-    for (; it != state.imports.end() && it->first < high; ++it) {
-        if (it->second.base + it->second.bytes <= low) continue;
-        if (!visit(it->first, it->second)) return false;
-    }
-    return true;
-}
-
-bool regionsKeptByJournal(const Context& context, HostImports& state, std::span<const std::pair<std::uint64_t, std::uint64_t>> regions) {
-    const auto window = importWindow.load(std::memory_order_relaxed);
-    if (!importJournalEnabled() || state.device != context.device || state.refreshedGeneration == 0 || window == 0 || state.refreshedWindow != window || effectiveBudget(context, state) != state.refreshedBudget) return false;
-    const auto changed = [&](std::pair<std::uint64_t, std::uint64_t> extent) { return GuestAllocations::GuestAllocationsChangedSince_nid_postfix(state.refreshedGeneration, static_cast<std::uintptr_t>(extent.first), static_cast<std::size_t>(extent.second - extent.first)); };
-    for (const auto& [begin, end] : regions) {
-        if (end <= begin) continue;
-        const auto [low, high] = widened(begin, end);
-        if (changed({low, high})) return false;
-        const bool kept = forImportsOver(state, low, high, [&](std::uint64_t base, const HostImport& entry) { return !state.pendingImports.contains(base) && !changed(importExtent(entry)); });
-        if (!kept) return false;
-    }
-    return true;
-}
-
-void verifyRegionsKept(const Context& context, HostImports& state, std::span<const std::pair<std::uint64_t, std::uint64_t>> regions) {
-    const auto before = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    GuestAllocations::Lease lease;
-    std::uint64_t published = 0;
-    if (!GuestAllocations::GuestAllocationsAcquireSettled_nid_no_patch(&lease, &published) || published != before) {
-        DriverDetail::CountVerify(DriverDetail::VerifyCount::RegionCheckSkipped);
-        return;
-    }
-    for (const auto& [begin, end] : regions) {
-        if (end <= begin) continue;
-        const auto [low, high] = widened(begin, end);
-        forImportsOver(state, low, high, [&](std::uint64_t base, const HostImport& entry) {
-            DriverDetail::CountVerify(DriverDetail::VerifyCount::RegionCheckChecked);
-            const auto bytes = keptBytes(entry, lease);
-            if (bytes.current) return true;
-            std::fprintf(stderr, "FATAL: APS5_VERIFY_REGION_CHECK: a template's region 0x%llx-0x%llx skipped the import reconcile, but the import 0x%llx+0x%llx over it no longer holds its ranges at generation %llu (kept %s, registry %s; reconciled at %llu)\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(base), static_cast<unsigned long long>(entry.bytes), static_cast<unsigned long long>(published), describeRange(bytes.kept).c_str(), describeRange(bytes.found).c_str(), static_cast<unsigned long long>(state.refreshedGeneration));
-            std::abort();
-        });
-    }
-}
-
-}
-
 ImportsProofCheck HostImportsUnchangedOver(const Context& context, HostImportsProof& proof, std::span<const std::pair<std::uint64_t, std::uint64_t>> regions, bool reconcile) {
     if (!regionProofsEnabled()) return (reconcile ? HostImportsReconciledUnchanged(context, proof) : HostImportsUnchanged(context, proof)) ? ImportsProofCheck::Unchanged : ImportsProofCheck::Changed;
     if (proof.device == VK_NULL_HANDLE || proof.device != context.device) return ImportsProofCheck::Changed;
@@ -8925,19 +8863,7 @@ ImportsProofCheck HostImportsUnchangedOver(const Context& context, HostImportsPr
     std::lock_guard lock(state.mutex);
     if (state.device != proof.device) return ImportsProofCheck::Changed;
     if (reconcile) {
-        if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) {
-            bool kept = false;
-            if (regionCheckEnabled()) {
-                Churn().regionChecks.fetch_add(1, std::memory_order_relaxed);
-                kept = regionsKeptByJournal(context, state, regions);
-            }
-            if (kept) {
-                Churn().regionSkips.fetch_add(1, std::memory_order_relaxed);
-                if (verifyRegionCheck()) verifyRegionsKept(context, state, regions);
-            } else {
-                reconcileImports(context, state);
-            }
-        }
+        if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) reconcileImports(context, state);
         if (state.device != proof.device) return ImportsProofCheck::Changed;
     } else if (state.proofGeneration != proof.refreshedGeneration || !importsCurrent(context, state)) {
         return ImportsProofCheck::Changed;
@@ -8979,8 +8905,8 @@ std::string TakeTailBundleText() {
     const auto delta = [](std::uint64_t current, std::uint64_t before) { return static_cast<unsigned long long>(current - before); };
     const auto micros = [](std::uint64_t current, std::uint64_t before) { return static_cast<unsigned long long>((current - before) / 1000u); };
     char text[1536];
-    std::snprintf(text, sizeof(text), " imports hashed and made outside the tracker lock %llu (%llu us outside it), hashed again under it %llu, tracker walks that waited for such an import %llu (%llu us); import reconciles aborted at the Import barrier before their lease %llu; journal reconciles during a pin wait %llu, pin-wait fallbacks to a full reconcile %llu, journal reseeds from a pin-wait lease %llu; template import proofs region-checked %llu, their reconciles skipped %llu; GPU-lock holders named as they took the lock %llu; fixed image ranges looked up without a lease %llu; readable leases built %llu, built during a pin wait %llu, served from the pin-wait cache %llu; pin waits started %llu, ended after %llu us (under 1 ms %llu, 1-10 ms %llu, longer %llu); pin waiter rounds %llu, GPU lock held in them %llu us, recorder submits in them %llu, submits skipped (the lease batch already submitted) %llu, import leases taken before the GPU lock %llu",
-                  delta(now.trackerUnlocked, seen.trackerUnlocked), micros(now.trackerUnlockedNs, seen.trackerUnlockedNs), delta(now.trackerRedos, seen.trackerRedos), delta(now.windowWaits, seen.windowWaits), micros(now.windowWaitNs, seen.windowWaitNs), delta(now.earlyBarrierAborts, seen.earlyBarrierAborts), delta(now.pinWaitJournal, seen.pinWaitJournal), delta(now.pinWaitFallbacks, seen.pinWaitFallbacks), delta(now.pinWaitReseeds, seen.pinWaitReseeds), delta(now.regionChecks, seen.regionChecks), delta(now.regionSkips, seen.regionSkips), delta(notes, seenNotes),
+    std::snprintf(text, sizeof(text), " imports hashed and made outside the tracker lock %llu (%llu us outside it), hashed again under it %llu, tracker walks that waited for such an import %llu (%llu us); import reconciles aborted at the Import barrier before their lease %llu; journal reconciles during a pin wait %llu, pin-wait fallbacks to a full reconcile %llu, journal reseeds from a pin-wait lease %llu; GPU-lock holders named as they took the lock %llu; fixed image ranges looked up without a lease %llu; readable leases built %llu, built during a pin wait %llu, served from the pin-wait cache %llu; pin waits started %llu, ended after %llu us (under 1 ms %llu, 1-10 ms %llu, longer %llu); pin waiter rounds %llu, GPU lock held in them %llu us, recorder submits in them %llu, submits skipped (the lease batch already submitted) %llu, import leases taken before the GPU lock %llu",
+                  delta(now.trackerUnlocked, seen.trackerUnlocked), micros(now.trackerUnlockedNs, seen.trackerUnlockedNs), delta(now.trackerRedos, seen.trackerRedos), delta(now.windowWaits, seen.windowWaits), micros(now.windowWaitNs, seen.windowWaitNs), delta(now.earlyBarrierAborts, seen.earlyBarrierAborts), delta(now.pinWaitJournal, seen.pinWaitJournal), delta(now.pinWaitFallbacks, seen.pinWaitFallbacks), delta(now.pinWaitReseeds, seen.pinWaitReseeds), delta(notes, seenNotes),
                   delta(lookups, seenLookups), delta(leases.readableBuilds + leases.retiringBuilds, seenLeases.readableBuilds + seenLeases.retiringBuilds), delta(leases.retiringBuilds, seenLeases.retiringBuilds), delta(leases.retiringHits, seenLeases.retiringHits),
                   delta(leases.pinWaits, seenLeases.pinWaits), micros(leases.pinWaitNs, seenLeases.pinWaitNs), delta(leases.pinWaitsUnderMs, seenLeases.pinWaitsUnderMs), delta(leases.pinWaitsUnderTenMs, seenLeases.pinWaitsUnderTenMs), delta(leases.pinWaitsLonger, seenLeases.pinWaitsLonger),
                   delta(waiter.rounds, seenWaiter.rounds), micros(waiter.heldNs, seenWaiter.heldNs), delta(waiter.submits, seenWaiter.submits), delta(waiter.submitsSkipped, seenWaiter.submitsSkipped), delta(waiter.leasesBeforeLock, seenWaiter.leasesBeforeLock));
@@ -9041,8 +8967,6 @@ ImportChurnCounts ImportChurnTotals() {
     counts.pinWaitJournal = churn.pinWaitJournal.load(std::memory_order_relaxed);
     counts.pinWaitFallbacks = churn.pinWaitFallbacks.load(std::memory_order_relaxed);
     counts.pinWaitReseeds = churn.pinWaitReseeds.load(std::memory_order_relaxed);
-    counts.regionChecks = churn.regionChecks.load(std::memory_order_relaxed);
-    counts.regionSkips = churn.regionSkips.load(std::memory_order_relaxed);
     counts.absorbRefusals = churn.absorbRefusals.load(std::memory_order_relaxed);
     counts.absorbWitnessHits = churn.absorbWitnessHits.load(std::memory_order_relaxed);
     const auto unlocked = GuestMemory::UnlockedImportTotals();
