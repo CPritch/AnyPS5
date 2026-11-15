@@ -27,7 +27,7 @@ Submitters& AllSubmitters() {
 }
 
 bool QueueSubmitter::Enabled() {
-    return RuntimeSwitches::Set(RuntimeSwitch::AsyncSubmit);
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoAsyncSubmit);
 }
 
 QueueSubmitter& QueueSubmitter::For(VkDevice device, VkQueue queue, PFN_vkQueueSubmit submit, PFN_vkDeviceWaitIdle waitIdle) {

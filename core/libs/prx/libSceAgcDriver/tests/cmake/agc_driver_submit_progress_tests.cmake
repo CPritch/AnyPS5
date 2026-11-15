@@ -9,9 +9,9 @@ if(BUILD_TESTING)
     add_test(NAME agc_submit_progress_deferred_encode COMMAND agc_driver_submit_progress_tests)
     add_test(NAME agc_submit_progress_deferred_encode_verify COMMAND agc_driver_submit_progress_tests)
     set_tests_properties(agc_submit_progress_deferred_encode PROPERTIES
-            ENVIRONMENT "APS5_SUBMIT_PROGRESS=1;APS5_ASYNC_SUBMIT=1;APS5_DEFERRED_ENCODE=1" TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            ENVIRONMENT "APS5_SUBMIT_PROGRESS=1;APS5_DEFERRED_ENCODE=1" TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     set_tests_properties(agc_submit_progress_deferred_encode_verify PROPERTIES
-            ENVIRONMENT "APS5_SUBMIT_PROGRESS=1;APS5_ASYNC_SUBMIT=1;APS5_DEFERRED_ENCODE=1;APS5_VERIFY_DEFERRED_ENCODE=1" TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            ENVIRONMENT "APS5_SUBMIT_PROGRESS=1;APS5_DEFERRED_ENCODE=1;APS5_VERIFY_DEFERRED_ENCODE=1" TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
         set_tests_properties(agc_submit_progress_deferred_encode agc_submit_progress_deferred_encode_verify PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

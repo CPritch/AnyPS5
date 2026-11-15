@@ -727,7 +727,7 @@ void RingOldSlotWrite(Scene& scene) {
 
 void RingRefusals(Scene& scene) {
     using AgcDriver::Graphics::AddressDrawReuse;
-    const bool inPlace = std::getenv("APS5_MOVED_BUFFERS_IN_PLACE") != nullptr && std::getenv("APS5_NO_MOVED_BUFFERS_IN_PLACE") == nullptr;
+    const bool inPlace = std::getenv("APS5_NO_MOVED_BUFFERS_IN_PLACE") == nullptr;
     {
         Ring ring(scene);
         Require(ring.Draw(90) == 90, "address draw space reuse: the first draw of the ring did not read its slot");

@@ -8360,7 +8360,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
 }
 
 bool ShaderResources::movedInPlace(Recorder& recorder, const Allocation& item, std::uint64_t address, std::uint64_t size, MovedBuffer& entry) const {
-    static const bool enabled = std::getenv("APS5_NO_MOVED_BUFFERS_IN_PLACE") == nullptr && std::getenv("APS5_MOVED_BUFFERS_IN_PLACE") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_MOVED_BUFFERS_IN_PLACE") == nullptr;
     auto& counters = MovedInPlace();
     const auto refuse = [&] {
         counters.refused.fetch_add(1, std::memory_order_relaxed);

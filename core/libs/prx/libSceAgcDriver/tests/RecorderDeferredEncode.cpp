@@ -382,7 +382,7 @@ std::string joined(const std::vector<std::string>& ops) {
 }
 
 void DeferredBatchesEncodeOffTheRecordingThread() {
-    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoAsyncSubmit, false);
     RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
     const auto before = CommandEncoders::Totals();
     Fixture fixture;
@@ -427,7 +427,7 @@ void DeferredBatchesEncodeOffTheRecordingThread() {
 }
 
 void SubmitWaitsForTheEncodeAndDrainWaitsForBoth() {
-    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoAsyncSubmit, false);
     RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
     const auto before = CommandEncoders::Totals();
     Fixture fixture;
@@ -477,7 +477,7 @@ void SubmitWaitsForTheEncodeAndDrainWaitsForBoth() {
 }
 
 void EncodeFailureIsRethrown() {
-    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoAsyncSubmit, false);
     RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
     const auto before = CommandEncoders::Totals();
     Fixture fixture;
@@ -515,7 +515,7 @@ void EncodeFailureIsRethrown() {
 }
 
 void DeferredEncodeIsDecidedPerBatch() {
-    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoAsyncSubmit, false);
     Fixture fixture;
     {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -546,14 +546,14 @@ void DeferredEncodeIsDecidedPerBatch() {
 }
 
 void AsyncSubmitOffEncodesInline() {
-    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoAsyncSubmit, false);
     RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
     Fixture fixture;
     {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         Recorder recorder(fixture.context);
         fixture.Fill(recorder, 1);
-        RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, false);
+        RuntimeSwitches::Assign(RuntimeSwitch::NoAsyncSubmit, true);
         fixture.Fill(recorder, 2);
         recorder.Submit();
         const auto submissions = fixture.Submissions();
@@ -572,7 +572,7 @@ void AsyncSubmitOffEncodesInline() {
 }
 
 void DiscardedBatchIsNeverEncoded() {
-    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoAsyncSubmit, false);
     RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
     const auto before = CommandEncoders::Totals();
     Fixture fixture;
@@ -598,7 +598,7 @@ void DiscardedBatchIsNeverEncoded() {
 }
 
 void RetiredBatchesWaitForTheirSubmitToReturn() {
-    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoAsyncSubmit, false);
     for (const bool deferred : {true, false}) {
         RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, deferred);
         const std::string kind = deferred ? "deferred" : "direct";
@@ -643,7 +643,7 @@ void RetiredBatchesWaitForTheirSubmitToReturn() {
 }
 
 void StaleHandleIsRefusedAfterSubmit() {
-    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoAsyncSubmit, false);
     RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
     Fixture fixture;
     {
@@ -666,7 +666,7 @@ void StaleHandleIsRefusedAfterSubmit() {
 }
 
 void VerifyEncodesInline() {
-    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoAsyncSubmit, false);
     RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
     const auto before = CommandEncoders::Totals();
     Fixture fixture;
@@ -711,7 +711,7 @@ int main(int argc, char** argv) {
             RetiredBatchesWaitForTheirSubmitToReturn();
             StaleHandleIsRefusedAfterSubmit();
         }
-        RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, false);
+        RuntimeSwitches::Assign(RuntimeSwitch::NoAsyncSubmit, true);
         RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, false);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

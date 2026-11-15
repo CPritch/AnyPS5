@@ -4416,7 +4416,7 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         snapshotRecorder.NotePendingWrite(element, elementBytes);
         Require(resources.PrepareDrawBindings(snapshotRecorder) == nullptr, "GPU-produced input was replaced with stale CPU memory");
         {
-            const bool inPlace = std::getenv("APS5_MOVED_BUFFERS_IN_PLACE") != nullptr && std::getenv("APS5_NO_MOVED_BUFFERS_IN_PLACE") == nullptr;
+            const bool inPlace = std::getenv("APS5_NO_MOVED_BUFFERS_IN_PLACE") == nullptr;
             constexpr std::uint32_t movedBytes = 256;
             const auto movedTo = [&](std::uint64_t where) {
                 auto moved = program;
