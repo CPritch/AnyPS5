@@ -56,6 +56,7 @@
 #else
 #include <cstdint>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <fstream>
 #ifndef __APPLE__
@@ -503,9 +504,13 @@ PacketTag CurrentPacket() {
 }
 
 const char* ReadSiteName(ReadSite site) {
-    static const char* const names[static_cast<std::size_t>(ReadSite::Count)] = {"unknown", "capture", "dispatch-cache", "texture-compare", "texture-read", "buffer-upload", "index-buffer", "vertex-buffer", "registers", "indirect-args", "wait", "label", "scanout", "store", "mirror-refresh", "draw-cache"};
+    static const char* const names[static_cast<std::size_t>(ReadSite::Count)] = {"unknown", "capture", "dispatch-cache", "texture-compare", "texture-read", "buffer-upload", "index-buffer", "vertex-buffer", "registers", "indirect-args", "wait", "label", "scanout", "store", "mirror-refresh", "draw-cache", "host-write"};
     const auto index = static_cast<std::size_t>(site);
     return index < static_cast<std::size_t>(ReadSite::Count) ? names[index] : "?";
+}
+
+bool WritesGuestMemory(ReadSite site) {
+    return site == ReadSite::Store || site == ReadSite::HostWrite;
 }
 
 ReadSite SetReadSite(ReadSite site) {
@@ -547,9 +552,20 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
     }
     return captured;
 #else
-    static_cast<void>(skip);
-    frames[0] = ModuleOffset(__builtin_return_address(0));
-    return 1;
+    void* raw[24];
+    const auto wanted = static_cast<int>(std::min<std::size_t>(frames.size() + 1 + skip, std::size(raw)));
+    const int captured = backtrace(raw, wanted);
+    static const auto base = [] {
+        Dl_info info{};
+        return dladdr(reinterpret_cast<const void*>(&CaptureCallerOffsets), &info) != 0 ? reinterpret_cast<std::uintptr_t>(info.dli_fbase) : std::uintptr_t{0};
+    }();
+    std::size_t written = 0;
+    for (int i = 1 + static_cast<int>(skip); i < captured && written < frames.size(); ++i) {
+        Dl_info info{};
+        const auto address = reinterpret_cast<std::uintptr_t>(raw[i]);
+        frames[written++] = base != 0 && dladdr(raw[i], &info) != 0 && reinterpret_cast<std::uintptr_t>(info.dli_fbase) == base ? address - base : 0;
+    }
+    return written;
 #endif
 }
 
@@ -1179,24 +1195,37 @@ bool readableWithoutQuery(std::uintptr_t address, std::size_t bytes) {
 
 // Checks that [address, address + bytes) is mapped with read (and, if asked, write) access. Returns
 // an empty string when it is, otherwise why it is not.
-std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
+bool checkAccess(std::uintptr_t address, std::size_t bytes, bool writable, std::string* reason) {
     const TimedAccess timed(CounterVerify, bytes);
-    if (onOwnLiveStack(address, bytes)) return {};
+    if (onOwnLiveStack(address, bytes)) return true;
 #ifdef __linux__
-    if (!writable && readableWithoutQuery(address, bytes)) return {};
+    if (!writable && readableWithoutQuery(address, bytes)) return true;
 #endif
-    std::string reason;
+    bool accessible = true;
     const bool queried = describePages(address, bytes, [&](const PageRun& run) {
         if (!run.readable) {
-            char text[128];
-            std::snprintf(text, sizeof(text), "guest memory is not readable at 0x%llx (range 0x%llx+0x%zx)", static_cast<unsigned long long>(run.begin), static_cast<unsigned long long>(address), bytes);
-            reason = text;
+            accessible = false;
+            if (reason != nullptr) {
+                char text[128];
+                std::snprintf(text, sizeof(text), "guest memory is not readable at 0x%llx (range 0x%llx+0x%zx)", static_cast<unsigned long long>(run.begin), static_cast<unsigned long long>(address), bytes);
+                *reason = text;
+            }
         } else if (writable && !run.writable) {
-            reason = "guest memory has no write permission";
+            accessible = false;
+            if (reason != nullptr) *reason = "guest memory has no write permission";
         }
-        return reason.empty();
+        return accessible;
     });
-    if (!queried && reason.empty()) reason = "cannot query guest memory";
+    if (!queried && accessible) {
+        accessible = false;
+        if (reason != nullptr) *reason = "cannot query guest memory";
+    }
+    return accessible;
+}
+
+std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
+    std::string reason;
+    checkAccess(address, bytes, writable, &reason);
     return reason;
 }
 
@@ -1218,7 +1247,7 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
 
 bool Accessible(const void* pointer, std::size_t bytes, bool writable) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
-    return address != 0 && bytes <= std::numeric_limits<std::uintptr_t>::max() - address && verify(address, bytes, writable).empty();
+    return address != 0 && bytes <= std::numeric_limits<std::uintptr_t>::max() - address && checkAccess(address, bytes, writable, nullptr);
 }
 
 std::uint64_t ForgetSerial() {
@@ -1316,10 +1345,36 @@ std::vector<std::uint64_t> PagesOf(std::span<const std::pair<std::uint64_t, std:
     return pages;
 }
 
-void HashPages(std::uint64_t first, std::span<const std::pair<std::uint64_t, std::uint64_t>> spans, std::vector<std::uint64_t>& hashes) {
+std::vector<std::uint8_t> TrappedPages(std::span<const std::uint64_t> pages) {
+    std::vector<std::uint8_t> trapped(pages.size(), 0);
+#ifdef __APPLE__
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+    for (std::size_t from = 0; from < pages.size();) {
+        auto to = from + 1;
+        while (to < pages.size() && pages[to] == pages[to - 1] + WritePageBytes) ++to;
+        GuestWriteWatch::GuestWriteWatchReadTraps_nid_postfix(static_cast<std::uintptr_t>(pages[from]), (to - from) * WritePageBytes, +[](void* context, std::uintptr_t begin, std::uintptr_t end) { static_cast<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>*>(context)->emplace_back(begin, end); }, &runs);
+        from = to;
+    }
+    if (runs.empty()) return trapped;
+    std::sort(runs.begin(), runs.end());
+    for (std::size_t index = 0; index < pages.size(); ++index) {
+        const auto page = static_cast<std::uintptr_t>(pages[index]);
+        const auto run = std::partition_point(runs.begin(), runs.end(), [&](const auto& candidate) { return candidate.second <= page; });
+        trapped[index] = run != runs.end() && run->first < page + WritePageBytes;
+    }
+#endif
+    return trapped;
+}
+
+void HashPages(std::uint64_t first, std::span<const std::pair<std::uint64_t, std::uint64_t>> spans, std::vector<std::uint64_t>& hashes, std::vector<std::uint8_t>& unknown) {
     const auto pages = PagesOf(spans);
+    const auto trapped = TrappedPages(pages);
     SplitPages(pages.size(), [&](std::size_t from, std::size_t to) {
-        for (auto index = from; index < to; ++index) hashes[static_cast<std::size_t>((pages[index] - first) / WritePageBytes)] = HashPage(reinterpret_cast<const std::byte*>(pages[index]));
+        for (auto index = from; index < to; ++index) {
+            const auto at = static_cast<std::size_t>((pages[index] - first) / WritePageBytes);
+            if (trapped[index] != 0) unknown[at] = 1;
+            else hashes[at] = HashPage(reinterpret_cast<const std::byte*>(pages[index]));
+        }
     });
 }
 
@@ -1334,23 +1389,25 @@ struct WindowCopy {
     std::span<const std::uint64_t> hashes;
     std::span<const std::byte> image;
     StampKind held = StampKind::ImportWindow;
-    std::span<const std::uint8_t> stale{};
-    WindowVerify* verify = nullptr;
+        std::span<const std::uint8_t> stale{};
+        WindowVerify* verify = nullptr;
+        std::span<const std::uint8_t> unknown{};
 
     bool Holds(std::uintptr_t page) const {
         if (held == StampKind::Driver) return page >= first && page - first <= image.size() && image.size() - (page - first) >= WritePageBytes && CompareMapped(page, image.subspan(page - first, WritePageBytes)) == Compare::Equal;
         if (page < first || (page - first) / WritePageBytes >= hashes.size()) return false;
-        const auto index = static_cast<std::size_t>((page - first) / WritePageBytes);
-        const auto hash = HashPage(reinterpret_cast<const std::byte*>(page));
-        const bool kept = hash == hashes[index] && (stale.empty() || stale[index] == 0);
-        if (verify != nullptr) {
-            DriverDetail::CountVerify(DriverDetail::VerifyCount::UnlockedImportChecked);
-            if (kept && hash != verify->locked[index]) {
-                std::lock_guard lock(verify->mutex);
-                verify->disagreed.push_back(page);
+            const auto index = static_cast<std::size_t>((page - first) / WritePageBytes);
+            if (index < unknown.size() && unknown[index] != 0) return false;
+            const auto hash = HashPage(reinterpret_cast<const std::byte*>(page));
+            const bool kept = hash == hashes[index] && (stale.empty() || stale[index] == 0);
+            if (verify != nullptr) {
+                DriverDetail::CountVerify(DriverDetail::VerifyCount::UnlockedImportChecked);
+                if (kept && hash != verify->locked[index]) {
+                    std::lock_guard lock(verify->mutex);
+                    verify->disagreed.push_back(page);
+                }
             }
-        }
-        return kept;
+            return kept;
     }
 };
 
@@ -1403,16 +1460,8 @@ struct WriteTracker {
     std::atomic<std::uint64_t> stable{1};
     std::atomic<bool> watchedPublished{false};
     std::vector<void*> pages;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> importing;
-    std::condition_variable_any imported;
-    // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
-    // collect fully inside one skips GetWriteWatch, whose cost is proportional to the range's pages,
-    // and the same surfaces are collected several times per epoch (each storage mip binding, a sampled
-    // view plus its storage refresh, a write-back followed by a refresh, and every dispatch of the
-    // epoch binding the same targets). Entries carry the walking thread's epoch, so no entry matches
-    // another thread: the ring consulted first is per thread (ThreadCollectMemo, no mutex, no
-    // eviction by other threads' walks); this shared ring (8 workers with epochs of several packets
-    // hold a few hundred distinct ranges) serves APS5_SHARED_COLLECT_MEMO=1.
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> importing;
+        std::condition_variable_any imported;
     struct Memo {
         std::uintptr_t begin = 0;
         std::uintptr_t end = 0;
@@ -1420,8 +1469,31 @@ struct WriteTracker {
         std::uint64_t unwatched = 0;
         std::uint64_t mapping = 0;
     };
-    std::array<Memo, 256> memo{};
-    std::size_t nextMemo = 0;
+
+    struct ObservationLeaf {
+        std::array<std::atomic<std::uint64_t>, LeafBlocks> ticks{};
+        std::array<std::atomic<std::uint64_t>, LeafBlocks / CoarseBlocks> coarse{};
+    };
+    std::unique_ptr<std::atomic<ObservationLeaf*>[]> observationLeaves;
+    std::size_t observationLeafCount = 0;
+    std::atomic<const std::atomic<ObservationLeaf*>*> observationTable{nullptr};
+    std::atomic<std::uint64_t> observationFloor{0};
+    std::atomic<std::uint64_t> observationUnwatched{std::numeric_limits<std::uint64_t>::max()};
+    std::atomic<std::uint64_t> observationMapping{std::numeric_limits<std::uint64_t>::max()};
+    struct ExactObservation {
+        std::uint64_t first = 0;
+        std::uint64_t stop = 0;
+        std::uint64_t tick = 0;
+    };
+    std::array<ExactObservation, 16> exactObservations{};
+    std::size_t nextExactObservation = 0;
+
+    bool exactlyObserved(std::uint64_t first, std::uint64_t stop, std::uint64_t need) const {
+        for (const auto& entry : exactObservations) {
+            if (entry.tick >= need && entry.first <= first && stop <= entry.stop) return true;
+        }
+        return false;
+    }
 
     void initialize() {
         if (initialized) return;
@@ -1431,7 +1503,7 @@ struct WriteTracker {
         watched = size != 0 && GuestArena::GuestArenaWriteWatched_nid_postfix();
         if (!watched) return;
         leaves.resize((size / WriteBlockBytes + LeafBlocks) / LeafBlocks);
-        coverage.Initialize(base, size);
+        coverage.Initialize(base, size, std::getenv("APS5_NO_COVERAGE_SUMMARY") == nullptr);
         pages.resize(1u << 16);
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
 #else
@@ -1442,6 +1514,72 @@ struct WriteTracker {
             watchedPublished.store(true, std::memory_order_release);
         }
 #endif
+        if (!watched) return;
+        observationLeafCount = leaves.size();
+        observationLeaves = std::make_unique<std::atomic<ObservationLeaf*>[]>(observationLeafCount);
+        observationTable.store(observationLeaves.get(), std::memory_order_release);
+    }
+
+    bool inObservationRange(std::uint64_t first, std::uint64_t stop) const {
+#ifdef _WIN32
+        return first >= base && stop <= base + size;
+#else
+        return stop <= LeafCount * LeafBlocks * WriteBlockBytes;
+#endif
+    }
+
+    std::uint64_t observedTick(std::uint64_t block) const {
+        if (block / LeafBlocks >= observationLeafCount) return 0;
+        const auto* leaf = observationLeaves[block / LeafBlocks].load(std::memory_order_relaxed);
+        return leaf != nullptr ? leaf->ticks[block % LeafBlocks].load(std::memory_order_relaxed) : 0;
+    }
+
+    bool observedSince(std::uint64_t first, std::uint64_t stop, std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t mapping) const {
+        const auto* table = observationTable.load(std::memory_order_acquire);
+        if (table == nullptr || observationUnwatched.load(std::memory_order_acquire) != unwatched || observationMapping.load(std::memory_order_acquire) != mapping) return false;
+        if (!inObservationRange(first, stop)) return false;
+        const auto need = std::max(epoch, observationFloor.load(std::memory_order_acquire));
+        const auto last = blockOf(stop - 1);
+        auto block = blockOf(first);
+        while (block <= last) {
+            const auto index = block / LeafBlocks;
+            if (index >= observationLeafCount) return false;
+            const auto* leaf = table[index].load(std::memory_order_acquire);
+            if (leaf == nullptr) return false;
+            const auto end = std::min<std::uint64_t>(last + 1, (index + 1) * LeafBlocks);
+            while (block < end) {
+                if (block % CoarseBlocks == 0 && block + CoarseBlocks <= end) {
+                    if (leaf->coarse[(block % LeafBlocks) / CoarseBlocks].load(std::memory_order_acquire) < need) return false;
+                    block += CoarseBlocks;
+                    continue;
+                }
+                if (leaf->ticks[block % LeafBlocks].load(std::memory_order_acquire) < need) return false;
+                ++block;
+            }
+        }
+        return true;
+    }
+
+    void publishObserved(std::uint64_t first, std::uint64_t last, std::uint64_t tick) {
+        for (auto block = first; block <= last;) {
+            const auto index = block / LeafBlocks;
+            auto* leaf = observationLeaves[index].load(std::memory_order_relaxed);
+            if (leaf == nullptr) {
+                leaf = new ObservationLeaf();
+                observationLeaves[index].store(leaf, std::memory_order_release);
+            }
+            const auto end = std::min<std::uint64_t>(last + 1, (index + 1) * LeafBlocks);
+            for (auto at = block; at < end; ++at) {
+                auto& slot = leaf->ticks[at % LeafBlocks];
+                if (slot.load(std::memory_order_relaxed) < tick) slot.store(tick, std::memory_order_release);
+            }
+            for (auto group = (block % LeafBlocks) / CoarseBlocks; group <= ((end - 1) % LeafBlocks) / CoarseBlocks; ++group) {
+                std::uint64_t least = std::numeric_limits<std::uint64_t>::max();
+                for (std::size_t at = group * CoarseBlocks; at < (group + 1) * CoarseBlocks; ++at) least = std::min(least, leaf->ticks[at].load(std::memory_order_relaxed));
+                leaf->coarse[group].store(least, std::memory_order_release);
+            }
+            block = end;
+        }
     }
 
     bool covers(std::uint64_t address, std::size_t bytes) const {
@@ -1843,6 +1981,10 @@ public:
         lock.unlock();
     }
 
+    void Stabilize() {
+        publish();
+    }
+
     void Suspend() {
         lock.unlock();
     }
@@ -1920,18 +2062,14 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
 }
 #endif
 
-// Collect epochs are per thread and globally unique: every bump takes a fresh value from one counter,
-// so a memo entry (stamped with the epoch of its walk) can only match the thread that made it, and
-// only until that thread's next ordering point (the queue workers bump at theirs, see the header). A
-// thread that never bumped is given a new epoch for every collect: its walks are never reused (the
-// presenter, game threads inside the flush hook), as nothing orders the CPU's writes for it.
 std::atomic<std::uint64_t> nextCollectEpoch{1};
 struct CollectEpochSlot {};
 std::atomic<std::uint64_t> lastBumpedEpoch{0};
+std::atomic<void (*)(int)> observationHook{nullptr};
 
 std::uint64_t currentCollectEpoch() {
     if (const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get(); epoch != 0) return epoch;
-    return nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    return nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
 bool collectMemoEnabled() {
@@ -1939,155 +2077,20 @@ bool collectMemoEnabled() {
     return !disabled;
 }
 
-// The per-thread memo ring (see WriteTracker::Memo): sized to a packet's working set (a dispatch
-// collects each of its few dozen image surfaces in stage A and again in stage B). Entries of a
-// thread that never bumps its epoch never match (each collect gets a fresh epoch), as intended.
-// APS5_SHARED_COLLECT_MEMO=1 uses the tracker's shared ring under its mutex instead.
 struct ThreadCollectMemo {
     std::array<WriteTracker::Memo, 64> entries{};
     std::size_t next = 0;
 };
-ThreadCollectMemo& threadCollectMemo() {
-    struct Slot {};
-    auto* memo = HostThreadSlot<ThreadCollectMemo*, Slot>::Get();
-    if (memo == nullptr) {
-        ShaderRecompiler::ThreadOwned(memo);
-        HostThreadSlot<ThreadCollectMemo*, Slot>::Set(memo);
-    }
-    return *memo;
+
+void syncObservationContext(WriteTracker& tracker, std::uint64_t unwatched, std::uint64_t mapping) {
+    if (tracker.observationUnwatched.load(std::memory_order_relaxed) == unwatched && tracker.observationMapping.load(std::memory_order_relaxed) == mapping) return;
+    tracker.observationFloor.store(nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1, std::memory_order_release);
+    tracker.observationUnwatched.store(unwatched, std::memory_order_release);
+    tracker.observationMapping.store(mapping, std::memory_order_release);
 }
 
-bool flatCollectMap() {
-    static const bool flat = std::getenv("APS5_NO_FLAT_COLLECT_MAP") == nullptr;
-    return flat;
-}
-
-bool flatCollectMapVerified() {
-    static const bool verified = flatCollectMap() && std::getenv("APS5_VERIFY_FLAT_COLLECT_MAP") != nullptr;
-    return verified;
-}
-
-struct EpochCollectMap {
-    using Range = std::pair<std::uintptr_t, std::uintptr_t>;
-    std::uint64_t epoch = 0;
-    std::uint64_t unwatched = 0;
-    std::uint64_t mapping = 0;
-    std::map<std::uintptr_t, std::uintptr_t> ranges;
-    std::vector<Range> flat;
-
-    bool Empty() const {
-        return flatCollectMap() ? flat.empty() : ranges.empty();
-    }
-
-    bool Covers(std::uintptr_t begin, std::uintptr_t end) const {
-        if (end <= begin) return false;
-        if (!flatCollectMap()) return mapCovers(begin, end);
-        const auto next = std::upper_bound(flat.begin(), flat.end(), begin, [](std::uintptr_t value, const Range& range) { return value < range.first; });
-        const bool covered = next != flat.begin() && std::prev(next)->second >= end;
-        if (flatCollectMapVerified() && covered != mapCovers(begin, end)) {
-            std::fprintf(stderr, "FATAL: APS5_VERIFY_FLAT_COLLECT_MAP: the flat collect map answered %d for 0x%llx-0x%llx and the ordered map %d\n", covered ? 1 : 0, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), covered ? 0 : 1);
-            std::fflush(stderr);
-            std::abort();
-        }
-        return covered;
-    }
-
-    bool Holds(std::uint64_t now, std::uintptr_t begin, std::uintptr_t end) {
-        if (mapping == now || !GuestAllocations::GuestAllocationsChangedSince_nid_postfix(mapping, begin, end - begin)) return true;
-        Reset(now);
-        return false;
-    }
-
-    void Reset(std::uint64_t now) {
-        ranges.clear();
-        flat.clear();
-        mapping = now;
-    }
-
-    void Note(std::uint64_t now, std::uintptr_t begin, std::uintptr_t end) {
-        Holds(now, begin, end);
-        Record(begin, end);
-    }
-
-    void Record(std::uintptr_t begin, std::uintptr_t end) {
-        if (flatCollectMap()) recordFlat(begin, end);
-        if (!flatCollectMap() || flatCollectMapVerified()) recordMap(begin, end);
-    }
-
-private:
-    bool mapCovers(std::uintptr_t begin, std::uintptr_t end) const {
-        const auto next = ranges.upper_bound(begin);
-        return next != ranges.begin() && std::prev(next)->second >= end;
-    }
-
-    void recordFlat(std::uintptr_t begin, std::uintptr_t end) {
-        auto next = std::upper_bound(flat.begin(), flat.end(), begin, [](std::uintptr_t value, const Range& range) { return value < range.first; });
-        if (next != flat.begin()) {
-            const auto previous = std::prev(next);
-            if (previous->second >= begin) {
-                previous->second = std::max(end, previous->second);
-                auto last = next;
-                while (last != flat.end() && last->first <= previous->second) {
-                    previous->second = std::max(previous->second, last->second);
-                    ++last;
-                }
-                flat.erase(next, last);
-                return;
-            }
-        }
-        auto last = next;
-        while (last != flat.end() && last->first <= end) {
-            end = std::max(end, last->second);
-            ++last;
-        }
-        if (next == last) {
-            flat.insert(next, Range{begin, end});
-            return;
-        }
-        *next = Range{begin, end};
-        flat.erase(std::next(next), last);
-    }
-
-    void recordMap(std::uintptr_t begin, std::uintptr_t end) {
-        auto next = ranges.upper_bound(begin);
-        if (next != ranges.begin()) {
-            const auto previous = std::prev(next);
-            if (previous->second >= begin) {
-                previous->second = std::max(end, previous->second);
-                while (next != ranges.end() && next->first <= previous->second) {
-                    previous->second = std::max(previous->second, next->second);
-                    next = ranges.erase(next);
-                }
-                return;
-            }
-        }
-        while (next != ranges.end() && next->first <= end) {
-            end = std::max(end, next->second);
-            next = ranges.erase(next);
-        }
-        ranges.emplace_hint(next, begin, end);
-    }
-};
-
-EpochCollectMap& epochCollectMap(std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t mapping) {
-    struct Slot {};
-    auto& map = ThreadScratch<EpochCollectMap, Slot>();
-    if (map.epoch != epoch || map.unwatched != unwatched || map.Empty()) {
-        map.Reset(mapping);
-        map.epoch = epoch;
-        map.unwatched = unwatched;
-    }
-    return map;
-}
-
-bool epochCollectMapEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_EPOCH_COLLECT_MAP") == nullptr;
-    return enabled;
-}
-
-bool sharedCollectMemo() {
-    static const bool shared = std::getenv("APS5_SHARED_COLLECT_MEMO") != nullptr;
-    return shared;
+void observationPoint(int point) {
+    if (const auto hook = observationHook.load(std::memory_order_acquire)) hook(point);
 }
 
 struct PrecollectedSlot {};
@@ -2215,9 +2218,10 @@ bool collectViews(CollectFunction collect, std::uint64_t first, std::uint64_t st
 
 void stampWindowRuns(StampRuns& runs) {
     const auto pages = PagesOf(runs.windowRuns);
+    const auto trapped = TrappedPages(pages);
     std::vector<std::uint8_t> held(pages.size(), 0);
     SplitPages(pages.size(), [&](std::size_t from, std::size_t to) {
-        for (auto index = from; index < to; ++index) held[index] = runs.window->Holds(static_cast<std::uintptr_t>(pages[index]));
+        for (auto index = from; index < to; ++index) held[index] = trapped[index] == 0 && runs.window->Holds(static_cast<std::uintptr_t>(pages[index]));
     });
     auto& tracker = runs.tracker;
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
@@ -2314,6 +2318,7 @@ void awaitUnlockedImports(WriteTracker& tracker, std::uint64_t first, std::uint6
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
     awaitUnlockedImports(tracker, first, stop);
     ++tracker.generation;
+    observationPoint(1);
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
@@ -2330,115 +2335,126 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     return complete;
 }
 
-std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
-    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
+    using Status = Observation::Status;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return {Status::Uncovered, 0};
     auto& tracker = Tracker();
-    // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
-    auto first = address & ~(page - 1);
-    auto stop = (address + bytes + page - 1) & ~(page - 1);
-    if (stop <= first) return 0;
-    // One epoch for the lookup and the entry made after the walk: an unbumped thread's fresh epoch
-    // must not differ between them.
+    const auto first = address & ~(page - 1);
+    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    if (stop <= first) return {Status::Uncovered, 0};
     const auto epoch = currentCollectEpoch();
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
-    const bool epochal = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0;
+    const bool useMemo = memoized && collectMemoEnabled();
     if (const auto* precollected = useMemo ? HostThreadSlot<const PrecollectedWrites*, PrecollectedSlot>::Get() : nullptr; precollected != nullptr && precollected->epoch != 0 && precollected->epoch == HostThreadSlot<std::uint64_t, CollectTokenSlot>::Get()) {
         for (const auto& walk : precollected->walks) {
             if (walk.unwatched == unwatched && walk.begin <= first && stop <= walk.end && mappingHolds(walk.mapping, mapping, first, stop)) {
                 precollectedHits.fetch_add(1, std::memory_order_relaxed);
-                return tracker.stable.load(std::memory_order_acquire);
+                return {Status::Complete, tracker.stable.load(std::memory_order_acquire)};
             }
         }
     }
-    if (useMemo && epochal && !sharedCollectMemo()) {
-        // An entry exists only for a completed walk of an in-arena range, so the tracker is
-        // initialized and watched; nothing below the lock needs asking.
-        if (epochCollectMapEnabled()) {
-            auto& map = epochCollectMap(epoch, unwatched, mapping);
-            if (map.Covers(first, stop) && map.Holds(mapping, first, stop)) {
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                return tracker.stable.load(std::memory_order_acquire);
-            }
-        }
-        for (const auto& entry : threadCollectMemo().entries) {
-            if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end && mappingHolds(entry.mapping, mapping, first, stop)) {
-                // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
-                // overlapping collect) were written before this caller reads, and an older value would
-                // make every later UnchangedSince fail until the epoch ends.
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                return tracker.stable.load(std::memory_order_acquire);
-            }
-        }
+    const bool shared = useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0;
+    if (shared && tracker.observedSince(first, stop, epoch, unwatched, mapping)) {
+        collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        return {Status::Complete, tracker.stable.load(std::memory_order_acquire)};
     }
-    const auto token = useMemo && tokenFollower && tokenWalkShare() && !sharedCollectMemo() ? HostThreadSlot<std::uint64_t, CollectTokenSlot>::Get() : 0;
+    const auto token = useMemo && tokenFollower && tokenWalkShare() ? HostThreadSlot<std::uint64_t, CollectTokenSlot>::Get() : 0;
     if (token != 0 && sharedWalkCovers(token, first, stop, unwatched, mapping)) {
         tokenShareHits.fetch_add(1, std::memory_order_relaxed);
-        auto& memo = threadCollectMemo();
-        memo.entries[memo.next++ % memo.entries.size()] = {first, stop, epoch, unwatched, mapping};
-        return tracker.stable.load(std::memory_order_acquire);
+        return {Status::Complete, tracker.stable.load(std::memory_order_acquire)};
     }
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
-    auto cursor = first;
-    if (useMemo && sharedCollectMemo()) {
-        for (const auto& entry : tracker.memo) {
-            if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.begin <= cursor && stop <= entry.end && mappingHolds(entry.mapping, mapping, cursor, stop)) {
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                return tracker.generation;
+    if (!tracker.watched || !tracker.covers(address, bytes)) return {Status::Uncovered, 0};
+    syncObservationContext(tracker, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix());
+    const auto tick = nextCollectEpoch.load(std::memory_order_acquire);
+    struct Run {
+        std::uint64_t first;
+        std::uint64_t stop;
+        bool exact;
+    };
+    struct RunSlot {};
+    auto& runs = ThreadScratch<std::vector<Run>, RunSlot>();
+    runs.clear();
+    if (!shared) runs.push_back({first, stop, false});
+    else {
+        const auto need = std::max(epoch, tracker.observationFloor.load(std::memory_order_relaxed));
+        const auto lastBlock = tracker.blockOf(stop - 1);
+        const auto addRun = [&](std::uint64_t from, std::uint64_t to) {
+            const auto begin = tracker.blockBegin(from);
+            const auto end = tracker.blockBegin(to + 1);
+            if (tracker.covers(begin, static_cast<std::size_t>(end - begin))) runs.push_back({begin, end, false});
+            else if (!tracker.exactlyObserved(std::max(first, begin), std::min(stop, end), need)) runs.push_back({std::max(first, begin), std::min(stop, end), true});
+        };
+        bool open = false;
+        std::uint64_t from = 0;
+        for (auto block = tracker.blockOf(first); block <= lastBlock; ++block) {
+            if (tracker.observedTick(block) < need) {
+                if (!open) from = block;
+                open = true;
+            } else if (open) {
+                addRun(from, block - 1);
+                open = false;
             }
         }
+        if (open) addRun(from, lastBlock);
     }
-    const TimedAccess timed(CounterCollect, bytes);
-    const auto requestedFirst = first;
-    const auto requestedStop = stop;
-    if (useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && bytes <= WriteBlockBytes) {
-        const auto begin = first & ~(WriteBlockBytes - 1);
-        const auto end = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
-        if (end > begin && tracker.covers(begin, end - begin)) {
-            first = begin;
-            stop = end;
+    if (runs.empty()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+    std::optional<TimedAccess> timed;
+    if (!runs.empty()) timed.emplace(CounterCollect, bytes);
+    std::size_t done = 0;
+    auto status = Status::Complete;
+    for (auto& run : runs) {
+        bool complete = walkWrites(tracker, run.first, run.stop, StampKind::Cpu);
+        if (!complete && (run.first < first || run.stop > stop)) {
+            run = {std::max(first, run.first), std::min(stop, run.stop), true};
+            complete = walkWrites(tracker, run.first, run.stop, StampKind::Cpu);
         }
-    }
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
+        if (!complete) {
 #ifdef _WIN32
-        if (first == requestedFirst && stop == requestedStop) return 0;
-        first = requestedFirst;
-        stop = requestedStop;
-        if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+            status = Status::Refused;
 #else
-        return 0;
+            status = Status::Failed;
 #endif
-    }
-    // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
-    if (collectMemoEnabled()) {
-        const auto serial = unwatchSerial.load(std::memory_order_relaxed);
-        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial, mapping};
-        else {
-            if (useMemo && epochal) {
-                auto& memo = threadCollectMemo();
-                memo.entries[memo.next++ % memo.entries.size()] = {first, stop, epoch, serial, mapping};
-            }
-            if (epochal && epochCollectMapEnabled()) {
-                epochCollectMap(epoch, serial, mapping).Note(mapping, first, stop);
-            }
+            break;
         }
+        if (shared && run.exact) tracker.exactObservations[tracker.nextExactObservation++ % tracker.exactObservations.size()] = {run.first, run.stop, tick};
+        ++done;
     }
-    if (token != 0) shareWalk(token, {first, stop, unwatchSerial.load(std::memory_order_relaxed), mapping, tracker.generation.load(std::memory_order_relaxed)});
-    return tracker.generation;
+    lock.Stabilize();
+    const auto generation = tracker.generation.load(std::memory_order_relaxed);
+    observationPoint(2);
+    for (std::size_t index = 0; index < done; ++index) {
+        auto from = tracker.blockOf(runs[index].first);
+        if (tracker.blockBegin(from) < runs[index].first) ++from;
+        const auto end = tracker.blockOf(runs[index].stop);
+        if (end > from) tracker.publishObserved(from, end - 1, tick);
+    }
+    if (status != Status::Complete) return {status, 0};
+    if (token != 0) shareWalk(token, {first, stop, unwatchSerial.load(std::memory_order_relaxed), mapping, generation});
+    return {Status::Complete, generation};
 }
 
+}
+
+Observation Observe(std::uint64_t address, std::size_t bytes) {
+    return observe(address, bytes, true);
 }
 
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
-    return collectWrites(address, bytes, true);
+    const auto observation = observe(address, bytes, true);
+    return observation.status == Observation::Status::Complete ? observation.generation : 0;
 }
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
-    return collectWrites(address, bytes, false);
+    const auto observation = observe(address, bytes, false);
+    return observation.status == Observation::Status::Complete ? observation.generation : 0;
+}
+
+void SetObservationHookForTest(void (*hook)(int point)) {
+    observationHook.store(hook, std::memory_order_release);
 }
 
 bool Precollect(PrecollectedWrites& into, std::uint64_t address, std::size_t bytes) {
@@ -2573,7 +2589,7 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
 }
 
 void BumpCollectEpoch() {
-    const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
@@ -2949,9 +2965,10 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     }
     auto spans = coveredSpans(tracker, first, stop);
     std::vector<std::uint64_t> hashes(static_cast<std::size_t>((stop - first) / page), 0);
+    std::vector<std::uint8_t> unknown(hashes.size(), 0);
     const auto hashSpans = [&] {
         for (const auto& [begin, end] : spans) CheckRange(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin), 1, false);
-        HashPages(first, spans, hashes);
+        HashPages(first, spans, hashes, unknown);
     };
     const auto elapsedNs = [](std::chrono::steady_clock::time_point start) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()); };
     const bool unlocked = unlockedImportEnabled();
@@ -2972,12 +2989,14 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
             skipUnlockedImportVerify();
             spans = std::move(again);
             std::fill(hashes.begin(), hashes.end(), 0);
+            std::fill(unknown.begin(), unknown.end(), 0);
             since = tracker.generation.load(std::memory_order_relaxed);
             hashSpans();
         } else if (verifyUnlockedImport()) {
             verify.emplace();
             verify->locked.assign(hashes.size(), 0);
-            HashPages(first, spans, verify->locked);
+            std::vector<std::uint8_t> lockedUnknown(hashes.size(), 0);
+            HashPages(first, spans, verify->locked, lockedUnknown);
             std::uint64_t compared = 0;
             for (const auto& [begin, end] : spans) compared += (end - begin) / page;
             DriverDetail::CountVerify(DriverDetail::VerifyCount::UnlockedImportChecked, compared);
@@ -3030,7 +3049,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         return false;
     }
     bumpSubscriptions(first, stop - first, WriteBumpSource::Import);
-    const WindowCopy window{first, hashes, {}, StampKind::ImportWindow, stale, verify ? &*verify : nullptr};
+    const WindowCopy window{first, hashes, {}, StampKind::ImportWindow, stale, verify ? &*verify : nullptr, unknown};
     leaving.clear();
     std::erase_if(spans, [&](const auto& span) {
         if (failsWalk(2, span.first, span.second) || !walkWrites(tracker, span.first, span.second, StampKind::Cpu, true, &window)) {
@@ -3115,7 +3134,7 @@ bool SweepSubscription(const WriteSubscription& subscription) {
     auto& index = Index();
     index.sweeps.fetch_add(1, std::memory_order_relaxed);
     for (const auto& [begin, end] : subscription.spans) {
-        if (collectWrites(begin, static_cast<std::size_t>(end - begin), true) == 0) {
+        if (CollectWrites(begin, static_cast<std::size_t>(end - begin)) == 0) {
             index.sweepFailures.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -4670,7 +4689,7 @@ void PrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
     if (GpuMutex().HeldByThisThread()) noteLockedHostWrite(address, bytes);
     const HostWriteInFlight inFlight;
     if (hostWritesStopped.load(std::memory_order_seq_cst)) return;
-    const ReadSiteScope site(ReadSite::Store);
+    const ReadSiteScope site(ReadSite::HostWrite);
     if (!MemoryProfiled()) {
         FlushGpuWrites(address, bytes);
         return;

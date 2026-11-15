@@ -28,7 +28,9 @@ void GuestWriteWatchSetAliases_nid_postfix(std::uintptr_t address, std::size_t b
 std::size_t GuestWriteWatchAliases_nid_postfix(std::uintptr_t address, std::size_t bytes, void (*alias)(void* context, std::uintptr_t begin, std::uintptr_t end, std::uintptr_t other), void* context);
 std::uint64_t GuestWriteWatchAliasSerial_nid_postfix();
 bool GuestWriteWatchSetReadTrapResolver_nid_postfix(void (*resolve)(std::uintptr_t begin, std::uintptr_t end));
+void GuestWriteWatchSetReadTrapBypass_nid_postfix(bool (*bypass)());
 bool GuestWriteWatchTrapReads_nid_postfix(std::uintptr_t address, std::size_t bytes);
+void GuestWriteWatchReadTraps_nid_postfix(std::uintptr_t address, std::size_t bytes, void (*trapped)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context);
 void GuestWriteWatchReleaseReads_nid_postfix(std::uintptr_t address, std::size_t bytes);
 
 }

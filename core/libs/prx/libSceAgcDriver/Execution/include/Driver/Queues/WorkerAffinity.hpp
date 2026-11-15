@@ -18,6 +18,12 @@ void PinPreparerThread(const char* role);
 void PinResolverThread(const char* role);
 void PinResolverLaneThread(const char* role);
 
+void ReserveCommitterCore();
+
+void ReserveFinisherCore();
+
+void NameDriverThread(const char* name);
+
 }
 
 #endif

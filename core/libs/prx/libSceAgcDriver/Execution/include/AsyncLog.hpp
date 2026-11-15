@@ -1,4 +1,5 @@
 #pragma once
+#include "prx/libc/include/HostThread.hpp"
 
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -206,7 +207,7 @@ private:
         LogSink().store(&AsyncLog::Sink, std::memory_order_release);
         std::atexit(&AsyncLog::FlushAtEnd);
         InitializeWaits();
-        std::thread([this] {
+        Libc::StartHostThread([this] {
             CpuTopology::PinHelperThread("log writer");
             Run();
         }).detach();

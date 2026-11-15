@@ -368,13 +368,13 @@ IrU32 TranslationContext::quietNan32(IrU32 bits) {
 IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct, bool multiplication) {
     if (!ExactF32Arithmetic()) return result;
     const auto isNan = [&](IrValue& value) -> IrValue& { return ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&value}); };
+    IrValue* candidate = nullptr;
     const bool normalFactor = multiplication && std::any_of(sources.begin(), sources.end(), [](const IrValue* source) {
         const IrValue* constant = constantF32Bits(*source);
         if (constant == nullptr) return false;
         const std::uint32_t exponent = (constant->ImmediateU32() >> 23u) & 0xffu;
         return exponent != 0u && exponent != 0xffu;
     });
-    IrValue* candidate = nullptr;
     for (auto source = sources.end(); source != sources.begin();) {
         --source;
         IrValue& sourceBits = ir.BitCastU32(**source);

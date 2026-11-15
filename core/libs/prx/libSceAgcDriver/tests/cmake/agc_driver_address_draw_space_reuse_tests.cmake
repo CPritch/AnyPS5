@@ -1,5 +1,7 @@
 if(BUILD_TESTING)
     set_property(TEST agc_driver_address_draw_space_reuse APPEND PROPERTY ENVIRONMENT "APS5_NO_BDA_TEMPLATES=1")
+    add_test(NAME agc_driver_address_draw_space_reuse_in_place COMMAND agc_driver_address_draw_space_reuse_tests)
+    set_tests_properties(agc_driver_address_draw_space_reuse_in_place PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FAST_F16=0;APS5_FAST_F32=0;APS5_A2C_FALLBACK=0;APS5_DRAW_PIPELINE=0;APS5_PIPELINE_DISPATCH=0;APS5_NO_BDA_TEMPLATES=1;APS5_MOVED_BUFFERS_IN_PLACE=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME agc_driver_address_draw_space_reuse_off COMMAND agc_driver_address_draw_space_reuse_tests --off)
     set_tests_properties(agc_driver_address_draw_space_reuse_off PROPERTIES ENVIRONMENT "APS5_NO_ADDRESS_DRAW_REUSE=1;APS5_NO_BDA_TEMPLATES=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
     if(WIN32)

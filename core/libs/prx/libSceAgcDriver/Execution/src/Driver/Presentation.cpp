@@ -211,6 +211,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     if (!pinned) {
         pinned = true;
         PinWorkerThread("presenter");
+        NameDriverThread("presenter");
         GuestMemory::MarkPresenterThread();
     }
     CheckFailure();

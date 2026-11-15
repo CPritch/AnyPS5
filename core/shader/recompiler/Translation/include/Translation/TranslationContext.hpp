@@ -27,6 +27,7 @@ public:
     void SetEntryRounding(const RoundingState& state) { setRounding(state); }
     void SetNativeFloat16(bool enabled, bool fma) { nativeFloat16 = enabled; nativeFloat16Fma = enabled && fma; }
     void SetFastFloat16(bool enabled) { fastFloat16 = enabled; }
+    void SetNativeInteger16(bool enabled) { nativeInteger16 = enabled; }
     void SetFloat32DenormPreserve(bool enabled) { float32DenormPreserve = enabled; }
     void SetFloat32FlushToZero(bool enabled) { float32FlushToZero = enabled; }
     void SetFloat32FlushDeclared(bool enabled) { float32FlushDeclared = enabled; }
@@ -129,6 +130,7 @@ private:
     IrU1 readMaskValid(const RdnaOperand& operand);
     static bool maskLanesExact(const RdnaOperand& operand);
     std::array<IrU32, 2> writeMask(const RdnaOperand& operand, IrU1 value, bool write64 = false);
+    void writeMaskLanes(const RdnaOperand& operand, IrU1 lane, IrU1 valid);
     void writeCompareResult(const RdnaOperand& operand, IrU1 value);
     MemoryFlags addMemoryInfo(const MemoryInfo& memory, std::uint32_t pc);
     bool floatAtomicFlush(IrOpcode opcode) const;
@@ -236,7 +238,9 @@ private:
     bool float16Native(const RdnaInstruction& inst, IrOpcode opcode, const RdnaOperand& lhsOperand, const RdnaOperand& rhsOperand);
     bool float16NativeFma(const RdnaInstruction& inst, bool accumulator);
     IrF32 fmaF16RoundedToOdd(IrF32 lhs, IrF32 rhs, IrF32 addend);
+    IrF32 floatUnaryValue(const RdnaInstruction& inst, IrOpcode opcode);
     bool floatUnary(const RdnaInstruction& inst, IrOpcode opcode);
+    bool floatUnaryClampInfinity(const RdnaInstruction& inst, IrOpcode opcode);
     bool floatBinary(const RdnaInstruction& inst, IrOpcode opcode, bool reverse);
     bool floatTernary(const RdnaInstruction& inst, IrOpcode opcode, bool accumulator, bool mix);
     bool ieeeMinMaxF32(const RdnaInstruction& inst, IrOpcode opcode);
@@ -290,6 +294,8 @@ private:
     IrU32 saturateInteger16(const RdnaOperand& destination, IrU32 value, bool sign);
     bool packedInteger16Mad(const RdnaInstruction& inst, bool sign);
     bool packedInteger16MinMax(const RdnaInstruction& inst, IrOpcode opcode, bool sign);
+    IrU32 readPackedU16Source(const RdnaOperand& operand);
+    bool packedInteger16Native(const RdnaInstruction& inst, IrOpcode opcode, std::uint32_t first, std::uint32_t second);
     bool sU64Mask(const RdnaInstruction& inst, IrOpcode logicalOpcode, IrOpcode bitOpcode, bool negateRhs, bool negateResult, bool unary);
     IrU1 u64MaskBinary(const RdnaInstruction& inst, IrOpcode opcode, bool negateRhs, bool negateResult);
     template <typename TWord>
@@ -403,6 +409,7 @@ private:
     bool nativeFloat16 = false;
     bool fastFloat16 = false;
     bool nativeFloat16Fma = false;
+    bool nativeInteger16 = false;
     IrBuilder ir;
     IrBlock& block;
     IrU1 instructionBranchCondition;

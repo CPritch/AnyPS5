@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
+#include "prx/libc/include/HostThread.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "ShaderDiskCache.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
@@ -81,7 +82,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
     }
     Check(result, "vkCreatePipelineCache");
     try {
-        if (!path.empty()) saver = std::thread([this] {
+        if (!path.empty()) saver = Libc::StartHostThread([this] {
             CpuTopology::PinHelperThread("pipeline cache saver");
             run();
         });

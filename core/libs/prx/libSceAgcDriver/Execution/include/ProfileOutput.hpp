@@ -1,4 +1,5 @@
 #pragma once
+#include "prx/libc/include/HostThread.hpp"
 
 #include "prx/libc/include/CpuTopology.hpp"
 #include <array>
@@ -22,7 +23,7 @@ class ProfileOutput {
 public:
     explicit ProfileOutput(std::function<void(std::string_view)> writer, std::size_t capacity = 4 * 1024 * 1024) : writer(std::move(writer)), capacity(capacity) {
         if (!this->writer || capacity == 0) throw std::invalid_argument("invalid profile output writer or capacity");
-        worker = std::thread([this] {
+        worker = Libc::StartHostThread([this] {
             CpuTopology::PinHelperThread("profile output");
             run();
         });

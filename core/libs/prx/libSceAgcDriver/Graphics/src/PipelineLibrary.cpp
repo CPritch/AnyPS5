@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
@@ -88,7 +89,7 @@ void runJobs(LibraryStore& store) {
 void enqueue(LibraryStore& store, VkDevice device, std::function<void()> job) {
     if (store.stopping) return;
     if (!store.worker.joinable()) {
-        store.worker = std::thread([&store] {
+        store.worker = Libc::StartHostThread([&store] {
             CpuTopology::PinBackgroundCompileThread("pipeline library", 10);
             runJobs(store);
         });

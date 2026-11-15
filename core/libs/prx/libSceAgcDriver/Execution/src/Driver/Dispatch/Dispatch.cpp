@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
@@ -131,7 +132,7 @@ bool Driver::pipelineDispatch() {
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
-    if (SkippedShader(address)) return;
+    if (SkippedShader(address) || RefusedDispatch(address)) return;
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
@@ -192,7 +193,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) return;
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
         if (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchConstantDwordFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchClampedGlobalFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchMemoryValueBufferFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
-        if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
+        if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesTableCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
     } else {
         if (submission.queue == 0 && DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
             const auto code = std::span(snapshot.code).subspan(codeOffset);
@@ -485,6 +486,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 const auto total = totalMs.fetch_add(elapsed, std::memory_order_relaxed) + elapsed;
                 if (elapsed > 200) std::fprintf(stderr, "[gpu] compute shader 0x%llx recompile took %.0f ms (%zu SPIR-V words, %zu captured regions, total %.1f s)\n", static_cast<unsigned long long>(address), elapsed, compiledResult->spirv.size(), captured.size(), total / 1000);
             }
+            if (const auto limit = MaxComputeSpirvWords(); limit != 0 && compiledResult->spirv.size() > limit)
+                throw std::runtime_error(std::to_string(compiledResult->spirv.size()) + " SPIR-V words, above APS5_MAX_COMPUTE_SPIRV_WORDS (" + std::to_string(limit) + ")");
         } catch (const std::exception& error) {
             std::string dump;
             if (dumpShaders) {
@@ -496,6 +499,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
             std::string reason = error.what();
             if (const auto newline = reason.find('\n'); newline != std::string::npos) reason.resize(newline);
+            if (SkipRefusedDispatches()) {
+                ReportRefusedDispatch(address, reason);
+                return;
+            }
             char where[96];
             if (dump.empty()) std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
             else std::snprintf(where, sizeof(where), "compute shader 0x%llx (%s): ", static_cast<unsigned long long>(address), dump.c_str());
@@ -689,6 +696,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
     const auto keysFill = indirectArguments == 0 && !partialLastGroup ? MatchSgprPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) : std::nullopt;
     const auto filledKeys = keysFill ? KeysFillMemo(keysFill->pattern, false, true) : std::nullopt;
+    if (keysFill) Graphics::RetireMultisampleColorTargetsOnFmaskWrite(keysFill->base, keysFill->bytes);
 
     std::optional<Graphics::DepthPlaneClear> depthPlaneClear;
     if (indirectArguments == 0 && !partialLastGroup) {

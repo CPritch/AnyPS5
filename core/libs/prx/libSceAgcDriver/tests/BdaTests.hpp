@@ -14,11 +14,13 @@ struct BdaTestAccess {
     std::function<void(std::optional<VkDeviceSize>)> limitMemory;
     std::function<std::uint64_t()> allocationAttempts;
     std::function<void(std::optional<VkDeviceSize>)> limitImports;
+    std::function<void(std::optional<VkDeviceSize>)> limitImportTotal;
 };
 
 void RunBdaResourceTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access);
 void RunImportJournalVerifyTests(const AgcDriver::Graphics::Context& context);
 void RunImportJournalStaleTest(const AgcDriver::Graphics::Context& context, std::string_view kind);
+void RunHostImportValidityTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access);
 bool RunSparseBufferHoleTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access);
 void RunHeapMirrorUnwatchTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access, bool throughImport);
 void RunSparseHeapMirrorUnwatchTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access);

@@ -39,6 +39,12 @@ struct RegisterListEntry {
     bool valid = false;
 };
 
+struct FlipWork {
+    bool finished = false;
+    std::uint64_t serial = 0;
+    std::shared_ptr<FlipWork> previous;
+};
+
 struct Submission {
     std::uint64_t serial;
     std::uint32_t queue;
@@ -55,6 +61,7 @@ struct Submission {
     bool suspend = false;
     bool waitFree = false;
     bool holdsFlip = false;
+    std::shared_ptr<FlipWork> flipWork;
 
     std::uint64_t received = 0;
     std::vector<std::uint64_t> labelWrites;
@@ -71,6 +78,14 @@ struct Submission {
 
     ListedRegisters FindRegisterList(std::size_t cursor) const;
     ListedRegisters RegisterListOf(const RegisterListEntry& entry) const { return {std::span<const std::uint32_t>(registerListWords).subspan(entry.first, entry.words), true, entry.valid}; }
+    using PreparedWaits = std::map<std::pair<std::uint32_t, std::uint32_t>, std::shared_ptr<IRenderingWait>>;
+    struct IndirectSegment {
+        std::size_t start;
+        const std::uint32_t* target;
+        std::size_t words;
+        std::shared_ptr<const PreparedWaits> waits{};
+    };
+    std::vector<IndirectSegment> indirectSegments;
 };
 
 struct QueueWorker {
