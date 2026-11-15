@@ -423,6 +423,11 @@ void ReuseSurvivesASpaceDropBeforeItsVerify(Fixture& fixture) {
     std::printf("draws around a drop of the cached space %s: %s, %s, %s, %s; reused %llu, refused for the space %llu, made %llu, verify builds over a newer space %llu\n", fixture.verify ? "between a reuse and its verify build" : "after a reuse", Text(first).c_str(), Text(reused).c_str(), Text(refused).c_str(), Text(again).c_str(), since(Count::Reused), since(Count::RefusedSpace), since(Count::Made), since(Count::VerifiedNewerSpace));
     for (const auto& [colors, what] : {std::pair{first, "the first draw"}, std::pair{reused, "the reuse before the drop"}, std::pair{refused, "the draw after the drop"}, std::pair{again, "the reuse over the new space"}}) ExpectColors(colors, {255, 0, 255}, what);
     if (fixture.off) return;
+    if (fixture.verify && std::getenv("APS5_NO_TEMPLATE_CARRY") == nullptr) {
+        Expect(since(Count::Reused) == 3 && since(Count::RefusedSpace) == 0 && since(Count::Made) == 0, "the space the verify build rebuilt with the same content did not keep the template for the next reuses");
+        Expect(since(Count::VerifiedNewerSpace) == 0, "the verify build after the drop did not take a space of the same content");
+        return;
+    }
     Expect(since(Count::Reused) == 2 && since(Count::RefusedSpace) == 1 && since(Count::Made) == 1, "the drop of the cached space did not refuse the next reuse once, rebuild it over the new space and reuse that");
     Expect(since(Count::VerifiedNewerSpace) == (fixture.verify ? 1u : 0u), "the verify build after the drop did not take the newer space");
 }
