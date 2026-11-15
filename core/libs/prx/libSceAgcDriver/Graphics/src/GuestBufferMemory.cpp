@@ -6475,6 +6475,7 @@ void GuestBufferMemory::AcquireRegistered() {
     // stale by its generation, never newer than it (see AddressSpace).
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto spaceUntouched = [&](const AddressSpace& held, HostImports& imports) { return spaceUnchangedSince(context, held, imports, generation); };
+    const char* rebuildReason = "";
     if (addressSpaceCacheEnabled()) {
         auto current = spaces.current.load();
         const auto published = current;
@@ -6516,12 +6517,13 @@ void GuestBufferMemory::AcquireRegistered() {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
             if (current != nullptr && importsStale(context, state)) static_cast<void>(absorbUnrelatedChanges(context, state));
-            if (current == nullptr) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
+            if (current == nullptr) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? (rebuildReason = "waiter drop", spaces.rebuiltWaiterDrop) : (rebuildReason = "none current", spaces.rebuiltFirst)).fetch_add(1, std::memory_order_relaxed);
             else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
-            else if (current->keptThrough.load(std::memory_order_acquire) != generation && !spaceUntouched(*current, state)) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
-            else if (current->importsEpoch != state.epoch && (current = patchedSpace(state, std::move(current))) == nullptr) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
-            else if (state.growthDue || (state.growthFloor != std::numeric_limits<std::uint64_t>::max() && retiredPinnedReleased.load(std::memory_order_acquire))) spaces.rebuiltGrowth.fetch_add(1, std::memory_order_relaxed);
+            else if (current->keptThrough.load(std::memory_order_acquire) != generation && !spaceUntouched(*current, state)) (rebuildReason = "generation", spaces.rebuiltGeneration).fetch_add(1, std::memory_order_relaxed);
+            else if (current->importsEpoch != state.epoch && (current = patchedSpace(state, std::move(current))) == nullptr) (rebuildReason = "epoch", spaces.rebuiltEpoch).fetch_add(1, std::memory_order_relaxed);
+            else if (state.growthDue || (state.growthFloor != std::numeric_limits<std::uint64_t>::max() && retiredPinnedReleased.load(std::memory_order_acquire))) (rebuildReason = "growth", spaces.rebuiltGrowth).fetch_add(1, std::memory_order_relaxed);
             else hit = spaceKeepsMirrors(context, state, *current);
+            if (!hit && rebuildReason[0] == 0) rebuildReason = "mirrors or device";
             if (hit && current != published) {
                 spaces.patchedEpoch.fetch_add(1, std::memory_order_relaxed);
                 auto expected = published;
@@ -6904,34 +6906,33 @@ void GuestBufferMemory::AcquireRegistered() {
                 const bool comparable = templateCarryEnabled() && outline != nullptr && outline->device == context.device && outline->content != 0;
                 const bool sameContent = comparable && served == outline->served && servedBacked == outline->backed && servedCopied == outline->copied && built->ranges.size() == outline->table.size() && (built->ranges.empty() || std::memcmp(built->ranges.data(), outline->table.data(), built->ranges.size() * sizeof(built->ranges.front())) == 0);
                 built->content = sameContent ? outline->content : built->serial;
-                if (comparable && !sameContent && verifyIncrementalSpace()) {
-                    static std::atomic<std::uint64_t> reported{0};
-                    if (reported.fetch_add(1, std::memory_order_relaxed) < 24) {
-                        std::size_t first = 0;
-                        while (first < served.size() && first < outline->served.size() && served[first] == outline->served[first]) ++first;
-                        std::size_t same = 0;
-                        for (std::size_t at = 0, old = 0; at < served.size() && old < outline->served.size();) {
-                            if (served[at] == outline->served[old]) {
-                                ++same;
-                                ++at;
-                                ++old;
-                            } else if (served[at].begin < outline->served[old].begin) {
-                                ++at;
-                            } else if (outline->served[old].begin < served[at].begin) {
-                                ++old;
-                            } else {
-                                ++at;
-                                ++old;
+                if (outline != nullptr && verifyIncrementalSpace()) {
+                    std::string gone;
+                    std::string made;
+                    std::size_t goneCount = 0;
+                    std::size_t madeCount = 0;
+                    const auto note = [](std::string& text, std::size_t& count, const SpaceOutline::Served& entry) {
+                        char line[96];
+                        std::snprintf(line, sizeof(line), " 0x%llx-0x%llx/%llx/%x", static_cast<unsigned long long>(entry.begin), static_cast<unsigned long long>(entry.end), static_cast<unsigned long long>(entry.backing), entry.flags);
+                        if (count++ < 6) text += line;
+                    };
+                    std::size_t at = 0;
+                    std::size_t old = 0;
+                    while (at < served.size() || old < outline->served.size()) {
+                        if (old == outline->served.size() || (at < served.size() && served[at].begin < outline->served[old].begin)) {
+                            note(made, madeCount, served[at++]);
+                        } else if (at == served.size() || outline->served[old].begin < served[at].begin) {
+                            note(gone, goneCount, outline->served[old++]);
+                        } else {
+                            if (!(served[at] == outline->served[old])) {
+                                note(made, madeCount, served[at]);
+                                note(gone, goneCount, outline->served[old]);
                             }
+                            ++at;
+                            ++old;
                         }
-                        const auto text = [](const std::vector<SpaceOutline::Served>& list, std::size_t at) {
-                            char line[128];
-                            if (at < list.size()) std::snprintf(line, sizeof(line), "0x%llx-0x%llx backing %llx flags %x backed %u", static_cast<unsigned long long>(list[at].begin), static_cast<unsigned long long>(list[at].end), static_cast<unsigned long long>(list[at].backing), list[at].flags, list[at].backed);
-                            else std::snprintf(line, sizeof(line), "none");
-                            return std::string(line);
-                        };
-                        std::fprintf(stderr, "[incremental-space] a rebuilt space's content changed: %zu served regions, %zu before, %zu the same; the first that differs is %s, before %s; backed %s, copied %s (%zu, %zu before)\n", served.size(), outline->served.size(), same, text(served, first).c_str(), text(outline->served, first).c_str(), servedBacked == outline->backed ? "same" : "differs", servedCopied == outline->copied ? "same" : "differs", servedCopied.size(), outline->copied.size());
                     }
+                    std::fprintf(stderr, "[incremental-space] rebuild %llu (%s, %s, content %llu after %llu): %zu regions, %zu before; %zu new:%s; %zu gone:%s\n", static_cast<unsigned long long>(built->serial), rebuildReason, planned ? "incremental" : "full", static_cast<unsigned long long>(built->content), static_cast<unsigned long long>(outline->content), served.size(), outline->served.size(), madeCount, made.c_str(), goneCount, gone.c_str());
                 }
                 if (comparable && !sameContent && verifyIncrementalSpace()) {
                     std::size_t at = 0;
