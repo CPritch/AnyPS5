@@ -6215,6 +6215,14 @@ static std::uint64_t importIdentity(const HostImport& entry) {
     return held.serial;
 }
 
+static std::string churnText() {
+    const auto& churn = Churn();
+    const auto load = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    char text[256];
+    std::snprintf(text, sizeof(text), "retires reconcile %llu waiter %llu replace %llu evict %llu, other %llu, inserts %llu, reconciles %llu, full %llu", load(churn.retireReconcile), load(churn.retireWaiter), load(churn.retireReplace), load(churn.retireEvict), load(churn.tableOther), load(churn.inserts), load(churn.reconciles), load(churn.fullRefreshes));
+    return text;
+}
+
 static bool verifyIncrementalSpace() {
     static const bool enabled = std::getenv("APS5_VERIFY_INCREMENTAL_SPACE") != nullptr;
     return enabled;
@@ -6932,7 +6940,7 @@ void GuestBufferMemory::AcquireRegistered() {
                             ++old;
                         }
                     }
-                    std::fprintf(stderr, "[incremental-space] rebuild %llu (%s, %s, content %llu after %llu): %zu regions, %zu before; %zu new:%s; %zu gone:%s\n", static_cast<unsigned long long>(built->serial), rebuildReason, planned ? "incremental" : "full", static_cast<unsigned long long>(built->content), static_cast<unsigned long long>(outline->content), served.size(), outline->served.size(), madeCount, made.c_str(), goneCount, gone.c_str());
+                    std::fprintf(stderr, "[incremental-space] rebuild %llu (%s, %s, content %llu after %llu, epoch %llu, generation %llu, lease generation %llu): %zu regions, %zu before; %zu new:%s; %zu gone:%s; %s\n", static_cast<unsigned long long>(built->serial), rebuildReason, planned ? "incremental" : "full", static_cast<unsigned long long>(built->content), static_cast<unsigned long long>(outline->content), static_cast<unsigned long long>(importsEpoch), static_cast<unsigned long long>(generation), static_cast<unsigned long long>(leaseGeneration), served.size(), outline->served.size(), madeCount, made.c_str(), goneCount, gone.c_str(), churnText().c_str());
                 }
                 if (comparable && !sameContent && verifyIncrementalSpace()) {
                     std::size_t at = 0;
@@ -8237,6 +8245,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
         }
         importsRefreshed = true;
         if (state.epoch != space->importsEpoch) {
+            if (verifyIncrementalSpace()) std::fprintf(stderr, "[incremental-space] a build gives up space %llu: import epoch %llu, the space's %llu; generation %llu, the space's %llu, reconciled %llu; %s\n", static_cast<unsigned long long>(space->serial), static_cast<unsigned long long>(state.epoch), static_cast<unsigned long long>(space->importsEpoch), static_cast<unsigned long long>(GuestAllocations::GuestAllocationsGeneration_nid_postfix()), static_cast<unsigned long long>(space->generation), static_cast<unsigned long long>(state.refreshedGeneration), churnText().c_str());
             Spaces().dissolvedImports.fetch_add(1, std::memory_order_relaxed);
             dissolveSpace(true);
         }
