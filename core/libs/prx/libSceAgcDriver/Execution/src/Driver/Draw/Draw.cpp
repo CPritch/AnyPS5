@@ -1874,7 +1874,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
     if (pipelined && (!drawParameters.indirect || pipelinedIndirect) && (tail.queue == nullptr || deferredLabels().labels.empty()) && !localDevice->NeedsMeshLayerWindows(graphics, drawParameters)) {
         runCaptureCheckHook();
-        if (capturedMemoryChanged(memory)) {
+        static const bool finisherRecapture = std::getenv("APS5_FINISHER_RECAPTURE") != nullptr;
+        if ((tail.queue != nullptr || finisherRecapture) && capturedMemoryChanged(memory)) {
             const RecaptureScope recapture;
             if (tail.queue != nullptr) return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
             restartFinishedDraw(tail);
