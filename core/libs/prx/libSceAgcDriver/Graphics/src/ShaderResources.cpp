@@ -3510,7 +3510,7 @@ void ShaderResources::VerifyAddressReuse(const ShaderResources& built, std::span
         return std::string(text);
     };
     const auto info = [&](const VkDescriptorBufferInfo& bound) { return hex(reinterpret_cast<std::uint64_t>(bound.buffer)) + "+" + hex(bound.offset) + "/" + hex(bound.range); };
-    if (!built.bdaTemplate) fail("being a template: the full build is not served whole by the cached address space");
+    if (!built.bdaTemplate) fail("being a template: the full build is not served whole by the cached address space (the space serves it as " + std::to_string(static_cast<unsigned>(built.guestMemory.SpaceServesTemplate())) + " with kinds " + std::to_string(built.guestMemory.SpaceKinds()) + ", space " + std::to_string(built.guestMemory.SpaceSerial()) + " after " + std::to_string(bdaSpaceSerial) + ", reusable " + std::to_string(built.reusable) + ")");
     const bool sameSpace = built.bdaSpaceSerial == bdaSpaceSerial;
     if (!sameSpace) CountAddress(AddressCount::VerifiedNewerSpace);
     if (built.bdaGuardSerial != bdaGuardSerial) fail("the multisample target generation its table was built under: " + std::to_string(bdaGuardSerial) + " reused, " + std::to_string(built.bdaGuardSerial) + " built");
