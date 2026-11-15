@@ -892,6 +892,16 @@ UntrackedReproofCounters& ReproofCounters() {
     return counters;
 }
 
+std::atomic<bool> untrackedSurfaceSeen{false};
+
+void noteUntrackedSurface() {
+    if (!untrackedSurfaceSeen.load(std::memory_order_relaxed)) untrackedSurfaceSeen.store(true, std::memory_order_relaxed);
+}
+
+bool untrackedSurfacesPossible() {
+    return untrackedSurfaceSeen.load(std::memory_order_relaxed) || GuestMemory::UnwatchSerial() != 0;
+}
+
 std::span<const std::uint32_t> firstLayerWords(std::span<const std::uint32_t> words, std::optional<ShaderRecompiler::DescriptorImageShape> shape, std::array<std::uint32_t, 8>& narrowed, bool report) {
     if (shape != ShaderRecompiler::DescriptorImageShape::Image2D || words.size() != narrowed.size() || IsNullSampledTextureResource(words)) return words;
     try {
@@ -4210,15 +4220,16 @@ void ShaderResources::captureValidation() {
     for (const auto& texture : textures) objects.push_back(texture.get());
     LastRecordIndices(logged, objects, indices);
     validatedTextures.assign(textures.size(), {});
+    const bool stamps = untrackedSurfacesPossible();
     for (std::size_t i = 0; i < textures.size(); ++i) {
         if (indices[i] == log.size()) continue;
         const auto& found = log[indices[i]];
         validatedTextures[i] = {found.resource, found.bytes, found.keys, found.generation, 0, found.source, found.depth, true, found.committedGeneration, found.committed};
         auto& surface = validatedTextures[i];
-        if (!surface.depth && GuestMemory::CollectWrites(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes)) == 0) surface.untracked = untrackedRangeStamp(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes));
+        if (!surface.depth && stamps && GuestMemory::CollectWrites(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes)) == 0) surface.untracked = untrackedRangeStamp(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes));
     }
     storageUntracked.assign(storageTextures.size(), {});
-    for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+    for (std::size_t i = 0; stamps && i < storageTextures.size(); ++i) {
         const auto* image = storageTextures[i].get();
         if (image == nullptr) continue;
         const auto address = image->Descriptor().baseAddress;
@@ -4378,6 +4389,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         bool untracked = false;
         if (surface.collected == 0) {
+            noteUntrackedSurface();
             const bool recorded = surface.untracked[0] != 0;
             auto stamp = recorded ? untrackedRangeStamp(address, bytes) : std::array<std::uint64_t, 4>{};
             if (!recorded || stamp != surface.untracked) {
@@ -4457,6 +4469,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         proofLap(PartDepthChecks);
         bool untracked = false;
         if (GuestMemory::CollectWritesWitnessed(witness, address, bytes) == 0) {
+            noteUntrackedSurface();
             if (i >= storageUntracked.size() || storageUntracked[i][0] == 0 || untrackedRangeStamp(address, bytes) != storageUntracked[i]) {
                 countCollectRefusal(true, address, bytes);
                 return fail(FastFail::Collect);
