@@ -6387,7 +6387,6 @@ void GuestBufferMemory::AcquireRegistered() {
         // One pass in the registry's (ascending) order, so the regions come out sorted for AddSnapshot.
         // The import lock is taken per range: a mirror's preparation may wait for recorded work, which
         // must not happen under it.
-        regions.reserve(lease.size());
         static const std::uint64_t copyLimit = [] {
             const char* value = std::getenv("APS5_ADDRESS_COPY_MAX_MIB");
             return (value ? std::strtoull(value, nullptr, 10) : 64ull) << 20u;
@@ -6401,6 +6400,7 @@ void GuestBufferMemory::AcquireRegistered() {
         std::uint64_t coveredEnd = 0;
         std::uint64_t copiedBytes = 0;
         const auto outline = spacePatchEnabled() && importable && addressSpaceCacheEnabled() ? spaces.outline.load() : std::shared_ptr<const SpaceOutline>{};
+        regions.reserve(outline != nullptr && outline->device == context.device && !outline->regions.empty() ? outline->regions.size() + outline->regions.size() / 8 + 64 : lease.size());
         std::size_t outlineRegion = 0;
         std::size_t outlineAt = 0;
         std::uint64_t patchedThrough = 0;
