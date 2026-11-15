@@ -146,6 +146,8 @@ struct GuestBufferMemory::AddressSpace {
     VkDevice device = VK_NULL_HANDLE;
     // Identity for the life of this space (see CachedAddressTable).
     std::uint64_t serial = 0;
+    std::uint64_t content = 0;
+    std::vector<std::uint64_t> backing;
     GuestAllocations::Lease lease;
     std::vector<Region> base;
     struct HeapRun {
@@ -209,6 +211,30 @@ struct SpaceOutline {
     VkDevice device = VK_NULL_HANDLE;
     std::vector<Piece> ranges;
     std::vector<DirectRegion> regions;
+    std::uint64_t generation = 0;
+    std::uint64_t importsEpoch = 0;
+    std::uint64_t importsInserted = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> slow;
+    struct Served {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::uint64_t backing;
+        std::uint32_t flags;
+        std::uint32_t backed;
+        bool operator==(const Served&) const = default;
+    };
+    struct Copied {
+        std::uint64_t begin;
+        std::uint64_t end;
+        bool writable;
+        bool operator==(const Copied&) const = default;
+    };
+    std::uint64_t content = 0;
+    std::vector<Served> served;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> backed;
+    std::vector<Copied> copied;
+    std::vector<ShaderRecompiler::BdaAbi::Range> table;
+    std::vector<VkBuffer> buffers;
 };
 
 std::atomic<std::uint64_t> retiredPinnedBytes{0};
@@ -234,6 +260,16 @@ struct AddressSpaceCache {
     std::atomic<std::uint64_t> writableCompared{0};
     std::atomic<std::uint64_t> patchedEpoch{0};
     std::atomic<std::uint64_t> rebuiltGrowth{0};
+    std::atomic<std::uint64_t> incrementalRebuilds{0};
+    std::atomic<std::uint64_t> incrementalFallbacks{0};
+    std::atomic<std::uint64_t> incrementalKept{0};
+    std::atomic<std::uint64_t> incrementalVisited{0};
+    std::atomic<std::uint64_t> incrementalVerified{0};
+    std::atomic<std::uint64_t> incrementalVerifiedRegions{0};
+    std::atomic<std::uint64_t> incrementalVerifiedGaps{0};
+    std::atomic<std::uint64_t> incrementalDifferences{0};
+    std::atomic<std::uint64_t> contentCarried{0};
+    std::atomic<std::uint64_t> contentChanged{0};
 };
 
 AddressSpaceCache& Spaces() {
@@ -6155,11 +6191,157 @@ static bool outlineSameOver(const SpaceOutline& outline, const GuestAllocations:
 
 static bool importsUnchangedRange(const GuestAllocations::Lease& before, const GuestAllocations::Lease& now, std::size_t index, std::size_t& at) {
     const auto& range = now[index];
-    while (at < before.size() && before[at]->address < range->address) ++at;
+    at = static_cast<std::size_t>(std::partition_point(before.begin() + static_cast<std::ptrdiff_t>(std::min(at, before.size())), before.end(), [&](const auto& held) { return held->address < range->address; }) - before.begin());
     if (at >= before.size() || before[at].get() != range.get()) return false;
     const bool low = index == 0 ? at == 0 : at != 0 && before[at - 1].get() == now[index - 1].get();
     const bool high = index + 1 == now.size() ? at + 1 == before.size() : at + 1 < before.size() && before[at + 1].get() == now[index + 1].get();
     return low && high;
+}
+
+static bool incrementalSpaceEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_INCREMENTAL_SPACE") == nullptr;
+    return enabled;
+}
+
+static bool templateCarryEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_TEMPLATE_CARRY") == nullptr;
+    return enabled;
+}
+
+static std::uint64_t importIdentity(const HostImport& entry) {
+    static std::uint64_t serials = 0;
+    auto& held = const_cast<HostImport&>(entry);
+    if (held.serial == 0) held.serial = ++serials;
+    return held.serial;
+}
+
+static bool verifyIncrementalSpace() {
+    static const bool enabled = std::getenv("APS5_VERIFY_INCREMENTAL_SPACE") != nullptr;
+    return enabled;
+}
+
+struct SpacePlan {
+    struct Clean {
+        std::size_t leaseBegin;
+        std::size_t leaseEnd;
+        std::size_t pieceBegin;
+        std::size_t pieceEnd;
+        std::size_t regionBegin;
+        std::size_t regionEnd;
+    };
+    std::vector<Clean> clean;
+};
+
+static bool samePiece(const SpaceOutline::Piece& piece, const GuestAllocations::Range& range) {
+    return piece.address == range.address && piece.bytes == range.bytes && piece.backing == range.backingSerial;
+}
+
+static void mergeSpans(std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans) {
+    std::sort(spans.begin(), spans.end());
+    std::size_t kept = 0;
+    for (const auto& span : spans) {
+        if (span.second <= span.first) continue;
+        if (kept != 0 && span.first <= spans[kept - 1].second) spans[kept - 1].second = std::max(spans[kept - 1].second, span.second);
+        else spans[kept++] = span;
+    }
+    spans.resize(kept);
+}
+
+static bool importEventsSince(const HostImports& state, std::uint64_t epoch, std::uint64_t inserted, std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans) {
+    if (state.epoch < epoch || state.inserted < inserted) return false;
+    const auto then = epoch + inserted;
+    const auto now = state.epoch + state.inserted;
+    if (now - then > state.tableEvents.size()) return false;
+    for (auto stamp = then + 1; stamp <= now; ++stamp) {
+        const auto& event = state.tableEvents[stamp % state.tableEvents.size()];
+        if (event.stamp != stamp) return false;
+        spans.emplace_back(event.base, event.end);
+    }
+    return true;
+}
+
+static bool planIncrementalSpace(const SpaceOutline& outline, const GuestAllocations::Lease& lease, std::span<const std::pair<std::uint64_t, std::uint64_t>> changed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& work, SpacePlan& plan) {
+    const auto& pieces = outline.ranges;
+    const auto& kept = outline.regions;
+    const auto pieceEnd = [](const SpaceOutline::Piece& piece) { return piece.address + piece.bytes; };
+    for (const auto& [begin, end] : changed) {
+        const auto first = std::partition_point(pieces.begin(), pieces.end(), [&](const auto& piece) { return pieceEnd(piece) <= begin; });
+        const auto after = std::partition_point(first, pieces.end(), [&](const auto& piece) { return piece.address < end; });
+        work.emplace_back(first != pieces.begin() ? std::min(begin, std::prev(first)->address) : begin, after != pieces.end() ? std::max(end, pieceEnd(*after)) : end);
+    }
+    work.insert(work.end(), outline.slow.begin(), outline.slow.end());
+    mergeSpans(work);
+    for (auto& [begin, end] : work) {
+        const auto low = std::partition_point(kept.begin(), kept.end(), [&](const auto& region) { return region.end <= begin; });
+        if (low != kept.end() && low->begin < begin) begin = low->begin;
+        const auto high = std::partition_point(low, kept.end(), [&](const auto& region) { return region.begin < end; });
+        if (high != low && std::prev(high)->end > end) end = std::prev(high)->end;
+    }
+    mergeSpans(work);
+    plan.clean.clear();
+    std::size_t leaseAt = 0;
+    std::size_t pieceAt = 0;
+    std::size_t regionAt = 0;
+    const auto clean = [&](std::size_t leaseStop, std::size_t pieceStop, std::size_t regionStop) {
+        if (leaseStop - leaseAt != pieceStop - pieceAt) return false;
+        if (leaseStop == leaseAt) return regionStop == regionAt;
+        if (!samePiece(pieces[pieceAt], *lease[leaseAt]) || !samePiece(pieces[pieceStop - 1], *lease[leaseStop - 1])) return false;
+        plan.clean.push_back({leaseAt, leaseStop, pieceAt, pieceStop, regionAt, regionStop});
+        return true;
+    };
+    const auto index = [](const auto& list, const auto& at) { return static_cast<std::size_t>(at - list.begin()); };
+    const auto from = [](const auto& list, std::size_t at) { return list.begin() + static_cast<std::ptrdiff_t>(at); };
+    for (const auto& [begin, end] : work) {
+        const auto leaseStop = index(lease, std::partition_point(from(lease, leaseAt), lease.end(), [&](const auto& range) { return range->address + range->bytes <= begin; }));
+        const auto pieceStop = index(pieces, std::partition_point(from(pieces, pieceAt), pieces.end(), [&](const auto& piece) { return pieceEnd(piece) <= begin; }));
+        const auto regionStop = index(kept, std::partition_point(from(kept, regionAt), kept.end(), [&](const auto& region) { return region.end <= begin; }));
+        if (!clean(leaseStop, pieceStop, regionStop)) return false;
+        leaseAt = index(lease, std::partition_point(from(lease, leaseStop), lease.end(), [&](const auto& range) { return range->address < end; }));
+        pieceAt = index(pieces, std::partition_point(from(pieces, pieceStop), pieces.end(), [&](const auto& piece) { return piece.address < end; }));
+        regionAt = index(kept, std::partition_point(from(kept, regionStop), kept.end(), [&](const auto& region) { return region.begin < end; }));
+    }
+    return clean(lease.size(), pieces.size(), kept.size());
+}
+
+static bool wholePieces(const std::vector<SpaceOutline::Piece>& pieces, std::uint64_t begin, std::uint64_t end) {
+    auto at = std::partition_point(pieces.begin(), pieces.end(), [&](const auto& piece) { return piece.address < begin; });
+    auto cursor = begin;
+    for (; at != pieces.end() && at->address == cursor && cursor < end; ++at) cursor += at->bytes;
+    return cursor == end;
+}
+
+static void verifyCleanSegment(const SpaceOutline& outline, const GuestAllocations::Lease& lease, const SpacePlan::Clean& segment) {
+    auto& spaces = Spaces();
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    const auto differs = [&](const char* what, std::uint64_t begin, std::uint64_t end) {
+        if (spaces.incrementalDifferences.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[incremental-space] APS5_VERIFY_INCREMENTAL_SPACE: 0x%llx-0x%llx: %s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), what);
+    };
+    const auto& kept = outline.regions;
+    std::size_t region = segment.regionBegin;
+    std::size_t at = segment.pieceBegin;
+    std::size_t matched = 0;
+    for (std::size_t index = segment.leaseBegin; index < segment.leaseEnd; ++index) {
+        const auto& range = *lease[index];
+        const auto end = range.address + range.bytes;
+        if (!samePiece(outline.ranges[segment.pieceBegin + (index - segment.leaseBegin)], range)) differs("a skipped range is not the outline's", range.address, end);
+        while (region < segment.regionEnd && kept[region].end <= range.address) ++region;
+        const bool inside = region < segment.regionEnd && kept[region].begin <= range.address && end <= kept[region].end;
+        if (inside && kept[region].begin == range.address) {
+            const auto& held = kept[region];
+            ++matched;
+            spaces.incrementalVerifiedRegions.fetch_add(1, std::memory_order_relaxed);
+            const auto* entry = peekImport(state, held.begin, held.end);
+            if (!range.readable || !range.gpu) differs("a region kept in bulk starts at a range that is not a readable GPU range", held.begin, held.end);
+            else if (!outlineSameOver(outline, lease, index, at, held.end)) differs("a region kept in bulk fails the outline's check of its ranges", held.begin, held.end);
+            else if (entry == nullptr || entry != held.direct) differs("a region kept in bulk is not served by the outline's import", held.begin, held.end);
+            else if (!keptBytes(*entry, lease).current) differs("a region kept in bulk rests on an import over bytes that changed", held.begin, held.end);
+        } else if (!inside) {
+            spaces.incrementalVerifiedGaps.fetch_add(1, std::memory_order_relaxed);
+            if (range.readable && range.gpu) differs("a skipped gap holds a readable GPU range", range.address, end);
+        }
+    }
+    if (matched != segment.regionEnd - segment.regionBegin) differs("a region kept in bulk starts at no leased range", lease[segment.leaseBegin]->address, lease[segment.leaseEnd - 1]->address + lease[segment.leaseEnd - 1]->bytes);
 }
 
 template<typename TSpace>
@@ -6310,10 +6492,15 @@ void GuestBufferMemory::AcquireRegistered() {
                 if (entry == nullptr) return nullptr;
                 region.direct = entry;
             }
+            built->backing.reserve(built->base.size());
+            for (const auto& region : built->base) built->backing.push_back(region.direct != nullptr ? importIdentity(*region.direct) : region.mirror != nullptr ? region.mirror->serial : 0);
             built->generation = old->generation;
             built->importsEpoch = state.epoch;
             built->device = old->device;
             built->serial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
+            const bool sameBacking = templateCarryEnabled() && old->content != 0 && built->backing == old->backing;
+            built->content = sameBacking ? old->content : built->serial;
+            (sameBacking ? spaces.contentCarried : spaces.contentChanged).fetch_add(1, std::memory_order_relaxed);
             built->lease = old->lease;
             built->copied = old->copied;
             built->directReads = old->directReads;
@@ -6364,7 +6551,20 @@ void GuestBufferMemory::AcquireRegistered() {
     }
     if (space == nullptr) {
         // Pending GPU results in these ranges are stored when Upload prepares each region.
-        lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        const auto outline = spacePatchEnabled() && importable && addressSpaceCacheEnabled() ? spaces.outline.load() : std::shared_ptr<const SpaceOutline>{};
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> changedSpans;
+        std::uint64_t leaseGeneration = 0;
+        bool journaled = false;
+        if (incrementalSpaceEnabled() && outline != nullptr && outline->device == context.device && outline->generation != 0) {
+            GuestAllocations::Lease none;
+            journaled = GuestAllocations::GuestAllocationsAcquireChanged_nid_no_patch(outline->generation, [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>&, std::vector<std::pair<std::uint64_t, std::uint64_t>>&) {}, &changedSpans, &leaseGeneration, &none, &lease);
+        }
+        if (!journaled) {
+            lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+            if (!incrementalSpaceEnabled() || !GuestAllocations::GuestAllocationsLeaseGeneration_nid_no_patch(lease, &leaseGeneration, nullptr)) leaseGeneration = 0;
+        }
+        SpacePlan plan;
+        bool planned = false;
         static const bool reuseSpaceImports = std::getenv("APS5_NO_SPACE_IMPORT_REUSE") == nullptr;
         static const bool verifySpaceImports = std::getenv("APS5_VERIFY_SPACE_IMPORT_REUSE") != nullptr;
         const auto previousSpace = reuseSpaceImports && addressSpaceCacheEnabled() ? spaces.current.load() : std::shared_ptr<const AddressSpace>{};
@@ -6377,6 +6577,19 @@ void GuestBufferMemory::AcquireRegistered() {
             if (importFloor == 0) importFloor = state.useCounter + 1;
             state.buildFloor = importFloor;
             if (importable) promoteGrowth(context, state, lease);
+            if (journaled) {
+                thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> work;
+                work.clear();
+                planned = importEventsSince(state, outline->importsEpoch, outline->importsInserted, work) && planIncrementalSpace(*outline, lease, changedSpans, work, plan);
+                if (planned) {
+                    for (const auto& segment : plan.clean) {
+                        for (auto kept = segment.regionBegin; kept < segment.regionEnd; ++kept) outline->regions[kept].direct->lastUse = ++state.useCounter;
+                    }
+                } else {
+                    plan.clean.clear();
+                }
+            }
+            if (incrementalSpaceEnabled() && outline != nullptr) (planned ? spaces.incrementalRebuilds : spaces.incrementalFallbacks).fetch_add(1, std::memory_order_relaxed);
             // Taken before the pass: the imports it takes are the registry's ones (just reconciled, so
             // none is retired by a make below), and a mirror's preparation may sync the recorder, whose
             // completions can retire an import already taken; that moves the epoch, and Upload then
@@ -6399,7 +6612,6 @@ void GuestBufferMemory::AcquireRegistered() {
         std::uint64_t coveredBegin = 0;
         std::uint64_t coveredEnd = 0;
         std::uint64_t copiedBytes = 0;
-        const auto outline = spacePatchEnabled() && importable && addressSpaceCacheEnabled() ? spaces.outline.load() : std::shared_ptr<const SpaceOutline>{};
         regions.reserve(outline != nullptr && outline->device == context.device && !outline->regions.empty() ? outline->regions.size() + outline->regions.size() / 8 + 64 : lease.size());
         std::size_t outlineRegion = 0;
         std::size_t outlineAt = 0;
@@ -6412,16 +6624,37 @@ void GuestBufferMemory::AcquireRegistered() {
             if (keptLock.owns_lock()) keptLock.unlock();
             keptHeld = 0;
         };
-        std::size_t leasedNext = 0;
-        for (const auto& range : lease) {
-            const auto leasedAt = leasedNext++;
-            if (range->address < patchedThrough) continue;
-            if (!range->readable || !range->gpu) continue;
+        const bool outlining = spacePatchEnabled() && addressSpaceCacheEnabled();
+        std::vector<SpaceOutline::Piece> outlinePieces;
+        if (outlining) outlinePieces.reserve(lease.size());
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> slowRanges;
+        const auto keepClean = [&](const SpacePlan::Clean& segment) {
+            releaseKept();
+            if (verifyIncrementalSpace()) verifyCleanSegment(*outline, lease, segment);
+            const auto& kept = outline->regions;
+            for (auto at = segment.regionBegin; at < segment.regionEnd; ++at) {
+                Region region{kept[at].begin, kept[at].end, kept[at].writable, {}, nullptr};
+                region.hostBacked = true;
+                region.direct = kept[at].direct;
+                regions.push_back(std::move(region));
+                imported.emplace_back(kept[at].begin, kept[at].end);
+            }
+            outlinePieces.insert(outlinePieces.end(), outline->ranges.begin() + static_cast<std::ptrdiff_t>(segment.pieceBegin), outline->ranges.begin() + static_cast<std::ptrdiff_t>(segment.pieceEnd));
+            outlineRegion = std::max(outlineRegion, segment.regionEnd);
+            outlineAt = std::max(outlineAt, segment.pieceEnd);
+            if (segment.regionEnd != segment.regionBegin) patchedThrough = std::max(patchedThrough, kept[segment.regionEnd - 1].end);
+            spaces.incrementalKept.fetch_add(segment.regionEnd - segment.regionBegin, std::memory_order_relaxed);
+        };
+        const auto visit = [&](const std::size_t leaseIndex) {
+            const auto& range = lease[leaseIndex];
+            if (outlining) outlinePieces.push_back({range->address, range->bytes, range->backingSerial});
+            if (range->address < patchedThrough) return;
+            if (!range->readable || !range->gpu) return;
             if (outline != nullptr && outline->device == context.device) {
                 while (outlineRegion < outline->regions.size() && outline->regions[outlineRegion].end <= range->address) ++outlineRegion;
                 if (outlineRegion < outline->regions.size() && outline->regions[outlineRegion].begin == range->address) {
                     const auto& kept = outline->regions[outlineRegion];
-                    if (outlineSameOver(*outline, lease, leasedAt, outlineAt, kept.end)) {
+                    if (outlineSameOver(*outline, lease, leaseIndex, outlineAt, kept.end)) {
                         auto& state = Imports();
                         if (!keptLock.owns_lock()) keptLock.lock();
                         if (const auto* entry = findImport(state, kept.begin, kept.end); entry != nullptr && entry == kept.direct) {
@@ -6436,12 +6669,13 @@ void GuestBufferMemory::AcquireRegistered() {
                             imported.emplace_back(kept.begin, kept.end);
                             patchedThrough = kept.end;
                             if (!keptRunLock || ++keptHeld >= keptRunRegions) releaseKept();
-                            continue;
+                            return;
                         }
                     }
                 }
             }
             releaseKept();
+            slowRanges.emplace_back(range->address, range->address + range->bytes);
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
             const HostImport* entry = nullptr;
@@ -6458,7 +6692,6 @@ void GuestBufferMemory::AcquireRegistered() {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
                 const auto refusals = state.budgetRefusals;
-                const auto leaseIndex = leasedAt;
                 const HostImport* unchanged = previousSpace != nullptr && importsUnchangedRange(previousSpace->lease, lease, leaseIndex, previousAt) && !importsStale(context, state) ? findImport(state, range->address, range->address + range->bytes) : nullptr;
                 if (unchanged != nullptr && !verifySpaceImports) {
                     unchanged->lastUse = ++state.useCounter;
@@ -6504,7 +6737,7 @@ void GuestBufferMemory::AcquireRegistered() {
                     }
                     regions.push_back(std::move(part));
                 }
-                continue;
+                return;
             }
             if (entry != nullptr) {
                 region.hostBacked = true;
@@ -6512,7 +6745,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 region.direct = entry;
                 regions.push_back(std::move(region));
                 imported.emplace_back(range->address, range->address + range->bytes);
-                continue;
+                return;
             }
             if (mirrorsEnabled() && !WasEvicted(range->address)) {
                 region.mirror = acquireMirror(context, range, blocks, range->releasable);
@@ -6524,7 +6757,7 @@ void GuestBufferMemory::AcquireRegistered() {
                         region.backed = region.mirror->committed;
                     }
                     regions.push_back(std::move(region));
-                    continue;
+                    return;
                 }
             }
             addCopiedRange({range->address, range->address + range->bytes, range->writable});
@@ -6558,11 +6791,30 @@ void GuestBufferMemory::AcquireRegistered() {
                 region.direct = entry;
                 regions.push_back(std::move(region));
                 imported.emplace_back(range->address, range->address + range->bytes);
-                continue;
+                return;
             }
             copiedBytes += committed;
             const char* reason = !mirrorsEnabled() ? "mirrors disabled by APS5_NO_LEASE_MIRROR" : copied.sparse ? "unreadable pages" : !range->releasable ? "image mirror refused" : nullptr;
             copies.push_back({copied.begin, copied.end, committed, reason, reason == nullptr, overBudget});
+        };
+        std::size_t cleanAt = 0;
+        std::size_t visited = 0;
+        for (std::size_t leaseIndex = 0; leaseIndex < lease.size();) {
+            if (cleanAt < plan.clean.size() && plan.clean[cleanAt].leaseBegin == leaseIndex) {
+                keepClean(plan.clean[cleanAt]);
+                leaseIndex = plan.clean[cleanAt++].leaseEnd;
+                continue;
+            }
+            visit(leaseIndex++);
+            ++visited;
+        }
+        if (planned) {
+            spaces.incrementalVisited.fetch_add(visited, std::memory_order_relaxed);
+            if (verifyIncrementalSpace()) {
+                if (outlining && outlinePieces.size() != lease.size() && spaces.incrementalDifferences.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[incremental-space] APS5_VERIFY_INCREMENTAL_SPACE: the new outline holds %zu ranges, the lease %zu\n", outlinePieces.size(), lease.size());
+                const auto load = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+                if (spaces.incrementalVerified.fetch_add(1, std::memory_order_relaxed) % 64 == 0) std::fprintf(stderr, "[incremental-space] APS5_VERIFY_INCREMENTAL_SPACE: %llu incremental rebuilds (%llu fell back), %llu regions kept in bulk, %llu ranges visited; %llu rebuilt spaces kept their templates, %llu did not; checked %llu regions and %llu gap ranges, %llu differences\n", load(spaces.incrementalRebuilds), load(spaces.incrementalFallbacks), load(spaces.incrementalKept), load(spaces.incrementalVisited), load(spaces.contentCarried), load(spaces.contentChanged), load(spaces.incrementalVerifiedRegions), load(spaces.incrementalVerifiedGaps), load(spaces.incrementalDifferences));
+            }
         }
         releaseKept();
         releaseImportedMirrors(context, imported);
@@ -6588,9 +6840,15 @@ void GuestBufferMemory::AcquireRegistered() {
             // re-resolves every pointer as before.
             std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
             bool publish = true;
+            std::vector<std::uint64_t> backing;
+            std::vector<VkBuffer> buffers;
+            std::uint64_t stampEpoch = 0;
+            std::uint64_t stampInserted = 0;
             {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
+                stampEpoch = state.epoch;
+                stampInserted = state.inserted;
                 if (state.epoch != importsEpoch) {
                     publish = false;
                     spaces.unpublished.fetch_add(1, std::memory_order_relaxed);
@@ -6610,7 +6868,10 @@ void GuestBufferMemory::AcquireRegistered() {
                     }
                     regions.erase(regions.begin() + static_cast<std::ptrdiff_t>(kept), regions.end());
                     for (const auto& region : regions) {
-                        if (region.direct != nullptr || region.mirror != nullptr) ranges.push_back(addressRange(region));
+                        if (region.direct == nullptr && region.mirror == nullptr) continue;
+                        ranges.push_back(addressRange(region));
+                        backing.push_back(region.direct != nullptr ? importIdentity(*region.direct) : region.mirror->serial);
+                        buffers.push_back(region.direct != nullptr ? region.direct->buffer : VK_NULL_HANDLE);
                     }
                 }
             }
@@ -6624,24 +6885,54 @@ void GuestBufferMemory::AcquireRegistered() {
                 built->lease = std::move(lease);
                 built->ranges = std::move(ranges);
                 std::vector<Region> extras;
+                std::vector<SpaceOutline::Served> served;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> servedBacked;
+                std::vector<SpaceOutline::Copied> servedCopied;
+                served.reserve(backing.size());
                 for (auto& region : regions) {
                     if (region.direct != nullptr || region.mirror != nullptr) {
+                        const auto flags = (region.writable ? 1u : 0u) | (region.hostBacked ? 2u : 0u) | (region.sparse ? 4u : 0u) | (region.sparseHeap ? 8u : 0u) | (region.runCut ? 16u : 0u) | (region.mirror != nullptr ? 32u : 0u) | (region.direct != nullptr ? 64u : 0u);
+                        served.push_back({region.begin, region.end, backing[served.size()], flags, static_cast<std::uint32_t>(region.backed.size())});
+                        servedBacked.insert(servedBacked.end(), region.backed.begin(), region.backed.end());
                         built->base.push_back(std::move(region));
                     } else {
                         built->copied.push_back({region.begin, region.end, region.writable});
+                        servedCopied.push_back({region.begin, region.end, region.writable});
                         extras.push_back(std::move(region));
                     }
                 }
+                const bool comparable = templateCarryEnabled() && outline != nullptr && outline->device == context.device && outline->content != 0;
+                const bool sameContent = comparable && served == outline->served && servedBacked == outline->backed && servedCopied == outline->copied && built->ranges.size() == outline->table.size() && (built->ranges.empty() || std::memcmp(built->ranges.data(), outline->table.data(), built->ranges.size() * sizeof(built->ranges.front())) == 0);
+                built->content = sameContent ? outline->content : built->serial;
+                built->backing = std::move(backing);
+                (sameContent ? spaces.contentCarried : spaces.contentChanged).fetch_add(1, std::memory_order_relaxed);
+                if (sameContent && verifyIncrementalSpace() && buffers != outline->buffers && spaces.incrementalDifferences.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[incremental-space] APS5_VERIFY_INCREMENTAL_SPACE: a rebuilt space keeps its templates, but an import's buffer is not the one they were written against\n");
                 regions = std::move(extras);
                 lease.clear();
                 planSpaceMirrors(*built);
                 if (spacePatchEnabled()) {
                     auto kept = std::make_shared<SpaceOutline>();
                     kept->device = context.device;
-                    kept->ranges.reserve(built->lease.size());
-                    for (const auto& range : built->lease) kept->ranges.push_back({range->address, range->bytes, range->backingSerial});
+                    kept->ranges = std::move(outlinePieces);
+                    kept->generation = leaseGeneration;
+                    kept->importsEpoch = stampEpoch;
+                    kept->importsInserted = stampInserted;
+                    kept->content = built->content;
+                    kept->served = std::move(served);
+                    kept->backed = std::move(servedBacked);
+                    kept->copied = std::move(servedCopied);
+                    kept->table = built->ranges;
+                    kept->buffers = std::move(buffers);
                     for (const auto& region : built->base) {
-                        if (region.direct != nullptr && region.mirror == nullptr && !region.sparse) kept->regions.push_back({region.begin, region.end, region.writable, region.direct});
+                        if (region.direct != nullptr && region.mirror == nullptr && !region.sparse && (!incrementalSpaceEnabled() || wholePieces(kept->ranges, region.begin, region.end))) kept->regions.push_back({region.begin, region.end, region.writable, region.direct});
+                    }
+                    if (incrementalSpaceEnabled()) {
+                        for (const auto& [begin, end] : slowRanges) {
+                            const auto over = std::partition_point(kept->regions.begin(), kept->regions.end(), [&](const auto& region) { return region.end <= begin; });
+                            if (over != kept->regions.end() && over->begin <= begin && end <= over->end) continue;
+                            if (!kept->slow.empty() && begin <= kept->slow.back().second) kept->slow.back().second = std::max(kept->slow.back().second, end);
+                            else kept->slow.emplace_back(begin, end);
+                        }
                     }
                     spaces.outline.store(std::shared_ptr<const SpaceOutline>(std::move(kept)));
                 }
@@ -8954,7 +9245,7 @@ std::uint32_t GuestBufferMemory::SpaceKinds() const {
 }
 
 std::uint64_t GuestBufferMemory::SpaceSerial() const {
-    return space != nullptr ? space->serial : 0;
+    return space != nullptr ? space->content : 0;
 }
 
 namespace {
@@ -9049,7 +9340,7 @@ GuestBufferMemory::SpaceAttach GuestBufferMemory::AttachSpace(std::uint64_t seri
     Require(space == nullptr && lease.empty() && uploaded && !committed && regions.empty(), "an address-based template's space is taken while it holds one");
     if (serial == 0 || !addressSpaceCacheEnabled() || context.hostImportAlignment == 0) return SpaceAttach::Space;
     auto current = Spaces().current.load();
-    if (current == nullptr || current->serial != serial || current->device != context.device) return SpaceAttach::Space;
+    if (current == nullptr || current->content != serial || current->device != context.device) return SpaceAttach::Space;
     struct BuildingScope {
         explicit BuildingScope(GuestBufferMemory* self) { buildingBufferMemory = self; }
         ~BuildingScope() {
@@ -9342,9 +9633,7 @@ std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, st
     if (address < entry.base || address + bytes > entry.base + entry.bytes) return 0;
     // Serials are handed out on first use: a fresh import starts at 0, so one made after an earlier
     // import of the same range was dropped can never repeat that import's serial.
-    static std::uint64_t serials = 0;
-    if (entry.serial == 0) entry.serial = ++serials;
-    return entry.serial;
+    return importIdentity(entry);
 }
 
 bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof) {
