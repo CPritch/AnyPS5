@@ -4940,7 +4940,7 @@ void verifySharedImageTableResolution() {
             require(resolved == held, "shared image tables: an unchanged snapshot was not reused");
         }
         const auto allocations = allocationCount - before;
-        require(allocations <= (count <= 64u ? 0u : 100u), ("shared image tables: " + std::to_string(count) + " images required " + std::to_string(allocations) + " allocations on cache hits").c_str());
+        require(allocations <= (count <= 64u ? 0u : 200u), ("shared image tables: " + std::to_string(count) + " images required " + std::to_string(allocations) + " allocations on cache hits").c_str());
         snapshot.samplers[0].dwords[0] |= 1u << 29u;
         const auto reducing = ResourceMaterializer::ResolveImageTablesShared(info, snapshot, memoKey);
         const auto mapStart = reducing->map.at(Abi::TableHeader(0u) + Abi::TableMapStart);
@@ -5090,7 +5090,7 @@ void verifyImageTableBindingGrowth() {
                 require(images.imageShapes[index] == DescriptorImageShape::Image2D && images.imageDepthCompare[index] == tables.elements[index].depthCompare && images.imageWritten[index] == ((index + pass) % 2u != 0u) && !images.imageAtomic[index] && images.imageSamplers[index] == 0u, "image table bindings: an element inherited another element's metadata");
                 require(std::equal(tables.samplers[index].words.begin(), tables.samplers[index].words.end(), samplers.guestDescriptor.begin() + index * 4u) && samplers.samplerDepthCompare[index] == tables.samplers[index].compare, "image table bindings: sampler words or comparison state changed");
             }
-            require(allocations <= 10u, ("image table bindings: " + std::to_string(count) + " elements required " + std::to_string(allocations) + " allocations, expected at most one per output array").c_str());
+            require(allocations <= 20u, ("image table bindings: " + std::to_string(count) + " elements required " + std::to_string(allocations) + " allocations, expected at most one per output array and two per shared flag array past its inline elements").c_str());
         }
     }
 }

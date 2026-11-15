@@ -6,6 +6,7 @@ configure_windows_unwind(agc_nan_payload_elimination_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_nan_payload_elimination_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_nan_payload_elimination COMMAND agc_nan_payload_elimination_tests)
+    set_tests_properties(agc_nan_payload_elimination PROPERTIES ENVIRONMENT "APS5_FAST_F16=0;APS5_FAST_F32=0")
     if(WIN32)
         set_tests_properties(agc_nan_payload_elimination PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

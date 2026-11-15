@@ -398,9 +398,9 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     };
     const auto checkSpanBytes = std::max<std::size_t>(self.descriptorSpanBytes, sizeof(*value));
     if (page.wordwise && page.valid.Test(index) &&
-        (self.forceSync != 0u ? self.pendingSpan(address, checkSpanBytes, {}) != PendingWrite::None
-                              : (spanInvalidatesCache(self.pendingSpan(address, checkSpanBytes, {})) ||
-                                 (checkSpanBytes > sizeof(*value) && spanInvalidatesCache(self.pendingSpan(address, sizeof(*value), {})))))) {
+        (self.forceSync != 0u ? self.pendingWrite(address, checkSpanBytes, {}) != PendingWrite::None
+                              : (spanInvalidatesCache(self.pendingWrite(address, checkSpanBytes, {})) ||
+                                 (checkSpanBytes > sizeof(*value) && spanInvalidatesCache(self.pendingWrite(address, sizeof(*value), {})))))) {
         page.valid.Clear(index);
         page.raw.Clear(index);
     }
@@ -410,10 +410,10 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         bool forcedRaw = false;
         if (page.wordwise) {
             if (self.descriptorSpanBytes > sizeof(word) &&
-                (self.forceSync != 0u ? self.pendingSpan(address, self.descriptorSpanBytes, {}) != PendingWrite::None
-                                      : spanNeedsSync(self.pendingSpan(address, self.descriptorSpanBytes, {})))) {
+                (self.forceSync != 0u ? self.pendingWrite(address, self.descriptorSpanBytes, {}) != PendingWrite::None
+                                      : spanNeedsSync(self.pendingWrite(address, self.descriptorSpanBytes, {})))) {
                 policy = PendingWrite::Sync;
-                forcedRaw = self.forceSync != 0u && !spanNeedsSync(self.pendingSpan(address, self.descriptorSpanBytes, {}));
+                forcedRaw = self.forceSync != 0u && !spanNeedsSync(self.pendingWrite(address, self.descriptorSpanBytes, {}));
             } else {
                 policy = self.pendingWrite(address, sizeof(word), std::as_writable_bytes(std::span(&word, 1)));
                 if (self.forceSync != 0u && policy != PendingWrite::None) {
@@ -656,8 +656,8 @@ bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_
 
 bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t bytes) {
     const auto& self = *static_cast<const ShaderMemory*>(context);
-    if (self.pendingSpan == nullptr || bytes == 0) return false;
-    const auto policy = self.pendingSpan(address, static_cast<std::size_t>(bytes), {});
+    if (self.pendingWrite == nullptr || bytes == 0) return false;
+    const auto policy = self.pendingWrite(address, static_cast<std::size_t>(bytes), {});
     return policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
 }
 

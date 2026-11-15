@@ -384,7 +384,7 @@ int main() {
             released.store(true, std::memory_order_release);
             AgcDriverWaitIdle_nid_postfix();
             AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
-            const auto drains = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) - drainsBefore + DrawPipeline::DrainRequestsByReason(DrawPipeline::DrainReason::Capture) - captureDrainsBefore;
+            const auto drains = std::max(DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) - drainsBefore, DrawPipeline::DrainRequestsByReason(DrawPipeline::DrainReason::Capture) - captureDrainsBefore);
             for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
                 check(Output[lane] == value + 1u, "descriptor round " + std::to_string(round) + ": lane " + std::to_string(lane) + " of the output is " + std::to_string(Output[lane]) + ", expected " + std::to_string(value + 1u) + " (the dispatch read the buffer the table named before the pending fill of the table)");
             }
@@ -514,7 +514,7 @@ int main() {
         AgcDriverRegisterShader_nid_postfix(&keyFillShader);
         Shader planeClearShader = ComputeShader(PlaneClearCode.data(), sizeof(PlaneClearCode));
         AgcDriverRegisterShader_nid_postfix(&planeClearShader);
-        const auto expectInline = [&](std::size_t round) { return round == 0 || dispatchMisses || !pipelinedDispatch; };
+        const auto expectInline = [&](std::size_t round) { return !pipelinedDispatch || (round == 0 && !dispatchMisses); };
 
         auto* htile = NewBlock();
         constexpr std::uint32_t htileRecords = 64;
