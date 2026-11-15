@@ -182,7 +182,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             mask = ~std::uint64_t{0};
         }
     }
-    if (program.snapshot && StageLinksUserDataCallees(*program.snapshot, program.codeOffset)) {
+    if (program.snapshot && StageLinksUserDataCallees(*program.snapshot, program.codeOffset, program.binary.stage)) {
         mask = ~std::uint64_t{0};
     }
     stageCapture.userDataMask = mask;
