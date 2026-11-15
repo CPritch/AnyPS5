@@ -53,7 +53,15 @@ using namespace AgcDriver::Graphics;
     X(SetStencilTestEnableEXT) \
     X(SetStencilWriteMask) \
     X(WriteBufferMarkerAMD) \
-    X(WriteTimestamp)
+    X(WriteTimestamp) \
+    X(SetCullMode) \
+    X(SetDepthBoundsTestEnable) \
+    X(SetDepthCompareOp) \
+    X(SetDepthTestEnable) \
+    X(SetDepthWriteEnable) \
+    X(SetFrontFace) \
+    X(SetStencilOp) \
+    X(SetStencilTestEnable)
 
 #define TEST_POINTER_OPS(X) \
     X(BeginRenderPass) \
@@ -73,7 +81,15 @@ using namespace AgcDriver::Graphics;
     X(ResolveImage) \
     X(SetScissor) \
     X(SetViewport) \
-    X(UpdateBuffer)
+    X(UpdateBuffer) \
+    X(BindShadersEXT) \
+    X(ExecuteCommands) \
+    X(SetColorWriteMaskEXT) \
+    X(SetDepthBias2EXT) \
+    X(SetScissorWithCount) \
+    X(SetScissorWithCountEXT) \
+    X(SetViewportWithCount) \
+    X(SetViewportWithCountEXT)
 
 #define TEST_ALL_OPS(X) TEST_SCALAR_OPS(X) TEST_POINTER_OPS(X)
 
@@ -442,7 +458,73 @@ VKAPI_ATTR void VKAPI_CALL stubUpdateBuffer(VkCommandBuffer commands, VkBuffer b
     record(std::move(line));
 }
 
+VKAPI_ATTR void VKAPI_CALL stubBindShadersEXT(VkCommandBuffer commands, std::uint32_t stageCount, const VkShaderStageFlagBits* stages, const VkShaderEXT* shaders) {
+    auto line = begin(BindShadersEXTName, commands);
+    bytes(line, stageCount);
+    items(line, stages, stageCount);
+    items(line, shaders, stageCount);
+    record(std::move(line));
+}
+
+VKAPI_ATTR void VKAPI_CALL stubExecuteCommands(VkCommandBuffer commands, std::uint32_t count, const VkCommandBuffer* secondaries) {
+    auto line = begin(ExecuteCommandsName, commands);
+    bytes(line, count);
+    items(line, secondaries, count);
+    record(std::move(line));
+}
+
+VKAPI_ATTR void VKAPI_CALL stubSetColorWriteMaskEXT(VkCommandBuffer commands, std::uint32_t first, std::uint32_t count, const VkColorComponentFlags* masks) {
+    auto line = begin(SetColorWriteMaskEXTName, commands);
+    bytes(line, first);
+    bytes(line, count);
+    items(line, masks, count);
+    record(std::move(line));
+}
+
+VKAPI_ATTR void VKAPI_CALL stubSetDepthBias2EXT(VkCommandBuffer commands, const VkDepthBiasInfoEXT* info) {
+    auto line = begin(SetDepthBias2EXTName, commands);
+    masked(line, *info, &VkDepthBiasInfoEXT::pNext);
+    const auto* const representation = static_cast<const VkDepthBiasRepresentationInfoEXT*>(info->pNext);
+    if (representation == nullptr) line += "null";
+    else masked(line, *representation, &VkDepthBiasRepresentationInfoEXT::pNext);
+    record(std::move(line));
+}
+
+void countedScissors(const char* name, VkCommandBuffer commands, std::uint32_t count, const VkRect2D* scissors) {
+    auto line = begin(name, commands);
+    bytes(line, count);
+    items(line, scissors, count);
+    record(std::move(line));
+}
+
+void countedViewports(const char* name, VkCommandBuffer commands, std::uint32_t count, const VkViewport* viewports) {
+    auto line = begin(name, commands);
+    bytes(line, count);
+    items(line, viewports, count);
+    record(std::move(line));
+}
+
+VKAPI_ATTR void VKAPI_CALL stubSetScissorWithCount(VkCommandBuffer commands, std::uint32_t count, const VkRect2D* scissors) {
+    countedScissors(SetScissorWithCountName, commands, count, scissors);
+}
+
+VKAPI_ATTR void VKAPI_CALL stubSetScissorWithCountEXT(VkCommandBuffer commands, std::uint32_t count, const VkRect2D* scissors) {
+    countedScissors(SetScissorWithCountEXTName, commands, count, scissors);
+}
+
+VKAPI_ATTR void VKAPI_CALL stubSetViewportWithCount(VkCommandBuffer commands, std::uint32_t count, const VkViewport* viewports) {
+    countedViewports(SetViewportWithCountName, commands, count, viewports);
+}
+
+VKAPI_ATTR void VKAPI_CALL stubSetViewportWithCountEXT(VkCommandBuffer commands, std::uint32_t count, const VkViewport* viewports) {
+    countedViewports(SetViewportWithCountEXTName, commands, count, viewports);
+}
+
 VKAPI_ATTR void VKAPI_CALL stubUpdateDescriptorSets(VkDevice, std::uint32_t, const VkWriteDescriptorSet*, std::uint32_t, const VkCopyDescriptorSet*) {}
+
+VKAPI_ATTR void VKAPI_CALL stubAbsent() {}
+
+bool absentAreStubbed = false;
 
 VKAPI_ATTR VkResult VKAPI_CALL stubAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo*, VkDescriptorSet*) {
     return VK_SUCCESS;
@@ -472,7 +554,8 @@ int procLookups = 0;
 PFN_vkVoidFunction VKAPI_CALL stubProc(VkDevice, const char* name) {
     ++procLookups;
     const auto found = stubTable().find(name);
-    return found != stubTable().end() ? found->second : nullptr;
+    if (found != stubTable().end()) return found->second;
+    return absentAreStubbed ? reinterpret_cast<PFN_vkVoidFunction>(&stubAbsent) : nullptr;
 }
 
 PFN_vkVoidFunction VKAPI_CALL variantProc(VkDevice device, const char* name) {
@@ -547,6 +630,12 @@ struct Data {
     std::array<VkImageResolve, 2> resolves;
     std::array<VkViewport, 2> viewports;
     std::array<VkRect2D, 2> scissors;
+    std::array<VkShaderStageFlagBits, 2> shaderStages;
+    std::array<VkShaderEXT, 2> shaderObjects;
+    std::array<VkCommandBuffer, 2> secondaries;
+    std::array<VkColorComponentFlags, 3> writeMasks;
+    VkDepthBiasRepresentationInfoEXT biasRepresentation;
+    VkDepthBiasInfoEXT bias;
 };
 
 void pattern(void* target, std::size_t size, unsigned char& seed) {
@@ -602,6 +691,12 @@ void makeData(Data& data, std::vector<unsigned char>& large) {
     fill(data.resolves);
     data.viewports = {{{0.0f, 0.0f, 1920.0f, 1080.0f, 0.0f, 1.0f}, {16.0f, 32.0f, 64.0f, 128.0f, 0.25f, 0.75f}}};
     fill(data.scissors);
+    data.shaderStages = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT};
+    data.shaderObjects = {fake<VkShaderEXT>(0x2900), fake<VkShaderEXT>(0x2901)};
+    data.secondaries = {fake<VkCommandBuffer>(0x2a00), fake<VkCommandBuffer>(0x2a10)};
+    data.writeMasks = {0xfu, 0x7u, 0x1u};
+    data.biasRepresentation = {VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT, nullptr, VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT, VK_TRUE};
+    data.bias = {VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT, &data.biasRepresentation, 1.5f, 0.25f, 2.0f};
     large.resize(65536);
     pattern(large.data(), large.size(), seed);
 }
@@ -665,6 +760,22 @@ void recordAll(VkCommandBuffer commands, const Functions& f, const Data& d, cons
     f.cmdSetStencilTestEnableEXT(commands, VK_TRUE);
     f.cmdSetStencilWriteMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK, 0xf0);
     f.cmdSetViewport(commands, 1, 2, d.viewports.data());
+    f.cmdBindShadersEXT(commands, 2, d.shaderStages.data(), d.shaderObjects.data());
+    f.cmdExecuteCommands(commands, 2, d.secondaries.data());
+    f.cmdSetColorWriteMaskEXT(commands, 1, 3, d.writeMasks.data());
+    f.cmdSetCullMode(commands, VK_CULL_MODE_FRONT_BIT);
+    f.cmdSetDepthBias2EXT(commands, &d.bias);
+    f.cmdSetDepthBoundsTestEnable(commands, VK_FALSE);
+    f.cmdSetDepthCompareOp(commands, VK_COMPARE_OP_LESS);
+    f.cmdSetDepthTestEnable(commands, VK_FALSE);
+    f.cmdSetDepthWriteEnable(commands, VK_TRUE);
+    f.cmdSetFrontFace(commands, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    f.cmdSetScissorWithCount(commands, 2, d.scissors.data());
+    f.cmdSetScissorWithCountEXT(commands, 1, d.scissors.data() + 1);
+    f.cmdSetStencilOp(commands, VK_STENCIL_FACE_BACK_BIT, VK_STENCIL_OP_ZERO, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_INVERT, VK_COMPARE_OP_ALWAYS);
+    f.cmdSetStencilTestEnable(commands, VK_FALSE);
+    f.cmdSetViewportWithCount(commands, 2, d.viewports.data());
+    f.cmdSetViewportWithCountEXT(commands, 1, d.viewports.data() + 1);
     f.cmdUpdateBuffer(commands, fake<VkBuffer>(0x130f), 64, d.updateBytes.size(), d.updateBytes.data());
     f.cmdUpdateBuffer(commands, fake<VkBuffer>(0x1310), 0, large.size(), large.data());
     f.cmdWriteBufferMarkerAMD(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, fake<VkBuffer>(0x1311), 4, 0x1234);
@@ -695,7 +806,7 @@ void EveryOpReplaysItsDeepCopies() {
     const auto direct = calls;
     std::set<std::string> names;
     for (const auto& call : direct) names.insert(call.substr(0, call.find('@')));
-    Expect(names.size() == 53, "the direct calls reached " + std::to_string(names.size()) + " of the 53 functions");
+    Expect(names.size() == 69, "the direct calls reached " + std::to_string(names.size()) + " of the 69 functions");
     CommandStream stream;
     calls.clear();
     recordAll(stream.Handle(), functions, data, large);
@@ -740,7 +851,9 @@ void ResolverRefusals() {
     Expect(context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets") == reinterpret_cast<PFN_vkUpdateDescriptorSets>(&stubUpdateDescriptorSets), "a function that takes no command buffer was wrapped");
     ExpectThrows([&] { context.Function<PFN_vkVoidFunction>("vkCreateFence"); }, "missing Vulkan function: vkCreateFence", "resolving a function the device lacks");
     DeviceFunctions table{};
+    absentAreStubbed = true;
     FillDeviceFunctions(context, table);
+    absentAreStubbed = false;
     Expect(table.cmdDraw == context.Function<PFN_vkCmdDraw>("vkCmdDraw") && table.cmdBeginRendering == context.Function<PFN_vkCmdBeginRenderingKHR>("vkCmdBeginRenderingKHR"), "the device's function table does not hold the command stream thunks");
     Expect(reinterpret_cast<PFN_vkVoidFunction>(table.updateDescriptorSets) == reinterpret_cast<PFN_vkVoidFunction>(&stubUpdateDescriptorSets), "the device's function table wrapped vkUpdateDescriptorSets");
     context.functions = &table;
