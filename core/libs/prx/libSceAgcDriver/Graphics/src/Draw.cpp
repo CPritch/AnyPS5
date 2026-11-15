@@ -21,6 +21,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/InputMirror.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -4209,6 +4210,8 @@ void checkAttachments(const State& state, const PreparedDraw& prepared) {
     for (std::size_t index = 0; same && index < memo.views.size(); ++index) same = prepared.targets[index].resident == memo.residents[index].lock() && prepared.targetViews[index] == memo.views[index];
     if (same && state.depth) same = prepared.targetViews.back() == memo.depthView;
     noteAttachments(same ? AttachmentEvent::Verified : AttachmentEvent::Mismatch);
+    DriverDetail::CountVerify(DriverDetail::VerifyCount::PassAttachmentsChecked);
+    if (!same) DriverDetail::CountVerify(DriverDetail::VerifyCount::PassAttachmentsDiffered);
     if (!same) {
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[pass-attachments] verify: the memo's attachments differ from the full lookup (target 0x%llx, depth 0x%llx)\n", static_cast<unsigned long long>(state.hasColorTarget ? state.color.address : 0), static_cast<unsigned long long>(state.depth ? state.depth->address : 0));

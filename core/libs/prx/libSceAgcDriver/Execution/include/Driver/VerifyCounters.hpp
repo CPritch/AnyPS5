@@ -32,9 +32,11 @@ enum class VerifyCount : std::size_t {
     FixedImageLookupChecked,
     FixedImageLookupSkipped,
     AbsorbWitnessChecked,
+    PassAttachmentsChecked,
+    PassAttachmentsDiffered,
 };
 
-constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::AbsorbWitnessChecked) + 1;
+constexpr std::size_t VerifyCountSize = static_cast<std::size_t>(VerifyCount::PassAttachmentsDiffered) + 1;
 
 using VerifyCounts = std::array<std::uint64_t, VerifyCountSize>;
 

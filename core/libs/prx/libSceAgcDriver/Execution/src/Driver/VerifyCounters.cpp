@@ -36,6 +36,8 @@ constexpr std::array<Entry, VerifyCountSize> Entries{{
     {"vf_fixed_image_lookup_checked", "APS5_VERIFY_FIXED_IMAGE_LOOKUP"},
     {"vf_fixed_image_lookup_skipped", "APS5_VERIFY_FIXED_IMAGE_LOOKUP"},
     {"vf_absorb_witness_checked", "APS5_VERIFY_ABSORB_WITNESS"},
+    {"vf_pass_attachments_checked", "APS5_VERIFY_PASS_ATTACHMENTS"},
+    {"vf_pass_attachments_differed", "APS5_VERIFY_PASS_ATTACHMENTS"},
 }};
 
 std::array<std::atomic<std::uint64_t>, VerifyCountSize> totals{};
