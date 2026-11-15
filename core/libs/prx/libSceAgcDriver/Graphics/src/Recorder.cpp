@@ -2437,8 +2437,13 @@ void Recorder::SealPassWriteOnly() {
     if (open != nullptr) open->passHazards.SealWriteOnly();
 }
 
+bool Recorder::RenderPassOpen() const {
+    return open != nullptr && open->renderPass.open;
+}
+
 void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    ++passGeneration;
     auto& pass = open->renderPass;
     if (pass.draws != 0) {
         if (passDraws.size() >= 8192) passDraws.clear();
@@ -2555,6 +2560,7 @@ void Recorder::ensureOpen() {
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
     if (open == nullptr) {
+        ++passGeneration;
         auto batch = std::make_unique<Batch>();
         try {
             VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
