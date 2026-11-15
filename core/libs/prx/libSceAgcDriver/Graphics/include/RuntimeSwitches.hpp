@@ -20,7 +20,7 @@ enum class RuntimeSwitch : std::size_t {
     NoSpinHandoff,
     NoPassAttachmentMemo,
     NoAsyncSubmit,
-    DeferredEncode,
+    NoDeferredEncode,
     Count,
 };
 

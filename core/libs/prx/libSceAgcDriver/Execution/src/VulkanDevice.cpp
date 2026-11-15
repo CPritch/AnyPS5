@@ -2549,7 +2549,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->shaderProfile = std::move(shaderProfile);
     if (compileOnly) return;
     if (state->deferDestruction) state->contextDeviceProc = Graphics::DeferDestructionToIdle(state->device, state->deviceProc);
-    if (std::getenv("APS5_DEFERRED_ENCODE") != nullptr || Graphics::AbConfigured()) state->contextDeviceProc = Graphics::RecordCommandStreams(state->device, state->contextDeviceProc != nullptr ? state->contextDeviceProc : state->deviceProc);
+    if (std::getenv("APS5_NO_DEFERRED_ENCODE") == nullptr || Graphics::AbConfigured()) state->contextDeviceProc = Graphics::RecordCommandStreams(state->device, state->contextDeviceProc != nullptr ? state->contextDeviceProc : state->deviceProc);
     if (calibratedTimestamps != nullptr) {
         const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
         const auto domains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(state->instanceProc(state->instance, khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));
