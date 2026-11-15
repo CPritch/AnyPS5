@@ -941,7 +941,7 @@ public:
     }
 
     static void Amount(const char* scope, std::uint64_t amount) {
-        if (amount == 0 || !Recording()) return;
+        if (amount == 0 || !RecordingSlices()) return;
         if (auto* thread = Thread()) thread->Count(scope, amount);
     }
 
