@@ -1553,12 +1553,12 @@ struct OwnedPipelineBuild {
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 
-std::shared_ptr<Pipeline> residentPipeline(PipelineStore& store, const Context& context, std::uint64_t hash, const std::vector<std::byte>& key, bool& collision) {
+std::shared_ptr<Pipeline> residentPipeline(PipelineStore& store, const Context& context, std::uint64_t hash, std::span<const std::byte> key, bool& collision) {
     collision = false;
     const auto found = store.index.find(hash);
     if (found == store.index.end()) return nullptr;
     const auto it = found->second;
-    if (it->key != key) {
+    if (it->key.size() != key.size() || std::memcmp(it->key.data(), key.data(), key.size()) != 0) {
         collision = true;
         return nullptr;
     }
@@ -1579,8 +1579,9 @@ PipelineWanted WantCachedPipeline(const Context& context, const State& state, co
     PipelineWanted wanted;
     auto& store = Pipelines();
     struct WantedKeyStorage {};
-    auto& key = HostThreadLocal<std::vector<std::byte>, WantedKeyStorage>();
-    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    auto& storage = HostThreadLocal<std::vector<std::byte>, WantedKeyStorage>();
+    const auto length = pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout);
+    const std::span<const std::byte> key(storage.data(), length);
     if (key.empty()) {
         NoteDirectCompile(DirectCompile::PrivatePipeline);
         wanted.direct = true;
@@ -1617,8 +1618,8 @@ PipelineWanted WantCachedPipeline(const Context& context, const State& state, co
         }
         return [build, hash] {
             std::vector<std::byte> ownKey;
-            pipelineKey(ownKey, build->context, build->state, build->vertexInput, build->layouts, build->shaders, build->attachmentLayout);
-            if (ownKey.empty() || hashKey(ownKey) != hash) throw std::runtime_error("AGC graphics: a canonical pipeline state keys differently from its draw");
+            const auto ownLength = pipelineKey(ownKey, build->context, build->state, build->vertexInput, build->layouts, build->shaders, build->attachmentLayout);
+            if (ownLength == 0 || hashKey(std::span<const std::byte>(ownKey.data(), ownLength)) != hash) throw std::runtime_error("AGC graphics: a canonical pipeline state keys differently from its draw");
             static_cast<void>(CachedPipeline(build->context, build->state, build->vertexInput, build->layouts, build->shaders, build->attachmentLayout));
         };
     }, urgent);

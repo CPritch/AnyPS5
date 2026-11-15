@@ -1582,6 +1582,28 @@ struct WriteTracker {
         }
     }
 
+    void forgetObserved(std::uint64_t begin, std::uint64_t end) {
+        for (auto& entry : exactObservations) {
+            if (entry.first < end && begin < entry.stop) entry = {};
+        }
+#ifdef _WIN32
+        begin = std::max(begin, static_cast<std::uint64_t>(base));
+        end = std::min(end, static_cast<std::uint64_t>(base) + size);
+#endif
+        if (end <= begin) return;
+        const auto last = blockOf(end - 1);
+        for (auto block = blockOf(begin); block <= last;) {
+            const auto index = block / LeafBlocks;
+            if (index >= observationLeafCount) return;
+            const auto stop = std::min<std::uint64_t>(last + 1, (index + 1) * LeafBlocks);
+            if (auto* leaf = observationLeaves[index].load(std::memory_order_relaxed)) {
+                for (auto at = block; at < stop; ++at) leaf->ticks[at % LeafBlocks].store(0, std::memory_order_release);
+                for (auto group = (block % LeafBlocks) / CoarseBlocks; group <= ((stop - 1) % LeafBlocks) / CoarseBlocks; ++group) leaf->coarse[group].store(0, std::memory_order_release);
+            }
+            block = stop;
+        }
+    }
+
     bool covers(std::uint64_t address, std::size_t bytes) const {
 #ifdef _WIN32
         return coverage.Covers(address, bytes) && !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
@@ -2083,7 +2105,17 @@ struct ThreadCollectMemo {
 };
 
 void syncObservationContext(WriteTracker& tracker, std::uint64_t unwatched, std::uint64_t mapping) {
-    if (tracker.observationUnwatched.load(std::memory_order_relaxed) == unwatched && tracker.observationMapping.load(std::memory_order_relaxed) == mapping) return;
+    const auto held = tracker.observationMapping.load(std::memory_order_relaxed);
+    const bool watchHeld = tracker.observationUnwatched.load(std::memory_order_relaxed) == unwatched;
+    if (watchHeld && held == mapping) return;
+    struct SpanSlot {};
+    auto& spans = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, SpanSlot>();
+    std::uint64_t through = 0;
+    if (watchHeld && GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(held, &spans, &through)) {
+        for (const auto& [begin, end] : spans) tracker.forgetObserved(begin, end);
+        tracker.observationMapping.store(through, std::memory_order_release);
+        return;
+    }
     tracker.observationFloor.store(nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1, std::memory_order_release);
     tracker.observationUnwatched.store(unwatched, std::memory_order_release);
     tracker.observationMapping.store(mapping, std::memory_order_release);
@@ -2433,7 +2465,16 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         if (end > from) tracker.publishObserved(from, end - 1, tick);
     }
     if (status != Status::Complete) return {status, 0};
-    if (token != 0) shareWalk(token, {first, stop, unwatchSerial.load(std::memory_order_relaxed), mapping, generation});
+    if (token != 0) {
+        const auto serial = unwatchSerial.load(std::memory_order_relaxed);
+        bool widened = false;
+        for (std::size_t index = 0; index < done; ++index) {
+            if (runs[index].first > first || runs[index].stop < stop) continue;
+            shareWalk(token, {runs[index].first, runs[index].stop, serial, mapping, generation});
+            widened = true;
+        }
+        if (!widened) shareWalk(token, {first, stop, serial, mapping, generation});
+    }
     return {Status::Complete, generation};
 }
 

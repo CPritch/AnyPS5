@@ -366,8 +366,16 @@ void importJournalTests(const Context& context) {
     Require(kept != nullptr && kept->base == first && kept->bytes == piece, "a mapping elsewhere lost an unrelated import");
     change(guest + 8 * piece, false);
     change(guest + piece, true);
+    const auto* beside = HostImportFor(importing, first, piece);
+    Require(beside != nullptr && beside->base == first && beside->bytes == piece, "an adjacent mapping retired an import whose own range did not change");
+    {
+        GuestBufferMemory building(importing);
+        building.AcquireRegistered();
+        building.Upload(true);
+        building.WriteBack();
+    }
     const auto* grown = HostImportFor(importing, first, 2 * piece);
-    Require(grown != nullptr && grown->bytes == 2 * piece, "an adjacent mapping did not grow the import");
+    Require(grown != nullptr && grown->bytes == 2 * piece, "the build after an adjacent mapping did not grow the import");
     change(guest + piece, false);
     Require(HostImportFor(importing, first + piece, 16) == nullptr, "an unmap overlapping an import left the import");
     const auto* shrunk = HostImportFor(importing, first, piece);
@@ -415,8 +423,16 @@ void journalSeesNeighboursTest(const Context& context) {
     const auto address = fixture.Address(0, 2);
     Require(HostImportFor(importing, address, JournalPiece) != nullptr, "the neighbour fixture was not imported");
     fixture.Add(0, 3);
+    const auto* beside = HostImportFor(importing, address, JournalPiece);
+    Require(beside != nullptr && beside->base == address && beside->bytes == JournalPiece, "a mapping right next to an import retired it, though its own range did not change");
+    {
+        GuestBufferMemory building(importing);
+        building.AcquireRegistered();
+        building.Upload(true);
+        building.WriteBack();
+    }
     const auto* grown = HostImportFor(importing, address, JournalPiece);
-    Require(grown != nullptr && grown->base == address && grown->bytes == 2 * JournalPiece, "the journal kept an import over a mapping right next to it");
+    Require(grown != nullptr && grown->base == address && grown->bytes == 2 * JournalPiece, "the build after a mapping right next to an import did not grow it: the journal kept the growth from being owed");
     fixture.Add(0, 6);
     const auto* same = HostImportFor(importing, address, JournalPiece);
     Require(same == grown, "a mapping in the import's window that its run does not reach replaced the import");

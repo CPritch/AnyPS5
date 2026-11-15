@@ -391,7 +391,7 @@ std::vector<std::pair<pid_t, std::string>> DriverThreads() {
             std::ifstream comm(std::string("/proc/self/task/") + entry->d_name + "/comm");
             std::string name;
             std::getline(comm, name);
-            if (name.rfind("qworker 0x0", 0) == 0 || name.rfind("draw-commit", 0) == 0 || name.rfind("draw-finish", 0) == 0 || name.rfind("llvmpipe-", 0) == 0) threads.emplace_back(static_cast<pid_t>(std::stol(entry->d_name)), name + "/" + entry->d_name);
+            if (name.rfind("queue worker 0x", 0) == 0 || name.rfind("draw committer", 0) == 0 || name.rfind("draw finisher", 0) == 0 || name.rfind("llvmpipe-", 0) == 0) threads.emplace_back(static_cast<pid_t>(std::stol(entry->d_name)), name + "/" + entry->d_name);
         }
         closedir(tasks);
     }
@@ -402,8 +402,8 @@ std::vector<std::pair<pid_t, std::string>> DriverThreads() {
 void RequireNamedDriverThreads() {
     const auto threads = DriverThreads();
     const auto named = [&](const char* prefix) { return std::any_of(threads.begin(), threads.end(), [&](const auto& thread) { return thread.second.rfind(prefix, 0) == 0; }); };
-    Require(named("qworker 0x0"), "village draw cost: no thread is named qworker 0x0, so the driver CPU split cannot find the queue worker");
-    Require(named("draw-commit"), "village draw cost: no thread is named draw-commit, so the driver CPU split cannot find the committer");
+    Require(named("queue worker 0x"), "village draw cost: no thread is named queue worker 0x..., so the driver CPU split cannot find the queue worker");
+    Require(named("draw committer"), "village draw cost: no thread is named draw committer, so the driver CPU split cannot find the committer");
 }
 
 std::uint64_t ThreadCpuNs(pid_t tid) {

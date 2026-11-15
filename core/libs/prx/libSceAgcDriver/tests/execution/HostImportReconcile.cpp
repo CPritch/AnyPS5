@@ -233,8 +233,7 @@ Outcome ReconcileFollowsTheChanges() {
     Remove(arena, HalfWindow + 2 * MiB);
     Require(Graphics::HostImportsReconciledUnchanged(context, proof) && serial(first) == kept, "host import reconcile: removing registrations apart from its run dropped the import at " + Hex(first));
     Add(arena, HalfWindow, HalfWindow);
-    Require(!Graphics::HostImportsReconciledUnchanged(context, proof), "host import reconcile: a registration completed the window of " + Hex(first) + ", but the proof over its import held");
-    Require(serial(first) != kept, "host import reconcile: the import at " + Hex(first) + " stayed although its run grew to the whole window");
+    Require(Graphics::HostImportsReconciledUnchanged(context, proof) && serial(first) == kept, "host import reconcile: a registration that completed the window of " + Hex(first) + " retired its import, whose own range did not change");
     Remove(arena, HalfWindow);
 
     Require(Fill(*device, first), "host import reconcile: the range at " + Hex(first) + " cannot be filled again");

@@ -1993,7 +1993,7 @@ void Driver::restartFinishedDraw(DrawTail& tail) {
         }
         for (auto& program : tail.writablePrograms) {
             if (program.nullPixel || !changed(program)) continue;
-            auto snapshot = ProgramSnapshot(*tail.submission->shaders, program.binary.codeAddress, {program.snapshot->type});
+            auto snapshot = ProgramSnapshot(*tail.shaders, program.binary.codeAddress, {program.snapshot->type});
             if (snapshot == program.snapshot) continue;
             const auto& fresh = *snapshot;
             program.codeOffset = static_cast<std::size_t>((program.binary.codeAddress - fresh.codeAddress) / sizeof(std::uint32_t));

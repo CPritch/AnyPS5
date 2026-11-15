@@ -570,9 +570,13 @@ void CheckMappingChangeForcesWalk() {
     Require(CollectWrites(address, Page) != 0, "the first collect failed");
     const auto before = OsWalks();
     Require(CollectWrites(address, Page) != 0 && OsWalks() == before, "the retained walk was not reused");
+    const bool journal = std::getenv("APS5_NO_ALLOCATION_JOURNAL") == nullptr;
     GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(Base + 100 * Block), Page);
-    Require(CollectWrites(address, Page) != 0 && OsWalks() == before + 1, "a mapping change did not force a walk");
-    Require(CollectWrites(address, Page) != 0 && OsWalks() == before + 1, "the walk after a mapping change was not retained");
+    const auto elsewhere = before + (journal ? 0u : 1u);
+    Require(CollectWrites(address, Page) != 0 && OsWalks() == elsewhere, journal ? "a mapping change in another block forced a walk" : "a mapping change did not force a walk");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(Base + 60 * Block), Page);
+    Require(CollectWrites(address, Page) != 0 && OsWalks() == elsewhere + 1, "a mapping change in the block did not force a walk");
+    Require(CollectWrites(address, Page) != 0 && OsWalks() == elsewhere + 1, "the walk after a mapping change was not retained");
 }
 
 void CheckFailedRequestPublishesNothing() {
@@ -650,6 +654,8 @@ void CheckCoverageGapsAndInvalidations() {
     Require(Walked(Base + Block, 3 * Block, probe) != journal, journal ? "an allocation change outside an observation dropped it" : "an allocation change retained an old observation");
     if (journal) {
         GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(Base + 3 * Block), Page);
+        Require(!Walked(Base + Block, 3 * Block, probe), "an allocation change in another block of an observation dropped the probed block");
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(Base + 2 * Block), Page);
         Require(Walked(Base + Block, 3 * Block, probe), "an allocation change inside an observation retained it");
     }
     Unwatch(Base + 91 * Block, Page);

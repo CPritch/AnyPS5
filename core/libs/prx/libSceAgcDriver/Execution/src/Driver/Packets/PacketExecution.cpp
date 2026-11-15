@@ -200,6 +200,10 @@ public:
         return at != flips.end() && at->first == cursor;
     }
 
+    void Reset() {
+        at = flips.begin();
+    }
+
 private:
     const decltype(Submission::flips)& flips;
     decltype(Submission::flips)::const_iterator at;
@@ -218,6 +222,10 @@ public:
         const auto found = submission.FindRegisterList(cursor);
         if (!found.found) throw std::out_of_range("indirect register packet has no register list read at submission");
         return found;
+    }
+
+    void Reset() {
+        at = 0;
     }
 
 private:
@@ -399,6 +407,8 @@ void Driver::execute(Submission& submission) {
         while (nextSegment < submission.indirectSegments.size() && submission.indirectSegments[nextSegment].start <= cursor) {
             if (submission.indirectSegments[nextSegment].start == cursor && refreshIndirectSegment(submission, nextSegment)) {
                 recent.commands = submission.commands;
+                flipAt.Reset();
+                registerListAt.Reset();
                 continue;
             }
             ++nextSegment;
