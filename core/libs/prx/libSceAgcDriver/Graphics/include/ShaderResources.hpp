@@ -496,6 +496,11 @@ public:
         std::uint64_t bytes = 0;
     };
     static CollectRefusals CollectRefusalCounts();
+    struct UntrackedReproofs {
+        std::uint64_t stamped = 0;
+        std::uint64_t compared = 0;
+    };
+    static UntrackedReproofs UntrackedReproofCounts();
     struct PendingFails {
         std::uint64_t foreign = 0;
         std::uint64_t snapshot = 0;
@@ -721,6 +726,7 @@ private:
         bool committedProved = false;
         std::uint64_t aliasSerial = 0;
         bool aliased = false;
+        std::array<std::uint64_t, 4> untracked{};
     };
     bool keepsTemplateRecords() const;
     void captureValidation();
@@ -746,7 +752,7 @@ private:
     // holds; `reason` receives why the proof failed (Count: it passed), `overlapping` the surfaces
     // of a Pending failure in element order (empty otherwise), `accepted` whether a foreign overlap
     // was accepted by either rule (the verify switch then runs the full walk beside the proof).
-    bool fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, const std::vector<std::size_t>* only = nullptr, bool withStorage = true);
+    bool fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, const std::vector<std::size_t>* only = nullptr, bool withStorage = true, bool compares = true);
     enum class IndexOutcome : std::uint8_t { Accepted, Partial, Fallback };
     IndexOutcome indexRevalidate(std::span<const CompiledShader> shaders, std::uint64_t serialBefore);
     void subscribeIndex(std::span<const CompiledShader> shaders);
@@ -901,6 +907,7 @@ private:
     mutable std::atomic<std::uint64_t> guardsPlainColor{~std::uint64_t{0}};
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
+    std::vector<std::array<std::uint64_t, 4>> storageUntracked;
     std::vector<ShaderRecompiler::RegisteredImageView> registeredImageViews;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
     // its checks and kept only when unchanged after them (0: none): while it is still the serial,

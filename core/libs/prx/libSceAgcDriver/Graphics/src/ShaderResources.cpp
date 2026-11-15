@@ -198,6 +198,8 @@ struct CachedTexture {
     // The untrackedKey the snapshot was last read or compared equal at, for a surface outside the
     // write watch; zero when none was taken.
     std::array<std::uint64_t, 4> untracked{};
+    std::array<std::uint64_t, 4> proved{};
+    bool refuted = false;
     std::uint64_t surfaceBytes = 0;
     std::optional<CommittedSlabs> slabs;
 };
@@ -868,6 +870,28 @@ std::array<std::uint64_t, 4> untrackedKey(std::uint64_t address, std::size_t byt
     return (key[2] & 1u) == 0 ? key : std::array<std::uint64_t, 4>{};
 }
 
+std::array<std::uint64_t, 4> untrackedRangeStamp(std::uint64_t address, std::size_t bytes);
+
+bool UntrackedProofsVerified() {
+    static const bool verify = std::getenv("APS5_VERIFY_UNTRACKED_PROOFS") != nullptr;
+    return verify;
+}
+
+bool UntrackedReproofEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_UNTRACKED_REPROOF") != nullptr;
+    return !disabled;
+}
+
+struct UntrackedReproofCounters {
+    std::atomic<std::uint64_t> stamped{0};
+    std::atomic<std::uint64_t> compared{0};
+};
+
+UntrackedReproofCounters& ReproofCounters() {
+    static UntrackedReproofCounters counters;
+    return counters;
+}
+
 std::span<const std::uint32_t> firstLayerWords(std::span<const std::uint32_t> words, std::optional<ShaderRecompiler::DescriptorImageShape> shape, std::array<std::uint32_t, 8>& narrowed, bool report) {
     if (shape != ShaderRecompiler::DescriptorImageShape::Image2D || words.size() != narrowed.size() || IsNullSampledTextureResource(words)) return words;
     try {
@@ -1290,7 +1314,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             committed = std::move(ranges);
         }
     }
-    const auto untracked = source == nullptr && generation == 0 && !committed.has_value() && *keys == DccKeys::Uncompressed ? untrackedKey(address, bytes) : std::array<std::uint64_t, 4>{};
+    const bool keyed = source == nullptr && generation == 0 && !committed.has_value() && *keys == DccKeys::Uncompressed;
+    const auto untracked = keyed ? untrackedKey(address, bytes) : std::array<std::uint64_t, 4>{};
+    const auto epochStamp = keyed && untracked[0] == 0 && UntrackedReproofEnabled() ? untrackedRangeStamp(address, bytes) : std::array<std::uint64_t, 4>{};
     auto slabs = slabbed ? committedSlabs(resource, guestBytes, committed) : std::nullopt;
     const auto snapshotSize = snapshotBytes(slabs, bytes);
     auto& cache = Textures();
@@ -1314,7 +1340,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
-        } else if (source == nullptr && it->surfaceBytes == guestBytes && it->keys == *keys && it->slabs == slabs && stillCommitted(slabs, it->slabs)) {
+        } else if (source == nullptr && it->surfaceBytes == guestBytes && it->keys == *keys && it->slabs == slabs && stillCommitted(slabs, it->slabs) && !it->refuted) {
             // Unwritten pages need no comparison; partially resident textures compare only committed
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
@@ -1346,10 +1372,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 staleProof = true;
                 return false;
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || proved() || kept() || (!staleProof && equalsCommitted())) {
+            const auto proven = [&] {
+                const bool same = epochStamp[0] != 0 && it->proved == epochStamp && !UntrackedProofsVerified() && !Recorder::SnapshotWriteOverlaps(address, bytes);
+                if (same) ReproofCounters().stamped.fetch_add(1, std::memory_order_relaxed);
+                return same;
+            };
+            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || proved() || kept() || (!staleProof && (proven() || equalsCommitted()))) {
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 it->untracked = untracked;
+                it->proved = epochStamp;
                 touchTexture(cache, it);
                 LookupRecord record{it->texture.get(), resource, guestBytes, *keys, generation, nullptr};
                 if (generation == 0 && it->committed.has_value()) {
@@ -1424,7 +1456,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         const auto read = staging != nullptr ? staging->Bytes() : std::span<std::byte>(entry.bytes);
         readSnapshot(resource, *keys, entry.slabs, read);
-        if (!pending) entry.untracked = untracked;
+        if (!pending) {
+            entry.untracked = untracked;
+            entry.proved = epochStamp;
+        }
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
             std::size_t nonzero = 0;
@@ -1467,6 +1502,44 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     reportTextureCounters();
     if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
     return texture;
+}
+
+enum class SnapshotProof { Refused, Stamped, Unproved };
+
+CachedTexture* untrackedSnapshotEntry(TextureCache& cache, const Texture& texture, std::uint64_t address, std::size_t bytes) {
+    const auto found = cache.byTexture.find(&texture);
+    if (found == cache.byTexture.end()) return nullptr;
+    auto& entry = *found->second;
+    if (entry.source != nullptr || entry.address != address || entry.surfaceBytes != bytes || entry.bytes.size() != bytes || entry.keys != DccKeys::Uncompressed || entry.committed.has_value() || entry.refuted) return nullptr;
+    return &entry;
+}
+
+SnapshotProof untrackedSnapshotStamped(const Texture& texture, std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 4>& stamp) {
+    if (stamp[0] == 0 || Recorder::SnapshotWriteOverlaps(address, bytes)) return SnapshotProof::Refused;
+    auto& cache = Textures();
+    std::lock_guard lock(cache.mutex);
+    const auto* entry = untrackedSnapshotEntry(cache, texture, address, bytes);
+    if (entry == nullptr) return SnapshotProof::Refused;
+    if (entry->proved != stamp) return SnapshotProof::Unproved;
+    ReproofCounters().stamped.fetch_add(1, std::memory_order_relaxed);
+    return SnapshotProof::Stamped;
+}
+
+bool untrackedSnapshotCompared(const Texture& texture, std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 4>& stamp) {
+    if (Recorder::SnapshotWriteOverlaps(address, bytes) || PendingStorageOverlaps(address, bytes, nullptr)) return false;
+    auto& cache = Textures();
+    std::lock_guard lock(cache.mutex);
+    auto* entry = untrackedSnapshotEntry(cache, texture, address, bytes);
+    if (entry == nullptr) return false;
+    if (entry->proved == stamp) return true;
+    ReproofCounters().compared.fetch_add(1, std::memory_order_relaxed);
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+    if (!GuestMemory::EqualsCommitted(address, entry->bytes)) {
+        entry->refuted = true;
+        return false;
+    }
+    entry->proved = stamp;
+    return true;
 }
 
 // Storage images stay on the GPU between dispatches: while guest memory still holds what an image was
@@ -3909,6 +3982,23 @@ void countFullWalkTime(FastFail reason, std::chrono::steady_clock::time_point st
     Revalidations().fullNanoseconds[static_cast<std::size_t>(reason)].fetch_add(static_cast<std::uint64_t>(nanoseconds), std::memory_order_relaxed);
 }
 
+struct UntrackedVerification {
+    std::atomic<std::uint64_t> checked{0}, disagreed{0};
+};
+
+UntrackedVerification& UntrackedVerified() {
+    static UntrackedVerification verification;
+    static const bool registered = [] {
+        std::atexit([] {
+            const auto& total = UntrackedVerified();
+            if (total.checked.load() != 0) std::fprintf(stderr, "[verify-untracked] at exit: %llu fast proofs over untracked memory checked by the full walk, %llu disagreed\n", static_cast<unsigned long long>(total.checked.load()), static_cast<unsigned long long>(total.disagreed.load()));
+        });
+        return true;
+    }();
+    (void)registered;
+    return verification;
+}
+
 constexpr std::size_t RefusedSurfaceLimit = 65536;
 
 void countCollectRefusal(bool storage, std::uint64_t address, std::size_t bytes) {
@@ -4074,6 +4164,17 @@ void LastRecordIndices(std::span<const void* const> logged, std::span<const void
     }
 }
 
+namespace {
+
+std::array<std::uint64_t, 4> untrackedRangeStamp(std::uint64_t address, std::size_t bytes) {
+    const auto epoch = GuestMemory::CollectEpoch();
+    if (epoch == 0 || bytes == 0 || (GuestMemory::ForgetSerial() & 1u) != 0) return {};
+    const auto* recorder = Recorder::Active();
+    return {epoch, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetStamp(address, bytes), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+}
+
+}
+
 bool ShaderResources::keepsTemplateRecords() const {
     static const bool always = std::getenv("APS5_KEEP_TEMPLATE_RECORDS") != nullptr;
     static const bool addressTemplates = BdaTemplatesEnabled() && std::getenv("APS5_NO_BDA_TEMPLATE_RECORDS") == nullptr;
@@ -4113,6 +4214,16 @@ void ShaderResources::captureValidation() {
         if (indices[i] == log.size()) continue;
         const auto& found = log[indices[i]];
         validatedTextures[i] = {found.resource, found.bytes, found.keys, found.generation, 0, found.source, found.depth, true, found.committedGeneration, found.committed};
+        auto& surface = validatedTextures[i];
+        if (!surface.depth && GuestMemory::CollectWrites(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes)) == 0) surface.untracked = untrackedRangeStamp(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes));
+    }
+    storageUntracked.assign(storageTextures.size(), {});
+    for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        const auto* image = storageTextures[i].get();
+        if (image == nullptr) continue;
+        const auto address = image->Descriptor().baseAddress;
+        const auto bytes = static_cast<std::size_t>(image->GuestBytes());
+        if (GuestMemory::CollectWrites(address, bytes) == 0) storageUntracked[i] = untrackedRangeStamp(address, bytes);
     }
     lookupLog().clear();
     const auto trim = [](auto& scratch) {
@@ -4137,6 +4248,11 @@ ShaderResources::CollectRefusals ShaderResources::CollectRefusalCounts() {
     counts.surfaces = profile.refusedSurfaces.size();
     for (const auto& surface : profile.refusedSurfaces) counts.bytes += surface.second;
     return counts;
+}
+
+ShaderResources::UntrackedReproofs ShaderResources::UntrackedReproofCounts() {
+    auto& counters = ReproofCounters();
+    return {counters.stamped.load(std::memory_order_relaxed), counters.compared.load(std::memory_order_relaxed)};
 }
 
 ShaderResources::PendingFails ShaderResources::PendingFailCounts() {
@@ -4194,7 +4310,7 @@ void proofLap(ProofPart part) {
 // registry mutex), so the pending-image checks are skipped; otherwise one scan answers them for
 // every surface at once. The stamp checks go through one tracker lock, the cache checks through
 // the images' cached flags and one touch of the cache.
-bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, const std::vector<std::size_t>* only, bool withStorage) {
+bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, const std::vector<std::size_t>* only, bool withStorage, bool compares) {
     reason = FastFail::Count;
     overlapping.clear();
     accepted = false;
@@ -4221,10 +4337,13 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     auto& images = ThreadScratch<std::vector<const StorageTexture*>, ImagesTag>();
     struct ScannedKeysTag {};
     auto& scannedKeys = ThreadScratch<std::vector<DccKeys>, ScannedKeysTag>();
+    struct ReproofsTag {};
+    auto& reproofs = ThreadScratch<std::vector<std::pair<std::size_t, std::array<std::uint64_t, 4>>>, ReproofsTag>();
     queries.clear();
     pending.clear();
     owners.clear();
     images.clear();
+    reproofs.clear();
     scannedKeys.assign(textures.size(), DccKeys::Uncompressed);
     const auto query = [&](std::uint64_t begin, std::uint64_t end, const StorageTexture* except, const StorageTexture* identity, PendingOverlap owner) {
         pending.push_back({begin, end, except, identity, false});
@@ -4257,9 +4376,24 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
                 surface.committedProved = true;
             }
         }
+        bool untracked = false;
         if (surface.collected == 0) {
-            countCollectRefusal(false, address, bytes);
-            return fail(FastFail::Collect);
+            const bool recorded = surface.untracked[0] != 0;
+            auto stamp = recorded ? untrackedRangeStamp(address, bytes) : std::array<std::uint64_t, 4>{};
+            if (!recorded || stamp != surface.untracked) {
+                const bool reprovable = surface.source == nullptr && UntrackedReproofEnabled() && !DepthSurfaceAt(address);
+                if (reprovable && !recorded) stamp = untrackedRangeStamp(address, bytes);
+                const auto proof = reprovable ? untrackedSnapshotStamped(*textures[i], address, bytes, stamp) : SnapshotProof::Refused;
+                if (proof == SnapshotProof::Stamped) {
+                    surface.untracked = stamp;
+                } else if (proof == SnapshotProof::Unproved && compares && recorded && surface.untracked[2] == stamp[2]) {
+                    reproofs.emplace_back(i, stamp);
+                } else {
+                    countCollectRefusal(false, address, bytes);
+                    return fail(FastFail::Collect);
+                }
+            }
+            untracked = true;
         }
         proofLap(PartCollects);
         const auto* source = surface.source;
@@ -4288,21 +4422,21 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // proof while the registry did not.
             if (keys != DccKeys::Uncompressed && !(own.dccAddress == surface.resource.dccAddress && ClearedViewServes(context, surface.resource.format, keys))) query(address, address + bytes, source, source, {i, false, false});
             else if (!unchanged) query(address, address + bytes, source, nullptr, {i, false, keys == DccKeys::Uncompressed});
-            if (surface.resource.dccAddress != 0 || own.dccAddress != 0) countKeysProven(false);
+            if (compares && (surface.resource.dccAddress != 0 || own.dccAddress != 0)) countKeysProven(false);
         } else {
             // A snapshot holds its clear texels or the guest bytes: the keys must be what it was made under.
             const auto keys = surface.resource.dccAddress != 0 ? ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof()) : DccKeys::Uncompressed;
             if (keys != surface.keys) return fail(FastFail::Keys);
             scannedKeys[i] = keys;
             if (!unchanged) query(address, address + bytes, nullptr, nullptr, {i, false, false});
-            if (surface.resource.dccAddress != 0) countKeysProven(false);
+            if (compares && surface.resource.dccAddress != 0) countKeysProven(false);
         }
         proofLap(PartKeys);
         if (source != nullptr) {
             if (!source->Cached()) return fail(FastFail::Evicted);
-            queries.push_back({address, bytes, source->GenerationFor(address, bytes)});
+            if (!untracked) queries.push_back({address, bytes, source->GenerationFor(address, bytes)});
             images.push_back(source);
-        } else if (!surface.committedProved) {
+        } else if (!surface.committedProved && !untracked) {
             queries.push_back({address, bytes, surface.generation});
         }
     }
@@ -4321,9 +4455,13 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             return fail(FastFail::Depth);
         }
         proofLap(PartDepthChecks);
+        bool untracked = false;
         if (GuestMemory::CollectWritesWitnessed(witness, address, bytes) == 0) {
-            countCollectRefusal(true, address, bytes);
-            return fail(FastFail::Collect);
+            if (i >= storageUntracked.size() || storageUntracked[i][0] == 0 || untrackedRangeStamp(address, bytes) != storageUntracked[i]) {
+                countCollectRefusal(true, address, bytes);
+                return fail(FastFail::Collect);
+            }
+            untracked = true;
         }
         proofLap(PartCollects);
         if (own.dccAddress != 0) {
@@ -4331,12 +4469,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // uploaded under, through the image's proof; the memory query below), minus its
             // byte-compare fallback; the image's generation is left where it is.
             if (!keyProofs || image->ProvedKeys() != image->UploadedKeys()) return fail(FastFail::StorageKeys);
-            countKeysProven(true);
+            if (compares) countKeysProven(true);
         }
         proofLap(PartKeys);
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
         if (!image->Cached()) return fail(FastFail::Evicted);
-        queries.push_back({address, bytes, image->GenerationFor(address, bytes)});
+        if (!untracked) queries.push_back({address, bytes, image->GenerationFor(address, bytes)});
         images.push_back(image);
     }
     proofLap(PartElements);
@@ -4356,7 +4494,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         for (std::size_t k = 0; k < pending.size(); ++k) {
             if (!pending[k].overlaps) continue;
             if (OwnImageRefreshEnabled() && owners[k].viewUncompressed && pending[k].found == pending[k].except) {
-                if (BuildProfiled()) Revalidations().ownSourceViews.fetch_add(1, std::memory_order_relaxed);
+                if (compares && BuildProfiled()) Revalidations().ownSourceViews.fetch_add(1, std::memory_order_relaxed);
                 accepted = true;
                 continue;
             }
@@ -4367,7 +4505,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
                 return viewed.get() == pending[k].except || (viewed == nullptr && entry.sourceEligible && entry.sourceRefreshed);
             };
             if (const auto entry = refreshedOwner(owners[k]); entry != refreshed.end() && (entry->storage || pending[k].found == pending[k].except || (pending[k].found == nullptr && entry->sourceEligible) || lookupAccepts(*entry))) {
-                if (BuildProfiled()) Revalidations().refreshedOverlaps.fetch_add(1, std::memory_order_relaxed);
+                if (compares && BuildProfiled()) Revalidations().refreshedOverlaps.fetch_add(1, std::memory_order_relaxed);
                 accepted = true;
                 continue;
             }
@@ -4377,7 +4515,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             countPendingFail(pending);
             return fail(FastFail::Pending);
         }
-    } else if (unchanged && BuildProfiled()) {
+    } else if (compares && unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
     proofLap(PartPendingScan);
@@ -4397,6 +4535,19 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
     }
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
+    if (!reproofs.empty()) {
+        for (const auto& [i, stamp] : reproofs) {
+            auto& surface = validatedTextures[i];
+            const auto address = surface.resource.baseAddress;
+            const auto bytes = static_cast<std::size_t>(surface.bytes);
+            if (!untrackedSnapshotCompared(*textures[i], address, bytes, stamp)) {
+                countCollectRefusal(false, address, bytes);
+                return fail(FastFail::Collect);
+            }
+            surface.untracked = stamp;
+        }
+        return fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted, only, withStorage, false);
+    }
     for (const auto* image : images) image->NoteProved();
     for (std::size_t k = 0; k < elementCount; ++k) {
         const auto i = elementAt(k);
@@ -5376,6 +5527,19 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         }
     }
     bool fast = indexProved || (!noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted));
+    {
+        static const bool verifyUntracked = std::getenv("APS5_VERIFY_UNTRACKED_PROOFS") != nullptr;
+        const bool anyUntracked = std::any_of(validatedTextures.begin(), validatedTextures.end(), [](const ValidatedSurface& surface) { return surface.untracked[0] != 0; }) || std::any_of(storageUntracked.begin(), storageUntracked.end(), [](const auto& stamp) { return stamp[0] != 0; });
+        if (verifyUntracked && fast && anyUntracked) {
+            auto& [checked, disagreed] = UntrackedVerified();
+            const auto saved = validatedTextures;
+            const auto savedStorage = storageUntracked;
+            if (!fullWalk()) disagreed.fetch_add(1, std::memory_order_relaxed);
+            validatedTextures = saved;
+            storageUntracked = savedStorage;
+            if (checked.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999) std::fprintf(stderr, "[verify-untracked] %llu fast proofs over untracked memory checked by the full walk, %llu disagreed%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(disagreed.load()), 10);
+        }
+    }
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
