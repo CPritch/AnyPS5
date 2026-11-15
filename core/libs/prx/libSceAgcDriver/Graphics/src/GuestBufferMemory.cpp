@@ -268,6 +268,7 @@ struct AddressSpaceCache {
     std::atomic<std::uint64_t> incrementalVerifiedRegions{0};
     std::atomic<std::uint64_t> incrementalVerifiedGaps{0};
     std::atomic<std::uint64_t> incrementalDifferences{0};
+    std::atomic<std::uint64_t> waiterTrims{0};
     std::atomic<std::uint64_t> contentCarried{0};
     std::atomic<std::uint64_t> contentChanged{0};
 };
@@ -4965,6 +4966,67 @@ bool dropCachedSpace() {
     return true;
 }
 
+bool waiterSpaceTrimEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_WAITER_SPACE_TRIM") == nullptr;
+    return enabled;
+}
+
+bool releaseCachedSpace(std::uint64_t address, std::uint64_t end) {
+    auto& spaces = Spaces();
+    auto old = spaces.current.load();
+    if (old == nullptr) return false;
+    const auto low = address == 0 ? 0 : address - 1;
+    const auto high = end == std::numeric_limits<std::uint64_t>::max() ? end : end + 1;
+    const auto over = std::partition_point(old->base.begin(), old->base.end(), [&](const auto& region) { return region.end <= low; });
+    const bool served = (over != old->base.end() && over->begin < high) || std::any_of(old->copied.begin(), old->copied.end(), [&](const auto& range) { return range.begin < high && low < range.end; });
+    const auto& held = old->lease.Snapshot();
+    if (!waiterSpaceTrimEnabled() || served || held == nullptr || end <= address) return dropCachedSpace();
+    auto body = std::make_shared<GuestAllocations::Lease::Body>();
+    body->chunks.reserve(held->chunks.size());
+    body->starts.reserve(held->chunks.size() + 1);
+    const auto add = [&](std::shared_ptr<const GuestAllocations::Lease::Chunk> chunk) {
+        body->starts.push_back(body->starts.back() + chunk->ranges.size());
+        body->chunks.push_back(std::move(chunk));
+    };
+    bool released = false;
+    for (const auto& chunk : held->chunks) {
+        if (chunk->ranges.empty() || chunk->high <= address || chunk->low >= end) {
+            if (!chunk->ranges.empty()) add(chunk);
+            continue;
+        }
+        auto kept = std::make_shared<GuestAllocations::Lease::Chunk>();
+        for (const auto& range : chunk->ranges) {
+            if (range->address + range->bytes <= address || range->address >= end) kept->ranges.push_back(range);
+            else released = true;
+        }
+        if (kept->ranges.empty()) continue;
+        kept->low = kept->ranges.front()->address;
+        kept->high = kept->ranges.back()->address + kept->ranges.back()->bytes;
+        add(std::move(kept));
+    }
+    if (!released) return false;
+    auto built = std::make_shared<GuestBufferMemory::AddressSpace>();
+    built->generation = old->generation;
+    built->keptThrough.store(old->keptThrough.load(std::memory_order_acquire), std::memory_order_relaxed);
+    built->importsEpoch = old->importsEpoch;
+    built->device = old->device;
+    built->serial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
+    built->content = old->content;
+    built->backing = old->backing;
+    built->lease = GuestAllocations::Lease(std::shared_ptr<const GuestAllocations::Lease::Body>(std::move(body)));
+    built->base = old->base;
+    built->copied = old->copied;
+    built->ranges = old->ranges;
+    built->directReads = old->directReads;
+    planSpaceMirrors(*built);
+    for (std::size_t index = 0; index < built->heapRuns.size() && index < old->heapRuns.size(); ++index) built->verified[index].store(old->verified[index].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    for (std::size_t index = 0; index < built->writableMirrors.size() && index < old->writableMirrors.size(); ++index) built->writableVerified[index].store(old->writableVerified[index].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    auto expected = old;
+    if (!spaces.current.compare_exchange_strong(expected, std::shared_ptr<const GuestBufferMemory::AddressSpace>(std::move(built)))) return dropCachedSpace();
+    spaces.waiterTrims.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 struct WaiterCounters {
     std::atomic<std::uint64_t> rounds{0};
     std::atomic<std::uint64_t> heldNs{0};
@@ -4993,7 +5055,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     // reference: no GPU wait, no device lock (the mutating thread may be a driver thread holding
     // it). The registry rescans; a range still pinned by a build or a batch holding the space comes
     // back here and finishes lease batches below.
-    if (dropCachedSpace()) {
+    if (releaseCachedSpace(address, static_cast<std::uint64_t>(address) + bytes)) {
         droppedAddressSpace = true;
         auto& imports = Imports();
         const auto end = static_cast<std::uint64_t>(address) + bytes;
@@ -6823,7 +6885,7 @@ void GuestBufferMemory::AcquireRegistered() {
             if (verifyIncrementalSpace()) {
                 if (outlining && outlinePieces.size() != lease.size() && spaces.incrementalDifferences.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[incremental-space] APS5_VERIFY_INCREMENTAL_SPACE: the new outline holds %zu ranges, the lease %zu\n", outlinePieces.size(), lease.size());
                 const auto load = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-                if (spaces.incrementalVerified.fetch_add(1, std::memory_order_relaxed) % 64 == 0) std::fprintf(stderr, "[incremental-space] APS5_VERIFY_INCREMENTAL_SPACE: %llu incremental rebuilds (%llu fell back), %llu regions kept in bulk, %llu ranges visited; %llu rebuilt spaces kept their templates, %llu did not; checked %llu regions and %llu gap ranges, %llu differences\n", load(spaces.incrementalRebuilds), load(spaces.incrementalFallbacks), load(spaces.incrementalKept), load(spaces.incrementalVisited), load(spaces.contentCarried), load(spaces.contentChanged), load(spaces.incrementalVerifiedRegions), load(spaces.incrementalVerifiedGaps), load(spaces.incrementalDifferences));
+                if (spaces.incrementalVerified.fetch_add(1, std::memory_order_relaxed) % 64 == 0) std::fprintf(stderr, "[incremental-space] APS5_VERIFY_INCREMENTAL_SPACE: %llu incremental rebuilds (%llu fell back), %llu regions kept in bulk, %llu ranges visited; %llu rebuilt spaces kept their templates, %llu did not; the waiter kept %llu spaces without their pins on an unmapped span and dropped %llu; checked %llu regions and %llu gap ranges, %llu differences\n", load(spaces.incrementalRebuilds), load(spaces.incrementalFallbacks), load(spaces.incrementalKept), load(spaces.incrementalVisited), load(spaces.contentCarried), load(spaces.contentChanged), load(spaces.waiterTrims), load(spaces.waiterDrops), load(spaces.incrementalVerifiedRegions), load(spaces.incrementalVerifiedGaps), load(spaces.incrementalDifferences));
             }
         }
         releaseKept();
@@ -9472,6 +9534,14 @@ GuestBufferMemory::SpaceAttach GuestBufferMemory::AttachSpace(std::uint64_t seri
         return SpaceAttach::Imports;
     }
     return SpaceAttach::Attached;
+}
+
+bool GuestBufferMemory::SpaceStillCurrent() const {
+    if (space == nullptr || Spaces().current.load() != space) return false;
+    if (GuestAllocations::GuestAllocationsMutationWaiting_nid_postfix()) return false;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return state.epoch == space->importsEpoch && space->keptThrough.load(std::memory_order_acquire) == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
 }
 
 bool GuestBufferMemory::SpaceImportsCurrent() {

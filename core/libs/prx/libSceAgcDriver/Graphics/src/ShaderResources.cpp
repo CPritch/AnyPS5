@@ -3498,7 +3498,13 @@ bool ShaderResources::VerifyAddressTemplates() {
     return enabled;
 }
 
-void ShaderResources::VerifyAddressReuse(const ShaderResources& built, std::span<const MovedBuffer> moved) const {
+void ShaderResources::VerifyAddressReuse(const ShaderResources& built, std::span<const MovedBuffer> moved, bool spaceMoved) const {
+    static std::atomic<std::uint64_t> compared{0};
+    static std::atomic<std::uint64_t> incomparable{0};
+    const auto notComparable = [&](const char* what) {
+        const auto skipped = incomparable.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (skipped <= 16 || skipped % 256 == 0) std::fprintf(stderr, "[bda-templates] APS5_VERIFY_BDA_TEMPLATES: a reuse was not compared with its full build, whose address space moved on from the reused one during the verify (%s); %llu not compared, %llu compared\n", what, static_cast<unsigned long long>(skipped), static_cast<unsigned long long>(compared.load(std::memory_order_relaxed)));
+    };
     const auto fail = [](const std::string& what) {
         std::fprintf(stderr, "FATAL: APS5_VERIFY_BDA_TEMPLATES: a reused address-based template differs from a full build of its draw in %s\n", what.c_str());
         std::fflush(stderr);
@@ -3510,6 +3516,10 @@ void ShaderResources::VerifyAddressReuse(const ShaderResources& built, std::span
         return std::string(text);
     };
     const auto info = [&](const VkDescriptorBufferInfo& bound) { return hex(reinterpret_cast<std::uint64_t>(bound.buffer)) + "+" + hex(bound.offset) + "/" + hex(bound.range); };
+    if (!built.bdaTemplate && spaceMoved) {
+        notComparable("the full build is not served whole by a cached space");
+        return;
+    }
     if (!built.bdaTemplate) fail("being a template: the full build is not served whole by the cached address space (the space serves it as " + std::to_string(static_cast<unsigned>(built.guestMemory.SpaceServesTemplate())) + " with kinds " + std::to_string(built.guestMemory.SpaceKinds()) + ", space " + std::to_string(built.guestMemory.SpaceSerial()) + " after " + std::to_string(bdaSpaceSerial) + ", reusable " + std::to_string(built.reusable) + ")");
     const bool sameSpace = built.bdaSpaceSerial == bdaSpaceSerial;
     if (!sameSpace) CountAddress(AddressCount::VerifiedNewerSpace);
@@ -3528,13 +3538,23 @@ void ShaderResources::VerifyAddressReuse(const ShaderResources& built, std::span
     } else {
         for (const auto& mine : ranges) {
             const bool held = std::any_of(builtRanges.begin(), builtRanges.end(), [&](const auto& theirs) { return theirs.begin == mine.begin && theirs.end == mine.end && theirs.permissions == mine.permissions; });
+            if (!held && spaceMoved) {
+                notComparable("a range of the reused space is not in the newer one");
+                return;
+            }
             if (!held) fail("its BDA table: the range " + hex(mine.begin) + "-" + hex(mine.end) + " of the reused space " + std::to_string(bdaSpaceSerial) + " is missing from the newer space " + std::to_string(built.bdaSpaceSerial) + " a full build takes now");
         }
         const auto builtReads = built.guestMemory.InPlaceReads();
         for (const auto& [begin, end] : guestMemory.InPlaceReads()) {
-            if (std::none_of(builtReads.begin(), builtReads.end(), [&](const auto& range) { return range.first <= begin && end <= range.second; })) fail("the ranges it reads in place: " + hex(begin) + "-" + hex(end) + " of the reused space is not read in place by the newer space");
+            const bool read = std::any_of(builtReads.begin(), builtReads.end(), [&](const auto& range) { return range.first <= begin && end <= range.second; });
+            if (!read && spaceMoved) {
+                notComparable("a range the reused space reads in place is not read in place by the newer one");
+                return;
+            }
+            if (!read) fail("the ranges it reads in place: " + hex(begin) + "-" + hex(end) + " of the reused space is not read in place by the newer space");
         }
     }
+    compared.fetch_add(1, std::memory_order_relaxed);
     if (guestMemory.Writes() != built.guestMemory.Writes()) fail("the ranges it writes");
     const auto movedOf = [&](std::size_t index) { return std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; }); };
     const auto adjustmentOf = [&](std::size_t index) {

@@ -528,6 +528,7 @@ public:
     enum class SpaceAttach : std::uint8_t { Attached, Space, Imports, Snapshot };
     SpaceAttach AttachSpace(std::uint64_t serial, std::span<const GuestMemorySnapshot> snapshots, bool verifyMirrors);
     bool SpaceImportsCurrent();
+    bool SpaceStillCurrent() const;
     std::optional<std::pair<VkDescriptorBufferInfo, std::uint32_t>> InPlaceDescriptor(std::uint64_t address, std::size_t bytes) const;
     std::shared_ptr<const void> DetachSpace();
     bool SpaceOnly() const;
