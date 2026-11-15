@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <compare>
 #include <functional>
+#include <iterator>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -27,29 +29,129 @@ class Lease {
 public:
     using Ranges = std::vector<std::shared_ptr<const Range>>;
     using value_type = Ranges::value_type;
-    using const_iterator = Ranges::const_iterator;
+
+    struct Chunk {
+        Ranges ranges;
+        std::uint64_t low = 0;
+        std::uint64_t high = 0;
+    };
+
+    struct Body {
+        std::vector<std::shared_ptr<const Chunk>> chunks;
+        std::vector<std::size_t> starts{0};
+    };
+
+    class const_iterator {
+    public:
+        using iterator_category = std::random_access_iterator_tag;
+        using value_type = Lease::value_type;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const value_type*;
+        using reference = const value_type&;
+
+        const_iterator() = default;
+        const_iterator(const Body* body, std::size_t index) : body(body) { locate(index); }
+
+        reference operator*() const { return *current; }
+        pointer operator->() const { return current; }
+        reference operator[](difference_type offset) const { return *(*this + offset); }
+        const_iterator& operator++() {
+            if (++current == last) enter(chunk + 1);
+            return *this;
+        }
+        const_iterator operator++(int) {
+            auto before = *this;
+            ++*this;
+            return before;
+        }
+        const_iterator& operator--() {
+            if (current != first) --current;
+            else locate(index() - 1);
+            return *this;
+        }
+        const_iterator operator--(int) {
+            auto before = *this;
+            --*this;
+            return before;
+        }
+        const_iterator& operator+=(difference_type offset) {
+            if (current != nullptr && offset >= first - current && offset < last - current) current += offset;
+            else if (offset != 0) locate(static_cast<std::size_t>(static_cast<difference_type>(index()) + offset));
+            return *this;
+        }
+        const_iterator& operator-=(difference_type offset) { return *this += -offset; }
+        friend const_iterator operator+(const_iterator it, difference_type offset) { return it += offset; }
+        friend const_iterator operator+(difference_type offset, const_iterator it) { return it += offset; }
+        friend const_iterator operator-(const_iterator it, difference_type offset) { return it += -offset; }
+        friend difference_type operator-(const const_iterator& left, const const_iterator& right) { return static_cast<difference_type>(left.index()) - static_cast<difference_type>(right.index()); }
+        friend bool operator==(const const_iterator& left, const const_iterator& right) { return left.chunk == right.chunk && left.current == right.current; }
+        friend auto operator<=>(const const_iterator& left, const const_iterator& right) { return left.index() <=> right.index(); }
+
+    private:
+        std::size_t index() const { return body == nullptr ? 0 : body->starts[chunk] + static_cast<std::size_t>(current - first); }
+        void enter(std::size_t target) {
+            chunk = target;
+            if (body == nullptr || chunk >= body->chunks.size()) {
+                first = last = current = nullptr;
+                return;
+            }
+            const auto& ranges = body->chunks[chunk]->ranges;
+            first = current = ranges.data();
+            last = first + ranges.size();
+        }
+        void locate(std::size_t index) {
+            if (body == nullptr || index >= body->starts.back()) {
+                enter(body == nullptr ? 0 : body->chunks.size());
+                return;
+            }
+            const auto& starts = body->starts;
+            std::size_t low = 0;
+            std::size_t high = body->chunks.size();
+            while (high - low > 1) {
+                const auto middle = low + (high - low) / 2;
+                if (starts[middle] <= index) low = middle;
+                else high = middle;
+            }
+            enter(low);
+            current += index - starts[low];
+        }
+
+        const Body* body = nullptr;
+        std::size_t chunk = 0;
+        pointer current = nullptr;
+        pointer first = nullptr;
+        pointer last = nullptr;
+    };
     using iterator = const_iterator;
 
     Lease() = default;
-    explicit Lease(std::shared_ptr<const Ranges> ranges) : ranges(std::move(ranges)) {}
+    explicit Lease(std::shared_ptr<const Body> body) : body(std::move(body)) {}
+    explicit Lease(Ranges ranges) {
+        auto made = std::make_shared<Body>();
+        if (!ranges.empty()) {
+            auto chunk = std::make_shared<Chunk>();
+            chunk->low = ranges.front()->address;
+            chunk->high = ranges.back()->address + ranges.back()->bytes;
+            chunk->ranges = std::move(ranges);
+            made->starts.push_back(chunk->ranges.size());
+            made->chunks.push_back(std::move(chunk));
+        }
+        body = std::move(made);
+    }
+    explicit Lease(const std::shared_ptr<const Ranges>& ranges) : Lease(ranges != nullptr ? *ranges : Ranges{}) {}
 
-    const_iterator begin() const { return held().begin(); }
-    const_iterator end() const { return held().end(); }
-    std::size_t size() const { return held().size(); }
-    bool empty() const { return held().empty(); }
-    const value_type& operator[](std::size_t index) const { return held()[index]; }
-    const value_type& front() const { return held().front(); }
-    const value_type& back() const { return held().back(); }
-    void clear() { ranges.reset(); }
-    const std::shared_ptr<const Ranges>& Snapshot() const { return ranges; }
+    const_iterator begin() const { return const_iterator(body.get(), 0); }
+    const_iterator end() const { return const_iterator(body.get(), size()); }
+    std::size_t size() const { return body != nullptr ? body->starts.back() : 0; }
+    bool empty() const { return size() == 0; }
+    const value_type& operator[](std::size_t index) const { return *const_iterator(body.get(), index); }
+    const value_type& front() const { return body->chunks.front()->ranges.front(); }
+    const value_type& back() const { return body->chunks.back()->ranges.back(); }
+    void clear() { body.reset(); }
+    const std::shared_ptr<const Body>& Snapshot() const { return body; }
 
 private:
-    const Ranges& held() const {
-        static const Ranges none;
-        return ranges != nullptr ? *ranges : none;
-    }
-
-    std::shared_ptr<const Ranges> ranges;
+    std::shared_ptr<const Body> body;
 };
 using Mapped = std::vector<std::weak_ptr<const Range>>;
 

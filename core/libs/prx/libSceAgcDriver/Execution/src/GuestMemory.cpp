@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/VerifyCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ImportWorkers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
@@ -34,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <latch>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1321,6 +1323,28 @@ void SplitPages(std::size_t pages, const Range& range) {
     const auto workers = std::min<std::size_t>({ImportHashThreads, hostThreads, pages / ImportHashPagesPerThread});
     if (workers < 2) {
         range(std::size_t{0}, pages);
+        return;
+    }
+    if (ImportWorkers::Enabled()) {
+        struct Piece {
+            const Range* range;
+            std::latch* done;
+            std::size_t from;
+            std::size_t to;
+        };
+        std::latch done(static_cast<std::ptrdiff_t>(workers - 1));
+        std::array<Piece, ImportHashThreads> pieces;
+        for (std::size_t worker = 1; worker < workers; ++worker) {
+            auto* piece = &pieces[worker];
+            *piece = {&range, &done, pages * worker / workers, pages * (worker + 1) / workers};
+            const auto run = [piece] {
+                (*piece->range)(piece->from, piece->to);
+                piece->done->count_down();
+            };
+            if (!ImportWorkers::Get().Post(run)) run();
+        }
+        range(std::size_t{0}, pages / workers);
+        done.wait();
         return;
     }
     std::vector<std::jthread> threads;

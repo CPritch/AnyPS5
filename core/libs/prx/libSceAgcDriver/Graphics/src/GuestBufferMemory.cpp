@@ -1877,7 +1877,7 @@ std::pair<std::size_t, std::size_t> continuedRun(const GuestAllocations::Lease& 
     static const bool memo = std::getenv("APS5_NO_RUN_MEMO") == nullptr;
     if (!memo) return walkRun(lease, index, low, high);
     struct Memo {
-        std::weak_ptr<const GuestAllocations::Lease::Ranges> snapshot;
+        std::weak_ptr<const GuestAllocations::Lease::Body> snapshot;
         std::size_t index = 0;
         std::uint64_t window = 0;
         std::uint64_t low = 0;
@@ -6412,14 +6412,16 @@ void GuestBufferMemory::AcquireRegistered() {
             if (keptLock.owns_lock()) keptLock.unlock();
             keptHeld = 0;
         };
+        std::size_t leasedNext = 0;
         for (const auto& range : lease) {
+            const auto leasedAt = leasedNext++;
             if (range->address < patchedThrough) continue;
             if (!range->readable || !range->gpu) continue;
             if (outline != nullptr && outline->device == context.device) {
                 while (outlineRegion < outline->regions.size() && outline->regions[outlineRegion].end <= range->address) ++outlineRegion;
                 if (outlineRegion < outline->regions.size() && outline->regions[outlineRegion].begin == range->address) {
                     const auto& kept = outline->regions[outlineRegion];
-                    if (outlineSameOver(*outline, lease, static_cast<std::size_t>(&range - &lease[0]), outlineAt, kept.end)) {
+                    if (outlineSameOver(*outline, lease, leasedAt, outlineAt, kept.end)) {
                         auto& state = Imports();
                         if (!keptLock.owns_lock()) keptLock.lock();
                         if (const auto* entry = findImport(state, kept.begin, kept.end); entry != nullptr && entry == kept.direct) {
@@ -6456,7 +6458,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
                 const auto refusals = state.budgetRefusals;
-                const auto leaseIndex = static_cast<std::size_t>(&range - &lease[0]);
+                const auto leaseIndex = leasedAt;
                 const HostImport* unchanged = previousSpace != nullptr && importsUnchangedRange(previousSpace->lease, lease, leaseIndex, previousAt) && !importsStale(context, state) ? findImport(state, range->address, range->address + range->bytes) : nullptr;
                 if (unchanged != nullptr && !verifySpaceImports) {
                     unchanged->lastUse = ++state.useCounter;

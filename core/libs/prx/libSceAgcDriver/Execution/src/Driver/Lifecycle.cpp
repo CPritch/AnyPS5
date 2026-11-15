@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ImportWorkers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -23,6 +24,7 @@
 #include <cstdio>
 #include <cerrno>
 #include <exception>
+#include <latch>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -201,6 +203,7 @@ void Driver::stop() {
     CloseRegistrationPreparation();
     Graphics::StopPipelineCompilePool();
     Graphics::StopPipelineLibraryWorker();
+    ImportWorkers::Get().Stop();
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     Graphics::ReportHostImports();
     device.Reset();
@@ -247,6 +250,18 @@ Driver::Driver() {
         if (GuestMemory::GpuMutex().HeldByThisThread() || StackHoldsImport()) {
             import();
             return;
+        }
+        if (ImportWorkers::Enabled()) {
+            std::latch done(1);
+            const auto run = [&] {
+                import();
+                done.count_down();
+            };
+            if (ImportWorkers::Get().Post(run)) {
+                gpuMapImportThreads.fetch_add(1, std::memory_order_relaxed);
+                done.wait();
+                return;
+            }
         }
         std::thread host;
         try {

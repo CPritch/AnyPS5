@@ -53,7 +53,7 @@ constexpr std::size_t LeaseIndexDirtyLimit = 32;
 struct MutationState;
 
 struct SnapshotGeneration {
-    std::weak_ptr<const Lease::Ranges> ranges;
+    std::weak_ptr<const Lease::Body> ranges;
     std::uint64_t generation = 0;
     bool unsettled = false;
 };
@@ -65,6 +65,15 @@ struct LeaseIndex {
     std::size_t dirtyCount = 0;
 };
 
+constexpr std::size_t LeaseChunkRanges = 64;
+
+struct ChunkStore {
+    bool readableOnly = false;
+    std::vector<std::uint64_t> bounds{0};
+    std::vector<std::shared_ptr<const Lease::Chunk>> chunks{nullptr};
+    std::size_t missing = 1;
+};
+
 struct Registry {
     std::mutex mutex;
     std::map<std::uint64_t, std::shared_ptr<const Range>> ranges;
@@ -72,10 +81,12 @@ struct Registry {
     bool wholeChangePending = false;
     bool mainImageRegistered = false;
     std::map<std::uintptr_t, std::uintptr_t> registeredImages;
-    std::shared_ptr<const Lease::Ranges> readableLease;
-    std::shared_ptr<const Lease::Ranges> allLease;
+    std::shared_ptr<const Lease::Body> readableLease;
+    std::shared_ptr<const Lease::Body> allLease;
+    ChunkStore readableChunks{.readableOnly = true};
+    ChunkStore allChunks;
     std::uint64_t leaseStamp = 1;
-    std::shared_ptr<const Lease::Ranges> retiringLease;
+    std::shared_ptr<const Lease::Body> retiringLease;
     std::uint64_t retiringLeaseStamp = 0;
     std::uint64_t backingSerials = 0;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> retiring;
@@ -133,8 +144,43 @@ void noteLeaseChange() {
     ++registry().leaseStamp;
 }
 
+bool leaseChunksEnabled() {
+    static const bool enabled = leasePatchEnabled() && std::getenv("APS5_NO_LEASE_CHUNKS") == nullptr;
+    return enabled;
+}
+
+void dropChunks(ChunkStore& store, std::uint64_t begin, std::uint64_t end) {
+    const auto& bounds = store.bounds;
+    const auto drop = [&](std::size_t at) {
+        if (store.chunks[at] == nullptr) return;
+        store.chunks[at].reset();
+        ++store.missing;
+    };
+    auto slot = static_cast<std::size_t>(std::upper_bound(bounds.begin(), bounds.end(), begin) - bounds.begin());
+    if (slot != 0) --slot;
+    auto before = slot;
+    while (before != 0 && store.chunks[before - 1] == nullptr) --before;
+    if (before != 0 && store.chunks[before - 1]->high >= begin) drop(before - 1);
+    for (; slot < bounds.size() && bounds[slot] <= end; ++slot) drop(slot);
+}
+
+void dropLeaseChunks(std::uint64_t address, std::uint64_t bytes) {
+    const auto end = address + std::max<std::uint64_t>(bytes, 1);
+    dropChunks(registry().readableChunks, address, end);
+    dropChunks(registry().allChunks, address, end);
+}
+
+void resetLeaseChunks() {
+    for (auto* store : {&registry().readableChunks, &registry().allChunks}) {
+        store->bounds.assign(1, 0);
+        store->chunks.assign(1, nullptr);
+        store->missing = 1;
+    }
+}
+
 void noteRangeDirty(std::uint64_t address, std::uint64_t bytes) {
     noteLeaseChange();
+    dropLeaseChunks(address, bytes);
     auto& index = registry().leaseIndex;
     if (!index.valid) return;
     if (index.dirtyCount == LeaseIndexDirtyLimit) {
@@ -206,6 +252,7 @@ void renewBacking(std::uintptr_t address, std::size_t bytes, std::vector<std::pa
         renewed.backingSerial = freshBacking();
         it->second = std::make_shared<const Range>(renewed);
         noteLeaseChange();
+        dropLeaseChunks(renewed.address, renewed.bytes);
         renewedSpans.emplace_back(renewed.address, renewed.address + std::max<std::uint64_t>(renewed.bytes, 1));
     }
 }
@@ -520,9 +567,9 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     }
     const bool unchanged = journalEnabled() && !whole && state->journaled.empty();
     const auto ended = publishChanges(state->journaled, whole, std::move(snapshot));
-    std::shared_ptr<const Lease::Ranges> retiredReadable;
-    std::shared_ptr<const Lease::Ranges> retiredAll;
-    std::shared_ptr<const Lease::Ranges> retiredRetiring;
+    std::shared_ptr<const Lease::Body> retiredReadable;
+    std::shared_ptr<const Lease::Body> retiredAll;
+    std::shared_ptr<const Lease::Body> retiredRetiring;
     if (!unchanged) {
         retiredReadable = std::move(registry().readableLease);
         retiredAll = std::move(registry().allLease);
@@ -716,6 +763,7 @@ void registerImage(const void* image) {
     require(registered, "guest image has no committed pages");
     state.ranges.swap(replacement);
     state.leaseIndex.valid = false;
+    resetLeaseChunks();
     noteLeaseChange();
     state.wholeChangePending = true;
     state.registeredImages.emplace(reinterpret_cast<std::uintptr_t>(image), cursor);
@@ -822,6 +870,7 @@ std::uintptr_t registerImagePages(const ImagePages& collected) {
     }
     state.ranges.swap(replacement);
     state.leaseIndex.valid = false;
+    resetLeaseChunks();
     noteLeaseChange();
     state.wholeChangePending = true;
     return static_cast<std::uintptr_t>(std::prev(pages.end())->first + pageSize);
@@ -869,6 +918,7 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
     recordChange(mutation, image, end - begin);
     std::erase_if(state.ranges, [&](const auto& entry) { return !entry.second->releasable && entry.second->allocationAddress >= begin && entry.second->allocationAddress < end; });
     state.leaseIndex.valid = false;
+    resetLeaseChunks();
     state.registeredImages.erase(found);
 }
 
@@ -945,19 +995,22 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     const auto retiringLeasePins = [&] {
         const auto& cached = registry().retiringLease;
         if (cached == nullptr) return false;
-        auto at = std::upper_bound(cached->begin(), cached->end(), address, [](std::uint64_t value, const auto& range) { return value < range->address; });
-        if (at != cached->begin()) --at;
-        for (; at != cached->end() && ((*at)->address < end || (*at)->address == address); ++at) {
-            if ((*at)->address + (*at)->bytes > address || (*at)->address == address) return true;
+        for (const auto& chunk : cached->chunks) {
+            if (chunk->low > std::max<std::uint64_t>(end, address)) break;
+            if (chunk->high < address) continue;
+            for (const auto& range : chunk->ranges) {
+                if ((range->address < end && range->address + range->bytes > address) || range->address == address) return true;
+            }
         }
         return false;
     };
     for (;;) {
+        dropLeaseChunks(address, bytes);
         const bool retiringHeld = retiringLeasePins();
         if (registry().readableLease != nullptr || registry().allLease != nullptr || retiringHeld) {
             auto droppedReadable = std::move(registry().readableLease);
             auto droppedAll = std::move(registry().allLease);
-            std::shared_ptr<const Lease::Ranges> droppedRetiring;
+            std::shared_ptr<const Lease::Body> droppedRetiring;
             if (retiringHeld) droppedRetiring = std::move(registry().retiringLease);
             if (leasePatchEnabled() && cacheDrops++ < 2 && state != nullptr && state->lock.owns_lock()) {
                 release();
@@ -1308,19 +1361,21 @@ void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std:
     if (const auto observer = unmapObserver.load(std::memory_order_acquire)) observer(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
-static void verifyCachedLease(const Lease::Ranges& cached, bool readableOnly) {
+static void verifyCachedLease(const Lease& cached, bool readableOnly) {
     if (!verifyLeasePatch()) return;
-    std::size_t at = 0;
+    auto at = cached.begin();
+    std::size_t walked = 0;
     for (const auto& [address, range] : registry().ranges) {
         if (range->bytes == 0 || (readableOnly && !range->readable)) continue;
-        if (at >= cached.size() || cached[at] != range) {
+        if (at == cached.end() || *at != range) {
             std::fprintf(stderr, "FATAL: APS5_VERIFY_LEASE_PATCH: the cached lease differs from the registry at 0x%llx+0x%llx\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes));
             std::abort();
         }
         ++at;
+        ++walked;
     }
-    if (at == cached.size()) return;
-    std::fprintf(stderr, "FATAL: APS5_VERIFY_LEASE_PATCH: the cached lease holds %zu ranges past the registry's %zu\n", cached.size() - at, at);
+    if (at == cached.end()) return;
+    std::fprintf(stderr, "FATAL: APS5_VERIFY_LEASE_PATCH: the cached lease holds %zu ranges past the registry's %zu\n", cached.size() - walked, walked);
     std::abort();
 }
 
@@ -1328,44 +1383,170 @@ void GuestAllocationsSetUnmapObserver_nid_postfix(void (*callback)(std::uintptr_
     unmapObserver.store(callback, std::memory_order_release);
 }
 
-static void noteSnapshot(const std::shared_ptr<const Lease::Ranges>& ranges) {
+static void noteSnapshot(const std::shared_ptr<const Lease::Body>& ranges) {
     const bool settled = settledLocked();
     if (!settled && (!pinWaitJournalEnabled() || !journalEnabled() || registry().wholeChangePending)) return;
     auto& registered = registry();
     registered.snapshotGenerations[registered.snapshotNext++ % registered.snapshotGenerations.size()] = {ranges, generation.load(std::memory_order_acquire), !settled};
 }
 
-static std::shared_ptr<Lease::Ranges> buildReadableLocked(bool retiring) {
+static Lease::Ranges flatRanges(bool readableOnly, bool retiring) {
     const auto& index = currentLeaseIndex();
-    auto ranges = std::make_shared<Lease::Ranges>();
-    ranges->reserve(index.size());
+    Lease::Ranges ranges;
+    ranges.reserve(index.size());
     for (const auto& entry : index) {
-        if (entry.readable && (!retiring || !isRetiring(*entry.node->second))) ranges->push_back(entry.node->second);
+        if ((!readableOnly || entry.readable) && (!retiring || !isRetiring(*entry.node->second))) ranges.push_back(entry.node->second);
     }
     return ranges;
 }
 
-static void verifyRetiringCached(const Lease::Ranges& cached) {
+template <typename Emit>
+static void chunkEntries(std::span<const LeaseIndexEntry> entries, bool readableOnly, bool retiring, Emit&& emit) {
+    Lease::Ranges picked;
+    picked.reserve(entries.size());
+    for (const auto& entry : entries) {
+        if ((!readableOnly || entry.readable) && (!retiring || !isRetiring(*entry.node->second))) picked.push_back(entry.node->second);
+    }
+    const auto pieces = (picked.size() + LeaseChunkRanges - 1) / LeaseChunkRanges;
+    for (std::size_t piece = 0; piece < pieces; ++piece) {
+        const auto first = static_cast<std::ptrdiff_t>(picked.size() * piece / pieces);
+        const auto last = static_cast<std::ptrdiff_t>(picked.size() * (piece + 1) / pieces);
+        auto chunk = std::make_shared<Lease::Chunk>();
+        chunk->ranges.assign(std::make_move_iterator(picked.begin() + first), std::make_move_iterator(picked.begin() + last));
+        chunk->low = chunk->ranges.front()->address;
+        chunk->high = chunk->ranges.back()->address + chunk->ranges.back()->bytes;
+        emit(std::shared_ptr<const Lease::Chunk>(std::move(chunk)));
+    }
+}
+
+static std::shared_ptr<const Lease::Body> buildChunked(ChunkStore& store, bool retiring) {
+    const auto& index = currentLeaseIndex();
+    const auto touchesRetiring = [&](std::uint64_t low, std::uint64_t high) {
+        if (!retiring) return false;
+        for (const auto& [begin, end] : registry().retiring) {
+            if (low < end && begin < high) return true;
+        }
+        return false;
+    };
+    auto body = std::make_shared<Lease::Body>();
+    body->chunks.reserve(store.chunks.size());
+    body->starts.reserve(store.chunks.size() + 1);
+    const auto add = [&](std::shared_ptr<const Lease::Chunk> chunk) {
+        body->starts.push_back(body->starts.back() + chunk->ranges.size());
+        body->chunks.push_back(std::move(chunk));
+    };
+    const bool rebuild = store.missing != 0;
+    std::vector<std::uint64_t> bounds;
+    std::vector<std::shared_ptr<const Lease::Chunk>> chunks;
+    std::size_t missing = 0;
+    if (rebuild) {
+        bounds.reserve(store.chunks.size() + 8);
+        chunks.reserve(store.chunks.size() + 8);
+    }
+    const auto slots = store.chunks.size();
+    const auto byAddress = [](const LeaseIndexEntry& entry, std::uint64_t value) { return entry.address < value; };
+    for (std::size_t slot = 0; slot < slots;) {
+        if (auto& chunk = store.chunks[slot]; chunk != nullptr) {
+            if (!chunk->ranges.empty()) {
+                if (touchesRetiring(chunk->low, chunk->high)) {
+                    auto kept = std::make_shared<Lease::Chunk>();
+                    for (const auto& range : chunk->ranges) {
+                        if (!isRetiring(*range)) kept->ranges.push_back(range);
+                    }
+                    if (!kept->ranges.empty()) {
+                        kept->low = kept->ranges.front()->address;
+                        kept->high = kept->ranges.back()->address + kept->ranges.back()->bytes;
+                        add(std::move(kept));
+                    }
+                } else {
+                    add(chunk);
+                }
+            }
+            if (rebuild) {
+                bounds.push_back(store.bounds[slot]);
+                chunks.push_back(std::move(chunk));
+            }
+            ++slot;
+            continue;
+        }
+        auto next = slot;
+        while (next < slots && store.chunks[next] == nullptr) ++next;
+        const auto low = store.bounds[slot];
+        const auto first = std::lower_bound(index.begin(), index.end(), low, byAddress);
+        const auto last = next < slots ? std::lower_bound(first, index.end(), store.bounds[next], byAddress) : index.end();
+        const std::span<const LeaseIndexEntry> entries(first, last);
+        if (!entries.empty() && touchesRetiring(entries.front().address, entries.back().end)) {
+            for (auto at = slot; at < next; ++at) {
+                bounds.push_back(store.bounds[at]);
+                chunks.push_back(nullptr);
+                ++missing;
+            }
+            chunkEntries(entries, store.readableOnly, true, add);
+        } else {
+            bool leading = true;
+            chunkEntries(entries, store.readableOnly, false, [&](std::shared_ptr<const Lease::Chunk> chunk) {
+                bounds.push_back(leading ? low : chunk->low);
+                leading = false;
+                chunks.push_back(chunk);
+                add(std::move(chunk));
+            });
+        }
+        slot = next;
+    }
+    if (rebuild) {
+        if (chunks.empty()) {
+            bounds.push_back(0);
+            chunks.push_back(std::make_shared<Lease::Chunk>());
+        }
+        bounds.front() = 0;
+        if (chunks.size() > 2 * (index.size() / LeaseChunkRanges) + 64) {
+            resetLeaseChunks();
+        } else {
+            store.bounds = std::move(bounds);
+            store.chunks = std::move(chunks);
+            store.missing = missing;
+        }
+    }
+    return body;
+}
+
+static std::shared_ptr<const Lease::Body> buildLeaseLocked(ChunkStore& store, bool retiring) {
+    if (!leaseChunksEnabled()) return Lease(flatRanges(store.readableOnly, retiring)).Snapshot();
+    auto body = buildChunked(store, retiring);
+    if (verifyLeasePatch()) {
+        const auto flat = flatRanges(store.readableOnly, retiring);
+        const Lease built(body);
+        if (built.size() != flat.size() || !std::equal(flat.begin(), flat.end(), built.begin())) {
+            std::fprintf(stderr, "FATAL: APS5_VERIFY_LEASE_PATCH: the lease built from shared chunks (%zu ranges in %zu chunks) differs from one built from the registry (%zu ranges)\n", built.size(), body->chunks.size(), flat.size());
+            std::abort();
+        }
+    }
+    return body;
+}
+
+static void verifyRetiringCached(const std::shared_ptr<const Lease::Body>& body) {
     leaseCounters().retiringChecked.fetch_add(1, std::memory_order_relaxed);
-    const auto built = buildReadableLocked(true);
-    if (*built == cached) return;
-    std::fprintf(stderr, "FATAL: APS5_VERIFY_RETIRING_LEASE: the readable lease cached during a pin wait (%zu ranges, stamp %llu) differs from one built now (%zu ranges)\n", cached.size(), static_cast<unsigned long long>(registry().retiringLeaseStamp), built->size());
+    const auto built = flatRanges(true, true);
+    const Lease cached(body);
+    if (built.size() == cached.size() && std::equal(built.begin(), built.end(), cached.begin())) return;
+    std::fprintf(stderr, "FATAL: APS5_VERIFY_RETIRING_LEASE: the readable lease cached during a pin wait (%zu ranges, stamp %llu) differs from one built now (%zu ranges)\n", cached.size(), static_cast<unsigned long long>(registry().retiringLeaseStamp), built.size());
     std::abort();
 }
 
 static Lease acquireReadableLocked() {
     if (auto shared = registry().readableLease) {
-        verifyCachedLease(*shared, true);
-        return Lease(std::move(shared));
+        Lease cached(std::move(shared));
+        verifyCachedLease(cached, true);
+        return cached;
     }
     const bool retiring = !registry().retiring.empty();
     auto& counters = leaseCounters();
     if (retiring && retiringLeaseCacheEnabled() && registry().retiringLease != nullptr && registry().retiringLeaseStamp == registry().leaseStamp) {
         counters.retiringHits.fetch_add(1, std::memory_order_relaxed);
-        if (verifyRetiringLease()) verifyRetiringCached(*registry().retiringLease);
+        if (verifyRetiringLease()) verifyRetiringCached(registry().retiringLease);
         return Lease(registry().retiringLease);
     }
-    auto ranges = buildReadableLocked(retiring);
+    auto ranges = buildLeaseLocked(registry().readableChunks, retiring);
     (retiring ? counters.retiringBuilds : counters.readableBuilds).fetch_add(1, std::memory_order_relaxed);
     if (!retiring) {
         registry().readableLease = ranges;
@@ -1415,22 +1596,18 @@ Lease GuestAllocationsAcquireMapped_nid_no_patch(const Mapped& mapped) {
             current = next;
         }
     }
-    return Lease(std::move(ranges));
+    return Lease(std::move(*ranges));
 }
 
 static Lease acquireRegisteredLocked() {
     if (registry().retiring.empty()) {
         if (auto shared = registry().readableLease) {
-            verifyCachedLease(*shared, true);
-            return Lease(std::move(shared));
+            Lease cached(std::move(shared));
+            verifyCachedLease(cached, true);
+            return cached;
         }
     }
-    const auto& index = currentLeaseIndex();
-    auto ranges = std::make_shared<Lease::Ranges>();
-    ranges->reserve(index.size());
-    for (const auto& entry : index) {
-        if (entry.readable) ranges->push_back(entry.node->second);
-    }
+    auto ranges = buildLeaseLocked(registry().readableChunks, false);
     if (registry().retiring.empty()) registry().readableLease = ranges;
     noteSnapshot(ranges);
     return Lease(std::move(ranges));
@@ -1498,7 +1675,7 @@ bool GuestAllocationsAcquireChanged_nid_no_patch(std::uint64_t since, const std:
             picked->push_back(range);
         }
     }
-    *lease = Lease(std::move(picked));
+    *lease = Lease(std::move(*picked));
     if (whole != nullptr) *whole = acquireReadableLocked();
     return true;
 }
@@ -1541,16 +1718,12 @@ std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t a
 Lease GuestAllocationsAcquireAll_nid_postfix() {
     std::lock_guard lock(registry().mutex);
     if (auto shared = registry().allLease) {
-        verifyCachedLease(*shared, false);
-        return Lease(std::move(shared));
+        Lease cached(std::move(shared));
+        verifyCachedLease(cached, false);
+        return cached;
     }
     const bool retiring = !registry().retiring.empty();
-    const auto& index = currentLeaseIndex();
-    auto ranges = std::make_shared<Lease::Ranges>();
-    ranges->reserve(index.size());
-    for (const auto& entry : index) {
-        if (!retiring || !isRetiring(*entry.node->second)) ranges->push_back(entry.node->second);
-    }
+    auto ranges = buildLeaseLocked(registry().allChunks, retiring);
     if (!retiring) registry().allLease = ranges;
     return Lease(std::move(ranges));
 }
