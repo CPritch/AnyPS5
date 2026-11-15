@@ -836,7 +836,9 @@ struct VulkanDevice::State {
 
     template<typename TFunction>
     TFunction DeviceFunction(Graphics::FunctionName name) const {
-        auto function = reinterpret_cast<TFunction>(Graphics::ResolveDeviceFunction(device, deviceProc, name.Value()));
+        const bool streams = Graphics::StreamsCommands(contextDeviceProc);
+        if (!streams) ++Graphics::DeviceProcLookups();
+        auto function = reinterpret_cast<TFunction>(streams ? Graphics::ResolveDeviceFunction(device, deviceProc, name.Value()) : deviceProc(device, name.Value()));
         if (function == nullptr) {
             throw std::runtime_error(std::string("Vulkan device function missing: ") + name.Value());
         }
@@ -2546,7 +2548,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->shaderProfile = std::move(shaderProfile);
     if (compileOnly) return;
     if (state->deferDestruction) state->contextDeviceProc = Graphics::DeferDestructionToIdle(state->device, state->deviceProc);
-    state->contextDeviceProc = Graphics::RecordCommandStreams(state->device, state->contextDeviceProc != nullptr ? state->contextDeviceProc : state->deviceProc);
+    if (std::getenv("APS5_DEFERRED_ENCODE") != nullptr || Graphics::AbConfigured()) state->contextDeviceProc = Graphics::RecordCommandStreams(state->device, state->contextDeviceProc != nullptr ? state->contextDeviceProc : state->deviceProc);
     if (calibratedTimestamps != nullptr) {
         const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
         const auto domains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(state->instanceProc(state->instance, khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));

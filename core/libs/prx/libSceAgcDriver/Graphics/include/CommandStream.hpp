@@ -90,6 +90,7 @@ private:
 
 PFN_vkVoidFunction ResolveDeviceFunction(VkDevice device, PFN_vkGetDeviceProcAddr deviceProc, const char* name);
 PFN_vkGetDeviceProcAddr RecordCommandStreams(VkDevice device, PFN_vkGetDeviceProcAddr deviceProc);
+bool StreamsCommands(PFN_vkGetDeviceProcAddr deviceProc);
 
 }
 

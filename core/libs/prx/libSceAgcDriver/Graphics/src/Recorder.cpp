@@ -2568,7 +2568,7 @@ void Recorder::ensureOpen() {
     if (open == nullptr) {
         ++passGeneration;
         auto batch = std::make_unique<Batch>();
-        const bool deferred = RuntimeSwitches::Set(RuntimeSwitch::DeferredEncode) && QueueSubmitter::Enabled();
+        const bool deferred = RuntimeSwitches::Set(RuntimeSwitch::DeferredEncode) && QueueSubmitter::Enabled() && StreamsCommands(context.deviceProc);
         try {
             if (deferred) {
                 batch->stream = takeStream();

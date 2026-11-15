@@ -517,6 +517,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL streamedDeviceProc(VkDevice device, con
 
 }
 
+bool StreamsCommands(PFN_vkGetDeviceProcAddr deviceProc) {
+    return deviceProc == &streamedDeviceProc;
+}
+
 PFN_vkGetDeviceProcAddr RecordCommandStreams(VkDevice device, PFN_vkGetDeviceProcAddr deviceProc) {
     if (deviceProc == &streamedDeviceProc) return deviceProc;
     std::lock_guard lock(streamedDevicesMutex);
