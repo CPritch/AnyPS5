@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StageDelay.hpp"
 #include "prx/libc/include/HostThread.hpp"
@@ -43,6 +44,23 @@
 #include <string>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+constexpr std::chrono::microseconds LongestLockSpin{20};
+
+std::chrono::nanoseconds lockSpin() {
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoSpinHandoff)) return std::chrono::nanoseconds::zero();
+    return std::min<std::chrono::nanoseconds>(HandoffSpinWindow(), LongestLockSpin);
+}
+
+template<typename TMutex>
+std::unique_lock<TMutex> lockFor(TMutex& mutex) {
+    LockSpinning(mutex, lockSpin());
+    return std::unique_lock<TMutex>(mutex, std::adopt_lock);
+}
+
+}
 
 namespace {
 
@@ -465,11 +483,11 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
         return false;
     };
     if (!DrawPipeline::PendingWriteIndexed()) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         return scan();
     }
     if (DrawPipeline::VerifyPendingWriteIndex()) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         std::lock_guard index(indexLock);
         const bool indexed = pendingUnknown != 0 || pendingRanges.Overlaps(begin, end);
         CountVerify(VerifyCount::PendingWriteIndexChecked);
@@ -483,7 +501,7 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
 DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value) {
     if (!Busy() || !finisherProducer) return LabelLookup::NotHeld;
     const auto end = address + bytes;
-    std::lock_guard lock(mutex);
+    const auto lock = lockFor(mutex);
     for (auto held = pending.rbegin(); held != pending.rend(); ++held) {
         if (held->unknown) return LabelLookup::Unknown;
         const bool overlaps = std::any_of(held->writes.begin(), held->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
@@ -510,11 +528,11 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
         return false;
     };
     if (!DrawPipeline::PendingWriteIndexed()) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         return scan();
     }
     if (DrawPipeline::VerifyPendingWriteIndex()) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         std::lock_guard index(indexLock);
         const bool indexed = pendingUnknown != 0 || pendingRanges.OverlapsAny(ranges);
         CountVerify(VerifyCount::PendingWriteIndexChecked);
@@ -561,11 +579,11 @@ bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
     if (!Busy() || !finisherProducer) return false;
     const auto indexed = [&] { return pendingKeys.Find(key) != 0 || (shape != 0 && pendingShapes.Find(shape) != 0); };
     if (!DrawPipeline::PendingWriteIndexed()) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         return scanNewestKey(key, shape, nullptr) != 0;
     }
     if (DrawPipeline::VerifyPendingWriteIndex()) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         std::lock_guard index(indexLock);
         const bool found = indexed();
         CountVerify(VerifyCount::PendingWriteIndexChecked);
@@ -585,10 +603,10 @@ bool DrawFinisher::WaitPendingKey(std::uint64_t key, std::uint64_t shape) {
         after = target != 0 ? static_cast<std::size_t>(enqueuedJobs - target) : 0;
     };
     if (!DrawPipeline::PendingWriteIndexed()) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         target = scanNewestKey(key, shape, &after);
     } else if (DrawPipeline::VerifyPendingWriteIndex()) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         std::lock_guard index(indexLock);
         indexed();
         std::size_t scannedAfter = 0;
@@ -606,7 +624,7 @@ bool DrawFinisher::WaitPendingKey(std::uint64_t key, std::uint64_t shape) {
     static const bool monitored = std::getenv("APS5_NO_KEY_WAIT_MONITOR") == nullptr;
     if (monitored) IdleUntil(&ranJobs, HandoffSpinWindow(), [&] { return ranJobs.load(std::memory_order_acquire) >= target; });
     else SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) <= after; });
-    std::unique_lock lock(mutex);
+    auto lock = lockFor(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return ranJobs >= target || failure != nullptr; });
     --idleWaiters;
@@ -703,7 +721,7 @@ void DrawFinisher::WaitTurn() {
 void DrawFinisher::waitTurn(std::uint64_t sequence) {
     const auto turn = [&] { return ranJobs.load(std::memory_order_acquire) + 1 >= sequence; };
     if (IdleUntil(&ranJobs, HandoffSpinWindow(), turn)) return;
-    std::unique_lock lock(mutex);
+    auto lock = lockFor(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return turn() || failure != nullptr; });
     --idleWaiters;
@@ -757,7 +775,7 @@ void DrawFinisher::push(Slot slot, Pending held) {
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
     const ReclaimOnExit<Job> reclaimOnExit{reclaim};
-    std::unique_lock lock(mutex);
+    auto lock = lockFor(mutex);
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
@@ -848,7 +866,7 @@ void DrawFinisher::run(unsigned index) {
         bool failed = false;
         std::uint64_t sequence = 0;
         {
-            std::unique_lock lock(mutex);
+            auto lock = lockFor(mutex);
             ++sleepers;
             wake.wait(lock, [&] { return claimedJobs < enqueuedJobs; });
             --sleepers;
@@ -866,7 +884,7 @@ void DrawFinisher::run(unsigned index) {
             finisherOrdered = nullptr;
             finisherSequence = 0;
         }
-        std::unique_lock lock(mutex);
+        auto lock = lockFor(mutex);
         slot->error = std::move(error);
         slot->shutdown = shutdown;
         slot->prepared = true;
@@ -905,7 +923,7 @@ void DrawFinisher::run() {
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         const auto spun = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         {
-            std::unique_lock lock(mutex);
+            auto lock = lockFor(mutex);
             ++sleepers;
             wake.wait(lock, [&] { return !jobs.empty(); });
             --sleepers;
@@ -929,7 +947,7 @@ void DrawFinisher::run() {
         }
         bool report = false;
         {
-            std::lock_guard lock(mutex);
+            const auto lock = lockFor(mutex);
             if (error != nullptr && failure == nullptr) {
                 failure = error;
                 report = !shutdown;
@@ -944,7 +962,7 @@ void DrawFinisher::Settle() {
     if (!Busy() || OnFinisherThread()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
     const auto start = std::chrono::steady_clock::now();
-    std::unique_lock lock(mutex);
+    auto lock = lockFor(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return jobs.empty(); });
     --idleWaiters;
@@ -959,7 +977,7 @@ void DrawFinisher::Drain(QueueWaits::Site site) {
     if (busy) timing.emplace("DrawFinisher.Drain");
     const auto start = busy ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
-    std::unique_lock lock(mutex);
+    auto lock = lockFor(mutex);
     if (!jobs.empty()) {
         ++idleWaiters;
         idle.wait(lock, [&] { return jobs.empty(); });
@@ -974,7 +992,7 @@ void DrawFinisher::WaitPendingWritten(std::span<const Range> ranges) {
     const auto overlapping = [&](const Range& write) {
         return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < write.second && write.first < range.second; });
     };
-    std::unique_lock lock(mutex);
+    auto lock = lockFor(mutex);
     std::uint64_t target = 0;
     for (std::size_t i = pending.size(); i-- > 0;) {
         const auto& held = pending[i];
@@ -996,7 +1014,7 @@ void DrawFinisher::WaitPendingWritten(std::span<const Range> ranges) {
 
 void DrawFinisher::ReleaseRan() {
     std::vector<Job> done;
-    std::lock_guard lock(mutex);
+    const auto lock = lockFor(mutex);
     std::swap(done, ran);
 }
 
@@ -1018,7 +1036,7 @@ std::size_t DrawPipeline::Depth() {
 
 std::size_t DrawPipeline::QueuedItems() {
     auto& pipeline = Queue0();
-    std::lock_guard lock(pipeline.mutex);
+    const auto lock = lockFor(pipeline.mutex);
     return pipeline.items.size();
 }
 
@@ -1592,7 +1610,7 @@ void DrawPipeline::postPreProof(const void* currentTemplate, std::span<const Ran
     }
     if (state != PreProofIdle) return;
     {
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         const auto* after = static_cast<const Item*>(lanes[0].target);
         auto it = std::find_if(items.begin(), items.end(), [&](const Item& item) { return &item == after; });
         if (it == items.end()) return;
@@ -1704,7 +1722,7 @@ std::size_t DrawPipeline::EarlyIndex(const std::deque<Item>& items) {
 void DrawPipeline::OfferEarly(std::span<const Range> depth, const void* currentTemplate) {
     if (!pendingEarly.Offered() && pendingEarly.late && committingPipeline != nullptr) {
         auto& pipeline = *committingPipeline;
-        std::lock_guard lock(pipeline.mutex);
+        const auto lock = lockFor(pipeline.mutex);
         if (const auto next = EarlyIndex(pipeline.items); next != 0) {
             if (Graphics::LookalikeCommit()) pendingEarly.borrowed = &pipeline.items[next].early;
             else pendingEarly.hook = pipeline.items[next].early;
@@ -1785,7 +1803,7 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
         static AgcDriver::Mutex mutex;
         static std::array<std::pair<std::uint64_t, std::uint64_t>, 32> epochs{};
         static std::size_t next = 0;
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         const auto found = std::find_if(epochs.begin(), epochs.end(), [&](const auto& entry) { return entry.first == token; });
         if (found != epochs.end() && found->second != 0) {
             GuestMemory::AdoptCollectEpoch(found->second);
@@ -1987,7 +2005,7 @@ void DrawPipeline::enqueue(Item item, Prepare prepare) {
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
     const ReclaimOnExit<Item> reclaimOnExit{reclaim};
     const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    std::unique_lock lock(mutex);
+    auto lock = lockFor(mutex);
     if (!retired.empty()) std::swap(retired, reclaim);
     if (profile) lockWaitNs += elapsedNs(lockStart);
     rethrowFailure();
@@ -2219,7 +2237,7 @@ void DrawPipeline::run() {
         }
         const auto spun = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (!taken) {
-            std::unique_lock lock(mutex);
+            auto lock = lockFor(mutex);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
@@ -2294,7 +2312,7 @@ void DrawPipeline::run() {
             if (lane.distance != 0) --lane.distance;
         }
         {
-            std::lock_guard lock(mutex);
+            const auto lock = lockFor(mutex);
             const auto retiredNow = retiredItems.load(std::memory_order_relaxed) + 1;
             const bool unlockedWatch = UnlockedWriteWatch();
             if (unlockedWatch) {
@@ -2382,7 +2400,7 @@ void DrawPipeline::Stop() {
         else lane.join();
     }
     {
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         closing = true;
         committer = std::move(thread);
     }
@@ -2401,7 +2419,7 @@ void DrawPipeline::ReleaseRetired() {
         std::swap(spent, spentPrepares);
         std::swap(unprepared, prepares);
     }
-    std::lock_guard lock(mutex);
+    const auto lock = lockFor(mutex);
     std::swap(done, retired);
 }
 
@@ -2415,7 +2433,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     PerformanceTimer timing("DrawPipeline.Drain");
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
-    std::unique_lock lock(mutex);
+    auto lock = lockFor(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return items.empty(); });
     --idleWaiters;
@@ -2456,7 +2474,7 @@ void DrawPipeline::WaitWrittenAny(std::span<const Range> ranges, DrainReason rea
     };
     std::uint64_t target = 0;
     {
-        std::lock_guard lock(mutex);
+        const auto lock = lockFor(mutex);
         for (std::size_t i = items.size(); i-- > 0;) {
             const auto& writes = items[i].writes;
             if (std::none_of(writes.begin(), writes.end(), overlapping)) continue;
@@ -2471,7 +2489,7 @@ void DrawPipeline::WaitWrittenAny(std::span<const Range> ranges, DrainReason rea
     PerformanceTimer timing("DrawPipeline.WaitWritten");
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return retiredItems.load(std::memory_order_acquire) >= target; });
-    std::unique_lock lock(mutex);
+    auto lock = lockFor(mutex);
     ++targetWaiters;
     retiredWake.wait(lock, [&] {
         if (retiredItems.load(std::memory_order_acquire) >= target || failure != nullptr || stopped) return true;
@@ -2494,7 +2512,7 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || unordered) return false;
     const auto end = address + bytes;
     auto& pipeline = Queue0();
-    std::lock_guard lock(pipeline.mutex);
+    const auto lock = lockFor(pipeline.mutex);
     heldReadQueries.Add(1);
     auto from = pipeline.items.begin();
     if (skipCommittingReads && !pipeline.items.empty()) {
@@ -2527,7 +2545,7 @@ std::uint64_t DrawPipeline::HeldReadQueries() {
 }
 
 void DrawPipeline::ReleaseRunningReads() {
-    std::lock_guard lock(mutex);
+    const auto lock = lockFor(mutex);
     if (!items.empty()) items.front().reads.clear();
 }
 
@@ -2544,7 +2562,7 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
         if (lookup == DrawFinisher::LabelLookup::Unknown) return std::nullopt;
     }
     const auto end = address + bytes;
-    std::lock_guard lock(mutex);
+    const auto lock = lockFor(mutex);
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
         const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (!overlaps) continue;
@@ -2560,7 +2578,7 @@ DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::
     const auto end = address + bytes;
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return QueuedWrite::Unknown;
     auto answer = QueuedWrite::None;
-    std::lock_guard lock(mutex);
+    const auto lock = lockFor(mutex);
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
         if (std::none_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; })) continue;
         if (!item->store) return QueuedWrite::Unknown;
@@ -2608,7 +2626,7 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
         std::lock_guard counted(queuedWritesLock);
         return {retiredItems.load(std::memory_order_acquire), outstanding.load(std::memory_order_acquire), {}};
     }
-    std::lock_guard lock(mutex);
+    const auto lock = lockFor(mutex);
     Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
     if (PendingWriteIndexed() && !VerifyPendingWriteIndex()) return watch;
     for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
@@ -2634,7 +2652,7 @@ bool DrawPipeline::WrittenSince(const Watch& watch, std::span<const Range> reads
         if (retiredNow - watch.retired > watch.items) return true;
         return retiredWrites.Since(watch.retired, reads) != RetiredWrites::Answer::Clear;
     }
-    std::lock_guard lock(mutex);
+    const auto lock = lockFor(mutex);
     const auto scan = [&] {
         if (std::any_of(items.begin(), items.end(), [&](const Item& item) { return overlaps(item.writes); })) return true;
         const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
