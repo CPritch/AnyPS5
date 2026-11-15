@@ -3562,9 +3562,13 @@ bool SingleKeyColorFor(const GuestTextureResource& resource, std::uint64_t guest
 
 bool StorageTexture::singleBlocksOnGpu() const {
     if (!NoDrawReadbackWaits() || !SingleKeysReadable(descriptor)) return false;
+    const auto elementBytes = BytesPerElement(descriptor.format);
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
         for (std::uint32_t level = 0; level < mips.size(); ++level) {
-            if (geometry.HasLayer(level, layer) && (geometry.GuestLayerOffset(layer) + mips[level].tiledOffset) % 256 != 0) return false;
+            if (!geometry.HasLayer(level, layer)) continue;
+            const auto& mip = mips[level];
+            if ((geometry.GuestLayerOffset(layer) + mip.tiledOffset) % 256 != 0) return false;
+            if (blockUnits && !mip.tail && ThinBlockLayout(MipTileMode(descriptor.tileMode, mip), elementBytes)[0] % 256u != 0) return false;
         }
     }
     return true;
