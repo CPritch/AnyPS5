@@ -1326,6 +1326,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     const bool keyed = source == nullptr && generation == 0 && !committed.has_value() && *keys == DccKeys::Uncompressed;
     const auto untracked = keyed ? untrackedKey(address, bytes) : std::array<std::uint64_t, 4>{};
+    if (keyed) noteUntrackedSurface();
     const auto epochStamp = keyed && untracked[0] == 0 && UntrackedReproofEnabled() ? untrackedRangeStamp(address, bytes) : std::array<std::uint64_t, 4>{};
     auto slabs = slabbed ? committedSlabs(resource, guestBytes, committed) : std::nullopt;
     const auto snapshotSize = snapshotBytes(slabs, bytes);
