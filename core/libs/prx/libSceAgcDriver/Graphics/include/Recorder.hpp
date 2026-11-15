@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommandStream.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -32,7 +33,10 @@ namespace AgcDriver::Graphics {
 
 class Buffer;
 class QueueSubmitter;
+class CommandEncoders;
 class DeviceBuffer;
+class EncodeTicket;
+class QueueSubmitter;
 
 class CommandState {
 public:
@@ -825,6 +829,8 @@ private:
         VkCommandBuffer commands = VK_NULL_HANDLE;
         CommandState graphicsState;
         CommandState secondaryState;
+        std::unique_ptr<CommandStream> stream;
+        std::shared_ptr<EncodeTicket> encode;
         VkFence fence = VK_NULL_HANDLE;
         QueueSubmitter* submitter = nullptr;
         std::uint64_t submitPosition = 0;
@@ -1092,7 +1098,12 @@ private:
     void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
     void discard(std::unique_ptr<Batch> batch) noexcept;
     void removeLabels(Batch& batch);
-    void release(Batch& batch) noexcept;
+    void release(Batch& batch, bool retired = false) noexcept;
+    std::unique_ptr<CommandStream> takeStream();
+    void recycleStream(std::unique_ptr<CommandStream> stream) noexcept;
+    void encodeInline(Batch& batch);
+    CommandEncoders& commandEncoders();
+    void stopEncoders() noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
     static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only = std::nullopt);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> notedReads(const Batch& batch);
@@ -1192,6 +1203,9 @@ private:
     std::uint64_t drawUploadKeptSerial = 0;
     std::vector<VkFence> spare;
     std::vector<VkQueryPool> sparePools;
+    std::vector<std::unique_ptr<CommandStream>> spareStreams;
+    std::size_t spareStreamBytes = 0;
+    std::unique_ptr<CommandEncoders> encoders;
     mutable AgcDriver::Mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;
     std::uint64_t newestSubmitted = 0;

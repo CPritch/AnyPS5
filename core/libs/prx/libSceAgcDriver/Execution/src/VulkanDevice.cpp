@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommandStream.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -835,8 +836,7 @@ struct VulkanDevice::State {
 
     template<typename TFunction>
     TFunction DeviceFunction(Graphics::FunctionName name) const {
-        ++Graphics::DeviceProcLookups();
-        auto function = reinterpret_cast<TFunction>(deviceProc(device, name.Value()));
+        auto function = reinterpret_cast<TFunction>(Graphics::ResolveDeviceFunction(device, deviceProc, name.Value()));
         if (function == nullptr) {
             throw std::runtime_error(std::string("Vulkan device function missing: ") + name.Value());
         }
@@ -1169,7 +1169,11 @@ struct VulkanDevice::State {
             device = VK_NULL_HANDLE;
         }
         if (device != VK_NULL_HANDLE) {
-            const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+            VkResult idle;
+            {
+                const Graphics::QueueAccess access(queue);
+                idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+            }
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
             {
@@ -2542,6 +2546,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->shaderProfile = std::move(shaderProfile);
     if (compileOnly) return;
     if (state->deferDestruction) state->contextDeviceProc = Graphics::DeferDestructionToIdle(state->device, state->deviceProc);
+    state->contextDeviceProc = Graphics::RecordCommandStreams(state->device, state->contextDeviceProc != nullptr ? state->contextDeviceProc : state->deviceProc);
     if (calibratedTimestamps != nullptr) {
         const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
         const auto domains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(state->instanceProc(state->instance, khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));

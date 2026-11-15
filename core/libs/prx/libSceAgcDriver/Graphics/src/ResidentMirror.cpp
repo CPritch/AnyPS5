@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirror.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -21,6 +22,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
