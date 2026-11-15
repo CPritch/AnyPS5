@@ -6904,6 +6904,52 @@ void GuestBufferMemory::AcquireRegistered() {
                 const bool comparable = templateCarryEnabled() && outline != nullptr && outline->device == context.device && outline->content != 0;
                 const bool sameContent = comparable && served == outline->served && servedBacked == outline->backed && servedCopied == outline->copied && built->ranges.size() == outline->table.size() && (built->ranges.empty() || std::memcmp(built->ranges.data(), outline->table.data(), built->ranges.size() * sizeof(built->ranges.front())) == 0);
                 built->content = sameContent ? outline->content : built->serial;
+                if (comparable && !sameContent && verifyIncrementalSpace()) {
+                    static std::atomic<std::uint64_t> reported{0};
+                    if (reported.fetch_add(1, std::memory_order_relaxed) < 24) {
+                        std::size_t first = 0;
+                        while (first < served.size() && first < outline->served.size() && served[first] == outline->served[first]) ++first;
+                        std::size_t same = 0;
+                        for (std::size_t at = 0, old = 0; at < served.size() && old < outline->served.size();) {
+                            if (served[at] == outline->served[old]) {
+                                ++same;
+                                ++at;
+                                ++old;
+                            } else if (served[at].begin < outline->served[old].begin) {
+                                ++at;
+                            } else if (outline->served[old].begin < served[at].begin) {
+                                ++old;
+                            } else {
+                                ++at;
+                                ++old;
+                            }
+                        }
+                        const auto text = [](const std::vector<SpaceOutline::Served>& list, std::size_t at) {
+                            char line[128];
+                            if (at < list.size()) std::snprintf(line, sizeof(line), "0x%llx-0x%llx backing %llx flags %x backed %u", static_cast<unsigned long long>(list[at].begin), static_cast<unsigned long long>(list[at].end), static_cast<unsigned long long>(list[at].backing), list[at].flags, list[at].backed);
+                            else std::snprintf(line, sizeof(line), "none");
+                            return std::string(line);
+                        };
+                        std::fprintf(stderr, "[incremental-space] a rebuilt space's content changed: %zu served regions, %zu before, %zu the same; the first that differs is %s, before %s; backed %s, copied %s (%zu, %zu before)\n", served.size(), outline->served.size(), same, text(served, first).c_str(), text(outline->served, first).c_str(), servedBacked == outline->backed ? "same" : "differs", servedCopied == outline->copied ? "same" : "differs", servedCopied.size(), outline->copied.size());
+                    }
+                }
+                if (comparable && !sameContent && verifyIncrementalSpace()) {
+                    std::size_t at = 0;
+                    for (const auto& before : outline->served) {
+                        while (at < served.size() && served[at].end <= before.begin) ++at;
+                        auto reached = before.begin;
+                        for (auto next = at; next < served.size() && served[next].begin <= reached && reached < before.end; ++next) reached = std::max(reached, served[next].end);
+                        if (reached >= before.end) continue;
+                        const bool copied = std::any_of(servedCopied.begin(), servedCopied.end(), [&](const auto& range) { return range.begin <= reached && before.end <= range.end; });
+                        if (copied) continue;
+                        const auto held = std::partition_point(built->lease.begin(), built->lease.end(), [&](const auto& range) { return range->address + range->bytes <= reached; });
+                        const bool leased = held != built->lease.end() && (*held)->address <= reached && (*held)->readable && (*held)->gpu;
+                        const bool retiring = GuestAllocations::GuestAllocationsRetiring_nid_postfix(static_cast<std::uintptr_t>(reached), static_cast<std::size_t>(before.end - reached));
+                        static std::atomic<std::uint64_t> lost{0};
+                        if (leased) spaces.incrementalDifferences.fetch_add(1, std::memory_order_relaxed);
+                        if (lost.fetch_add(1, std::memory_order_relaxed) < 48) std::fprintf(stderr, "[incremental-space] APS5_VERIFY_INCREMENTAL_SPACE: 0x%llx-0x%llx of the last space's region 0x%llx-0x%llx is not served by the rebuilt one (%s rebuild): the lease %s it as a readable GPU range, a mutation %s for it\n", static_cast<unsigned long long>(reached), static_cast<unsigned long long>(before.end), static_cast<unsigned long long>(before.begin), static_cast<unsigned long long>(before.end), planned ? "incremental" : "full", leased ? "holds" : "does not hold", retiring ? "waits" : "does not wait");
+                    }
+                }
                 built->backing = std::move(backing);
                 (sameContent ? spaces.contentCarried : spaces.contentChanged).fetch_add(1, std::memory_order_relaxed);
                 if (sameContent && verifyIncrementalSpace() && buffers != outline->buffers && spaces.incrementalDifferences.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[incremental-space] APS5_VERIFY_INCREMENTAL_SPACE: a rebuilt space keeps its templates, but an import's buffer is not the one they were written against\n");
