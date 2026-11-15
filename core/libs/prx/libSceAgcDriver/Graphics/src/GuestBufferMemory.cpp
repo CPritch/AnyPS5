@@ -2289,6 +2289,11 @@ const HostImport* peekImport(const HostImports& state, std::uint64_t begin, std:
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
 const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict, ImportRequester requester);
 
+bool importGrowthEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_IMPORT_GROWTH") == nullptr;
+    return enabled;
+}
+
 std::optional<std::pair<std::uint64_t, std::uint64_t>> desiredRun(const GuestAllocations::Lease& lease, std::uint64_t address, std::uint64_t alignment) {
     const auto limit = importMaxBytes.load(std::memory_order_relaxed);
     const auto bounds = importRunBounds(lease, address, limit != 0 ? limit : std::numeric_limits<std::uint64_t>::max());
@@ -2310,6 +2315,7 @@ std::map<std::uint64_t, GrowthRun>::iterator growthAt(HostImports& state, std::u
 }
 
 void oweGrowth(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, std::uint64_t base, std::uint64_t bytes, GrowthBlock blocked, std::uint64_t budget) {
+    if (!importGrowthEnabled()) return;
     const auto desired = desiredRun(lease, base, context.hostImportAlignment);
     if (!desired || desired->first != base || desired->second != base + bytes) return;
     auto& run = growthAt(state, base, base + bytes)->second;
@@ -3111,8 +3117,22 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     std::erase_if(state.sparseRunJoins, [&](const auto& entry) { return affected(entry.first, 1) && !starts(entry.first); });
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwatched;
     std::vector<std::uint64_t> kept;
+    const auto alignment = context.hostImportAlignment;
+    const auto desiredOf = [&](const char* what, std::uint64_t address) {
+        const auto desired = desiredRun(lease, address, alignment);
+        if (journal != nullptr && journal->whole != nullptr) {
+            DriverDetail::CountVerify(DriverDetail::VerifyCount::JournalReconcileDecisions);
+            if (desiredRun(*journal->whole, address, alignment) != desired) reconcileDisagreement(what, address, desired ? desired->second - desired->first : 0, desired.has_value(), generation);
+        }
+        return desired;
+    };
+    const auto outgrown = [&](const HostImport& entry) {
+        if (importGrowthEnabled() || entry.joined) return false;
+        const auto desired = desiredOf("outgrown import", entry.base);
+        return desired && desired->first <= entry.base && entry.base + entry.bytes <= desired->second && desired->second - desired->first != entry.bytes;
+    };
     const auto check = [&](std::map<std::uint64_t, HostImport>::iterator it) {
-        if (decide("import", it->first, it->second.bytes, [&](const GuestAllocations::Lease& ranges) { return sameRange(it->second, ranges); })) {
+        if (decide("import", it->first, it->second.bytes, [&](const GuestAllocations::Lease& ranges) { return sameRange(it->second, ranges); }) && !outgrown(it->second)) {
             if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
             kept.push_back(it->first);
             return std::next(it);
@@ -3148,15 +3168,6 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     for (auto it = state.refusals.begin(); it != state.refusals.end();) it = !affected(it->first.first, it->first.second) || (stillRefused(state, &it->second, budget) && decide("refusal", it->first.first, it->first.second, [&](const GuestAllocations::Lease& ranges) { return sameRun(it->second, exactRun(ranges, it->first.first, it->first.second)); })) ? std::next(it) : state.refusals.erase(it);
     for (auto it = state.evictingRefusals.begin(); it != state.evictingRefusals.end();) it = !affected(it->first.first, it->first.second) || (evictingRefusalCurrent(state, it->second, budget) && decide("evicting refusal", it->first.first, it->first.second, [&](const GuestAllocations::Lease& ranges) { return sameRun(it->second, exactRun(ranges, it->first.first, it->first.second)); })) ? std::next(it) : state.evictingRefusals.erase(it);
     if (journalReconcileEnabled() && verifyJournalReconcile()) verifyTableInvariant(state, journal != nullptr);
-    const auto alignment = context.hostImportAlignment;
-    const auto desiredOf = [&](const char* what, std::uint64_t address) {
-        const auto desired = desiredRun(lease, address, alignment);
-        if (journal != nullptr && journal->whole != nullptr) {
-            DriverDetail::CountVerify(DriverDetail::VerifyCount::JournalReconcileDecisions);
-            if (desiredRun(*journal->whole, address, alignment) != desired) reconcileDisagreement(what, address, desired ? desired->second - desired->first : 0, desired.has_value(), generation);
-        }
-        return desired;
-    };
     for (auto it = state.growth.begin(); it != state.growth.end();) {
         if (!affected(it->first, it->second.end - it->first)) {
             ++it;
