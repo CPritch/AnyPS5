@@ -5924,10 +5924,11 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         }
         const auto after = AddressSpaceCounters();
         if (after.enabled) Require(after.hits == before.hits + 1 && after.rebuiltFirst + after.rebuiltGeneration + after.rebuiltWaiterDrop + after.rebuiltEpoch + after.rebuiltDevice == before.rebuiltFirst + before.rebuiltGeneration + before.rebuiltWaiterDrop + before.rebuiltEpoch + before.rebuiltDevice + 1, "second build did not take the cached address space");
+        const auto cacheDrops = LeaseCounters().cacheDrops;
         GuestHeap::GuestHeapFree_nid_postfix(block);
         Require(!registered(), "freed guest heap block remains registered");
         const auto dropped = AddressSpaceCounters();
-        if (dropped.enabled) Require(dropped.waiterDrops == after.waiterDrops + 1 && LeaseCounters().cacheDrops == dropped.waiterDrops, "the free did not drop the cached address space");
+        if (dropped.enabled) Require(dropped.waiterDrops == after.waiterDrops + 1 && LeaseCounters().cacheDrops == cacheDrops + 1, "the free did not drop the cached address space");
     }
     importCrossingTests(context, access);
     fixedReadOnlyRangeMirrorTests(context, access);
