@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
@@ -205,7 +206,10 @@ void Run(Context context, std::uint8_t* block) {
     const auto stencilAddress = address + BlockBytes / 2;
     const auto submit = [&](Recorder& recorder) {
         recorder.Submit();
-        Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle");
+        {
+            const QueueAccess access(context.queue);
+            Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle");
+        }
     };
     Recorder recorder(context);
     recorder.Activate();
@@ -315,7 +319,10 @@ void RunPairings(Context context, std::uint8_t* block) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     const auto submit = [&](Recorder& recorder) {
         recorder.Submit();
-        Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle");
+        {
+            const QueueAccess access(context.queue);
+            Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle");
+        }
     };
     Recorder recorder(context);
     recorder.Activate();
@@ -352,7 +359,10 @@ std::vector<std::uint32_t> RoundTrip(Context context, std::uint8_t* block, VkFor
     const auto address = reinterpret_cast<std::uint64_t>(block);
     const auto submit = [&](Recorder& recorder) {
         recorder.Submit();
-        Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle");
+        {
+            const QueueAccess access(context.queue);
+            Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle");
+        }
     };
     Recorder recorder(context);
     recorder.Activate();

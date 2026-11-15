@@ -555,6 +555,7 @@ if(BUILD_TESTING)
     endif()
     set_property(TEST agc_driver_host_import_lifetime APPEND PROPERTY ENVIRONMENT_MODIFICATION
         "APS5_RELEASE_UNDER_LOCK=unset:" "APS5_RELEASE_ON_UNLOCK=unset:")
+    set_property(TEST agc_driver_host_import_lifetime APPEND PROPERTY ENVIRONMENT "APS5_NO_ASYNC_SUBMIT=1")
     if(WIN32)
         add_test(NAME agc_driver_host_import_lifetime_other_family COMMAND agc_driver_recorder_tests --host-import-lifetime-other-family-only)
         set_tests_properties(agc_driver_host_import_lifetime_other_family PROPERTIES

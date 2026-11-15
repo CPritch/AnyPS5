@@ -8,6 +8,7 @@ target_sources(agc_host_import_retire_tests PRIVATE tests/HostImportFailure.cpp)
 if(BUILD_TESTING)
     set_target_properties(agc_host_import_retire_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_host_import_retire COMMAND agc_host_import_retire_tests)
+    set_property(TEST agc_host_import_retire APPEND PROPERTY ENVIRONMENT "APS5_NO_ASYNC_SUBMIT=1")
     if(WIN32)
         set_tests_properties(agc_host_import_retire PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
