@@ -37,6 +37,7 @@
 #if defined(__x86_64__) && defined(__GNUC__)
 #include <immintrin.h>
 #endif
+#include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -5769,12 +5770,27 @@ void Recorder::Submit() {
     DestroyDeferredAtIdle(context);
     const auto submitStart = std::chrono::steady_clock::now();
     batch->submitStarted.store(true, std::memory_order_release);
-    const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
-    if (result == VK_ERROR_DEVICE_LOST) {
-        const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
-        if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+    if (QueueSubmitter::Enabled()) {
+        auto* submitter = QueueSubmitter::Existing(context.queue);
+        if (submitter == nullptr) submitter = &QueueSubmitter::For(context.device, context.queue, function(queueSubmit, "vkQueueSubmit"), reinterpret_cast<PFN_vkDeviceWaitIdle>(context.deviceProc(context.device, "vkDeviceWaitIdle")));
+        batch->submitPosition = submitter->Enqueue({batch->commands, batch->fence, hold, holdValue, timeline, serial});
+        batch->submitter = submitter;
+    } else {
+        VkResult result;
+        {
+            const QueueAccess access(context.queue);
+            result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+        }
+        if (result == VK_ERROR_DEVICE_LOST) {
+            VkResult idle;
+            {
+                const QueueAccess access(context.queue);
+                idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            }
+            if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+        }
+        Check(result, "vkQueueSubmit recorder");
     }
-    Check(result, "vkQueueSubmit recorder");
     if (batch->guestWork) LibcRunReportMilestone_nid_no_patch(2);
     batch->submitted = true;
     batch->serial = ++submissions;
@@ -6247,6 +6263,7 @@ bool Recorder::Reap() {
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
     GuestMemory::NoteResolveEffect(GuestMemory::ResolveEffect::Reap);
     GuestMemory::NoteResolveRecorder(__builtin_return_address(0), __func__);
+    if (batch->submitter != nullptr) batch->submitter->WaitSubmitReturned(batch->submitPosition);
     inFlightKeptBytes -= batch->keptBytes;
     if (VerifyBatchKeeps()) verifyBatchKeeps(*batch);
     // The batch's writes stay published until its completions ran, on every exit path.
@@ -6330,7 +6347,11 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
-            const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            VkResult idle;
+            {
+                const QueueAccess access(context.queue);
+                idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            }
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
         if (result != VK_SUCCESS) {

@@ -31,6 +31,7 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+class QueueSubmitter;
 class DeviceBuffer;
 
 class CommandState {
@@ -825,6 +826,8 @@ private:
         CommandState graphicsState;
         CommandState secondaryState;
         VkFence fence = VK_NULL_HANDLE;
+        QueueSubmitter* submitter = nullptr;
+        std::uint64_t submitPosition = 0;
         std::vector<std::shared_ptr<void>> kept;
         std::vector<std::shared_ptr<void>> keptPerDraw;
         std::vector<const void*> keptOnceObjects;

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/InputMirror.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -284,7 +285,10 @@ void submitPrelude(const Context& context, PreludeBatch batch) {
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &batch.commands;
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, batch.fence), "vkQueueSubmit input mirror prelude");
+    {
+        const QueueAccess access(context.queue);
+        Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, batch.fence), "vkQueueSubmit input mirror prelude");
+    }
     PreludeState().inFlight.push_back(std::move(batch));
     Counts().preludes.fetch_add(1, std::memory_order_relaxed);
 }

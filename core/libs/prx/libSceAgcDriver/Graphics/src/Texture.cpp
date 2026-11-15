@@ -25,6 +25,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/KeptUnits.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -520,7 +521,11 @@ static VkDeviceSize BindSparseLevels(const Context& context, OwnedImage& owned, 
         std::unique_lock<GuestMemory::GpuMutexType> gpuLock;
         if (ownQueue) queueLock = std::unique_lock(*context.sparseQueueMutex);
         else gpuLock = std::unique_lock(GuestMemory::GpuMutex());
-        submitted = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, fence);
+        {
+            std::optional<QueueAccess> access;
+            if (!ownQueue) access.emplace(context.queue);
+            submitted = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, fence);
+        }
         if (submitted == VK_SUCCESS) waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
     }
     context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
@@ -6144,7 +6149,10 @@ void StorageTexture::FlushDumpSelected(const char* reason) {
             if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Submit();
             for (const auto& texture : selected) {
                 const auto& context = texture->context;
-                Check(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device), "private image readback wait");
+                {
+                    const QueueAccess access(context.queue);
+                    Check(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device), "private image readback wait");
+                }
                 Buffer host(context, static_cast<std::size_t>(texture->sliceLinearBytes * texture->arrayLayers), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
                 CommandBatch batch(context);
                 const auto commands = batch.Handle();
