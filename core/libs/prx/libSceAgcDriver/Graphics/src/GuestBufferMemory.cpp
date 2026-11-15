@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SnapshotCopies.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
@@ -426,12 +427,17 @@ struct ChurnTimer {
     ChurnTimer& operator=(const ChurnTimer&) = delete;
 };
 
+std::chrono::nanoseconds importLockSpin() {
+    static const std::chrono::nanoseconds window = std::getenv("APS5_NO_IMPORT_LOCK_SPIN") != nullptr ? std::chrono::nanoseconds{0} : std::min<std::chrono::nanoseconds>(HandoffSpinWindow(), std::chrono::microseconds(30));
+    return window;
+}
+
 class ImportsMutex {
 public:
     void lock() noexcept {
         if (!mutex.try_lock()) {
             const ChurnTimer waited(Churn().lockWaits, Churn().lockWaitNs);
-            mutex.lock();
+            LockSpinning(mutex, importLockSpin());
         }
         if (importsLockOrderChecked) ++importsHeld;
     }
@@ -6398,6 +6404,14 @@ void GuestBufferMemory::AcquireRegistered() {
         std::size_t outlineRegion = 0;
         std::size_t outlineAt = 0;
         std::uint64_t patchedThrough = 0;
+        static const bool keptRunLock = std::getenv("APS5_NO_KEPT_RUN_LOCK") == nullptr;
+        constexpr std::size_t keptRunRegions = 256;
+        std::unique_lock<ImportsMutex> keptLock(Imports().mutex, std::defer_lock);
+        std::size_t keptHeld = 0;
+        const auto releaseKept = [&] {
+            if (keptLock.owns_lock()) keptLock.unlock();
+            keptHeld = 0;
+        };
         for (const auto& range : lease) {
             if (range->address < patchedThrough) continue;
             if (!range->readable || !range->gpu) continue;
@@ -6407,7 +6421,7 @@ void GuestBufferMemory::AcquireRegistered() {
                     const auto& kept = outline->regions[outlineRegion];
                     if (outlineSameOver(*outline, lease, static_cast<std::size_t>(&range - &lease[0]), outlineAt, kept.end)) {
                         auto& state = Imports();
-                        std::lock_guard lock(state.mutex);
+                        if (!keptLock.owns_lock()) keptLock.lock();
                         if (const auto* entry = findImport(state, kept.begin, kept.end); entry != nullptr && entry == kept.direct) {
                             if (verifySpacePatch() && !keptBytes(*entry, lease).current) {
                                 std::fprintf(stderr, "FATAL: APS5_VERIFY_SPACE_PATCH: the copied region 0x%llx-0x%llx rests on an import over bytes that changed\n", static_cast<unsigned long long>(kept.begin), static_cast<unsigned long long>(kept.end));
@@ -6419,11 +6433,13 @@ void GuestBufferMemory::AcquireRegistered() {
                             regions.push_back(std::move(region));
                             imported.emplace_back(kept.begin, kept.end);
                             patchedThrough = kept.end;
+                            if (!keptRunLock || ++keptHeld >= keptRunRegions) releaseKept();
                             continue;
                         }
                     }
                 }
             }
+            releaseKept();
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
             const HostImport* entry = nullptr;
@@ -6546,6 +6562,7 @@ void GuestBufferMemory::AcquireRegistered() {
             const char* reason = !mirrorsEnabled() ? "mirrors disabled by APS5_NO_LEASE_MIRROR" : copied.sparse ? "unreadable pages" : !range->releasable ? "image mirror refused" : nullptr;
             copies.push_back({copied.begin, copied.end, committed, reason, reason == nullptr, overBudget});
         }
+        releaseKept();
         releaseImportedMirrors(context, imported);
         for (const auto& region : regions) {
             if (region.mirror != nullptr && region.mirror->heap && !region.mirror->sparse) heaps.push_back(region.mirror.get());
