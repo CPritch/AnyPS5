@@ -226,6 +226,21 @@ static std::uint32_t ReadFileBytes(std::uint64_t offset) {
     return offset < 0x100000000ull ? 20u : 24u;
 }
 
+static bool HoldsHostEncodedCommands(std::uintptr_t base, std::uint32_t end) {
+    std::uint32_t cursor = 0;
+    while (cursor < end) {
+        std::uint32_t first = 0;
+        if (end - cursor < sizeof(first) || !CopyGuestInBytes(&first, reinterpret_cast<const void*>(base + cursor), sizeof(first))) return false;
+        std::uint32_t step = 0;
+        if (Apr::IsNopHeader(first)) step = Apr::NopDwords(first) * static_cast<std::uint32_t>(sizeof(first));
+        else if ((first & 0xffu) == 0x28u) step = ReadFileBytes((first & 0xc0000fffu) == 0x528u ? 0x100000000ull : 0u);
+        else return true;
+        if (step == 0 || step > end - cursor) return false;
+        cursor += step;
+    }
+    return false;
+}
+
 static int AppendRead(Apr::CommandBufferObject* buffer, Apr::Opcode opcode, std::uint32_t fileId, const void* destination, std::uint64_t size, std::uint64_t offset) {
     if (!buffer) return SCE_KERNEL_ERROR_EINVAL;
     if (opcode != Apr::Opcode::ReadFile && (buffer->recording & Apr::ScatterGatherValid) == 0u) return SCE_KERNEL_ERROR_EINVAL;
@@ -492,7 +507,14 @@ int APS5_VABI sceAmprAprCommandBufferReadFile(Apr::CommandBufferObject* buffer, 
     load(current, offsetof(Apr::CommandBufferObject, offset));
     load(capacity, offsetof(Apr::CommandBufferObject, size));
     const auto bytes = ReadFileBytes(offset);
-    if (capacity < bytes || current > capacity - bytes) return SCE_KERNEL_ERROR_EBUSY;
+    if (capacity < bytes || current > capacity - bytes) {
+        if (current > capacity || !HoldsHostEncodedCommands(base, current)) return SCE_KERNEL_ERROR_EBUSY;
+        const int expanded = EnsureCommandCapacity(buffer, bytes);
+        if (expanded != 0) return expanded;
+        load(base, offsetof(Apr::CommandBufferObject, base));
+        load(current, offsetof(Apr::CommandBufferObject, offset));
+        load(capacity, offsetof(Apr::CommandBufferObject, size));
+    }
     std::uint32_t count;
     load(count, offsetof(Apr::CommandBufferObject, numCommands));
     if (count > 0x7ffffffeu) return SCE_KERNEL_ERROR_EINVAL;

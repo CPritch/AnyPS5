@@ -312,6 +312,20 @@ void TestFullBuffer() {
     Require(reads.Offset() > 2 * read && reads.Commands() == 4);
     Require(reads.buffer.base != reads.memory.data() && reads.buffer.size > 2 * read);
 
+    Recorder exactReads(2 * read - 1);
+    Require(sceAmprAprCommandBufferReadFile(&exactReads.buffer, &exactReads.gatherState, &exactReads.scatterState, 1, destination.data(), destination.size(), 0) == 0);
+    Require(sceAmprAprCommandBufferReadFile(&exactReads.buffer, &exactReads.gatherState, &exactReads.scatterState, 1, destination.data(), destination.size(), 0) == static_cast<int>(0x80020010));
+    Require(exactReads.Offset() == read && exactReads.Commands() == 1 && exactReads.buffer.base == exactReads.memory.data());
+
+    alignas(8) std::uint64_t written = 0;
+    const auto address = static_cast<std::uint32_t>(sceAmprMeasureCommandSizeWriteAddress_04_00());
+    Recorder mixed(address + read - 1);
+    Require(sceAmprCommandBufferWriteAddress_04_00(&mixed.buffer, &written, 1, 0) == 0);
+    Require(mixed.Offset() == address && mixed.buffer.base == mixed.memory.data());
+    Require(sceAmprAprCommandBufferReadFile(&mixed.buffer, &mixed.gatherState, &mixed.scatterState, 1, destination.data(), destination.size(), 0) == 0);
+    Require(mixed.Offset() == address + read && mixed.Commands() == 2);
+    Require(mixed.buffer.base != mixed.memory.data() && mixed.buffer.size >= address + read);
+
     Apr::CommandBufferObject unbound{};
     std::uint64_t gatherState = 0;
     std::uint64_t scatterState = 0;
