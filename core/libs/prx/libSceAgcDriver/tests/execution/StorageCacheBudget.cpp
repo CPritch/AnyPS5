@@ -225,12 +225,21 @@ int main(int argc, char** argv) {
                 Require(StorageTexture::FindLive(base + 7u * Stride, SurfaceBytes) == nullptr, "surface 7 survived a release two presents after its last use");
                 AgcDriver::Graphics::Recorder::CountPresent();
                 Require(AgcDriver::Graphics::Recorder::PresentedWithin(AgcDriver::Graphics::StoragePresentKeepWindow), "a present just counted is not within the keep window");
+                Require(Store(*device, base, 5) != nullptr, "surface 5 is not cached again");
+                auto heldSix = Store(*device, base, 6);
+                Require(heldSix != nullptr, "surface 6 is not cached again");
                 Require(Store(*device, base, 7) != nullptr, "surface 7 is not cached again");
+                device->WaitIdle();
                 std::this_thread::sleep_for(AgcDriver::Graphics::StoragePresentKeepWindow + std::chrono::milliseconds(50));
                 Require(!AgcDriver::Graphics::Recorder::PresentedWithin(AgcDriver::Graphics::StoragePresentKeepWindow), "a present older than the keep window is still within it");
-                Require(AgcDriver::Graphics::ReleaseTextureCaches(~std::uint64_t{0}) == allocated, "a release after presents stopped did not take the image used since the last present");
+                Require(AgcDriver::Graphics::ReleaseTextureCaches(~std::uint64_t{0}) == allocated, "a release after presents stopped did not take exactly the oldest image before stopping at the held one");
                 device->WaitIdle();
-                Require(StorageTexture::FindLive(base + 7u * Stride, SurfaceBytes) == nullptr, "surface 7 survived a release while presents had stopped for longer than the keep window");
+                Require(StorageTexture::FindLive(base + 5u * Stride, SurfaceBytes) == nullptr, "surface 5 survived a release while presents had stopped for longer than the keep window");
+                Require(StorageTexture::FindLive(base + 7u * Stride, SurfaceBytes) != nullptr, "a release went on evicting after an evicted image stayed alive outside the cache");
+                heldSix.reset();
+                Require(AgcDriver::Graphics::ReleaseTextureCaches(~std::uint64_t{0}) == allocated, "the next release did not take the image left after the stop");
+                device->WaitIdle();
+                Require(StorageTexture::FindLive(base + 7u * Stride, SurfaceBytes) == nullptr, "surface 7 survived the next release");
                 {
                     const auto kept = StorageTexture::FindLive(base + 3u * Stride, SurfaceBytes);
                     Require(kept != nullptr && kept->Dirty(), "a release of everything took the image with pending results");

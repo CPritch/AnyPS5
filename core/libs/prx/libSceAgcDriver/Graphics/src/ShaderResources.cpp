@@ -2031,6 +2031,7 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
     std::size_t storageCached = 0;
     std::size_t storagePending = 0;
     std::size_t storageRecent = 0;
+    std::size_t storageHeld = 0;
     bool storageScanned = false;
     bool sampledSkipped = false;
     bool storageSkipped = false;
@@ -2146,10 +2147,15 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
                     }
                     resources.clear();
                     ++storageEntries;
+                    const std::weak_ptr<StorageTexture> evicted = image;
                     image.reset();
                     freed = ImageMemoryReleasedBytes() - releasedBefore;
                     if (!removed) {
                         storageSkipped = true;
+                        break;
+                    }
+                    if (!Recorder::PresentedWithin(StoragePresentKeepWindow) && !evicted.expired()) {
+                        ++storageHeld;
                         break;
                     }
                 }
@@ -2161,12 +2167,12 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
     freed = ImageMemoryReleasedBytes() - releasedBefore;
     if (freed != 0) {
         futileReclaimAt.store(NoFutileReclaim, std::memory_order_release);
-    } else if (bytes != 0 && !sampledSkipped && !storageSkipped) {
+    } else if (bytes != 0 && !sampledSkipped && !storageSkipped && charged == 0) {
         futileReclaimPresent.store(Recorder::Presents(), std::memory_order_relaxed);
         futileReclaimAt.store(SteadyNanoseconds(), std::memory_order_release);
     }
-    char kept[192] = "";
-    if (storageScanned) std::snprintf(kept, sizeof(kept), "; of the %zu cached storage images, %zu with pending results and %zu used in this or the previous present were kept", storageCached, storagePending, storageRecent);
+    char kept[256] = "";
+    if (storageScanned) std::snprintf(kept, sizeof(kept), "; of the %zu cached storage images, %zu with pending results, %zu used in this or the previous present were kept, and the release stopped at %zu image still held after its eviction", storageCached, storagePending, storageRecent, storageHeld);
     std::fprintf(stderr, "[gpu] texture caches released %llu MiB of the %llu MiB asked for: %zu sampled entries%s, %zu cached builds holding sampled textures dropped, %zu sampled textures still held (%zu charged to the open batch), %zu storage images%s%s\n", static_cast<unsigned long long>(freed >> 20u), static_cast<unsigned long long>(bytes >> 20u), sampledEntries, sampledSkipped ? " (cache busy, skipped)" : "", sampledBuilds, held.size(), charged, storageEntries, storageSkipped ? " (cache or device busy, skipped)" : "", kept);
     return freed;
 }
