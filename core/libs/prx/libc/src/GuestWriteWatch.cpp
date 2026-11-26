@@ -280,20 +280,40 @@ private:
 
     void link(std::uintptr_t begin, std::uintptr_t end, std::uintptr_t partner) {
         _links.emplace(begin, Link{end, partner});
+        _partners.emplace(partner, begin);
         _linkBytes = std::max(_linkBytes, end - begin);
     }
 
+    void unlinkPartner(std::uintptr_t from, std::uintptr_t partner) {
+        auto [first, last] = _partners.equal_range(partner);
+        for (auto it = first; it != last; ++it) {
+            if (it->second != from) continue;
+            _partners.erase(it);
+            return;
+        }
+    }
+
     void cut(std::uintptr_t begin, std::uintptr_t end) {
+        if (_links.empty()) return;
+        const auto reach = begin > _linkBytes ? begin - _linkBytes : 0;
+        std::vector<std::multimap<std::uintptr_t, Link>::iterator> candidates;
+        for (auto it = _links.lower_bound(reach); it != _links.end() && it->first < end; ++it) candidates.push_back(it);
+        for (auto it = _partners.lower_bound(reach); it != _partners.end() && it->first < end; ++it) {
+            auto [first, last] = _links.equal_range(it->second);
+            for (auto link = first; link != last; ++link) {
+                if (link->second.partner == it->first) candidates.push_back(link);
+            }
+        }
+        std::ranges::sort(candidates, [](const auto& left, const auto& right) { return &*left < &*right; });
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
         std::vector<std::pair<std::uintptr_t, Link>> kept;
-        for (auto it = _links.begin(); it != _links.end();) {
+        for (const auto it : candidates) {
             const auto from = it->first;
             const auto bytes = it->second.end - from;
             const auto partner = it->second.partner;
-            if (!(from < end && begin < from + bytes) && !(partner < end && begin < partner + bytes)) {
-                ++it;
-                continue;
-            }
-            it = _links.erase(it);
+            if (!(from < end && begin < from + bytes) && !(partner < end && begin < partner + bytes)) continue;
+            unlinkPartner(from, partner);
+            _links.erase(it);
             std::vector<std::pair<std::uintptr_t, std::uintptr_t>> pieces{{0, bytes}};
             for (const auto base : {from, partner}) {
                 const auto low = std::min(bytes, begin > base ? begin - base : 0);
@@ -308,7 +328,10 @@ private:
             }
             for (const auto& [left, right] : pieces) kept.emplace_back(from + left, Link{from + right, partner + left});
         }
-        for (const auto& [from, piece] : kept) _links.emplace(from, piece);
+        for (const auto& [from, piece] : kept) {
+            _links.emplace(from, piece);
+            _partners.emplace(piece.partner, from);
+        }
     }
 
     bool takeFresh(std::uintptr_t begin, std::uintptr_t end, bool whole, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context) {
@@ -494,6 +517,7 @@ private:
     std::map<std::uintptr_t, std::uintptr_t> _ranges;
     std::map<std::uintptr_t, std::uintptr_t> _fresh;
     std::multimap<std::uintptr_t, Link> _links;
+    std::multimap<std::uintptr_t, std::uintptr_t> _partners;
     std::uintptr_t _linkBytes = 0;
 };
 
