@@ -49,7 +49,7 @@ constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
 
 }
 
-BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 8u))), cacheReclaim(context.cacheReclaim), device(context.device), unmap(context.Resolved(&DeviceFunctions::unmapMemory, "vkUnmapMemory")), destroyBuffer(context.Resolved(&DeviceFunctions::destroyBuffer, "vkDestroyBuffer")), freeMemory(context.Resolved(&DeviceFunctions::freeMemory, "vkFreeMemory")), allocateMemory(context.Resolved(&DeviceFunctions::allocateMemory, "vkAllocateMemory")), mapMemory(context.Resolved(&DeviceFunctions::mapMemory, "vkMapMemory")), physical(context.physical), memoryProperties(context.memory), memoryProperties2(context.memoryProperties2) {
+BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 8u))), cacheReclaim(context.cacheReclaim), cacheReclaimFutile(context.cacheReclaimFutile), device(context.device), unmap(context.Resolved(&DeviceFunctions::unmapMemory, "vkUnmapMemory")), destroyBuffer(context.Resolved(&DeviceFunctions::destroyBuffer, "vkDestroyBuffer")), freeMemory(context.Resolved(&DeviceFunctions::freeMemory, "vkFreeMemory")), allocateMemory(context.Resolved(&DeviceFunctions::allocateMemory, "vkAllocateMemory")), mapMemory(context.Resolved(&DeviceFunctions::mapMemory, "vkMapMemory")), physical(context.physical), memoryProperties(context.memory), memoryProperties2(context.memoryProperties2) {
     smallTier.budget = smallBudget;
     largeTier.budget = budget;
     deviceTier.budget = deviceBudget(context);
@@ -75,16 +75,33 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
     return allocateMemoryWithReuse(allocation, operation, hostType, allocatedType, newImage, {});
 }
 
+namespace {
+
+std::int64_t PoolSteadyNanoseconds() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+}
+
+bool BufferPool::deviceRefusedWhileFutile(std::uint32_t memoryType) const {
+    if (memoryType >= deviceRefusedAt.size() || cacheReclaimFutile == nullptr) return false;
+    const auto at = deviceRefusedAt[memoryType].load(std::memory_order_acquire);
+    if (at == 0) return false;
+    if (PoolSteadyNanoseconds() - at >= std::chrono::duration_cast<std::chrono::nanoseconds>(DeviceRefusalWindow).count()) return false;
+    return cacheReclaimFutile();
+}
+
 VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage, const std::function<bool(std::uint32_t)>& reuse) {
     if (allocatedType != nullptr) *allocatedType = allocation.memoryTypeIndex;
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    auto result = allocateMemory(device, &allocation, nullptr, &memory);
+    const bool skipDevice = hostType.has_value() && *hostType != allocation.memoryTypeIndex && deviceRefusedWhileFutile(allocation.memoryTypeIndex);
+    auto result = skipDevice ? VK_ERROR_OUT_OF_DEVICE_MEMORY : allocateMemory(device, &allocation, nullptr, &memory);
     const auto initialResult = result;
-    unsigned attempts = 1;
+    unsigned attempts = skipDevice ? 0u : 1u;
     VkDeviceSize reclaimed = 0;
     VkDeviceSize released = 0;
     const auto exhausted = [](VkResult value) { return value == VK_ERROR_OUT_OF_DEVICE_MEMORY || value == VK_ERROR_OUT_OF_HOST_MEMORY || value == VK_ERROR_TOO_MANY_OBJECTS; };
-    if (exhausted(result)) {
+    if (exhausted(result) && !skipDevice) {
         if (reuse && reuse(allocation.memoryTypeIndex)) return VK_NULL_HANDLE;
         reclaimed = trim();
         if (reuse && reuse(allocation.memoryTypeIndex)) return VK_NULL_HANDLE;
@@ -94,7 +111,7 @@ VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& a
             ++attempts;
         }
     }
-    if (exhausted(result)) {
+    if (exhausted(result) && !skipDevice) {
         if (cacheReclaim != nullptr) released = cacheReclaim(ReclaimTarget(allocation.allocationSize), newImage);
         if (reuse && reuse(allocation.memoryTypeIndex)) return VK_NULL_HANDLE;
         if (released != 0) {
@@ -113,6 +130,7 @@ VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& a
         ++attempts;
         if (result == VK_SUCCESS) {
             if (allocatedType != nullptr) *allocatedType = *hostType;
+            if (!skipDevice && allocation.memoryTypeIndex < deviceRefusedAt.size()) deviceRefusedAt[allocation.memoryTypeIndex].store(PoolSteadyNanoseconds(), std::memory_order_release);
             MemoryAccounting::Record(device, memory, host, memoryProperties, operation);
             static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
             const auto count = placements.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -122,6 +140,7 @@ VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& a
         }
     }
     if (result == VK_SUCCESS) {
+        if (allocation.memoryTypeIndex < deviceRefusedAt.size()) deviceRefusedAt[allocation.memoryTypeIndex].store(0, std::memory_order_release);
         MemoryAccounting::Record(device, memory, allocation, memoryProperties, operation);
         if (attempts > 1) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu released=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), static_cast<int>(initialResult), attempts);
         return memory;

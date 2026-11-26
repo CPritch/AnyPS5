@@ -23,6 +23,7 @@
 #include <utility>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using namespace AgcDriver::Graphics;
@@ -295,6 +296,59 @@ std::uint64_t cacheReleases = 0;
 VkDeviceSize ReleaseEverything(VkDeviceSize bytes, bool) {
     ++cacheReleases;
     return bytes;
+}
+
+bool futileCaches = false;
+
+bool FutileCaches() {
+    return futileCaches;
+}
+
+VkDeviceSize ReleaseNothing(VkDeviceSize, bool) {
+    ++cacheReleases;
+    return 0;
+}
+
+void RefusedDeviceSkippedWhileFutile() {
+    mock = MockDevice{};
+    cacheReleases = 0;
+    auto context = mockContext();
+    context.cacheReclaim = ReleaseNothing;
+    context.cacheReclaimFutile = FutileCaches;
+    auto pool = std::make_shared<BufferPool>(context);
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = 4 * MiB;
+    allocation.memoryTypeIndex = 0;
+    const auto place = [&](std::initializer_list<VkResult> results) {
+        mock.results = results;
+        const auto before = mock.attempts;
+        std::uint32_t type = 99;
+        const auto memory = pool->AllocateMemory(allocation, "test refused device", 1u, &type);
+        const auto made = mock.attempts - before;
+        mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
+        return std::pair<std::uint32_t, std::uint64_t>{type, made};
+    };
+    futileCaches = true;
+    auto [type, made] = place({VK_ERROR_OUT_OF_DEVICE_MEMORY});
+    Expect(type == 1 && made == 2 && cacheReleases == 1, "a refused device allocation did not fall back to the host type after one device attempt and one cache release");
+    std::tie(type, made) = place({});
+    Expect(type == 1 && made == 1 && cacheReleases == 1, "an allocation right after a device refusal tried device memory or the caches again although the caches had nothing to release");
+    futileCaches = false;
+    std::tie(type, made) = place({});
+    Expect(type == 0 && made == 1, "an allocation after a device refusal did not try device memory once the caches could release memory");
+    futileCaches = true;
+    std::tie(type, made) = place({});
+    Expect(type == 0 && made == 1, "a device-local success did not end the refusal");
+    std::tie(type, made) = place({VK_ERROR_OUT_OF_DEVICE_MEMORY});
+    Expect(type == 1 && made == 2, "a second device refusal did not fall back to the host type");
+    std::this_thread::sleep_for(BufferPool::DeviceRefusalWindow + std::chrono::milliseconds(20));
+    std::tie(type, made) = place({});
+    Expect(type == 0 && made == 1, "a device refusal older than its window still kept allocations out of device memory");
+    allocation.memoryTypeIndex = 1;
+    std::tie(type, made) = place({});
+    Expect(type == 1 && made == 1, "a host allocation was changed by the device refusal memo");
+    futileCaches = false;
+    Expect(mock.liveBytes == 0, "the refused device placement test leaked memory");
 }
 
 void HostSlotBeforeCacheRelease() {
@@ -1857,6 +1911,7 @@ int main(int argc, char** argv) {
         ImageMemoryOverBudget();
         RetainedImagesReleasedBeforeHostPlacement();
         HostPlacement();
+        RefusedDeviceSkippedWhileFutile();
         HostSlotBeforeCacheRelease();
         RefusedDevicePlacement();
         IdleReclaimSkipsHostPlaced();

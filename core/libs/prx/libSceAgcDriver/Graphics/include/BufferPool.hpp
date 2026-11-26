@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageMemory.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <cstdint>
@@ -67,6 +68,7 @@ public:
     static std::size_t Capacity(std::size_t bytes);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);
+    static constexpr std::chrono::milliseconds DeviceRefusalWindow{100};
     ImageAllocation AllocateImage(const Context& context, VkImage image, const VkImageCreateInfo& imageInfo, const char* operation, bool newImage, bool budgeted);
     std::size_t ImageSlabBlocks();
     static VkDeviceSize ImageBudget(VkDeviceSize deviceBudget);
@@ -175,6 +177,9 @@ private:
     static std::size_t MaxSlots();
     std::size_t maxSlots;
     VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes, bool newImage);
+    bool (*cacheReclaimFutile)();
+    std::array<std::atomic<std::int64_t>, VK_MAX_MEMORY_TYPES> deviceRefusedAt{};
+    bool deviceRefusedWhileFutile(std::uint32_t memoryType) const;
     VkDevice device;
     PFN_vkUnmapMemory unmap;
     PFN_vkDestroyBuffer destroyBuffer;
