@@ -1758,18 +1758,22 @@ static void CheckNoOverwriteRefusesReservation() {
         Require(sceKernelMapFlexibleMemory(&flexible, page * 2, 3, fixedNoOverwrite) == outOfMemory);
         Require(flexible == target);
         void* range = target;
-        Require(sceKernelReserveVirtualRange(&range, page * 2, fixedNoOverwrite, 0) == outOfMemory);
+        Require(sceKernelReserveVirtualRange(&range, page * 2, fixedNoOverwrite, 0) == 0);
         Require(range == target);
         void* pool = nullptr;
-        Require(sceKernelMemoryPoolReserve(target, page * 2, 0, fixedNoOverwrite, &pool) == outOfMemory);
+        Require(sceKernelMemoryPoolReserve(target, page * 2, 0, fixedNoOverwrite, &pool) == 0);
+        Require(pool == target);
         void* file = nullptr;
         Require(sceKernelMmap(target, page * 2, 3, sharedFixedNoOverwrite, fd, 0, &file) == outOfMemory);
         Require(file == nullptr);
     }
     VirtualQueryInfo info{};
-    Require(sceKernelVirtualQuery(base, 0, &info, sizeof(info)) == 0);
-    Require(!info.is_committed && !info.is_direct && !info.is_flexible && info.protection == 0);
-    Require(info.start == reinterpret_cast<std::uintptr_t>(base) && info.end == reinterpret_cast<std::uintptr_t>(base) + page * 4);
+    for (std::size_t offset = 0; offset < page * 4; offset += page) {
+        const auto address = reinterpret_cast<std::uintptr_t>(base) + offset;
+        Require(sceKernelVirtualQuery(base + offset, 0, &info, sizeof(info)) == 0);
+        Require(!info.is_committed && !info.is_direct && !info.is_flexible && info.protection == 0);
+        Require(info.start <= address && info.end > address && info.start >= reinterpret_cast<std::uintptr_t>(base) && info.end <= reinterpret_cast<std::uintptr_t>(base) + page * 4);
+    }
     void* replaced = base + page;
     Require(sceKernelMapDirectMemory(&replaced, page * 2, 3, 0x10, phys, 0) == 0);
     Require(replaced == base + page);

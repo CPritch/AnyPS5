@@ -1838,10 +1838,11 @@ int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
     const bool fixed = *addr != nullptr && (flags & GuestMapFixedFlag) != 0;
     if (fixed) {
         if (GuestArena::GuestArenaAvailable_nid_postfix() && !GuestArena::GuestArenaContains_nid_postfix(*addr, len)) return SCE_KERNEL_ERROR_EINVAL;
-        if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
+        constexpr int GuestMapNoOverwrite = 0x80;
+        const bool overReservation = (flags & GuestMapNoOverwrite) != 0 && mutation.Covers(*addr, len) && Reserved(*addr, len);
+        if (!overReservation && FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
         if (mutation.Covers(*addr, len)) {
-            constexpr int GuestMapNoOverwrite = 0x80;
-            if ((flags & GuestMapNoOverwrite) == 0 && RemapFixedIntoRegistered(mutation, *addr, len, 0, GuestMapFixedFlag)) {
+            if (((flags & GuestMapNoOverwrite) == 0 || overReservation) && RemapFixedIntoRegistered(mutation, *addr, len, 0, GuestMapFixedFlag)) {
                 RecordProtection(*addr, len, -1);
                 RecordReservation(*addr, len);
                 return 0;
