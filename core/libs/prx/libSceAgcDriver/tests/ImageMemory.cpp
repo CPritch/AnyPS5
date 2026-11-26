@@ -663,6 +663,30 @@ void PreferredDedicatedInHostMemory() {
     Clean();
 }
 
+void RefusedDeviceImagesShareHostBlock() {
+    ResetMock();
+    {
+        auto context = NewContext();
+        mock.refusedDevice = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        const auto first = NewImage(64 * KiB, 256, 3u);
+        const auto second = NewImage(64 * KiB, 256, 3u);
+        const auto preferred = NewImage(64 * KiB, 256, 3u, false, true);
+        auto firstAllocation = Take(context, first);
+        Bind(first, firstAllocation);
+        auto secondAllocation = Take(context, second);
+        Bind(second, secondAllocation);
+        auto preferredAllocation = Take(context, preferred);
+        Bind(preferred, preferredAllocation);
+        const auto& memory = mock.memories[Index(MemoryOf(firstAllocation))];
+        Expect(memory.type == 1 && memory.bytes > 64 * KiB && memory.dedicated == VK_NULL_HANDLE, "a small image the device refused was given host memory of its own instead of a host image block");
+        Expect(MemoryOf(secondAllocation) == MemoryOf(firstAllocation) && MemoryOf(preferredAllocation) == MemoryOf(firstAllocation), "small images the device refused did not share one host image block");
+        Drop(preferred, preferredAllocation);
+        Drop(second, secondAllocation);
+        Drop(first, firstAllocation);
+    }
+    Clean();
+}
+
 void SmallBudgetHeadroom() {
     ResetMock();
     {
@@ -1202,7 +1226,7 @@ void MemoryAccountingRanges() {
     auto fallbackContext = NewContext();
     mock.refusedDevice = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     auto fallback = Take(fallbackContext, NewImage(64 * KiB, 256, 3u));
-    Expect(find(fallback.Memory()).heap == 1 && find(fallback.Memory()).bytes == 64 * KiB, "image host fallback has the wrong memory charge");
+    Expect(find(fallback.Memory()).heap == 1 && find(fallback.Memory()).bytes == 4 * MiB && find(fallback.Memory()).retained == 4 * MiB - 64 * KiB, "an image placed in a host image block has the wrong memory charge");
     fallback.Reset();
     fallbackContext.bufferPool.reset();
     Expect(MemoryAccounting::Read(context.device).allocations.empty(), "image host fallback destruction left an allocation counted");
@@ -1233,6 +1257,7 @@ int main(int argc, char** argv) {
         BudgetPressureUsesLiveBlock();
         SmallBudgetHeadroom();
         PreferredDedicatedInHostMemory();
+        RefusedDeviceImagesShareHostBlock();
         ReleasedMemoryAccounting();
         ReleasedMemoryIsThreadLocal();
         std::puts("image allocation: ownership and host allocation failures");

@@ -937,6 +937,50 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
     const bool hostPlaced = memoryType < memoryProperties.memoryTypeCount && (memoryProperties.memoryHeaps[memoryProperties.memoryTypes[memoryType].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0;
     const bool separate = required || (preferred && !hostPlaced);
     const bool placedEligible = eligible || (slabShape && preferred && hostPlaced);
+    const auto newBlock = [&](std::uint32_t type) {
+        const auto dispose = [this](ImageBlock* block) noexcept {
+            if (block->memory != VK_NULL_HANDLE) MemoryAccounting::Free(freeMemory, device, block->memory);
+            delete block;
+        };
+        std::unique_ptr<ImageBlock, decltype(dispose)> block(new ImageBlock, dispose);
+        block->memoryType = type;
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = imageBlockBytes;
+        allocation.memoryTypeIndex = type;
+        ImageAllocation reused;
+        const auto reuse = [&](std::uint32_t candidate) {
+            reused = takeImageRange(pool, candidate, needed.size, needed.alignment);
+            return static_cast<bool>(reused);
+        };
+        try {
+            block->memory = allocateMemoryWithReuse(allocation, operation, std::nullopt, &block->memoryType, newImage, reuse);
+        } catch (const MemoryAllocationError& error) {
+            if (error.result != VK_ERROR_OUT_OF_DEVICE_MEMORY && error.result != VK_ERROR_OUT_OF_HOST_MEMORY && error.result != VK_ERROR_TOO_MANY_OBJECTS) throw;
+            return ImageAllocation{};
+        }
+        if (reused) return reused;
+        if (auto existing = takeImageRange(pool, block->memoryType, needed.size, needed.alignment)) return existing;
+        const auto units = static_cast<std::uint32_t>((needed.size + imageUnitBytes - 1u) / imageUnitBytes);
+        markImageRange(*block, 0, units, true);
+        block->freeUnits -= units;
+        block->allocations = 1;
+        block->hint = units;
+        MemoryAccounting::Retain(device, block->memory, imageBlockBytes - static_cast<VkDeviceSize>(units) * imageUnitBytes);
+        ImageAllocation result;
+        {
+            std::lock_guard lock(imageMutex);
+            auto* created = block.get();
+            const auto entry = imageBlocks.try_emplace(created->memory).first;
+            entry->second.reset(block.release());
+            linkImageBlock(*created);
+            result.owner = pool;
+            result.memory = created->memory;
+            result.memoryType = created->memoryType;
+            result.bytes = needed.size;
+            result.slab = true;
+        }
+        return result;
+    };
     const auto standalone = [&] {
         ImageAllocation result;
         result.owner = pool;
@@ -950,6 +994,23 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
         allocation.allocationSize = needed.size;
         allocation.memoryTypeIndex = memoryType;
         const auto fallback = context.RefusedDeviceMemoryFallback(needed.memoryTypeBits, memoryType);
+        if (slabShape && fallback.has_value()) {
+            const bool tryDevice = !deviceRefusedWhileFutile(memoryType);
+            if (tryDevice) {
+                try {
+                    result.memory = separate ? AllocateMemory(allocation, operation, std::nullopt, &result.memoryType, newImage) : TakeImageMemory(allocation, operation, std::nullopt, &result.memoryType, newImage);
+                    return result;
+                } catch (const MemoryAllocationError& error) {
+                    if (error.result != VK_ERROR_OUT_OF_DEVICE_MEMORY) throw;
+                }
+            }
+            auto placed = takeImageRange(pool, *fallback, needed.size, needed.alignment);
+            if (!placed) placed = newBlock(*fallback);
+            if (placed) {
+                if (tryDevice && memoryType < deviceRefusedAt.size()) deviceRefusedAt[memoryType].store(PoolSteadyNanoseconds(), std::memory_order_release);
+                return placed;
+            }
+        }
         result.memory = separate ? AllocateMemory(allocation, operation, fallback, &result.memoryType, newImage) : TakeImageMemory(allocation, operation, fallback, &result.memoryType, newImage);
         return result;
     };
@@ -964,48 +1025,8 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
         const auto usage = reported.heapUsage[heap];
         if (budget != 0 && (usage >= budget || imageBlockBytes > budget - usage)) return standalone();
     }
-    const auto dispose = [this](ImageBlock* block) noexcept {
-        if (block->memory != VK_NULL_HANDLE) MemoryAccounting::Free(freeMemory, device, block->memory);
-        delete block;
-    };
-    std::unique_ptr<ImageBlock, decltype(dispose)> block(new ImageBlock, dispose);
-    block->memoryType = memoryType;
-    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocation.allocationSize = imageBlockBytes;
-    allocation.memoryTypeIndex = memoryType;
-    ImageAllocation reused;
-    const auto reuse = [&](std::uint32_t type) {
-        reused = takeImageRange(pool, type, needed.size, needed.alignment);
-        return static_cast<bool>(reused);
-    };
-    try {
-        block->memory = allocateMemoryWithReuse(allocation, operation, std::nullopt, &block->memoryType, newImage, reuse);
-    } catch (const MemoryAllocationError& error) {
-        if (error.result != VK_ERROR_OUT_OF_DEVICE_MEMORY && error.result != VK_ERROR_OUT_OF_HOST_MEMORY && error.result != VK_ERROR_TOO_MANY_OBJECTS) throw;
-        return standalone();
-    }
-    if (reused) return reused;
-    if (auto existing = takeImageRange(pool, block->memoryType, needed.size, needed.alignment)) return existing;
-    const auto units = static_cast<std::uint32_t>((needed.size + imageUnitBytes - 1u) / imageUnitBytes);
-    markImageRange(*block, 0, units, true);
-    block->freeUnits -= units;
-    block->allocations = 1;
-    block->hint = units;
-    MemoryAccounting::Retain(device, block->memory, imageBlockBytes - static_cast<VkDeviceSize>(units) * imageUnitBytes);
-    ImageAllocation result;
-    {
-        std::lock_guard lock(imageMutex);
-        auto* created = block.get();
-        const auto entry = imageBlocks.try_emplace(created->memory).first;
-        entry->second.reset(block.release());
-        linkImageBlock(*created);
-        result.owner = pool;
-        result.memory = created->memory;
-        result.memoryType = created->memoryType;
-        result.bytes = needed.size;
-        result.slab = true;
-    }
-    return result;
+    if (auto created = newBlock(memoryType)) return created;
+    return standalone();
 }
 
 void BufferPool::releaseImageAllocation(const ImageAllocation& allocation) noexcept {
