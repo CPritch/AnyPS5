@@ -35,6 +35,8 @@ class GraphicsPipelineCache;
 class Recorder;
 class CommandState;
 class DescriptorCache;
+class BindlessTable;
+class TextureService;
 class SamplerCache;
 class ShaderResources;
 class PlaceholderImages;
@@ -324,6 +326,8 @@ struct Context {
     bool bufferInt64Atomics = false;
     VkDeviceAddress atomicLockTable = 0;
     const PlaceholderImages* placeholderImages = nullptr;
+    BindlessTable* bindlessTable = nullptr;
+    TextureService* textureService = nullptr;
     bool viewportIndexLayer = false;
     bool demoteToHelperInvocation = false;
     bool earlyFragmentSampleMaskTestBeforeSampleCounting = false;
