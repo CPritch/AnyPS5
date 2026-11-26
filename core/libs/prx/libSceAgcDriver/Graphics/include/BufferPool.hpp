@@ -69,6 +69,8 @@ public:
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);
     static constexpr std::chrono::milliseconds DeviceRefusalWindow{100};
+    static constexpr std::chrono::milliseconds RefusedCeilingWindow{500};
+    VkDeviceSize RefusedHeapCeiling(std::uint32_t heap) const;
     ImageAllocation AllocateImage(const Context& context, VkImage image, const VkImageCreateInfo& imageInfo, const char* operation, bool newImage, bool budgeted);
     std::size_t ImageSlabBlocks();
     static VkDeviceSize ImageBudget(VkDeviceSize deviceBudget);
@@ -179,6 +181,9 @@ private:
     VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes, bool newImage);
     bool (*cacheReclaimFutile)();
     std::array<std::atomic<std::int64_t>, VK_MAX_MEMORY_TYPES> deviceRefusedAt{};
+    std::array<std::atomic<std::uint64_t>, VK_MAX_MEMORY_HEAPS> refusedCeiling{};
+    std::array<std::atomic<std::int64_t>, VK_MAX_MEMORY_HEAPS> refusedCeilingAt{};
+    void noteDeviceRefusal(std::uint32_t memoryType);
     bool deviceRefusedWhileFutile(std::uint32_t memoryType) const;
     VkDevice device;
     PFN_vkUnmapMemory unmap;
@@ -234,6 +239,7 @@ VkDeviceMemory AllocateImageMemory(const Context& context, const VkMemoryAllocat
 void ReleaseImageMemory(const Context& context, VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
 
 VkDeviceSize ReleaseRetainedImageMemory(const Context& context, VkDeviceSize bytes);
+VkDeviceSize RefusedDeviceHeapCeiling(const Context& context, std::uint32_t heap);
 
 }
 

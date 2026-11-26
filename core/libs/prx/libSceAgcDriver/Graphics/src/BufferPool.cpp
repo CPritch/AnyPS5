@@ -91,6 +91,29 @@ bool BufferPool::deviceRefusedWhileFutile(std::uint32_t memoryType) const {
     return cacheReclaimFutile();
 }
 
+void BufferPool::noteDeviceRefusal(std::uint32_t memoryType) {
+    if (memoryType >= memoryProperties.memoryTypeCount || memoryProperties2 == nullptr || physical == VK_NULL_HANDLE) return;
+    const auto heap = memoryProperties.memoryTypes[memoryType].heapIndex;
+    if (heap >= refusedCeiling.size() || (memoryProperties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
+    memoryProperties2(physical, &properties);
+    if (reported.heapUsage[heap] == 0) return;
+    refusedCeiling[heap].store(reported.heapUsage[heap], std::memory_order_relaxed);
+    refusedCeilingAt[heap].store(PoolSteadyNanoseconds(), std::memory_order_release);
+}
+
+VkDeviceSize BufferPool::RefusedHeapCeiling(std::uint32_t heap) const {
+    if (heap >= refusedCeiling.size()) return 0;
+    const auto at = refusedCeilingAt[heap].load(std::memory_order_acquire);
+    if (at == 0 || PoolSteadyNanoseconds() - at >= std::chrono::duration_cast<std::chrono::nanoseconds>(RefusedCeilingWindow).count()) return 0;
+    return refusedCeiling[heap].load(std::memory_order_relaxed);
+}
+
+VkDeviceSize RefusedDeviceHeapCeiling(const Context& context, std::uint32_t heap) {
+    return context.bufferPool != nullptr ? context.bufferPool->RefusedHeapCeiling(heap) : 0;
+}
+
 VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage, const std::function<bool(std::uint32_t)>& reuse) {
     if (allocatedType != nullptr) *allocatedType = allocation.memoryTypeIndex;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -101,6 +124,7 @@ VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& a
     VkDeviceSize reclaimed = 0;
     VkDeviceSize released = 0;
     const auto exhausted = [](VkResult value) { return value == VK_ERROR_OUT_OF_DEVICE_MEMORY || value == VK_ERROR_OUT_OF_HOST_MEMORY || value == VK_ERROR_TOO_MANY_OBJECTS; };
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !skipDevice) noteDeviceRefusal(allocation.memoryTypeIndex);
     if (exhausted(result) && !skipDevice) {
         if (reuse && reuse(allocation.memoryTypeIndex)) return VK_NULL_HANDLE;
         reclaimed = trim();

@@ -351,6 +351,36 @@ void RefusedDeviceSkippedWhileFutile() {
     Expect(mock.liveBytes == 0, "the refused device placement test leaked memory");
 }
 
+void RefusalTeachesHeapCeiling() {
+    mock = MockDevice{};
+    auto context = budgetContext();
+    reportedBudget = 1620 * MiB;
+    reportedUsage = 1500 * MiB;
+    auto pool = std::make_shared<BufferPool>(context);
+    Expect(pool->RefusedHeapCeiling(0) == 0, "a pool reported a heap ceiling before any refusal");
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = 4 * MiB;
+    allocation.memoryTypeIndex = 0;
+    mock.results = {VK_ERROR_OUT_OF_DEVICE_MEMORY};
+    std::uint32_t type = 99;
+    auto memory = pool->AllocateMemory(allocation, "test ceiling", 1u, &type);
+    mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
+    Expect(type == 1, "a refused device allocation with a host type was not placed in host memory");
+    Expect(pool->RefusedHeapCeiling(0) == 1500 * MiB, "a device refusal did not record the heap usage it happened at as the heap's ceiling");
+    Expect(pool->RefusedHeapCeiling(1) == 0, "a device refusal set a ceiling on the host heap");
+    allocation.memoryTypeIndex = 1;
+    mock.results = {VK_ERROR_OUT_OF_DEVICE_MEMORY};
+    try {
+        memory = pool->AllocateMemory(allocation, "test host refusal");
+        mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
+    } catch (const std::exception&) {
+    }
+    Expect(pool->RefusedHeapCeiling(1) == 0, "a refusal in a host type set a ceiling on the host heap");
+    std::this_thread::sleep_for(BufferPool::RefusedCeilingWindow + std::chrono::milliseconds(20));
+    Expect(pool->RefusedHeapCeiling(0) == 0, "a learned heap ceiling outlived its window");
+    Expect(mock.liveBytes == 0, "the heap ceiling test leaked memory");
+}
+
 void HostSlotBeforeCacheRelease() {
     mock = MockDevice{};
     auto context = budgetContext();
@@ -1912,6 +1942,7 @@ int main(int argc, char** argv) {
         RetainedImagesReleasedBeforeHostPlacement();
         HostPlacement();
         RefusedDeviceSkippedWhileFutile();
+        RefusalTeachesHeapCeiling();
         HostSlotBeforeCacheRelease();
         RefusedDevicePlacement();
         IdleReclaimSkipsHostPlaced();

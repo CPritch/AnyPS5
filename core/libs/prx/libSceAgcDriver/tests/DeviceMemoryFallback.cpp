@@ -140,6 +140,28 @@ void FutileReclaimTests() {
     Expect(!TextureCacheReclaimFutile(), "a futile reclaim outlived its window");
 }
 
+VkDeviceSize ceilingReturned = 0;
+
+VkDeviceSize mockCeiling(const Context&, std::uint32_t heap) {
+    return heap == 0 ? ceilingReturned : 0;
+}
+
+void RefusedCeilingTests() {
+    const std::uint32_t both = (1u << HostType) | (1u << DeviceType);
+    Context context = mockContext(true);
+    context.refusedHeapCeiling = mockCeiling;
+    reportedBudget = 3000 * MiB;
+    reportedUsage = 2000 * MiB;
+    ceilingReturned = 0;
+    Expect(context.DeviceMemoryType(both, 64 * MiB, "test") == DeviceType, "an allocation within the budget left device-local memory without a learned ceiling");
+    ceilingReturned = 2010 * MiB;
+    Expect(context.DeviceMemoryType(both, 64 * MiB, "test") == HostType, "an allocation past the ceiling a refusal taught stayed in device-local memory");
+    Expect(context.DeviceMemoryType(both, 8 * MiB, "test") == DeviceType, "an allocation below the learned ceiling left device-local memory");
+    ceilingReturned = 3500 * MiB;
+    Expect(context.DeviceMemoryType(both, 64 * MiB, "test") == DeviceType, "a learned ceiling above the reported budget lowered it");
+    ceilingReturned = 0;
+}
+
 void RefusedFallbackTests() {
     const auto context = mockContext(true);
     const std::uint32_t both = (1u << HostType) | (1u << DeviceType);
@@ -252,6 +274,7 @@ int main() {
         RefusedFallbackTests();
         ReclaimTests();
         FutileReclaimTests();
+        RefusedCeilingTests();
         HeadroomTests();
         SecondHeapHeadroomTests();
     } catch (const std::exception& error) {

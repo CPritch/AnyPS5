@@ -5257,6 +5257,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.cacheReclaim = Graphics::ReleaseTextureCaches;
     context.cacheReclaimFutile = Graphics::TextureCacheReclaimFutile;
     context.retainedImageReclaim = Graphics::ReleaseRetainedImageMemory;
+    context.refusedHeapCeiling = Graphics::RefusedDeviceHeapCeiling;
     return context;
 }
 
