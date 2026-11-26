@@ -3022,6 +3022,50 @@ static void CheckPinnedRangeIsLeftOutOfNewLeases() {
     Require(munmap_nid_postfix(again, page) == 0);
 }
 
+static std::uintptr_t waitedAddress = 0;
+static bool waitedLeasesCached = false;
+static bool waitedRangeListed = false;
+
+static bool PinWaiterRepeatsLeases(std::uintptr_t, std::size_t) {
+    const auto lists = [](const GuestAllocations::Lease& lease) {
+        return std::any_of(lease.begin(), lease.end(), [](const auto& range) { return range->address == waitedAddress; });
+    };
+    const auto firstRegistered = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
+    const auto secondRegistered = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
+    const auto firstReadable = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    const auto secondReadable = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    const auto firstAll = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
+    const auto secondAll = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
+    waitedLeasesCached = firstRegistered.Snapshot() == secondRegistered.Snapshot() && firstReadable.Snapshot() == secondReadable.Snapshot() && firstAll.Snapshot() == secondAll.Snapshot();
+    waitedRangeListed = lists(firstRegistered) && !lists(firstReadable) && !lists(firstAll);
+    pinHolder.clear();
+    return true;
+}
+
+static void CheckLeasesStayCachedWhileAMutationWaits() {
+    constexpr std::size_t page = 0x4000;
+    const auto failed = reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1));
+    void* raw = mmap_nid_postfix(nullptr, page * 2, 3, 0x1002, -1, 0);
+    Require(raw != failed);
+    waitedAddress = reinterpret_cast<std::uintptr_t>(raw);
+    waitedLeasesCached = false;
+    waitedRangeListed = false;
+    pinHolder = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
+    GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(PinWaiterRepeatsLeases);
+    bool unmapped = false;
+    try {
+        unmapped = munmap_nid_postfix(raw, page * 2) == 0;
+    } catch (const std::exception&) {
+    }
+    GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(nullptr);
+    pinHolder.clear();
+    Require(unmapped);
+    Require(waitedLeasesCached);
+    Require(waitedRangeListed);
+    const auto registered = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
+    Require(std::none_of(registered.begin(), registered.end(), [&](const auto& range) { return range->address == waitedAddress; }));
+}
+
 #ifdef _WIN32
 static void RequireResidentMapping(const void* address) {
     MEMORY_BASIC_INFORMATION info{};
@@ -5041,6 +5085,7 @@ int main(int argc, char** argv) {
     CheckMtypeprotectLeavesAReplacementAllocation();
     CheckReleaseOfManyViewsScalesLinearly();
     CheckPinnedRangeIsLeftOutOfNewLeases();
+    CheckLeasesStayCachedWhileAMutationWaits();
     CheckBreakingAResidentRunKeepsConcurrentAccesses();
     CheckRemappedDirectMemoryIsChargedOnce();
     CheckFixedRemapReprotectsHost();

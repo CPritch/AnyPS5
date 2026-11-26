@@ -48,6 +48,7 @@ struct Registry {
     bool mainImageRegistered = false;
     std::map<std::uintptr_t, std::uintptr_t> registeredImages;
     std::shared_ptr<const Lease::Ranges> readableLease;
+    std::shared_ptr<const Lease::Ranges> registeredLease;
     std::shared_ptr<const Lease::Ranges> allLease;
     std::uint64_t backingSerials = 0;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> retiring;
@@ -232,6 +233,7 @@ bool backWritableImageAnonymously() {
 void* GuestAllocationsBegin_nid_postfix() {
     auto* state = new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
     registry().readableLease.reset();
+    registry().registeredLease.reset();
     registry().allLease.reset();
     return state;
 }
@@ -270,6 +272,7 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     mapped.clear();
     const bool noted = !state->gpuMapped.empty();
     registry().readableLease.reset();
+    registry().registeredLease.reset();
     registry().allLease.reset();
     delete state;
     if (!weak.empty()) observer(weak, ended);
@@ -548,6 +551,7 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         retiring.erase(std::find(retiring.begin(), retiring.end(), std::pair<std::uintptr_t, std::uintptr_t>{address, end}));
         retiringRanges.fetch_sub(1, std::memory_order_release);
         registry().readableLease.reset();
+        registry().registeredLease.reset();
         registry().allLease.reset();
         marked = false;
     };
@@ -557,6 +561,7 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     } unmarkOnExit{unmark};
     for (;;) {
         registry().readableLease.reset();
+        registry().registeredLease.reset();
         registry().allLease.reset();
         bool pinned = false;
         auto it = ranges.upper_bound(address);
@@ -898,7 +903,7 @@ Lease GuestAllocationsAcquire_nid_postfix() {
     for (const auto& [address, range] : registry().ranges) {
         if (range->HostReadable() && range->bytes != 0 && !isRetiring(*range)) ranges->push_back(range);
     }
-    if (registry().retiring.empty()) registry().readableLease = ranges;
+    registry().readableLease = ranges;
     return Lease(std::move(ranges));
 }
 
@@ -943,10 +948,12 @@ Lease GuestAllocationsAcquireRegistered_nid_postfix() {
     if (registry().retiring.empty()) {
         if (auto shared = registry().readableLease) return Lease(std::move(shared));
     }
+    if (auto shared = registry().registeredLease) return Lease(std::move(shared));
     auto ranges = std::make_shared<Lease::Ranges>();
     for (const auto& [address, range] : registry().ranges) {
         if (range->HostReadable() && range->bytes != 0) ranges->push_back(range);
     }
+    registry().registeredLease = ranges;
     if (registry().retiring.empty()) registry().readableLease = ranges;
     return Lease(std::move(ranges));
 }
@@ -969,7 +976,7 @@ Lease GuestAllocationsAcquireAll_nid_postfix() {
     for (const auto& [address, range] : registry().ranges) {
         if (range->bytes != 0 && !isRetiring(*range)) ranges->push_back(range);
     }
-    if (registry().retiring.empty()) registry().allLease = ranges;
+    registry().allLease = ranges;
     return Lease(std::move(ranges));
 }
 
