@@ -2546,6 +2546,7 @@ std::atomic<std::int64_t> traceBarriersLeft{[] {
 }()};
 std::atomic<std::uint64_t> timingPresents{0};
 std::atomic<std::uint64_t> presentSerial{0};
+std::atomic<std::int64_t> presentedAtNs{0};
 std::atomic<std::uint64_t> settledFrames{0};
 std::atomic<std::uint64_t> settledFrameBusyNs{0};
 std::atomic<bool> batchStampsRequested{false};
@@ -2696,11 +2697,18 @@ void Recorder::NoteAccess(CommandClass which, const Access& access) {
 void Recorder::CountPresent() {
     timingPresents.fetch_add(1, std::memory_order_relaxed);
     presentSerial.fetch_add(1, std::memory_order_relaxed);
+    presentedAtNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
     ReferenceStorage::Shared().ReleaseIdle();
 }
 
 std::uint64_t Recorder::Presents() {
     return presentSerial.load(std::memory_order_relaxed);
+}
+
+bool Recorder::PresentedWithin(std::chrono::nanoseconds window) {
+    if (presentSerial.load(std::memory_order_relaxed) == 0) return false;
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    return now - presentedAtNs.load(std::memory_order_relaxed) < window.count();
 }
 
 void Recorder::NoteFrameGpuBusy(double milliseconds) {

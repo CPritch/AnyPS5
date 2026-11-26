@@ -7,6 +7,7 @@
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -221,6 +223,14 @@ int main(int argc, char** argv) {
                 Require(AgcDriver::Graphics::ReleaseTextureCaches(~std::uint64_t{0}) == allocated, "a release two presents later did not take the image last used before them");
                 device->WaitIdle();
                 Require(StorageTexture::FindLive(base + 7u * Stride, SurfaceBytes) == nullptr, "surface 7 survived a release two presents after its last use");
+                AgcDriver::Graphics::Recorder::CountPresent();
+                Require(AgcDriver::Graphics::Recorder::PresentedWithin(AgcDriver::Graphics::StoragePresentKeepWindow), "a present just counted is not within the keep window");
+                Require(Store(*device, base, 7) != nullptr, "surface 7 is not cached again");
+                std::this_thread::sleep_for(AgcDriver::Graphics::StoragePresentKeepWindow + std::chrono::milliseconds(50));
+                Require(!AgcDriver::Graphics::Recorder::PresentedWithin(AgcDriver::Graphics::StoragePresentKeepWindow), "a present older than the keep window is still within it");
+                Require(AgcDriver::Graphics::ReleaseTextureCaches(~std::uint64_t{0}) == allocated, "a release after presents stopped did not take the image used since the last present");
+                device->WaitIdle();
+                Require(StorageTexture::FindLive(base + 7u * Stride, SurfaceBytes) == nullptr, "surface 7 survived a release while presents had stopped for longer than the keep window");
                 {
                     const auto kept = StorageTexture::FindLive(base + 3u * Stride, SurfaceBytes);
                     Require(kept != nullptr && kept->Dirty(), "a release of everything took the image with pending results");

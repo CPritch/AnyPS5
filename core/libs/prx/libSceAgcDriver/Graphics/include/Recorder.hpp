@@ -747,6 +747,7 @@ public:
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
     // StorageTexture's write-back hysteresis.
     static std::uint64_t Presents();
+    static bool PresentedWithin(std::chrono::nanoseconds window);
     static void NoteFrameGpuBusy(double milliseconds);
     static std::pair<std::uint64_t, double> FrameGpuBusy();
     static void RequestBatchStamps();

@@ -2116,13 +2116,14 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
                         storageRecent = 0;
                         bool spared = false;
                         const auto present = Recorder::Presents();
+                        const bool presenting = Recorder::PresentedWithin(StoragePresentKeepWindow);
                         for (auto it = cache.entries.end(); it != cache.entries.begin();) {
                             --it;
                             if (it->texture->Dirty()) {
                                 ++storagePending;
                                 continue;
                             }
-                            if (present != 0u && it->lastPresent + 1u >= present) {
+                            if (presenting && present != 0u && it->lastPresent + 1u >= present) {
                                 ++storageRecent;
                                 continue;
                             }
