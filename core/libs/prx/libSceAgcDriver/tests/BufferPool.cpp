@@ -333,6 +333,10 @@ void RefusedDeviceSkippedWhileFutile() {
     Expect(type == 1 && made == 2 && cacheReleases == 1, "a refused device allocation did not fall back to the host type after one device attempt and one cache release");
     std::tie(type, made) = place({});
     Expect(type == 1 && made == 1 && cacheReleases == 1, "an allocation right after a device refusal tried device memory or the caches again although the caches had nothing to release");
+    std::tie(type, made) = place({VK_ERROR_OUT_OF_DEVICE_MEMORY});
+    Expect(type == 0 && made == 2, "a host allocation that failed while device attempts were skipped did not fall back to the full path in device memory");
+    std::tie(type, made) = place({VK_ERROR_OUT_OF_DEVICE_MEMORY});
+    Expect(type == 1 && made == 2, "a device refusal after the skip ended did not fall back to the host type");
     futileCaches = false;
     std::tie(type, made) = place({});
     Expect(type == 0 && made == 1, "an allocation after a device refusal did not try device memory once the caches could release memory");
@@ -357,7 +361,7 @@ void RefusalTeachesHeapCeiling() {
     reportedBudget = 1620 * MiB;
     reportedUsage = 1500 * MiB;
     auto pool = std::make_shared<BufferPool>(context);
-    Expect(pool->RefusedHeapCeiling(0) == 0, "a pool reported a heap ceiling before any refusal");
+    Expect(pool->RefusedHeapCeiling(0, 4 * MiB) == 0, "a pool reported a heap ceiling before any refusal");
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = 4 * MiB;
     allocation.memoryTypeIndex = 0;
@@ -366,8 +370,10 @@ void RefusalTeachesHeapCeiling() {
     auto memory = pool->AllocateMemory(allocation, "test ceiling", 1u, &type);
     mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
     Expect(type == 1, "a refused device allocation with a host type was not placed in host memory");
-    Expect(pool->RefusedHeapCeiling(0) == 1500 * MiB, "a device refusal did not record the heap usage it happened at as the heap's ceiling");
-    Expect(pool->RefusedHeapCeiling(1) == 0, "a device refusal set a ceiling on the host heap");
+    Expect(pool->RefusedHeapCeiling(0, 4 * MiB) == 1500 * MiB, "a device refusal did not record the heap usage it happened at as the heap's ceiling");
+    Expect(pool->RefusedHeapCeiling(0, 8 * MiB) == 1500 * MiB, "a request larger than the refused one was not held to the ceiling");
+    Expect(pool->RefusedHeapCeiling(0, MiB) == 0, "a request smaller than the refused one was held to its ceiling");
+    Expect(pool->RefusedHeapCeiling(1, 4 * MiB) == 0, "a device refusal set a ceiling on the host heap");
     allocation.memoryTypeIndex = 1;
     mock.results = {VK_ERROR_OUT_OF_DEVICE_MEMORY};
     try {
@@ -375,9 +381,9 @@ void RefusalTeachesHeapCeiling() {
         mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
     } catch (const std::exception&) {
     }
-    Expect(pool->RefusedHeapCeiling(1) == 0, "a refusal in a host type set a ceiling on the host heap");
+    Expect(pool->RefusedHeapCeiling(1, 4 * MiB) == 0, "a refusal in a host type set a ceiling on the host heap");
     std::this_thread::sleep_for(BufferPool::RefusedCeilingWindow + std::chrono::milliseconds(20));
-    Expect(pool->RefusedHeapCeiling(0) == 0, "a learned heap ceiling outlived its window");
+    Expect(pool->RefusedHeapCeiling(0, 4 * MiB) == 0, "a learned heap ceiling outlived its window");
     Expect(mock.liveBytes == 0, "the heap ceiling test leaked memory");
 }
 

@@ -254,7 +254,7 @@ struct Context {
     VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes, bool newImage) = nullptr;
     bool (*cacheReclaimFutile)() = nullptr;
     VkDeviceSize (*retainedImageReclaim)(const Context& context, VkDeviceSize bytes) = nullptr;
-    VkDeviceSize (*refusedHeapCeiling)(const Context& context, std::uint32_t heap) = nullptr;
+    VkDeviceSize (*refusedHeapCeiling)(const Context& context, std::uint32_t heap, VkDeviceSize bytes) = nullptr;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;
     GraphicsPipelineCache* graphicsPipelines = nullptr;
@@ -457,7 +457,7 @@ struct Context {
         const auto heap = memory.memoryTypes[type].heapIndex;
         auto report = ReportedHeap(heap);
         if (refusedHeapCeiling != nullptr) {
-            if (const auto ceiling = refusedHeapCeiling(*this, heap); ceiling != 0 && (report.budget == 0 || ceiling < report.budget)) report.budget = ceiling;
+            if (const auto ceiling = refusedHeapCeiling(*this, heap, bytes); ceiling != 0 && (report.budget == 0 || ceiling < report.budget)) report.budget = ceiling;
         }
         if (report.Fits(bytes)) return type;
         const auto host = HostMemoryType(mask);

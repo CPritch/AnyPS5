@@ -142,7 +142,7 @@ void FutileReclaimTests() {
 
 VkDeviceSize ceilingReturned = 0;
 
-VkDeviceSize mockCeiling(const Context&, std::uint32_t heap) {
+VkDeviceSize mockCeiling(const Context&, std::uint32_t heap, VkDeviceSize) {
     return heap == 0 ? ceilingReturned : 0;
 }
 

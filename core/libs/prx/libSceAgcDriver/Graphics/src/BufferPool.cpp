@@ -91,7 +91,7 @@ bool BufferPool::deviceRefusedWhileFutile(std::uint32_t memoryType) const {
     return cacheReclaimFutile();
 }
 
-void BufferPool::noteDeviceRefusal(std::uint32_t memoryType) {
+void BufferPool::noteDeviceRefusal(std::uint32_t memoryType, VkDeviceSize bytes) {
     if (memoryType >= memoryProperties.memoryTypeCount || memoryProperties2 == nullptr || physical == VK_NULL_HANDLE) return;
     const auto heap = memoryProperties.memoryTypes[memoryType].heapIndex;
     if (heap >= refusedCeiling.size() || (memoryProperties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return;
@@ -100,18 +100,20 @@ void BufferPool::noteDeviceRefusal(std::uint32_t memoryType) {
     memoryProperties2(physical, &properties);
     if (reported.heapUsage[heap] == 0) return;
     refusedCeiling[heap].store(reported.heapUsage[heap], std::memory_order_relaxed);
+    refusedCeilingBytes[heap].store(bytes, std::memory_order_relaxed);
     refusedCeilingAt[heap].store(PoolSteadyNanoseconds(), std::memory_order_release);
 }
 
-VkDeviceSize BufferPool::RefusedHeapCeiling(std::uint32_t heap) const {
+VkDeviceSize BufferPool::RefusedHeapCeiling(std::uint32_t heap, VkDeviceSize bytes) const {
     if (heap >= refusedCeiling.size()) return 0;
     const auto at = refusedCeilingAt[heap].load(std::memory_order_acquire);
     if (at == 0 || PoolSteadyNanoseconds() - at >= std::chrono::duration_cast<std::chrono::nanoseconds>(RefusedCeilingWindow).count()) return 0;
+    if (bytes < refusedCeilingBytes[heap].load(std::memory_order_relaxed)) return 0;
     return refusedCeiling[heap].load(std::memory_order_relaxed);
 }
 
-VkDeviceSize RefusedDeviceHeapCeiling(const Context& context, std::uint32_t heap) {
-    return context.bufferPool != nullptr ? context.bufferPool->RefusedHeapCeiling(heap) : 0;
+VkDeviceSize RefusedDeviceHeapCeiling(const Context& context, std::uint32_t heap, VkDeviceSize bytes) {
+    return context.bufferPool != nullptr ? context.bufferPool->RefusedHeapCeiling(heap, bytes) : 0;
 }
 
 VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage, const std::function<bool(std::uint32_t)>& reuse) {
@@ -124,7 +126,7 @@ VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& a
     VkDeviceSize reclaimed = 0;
     VkDeviceSize released = 0;
     const auto exhausted = [](VkResult value) { return value == VK_ERROR_OUT_OF_DEVICE_MEMORY || value == VK_ERROR_OUT_OF_HOST_MEMORY || value == VK_ERROR_TOO_MANY_OBJECTS; };
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !skipDevice) noteDeviceRefusal(allocation.memoryTypeIndex);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !skipDevice) noteDeviceRefusal(allocation.memoryTypeIndex, allocation.allocationSize);
     if (exhausted(result) && !skipDevice) {
         if (reuse && reuse(allocation.memoryTypeIndex)) return VK_NULL_HANDLE;
         reclaimed = trim();
@@ -162,6 +164,10 @@ VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& a
             if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[bufferpool] %s: memory type %u is out of device memory for %llu bytes after reclaiming %llu and releasing %llu; placed in host memory type %u until it is released; %llu such allocations, %llu MiB\n", operation, allocation.memoryTypeIndex, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), *hostType, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
             return memory;
         }
+    }
+    if (skipDevice && result != VK_SUCCESS) {
+        deviceRefusedAt[allocation.memoryTypeIndex].store(0, std::memory_order_release);
+        return allocateMemoryWithReuse(allocation, operation, hostType, allocatedType, newImage, reuse);
     }
     if (result == VK_SUCCESS) {
         if (allocation.memoryTypeIndex < deviceRefusedAt.size()) deviceRefusedAt[allocation.memoryTypeIndex].store(0, std::memory_order_release);
