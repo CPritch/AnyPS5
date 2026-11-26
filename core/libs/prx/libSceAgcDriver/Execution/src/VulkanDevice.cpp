@@ -6616,8 +6616,8 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
     };
     std::shared_ptr<ComputePipelineObjects> objects;
     try {
-        objects = createComputePipeline(context, shader, setLayout, layoutKey, pushStages, programAddress);
         if (Graphics::PipelineJournalEnabled() && !state->probingFloatControls) Graphics::RecordComputePipeline(shader, pushStages != 0);
+        objects = createComputePipeline(context, shader, setLayout, layoutKey, pushStages, programAddress);
     } catch (...) {
         finish(nullptr, std::current_exception());
         throw;

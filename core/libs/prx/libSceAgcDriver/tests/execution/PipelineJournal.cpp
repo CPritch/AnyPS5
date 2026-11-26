@@ -443,6 +443,40 @@ void HeldModuleTests() {
     Require(held > 0 && held * 4 < replayed.journal.loadedBytes, "the one-thread replay held " + std::to_string(held) + " bytes of modules at once from a " + std::to_string(replayed.journal.loadedBytes) + "-byte journal");
 }
 
+void UnfinishedBuildIsRecorded() {
+    using namespace NarrowConstantStoreFixture;
+    Block compute(BlockBytes);
+    const auto words = AddressWords(compute);
+    const auto code = ComputeCode(40);
+    const auto recorded = Snapshot();
+    {
+        const auto device = OpenVulkanTestDevice();
+        Require(device != nullptr, "the device for the unfinished build could not be opened");
+        device->WaitForPipelineJournalReplay();
+        auto result = CompileCompute(*device, code, words, 32);
+        result.specialization.push_back({0x7fff0000u, 0u});
+        result.specialization.push_back({0x7fff0000u, 0u});
+        bool built = true;
+        try {
+            device->PrebuildComputePipeline(result, reinterpret_cast<std::uintptr_t>(code.data()));
+        } catch (const std::exception&) {
+            built = false;
+        }
+        Require(!built, "a compute pipeline with a duplicate specialization ID was built");
+        AgcDriver::Graphics::FlushPipelineJournal();
+        const auto after = Snapshot();
+        Require(after.journal.recordedCompute == recorded.journal.recordedCompute + 1 && after.journal.writeFailures == recorded.journal.writeFailures, "the compute pipeline whose build did not finish was not recorded");
+    }
+    const auto before = Snapshot();
+    {
+        const auto device = OpenVulkanTestDevice();
+        Require(device != nullptr, "the device replaying the unfinished build could not be opened");
+        device->WaitForPipelineJournalReplay();
+        const auto replayed = Snapshot();
+        Require(replayed.journal.replayFailed == before.journal.replayFailed + 1 && replayed.journal.replayRejected == before.journal.replayRejected, "the next run did not build the recorded pipeline again: " + std::to_string(replayed.journal.replayFailed - before.journal.replayFailed) + " failed, " + std::to_string(replayed.journal.replayRejected - before.journal.replayRejected) + " rejected");
+    }
+}
+
 // --benchmark [count]: `count` distinct compute programs, dispatched for the first time on three
 // devices in turn. The first device starts without the driver's pipeline cache file (a driver with
 // an on-disk shader cache of its own, lavapipe's Mesa cache here, still serves from it unless that
@@ -893,6 +927,7 @@ int main(int argc, char** argv) {
         EvictionKeepsPendingModules();
         OversizedRecordKeepsTheJournal();
         HeldModuleTests();
+        UnfinishedBuildIsRecorded();
         std::puts("pipeline journal record and replay passed");
         return 0;
     } catch (const std::exception& error) {
