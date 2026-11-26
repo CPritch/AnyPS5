@@ -631,6 +631,38 @@ void BudgetPressureUsesLiveBlock() {
     Clean();
 }
 
+void PreferredDedicatedInHostMemory() {
+    ResetMock();
+    {
+        auto context = NewContext();
+        context.physical = Handle<VkPhysicalDevice>(1);
+        context.memoryProperties2 = MemoryProperties2;
+        const auto device = NewImage(64 * KiB, 256, 3u, false, true);
+        auto deviceAllocation = Take(context, device, true);
+        Bind(device, deviceAllocation);
+        Expect(deviceAllocation.MemoryType() == 0 && mock.memories[Index(MemoryOf(deviceAllocation))].dedicated == device.image, "an image that prefers a dedicated allocation in device-local memory did not get one");
+        mock.reportedUsage = mock.reportedBudget;
+        const auto first = NewImage(64 * KiB, 256, 3u, false, true);
+        const auto second = NewImage(64 * KiB, 256, 3u, false, true);
+        auto firstAllocation = Take(context, first, true);
+        Bind(first, firstAllocation);
+        auto secondAllocation = Take(context, second, true);
+        Bind(second, secondAllocation);
+        Expect(firstAllocation.MemoryType() == 1 && secondAllocation.MemoryType() == 1, "images that prefer a dedicated allocation over the device-local budget were not placed in host memory");
+        Expect(mock.memories[Index(MemoryOf(firstAllocation))].dedicated == VK_NULL_HANDLE, "an image placed in host memory kept a dedicated allocation it only preferred");
+        Expect(MemoryOf(firstAllocation) == MemoryOf(secondAllocation), "two small host-placed images that only prefer dedicated allocations did not share an image block");
+        const auto required = NewImage(64 * KiB, 256, 3u, true);
+        auto requiredAllocation = Take(context, required, true);
+        Bind(required, requiredAllocation);
+        Expect(requiredAllocation.MemoryType() == 1 && mock.memories[Index(MemoryOf(requiredAllocation))].dedicated == required.image, "an image placed in host memory lost the dedicated allocation it requires");
+        Drop(required, requiredAllocation);
+        Drop(second, secondAllocation);
+        Drop(first, firstAllocation);
+        Drop(device, deviceAllocation);
+    }
+    Clean();
+}
+
 void SmallBudgetHeadroom() {
     ResetMock();
     {
@@ -1200,6 +1232,7 @@ int main(int argc, char** argv) {
         RejectedImageForms();
         BudgetPressureUsesLiveBlock();
         SmallBudgetHeadroom();
+        PreferredDedicatedInHostMemory();
         ReleasedMemoryAccounting();
         ReleasedMemoryIsThreadLocal();
         std::puts("image allocation: ownership and host allocation failures");

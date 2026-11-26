@@ -879,9 +879,11 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
     Require(needed.size != 0 && std::has_single_bit(needed.alignment), "invalid image memory requirements");
     auto pool = GetBufferPool(context);
     Require(pool.get() == this, "an image allocation must use its context's buffer pool");
-    const bool separate = dedicated.requiresDedicatedAllocation != VK_FALSE || dedicated.prefersDedicatedAllocation != VK_FALSE;
+    const bool required = dedicated.requiresDedicatedAllocation != VK_FALSE;
+    const bool preferred = !required && dedicated.prefersDedicatedAllocation != VK_FALSE;
     static const bool disabled = std::getenv("APS5_IMAGE_SLABS") == nullptr || std::getenv("APS5_NO_IMAGE_SLABS") != nullptr;
-    const bool eligible = !disabled && !separate && imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && imageInfo.pNext == nullptr && needed.size <= (VkDeviceSize{1} << 20u) && needed.alignment < imageBlockBytes;
+    const bool slabShape = !disabled && !required && imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && imageInfo.pNext == nullptr && needed.size <= (VkDeviceSize{1} << 20u) && needed.alignment < imageBlockBytes;
+    const bool eligible = slabShape && !preferred;
     const auto preferredType = context.MemoryType(needed.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (eligible) {
         if (auto existing = takeImageRange(pool, preferredType, needed.size, needed.alignment)) return existing;
@@ -891,6 +893,9 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
         }
     }
     const auto memoryType = budgeted ? context.DeviceMemoryType(needed.memoryTypeBits, needed.size, operation) : preferredType;
+    const bool hostPlaced = memoryType < memoryProperties.memoryTypeCount && (memoryProperties.memoryHeaps[memoryProperties.memoryTypes[memoryType].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0;
+    const bool separate = required || (preferred && !hostPlaced);
+    const bool placedEligible = eligible || (slabShape && preferred && hostPlaced);
     const auto standalone = [&] {
         ImageAllocation result;
         result.owner = pool;
@@ -907,7 +912,7 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
         result.memory = separate ? AllocateMemory(allocation, operation, fallback, &result.memoryType, newImage) : TakeImageMemory(allocation, operation, fallback, &result.memoryType, newImage);
         return result;
     };
-    if (!eligible) return standalone();
+    if (!placedEligible) return standalone();
     if (auto existing = takeImageRange(pool, memoryType, needed.size, needed.alignment)) return existing;
     if (context.memoryProperties2 != nullptr && context.physical != VK_NULL_HANDLE) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
