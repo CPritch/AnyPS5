@@ -776,6 +776,10 @@ std::optional<std::uint32_t> BufferPool::imageRange(const ImageBlock& block, std
 }
 
 void BufferPool::markImageRange(ImageBlock& block, std::uint32_t first, std::uint32_t units, bool occupied) noexcept {
+    if (!occupied) {
+        block.unfitUnits = imageBlockUnits + 1u;
+        block.unfitAlignment = 0;
+    }
     const auto end = first + units;
     for (auto position = first; position < end;) {
         const auto word = position / 64u;
@@ -809,8 +813,15 @@ ImageAllocation BufferPool::takeImageRange(const std::shared_ptr<BufferPool>& po
     const auto aligned = static_cast<std::uint32_t>(std::max(alignment, imageUnitBytes) / imageUnitBytes);
     std::lock_guard lock(imageMutex);
     for (auto* block = imageAvailable[memoryType]; block != nullptr; block = block->next) {
+        if (units >= block->unfitUnits && aligned >= block->unfitAlignment) continue;
         const auto first = imageRange(*block, units, aligned);
-        if (!first) continue;
+        if (!first) {
+            if (block->unfitUnits > imageBlockUnits || (units <= block->unfitUnits && aligned <= block->unfitAlignment)) {
+                block->unfitUnits = units;
+                block->unfitAlignment = aligned;
+            }
+            continue;
+        }
         if (block->retained) {
             block->retained = false;
             retainedImageSlabBytes.fetch_sub(imageBlockBytes, std::memory_order_relaxed);

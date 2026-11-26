@@ -96,6 +96,8 @@ private:
         std::uint32_t freeUnits = imageBlockUnits;
         std::uint32_t allocations = 0;
         std::uint32_t hint = 0;
+        std::uint32_t unfitUnits = imageBlockUnits + 1u;
+        std::uint32_t unfitAlignment = 0;
         ImageBlock* previous = nullptr;
         ImageBlock* next = nullptr;
         bool retained = false;

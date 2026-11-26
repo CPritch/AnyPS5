@@ -404,6 +404,48 @@ void BoundaryRanges() {
     Clean();
 }
 
+void FragmentedBlockRanges() {
+    ResetMock();
+    {
+        auto context = NewContext();
+        std::array<ImageSpec, 8> images{};
+        std::array<ImageAllocation, 8> allocations{};
+        for (std::size_t index = 0; index < images.size(); ++index) {
+            images[index] = NewImage(512 * KiB);
+            allocations[index] = Take(context, images[index]);
+            Bind(images[index], allocations[index]);
+        }
+        const auto firstBlock = MemoryOf(allocations[0]);
+        Expect(context.bufferPool->ImageSlabBlocks() == 1, "eight 512 KiB images did not share one image block");
+        for (const std::size_t index : {1u, 3u, 5u, 7u}) Drop(images[index], allocations[index]);
+        std::array<ImageSpec, 8> wide{};
+        std::array<ImageAllocation, 8> wideAllocations{};
+        for (std::size_t index = 0; index < wide.size(); ++index) {
+            wide[index] = NewImage(MiB);
+            wideAllocations[index] = Take(context, wide[index]);
+            Bind(wide[index], wideAllocations[index]);
+            Expect(MemoryOf(wideAllocations[index]) != firstBlock, "a 1 MiB image was placed in a block with only 512 KiB holes");
+        }
+        Expect(context.bufferPool->ImageSlabBlocks() == 3, "eight 1 MiB images did not fill two more image blocks");
+        const auto narrow = NewImage(512 * KiB);
+        auto narrowAllocation = Take(context, narrow);
+        Bind(narrow, narrowAllocation);
+        Expect(MemoryOf(narrowAllocation) == firstBlock, "a 512 KiB image skipped a block with 512 KiB holes after 1 MiB images did not fit it");
+        Drop(images[2], allocations[2]);
+        Drop(images[4], allocations[4]);
+        const auto refit = NewImage(MiB);
+        auto refitAllocation = Take(context, refit);
+        Bind(refit, refitAllocation);
+        Expect(MemoryOf(refitAllocation) == firstBlock, "a 1 MiB image skipped a block whose released neighbours made room for it");
+        Expect(context.bufferPool->ImageSlabBlocks() == 3, "a 1 MiB image that fits a released range made a new image block");
+        Drop(refit, refitAllocation);
+        Drop(narrow, narrowAllocation);
+        for (std::size_t index = 0; index < wide.size(); ++index) Drop(wide[index], wideAllocations[index]);
+        for (const std::size_t index : {0u, 6u}) Drop(images[index], allocations[index]);
+    }
+    Clean();
+}
+
 void UnboundAllocationRollback() {
     ResetMock();
     {
@@ -1148,6 +1190,7 @@ int main(int argc, char** argv) {
         std::puts("image allocation: variable and boundary ranges");
         VariableRanges();
         BoundaryRanges();
+        FragmentedBlockRanges();
         BlockAlignmentFallback();
         UnboundAllocationRollback();
         std::puts("image allocation: types and dedicated requirements");
