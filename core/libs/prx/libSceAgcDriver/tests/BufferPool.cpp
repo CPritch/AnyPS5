@@ -330,9 +330,9 @@ void RefusedDeviceSkippedWhileFutile() {
     };
     futileCaches = true;
     auto [type, made] = place({VK_ERROR_OUT_OF_DEVICE_MEMORY});
-    Expect(type == 1 && made == 2 && cacheReleases == 1, "a refused device allocation did not fall back to the host type after one device attempt and one cache release");
+    Expect(type == 1 && made == 2 && cacheReleases == 0, "a refused device allocation did not fall back to the host type after one device attempt, or released the caches they had just proved futile");
     std::tie(type, made) = place({});
-    Expect(type == 1 && made == 1 && cacheReleases == 1, "an allocation right after a device refusal tried device memory or the caches again although the caches had nothing to release");
+    Expect(type == 1 && made == 1 && cacheReleases == 0, "an allocation right after a device refusal tried device memory or the caches again although the caches had nothing to release");
     std::tie(type, made) = place({VK_ERROR_OUT_OF_DEVICE_MEMORY});
     Expect(type == 0 && made == 2, "a host allocation that failed while device attempts were skipped did not fall back to the full path in device memory");
     std::tie(type, made) = place({VK_ERROR_OUT_OF_DEVICE_MEMORY});
@@ -352,6 +352,10 @@ void RefusedDeviceSkippedWhileFutile() {
     std::tie(type, made) = place({});
     Expect(type == 1 && made == 1, "a host allocation was changed by the device refusal memo");
     futileCaches = false;
+    allocation.memoryTypeIndex = 0;
+    const auto releasesBefore = cacheReleases;
+    std::tie(type, made) = place({VK_ERROR_OUT_OF_DEVICE_MEMORY});
+    Expect(type == 1 && cacheReleases == releasesBefore + 1, "a device refusal did not release the caches once they could release memory");
     Expect(mock.liveBytes == 0, "the refused device placement test leaked memory");
 }
 

@@ -144,7 +144,7 @@ VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& a
         }
     }
     if (exhausted(result) && !skipDevice) {
-        if (cacheReclaim != nullptr) released = cacheReclaim(ReclaimTarget(allocation.allocationSize), newImage);
+        if (cacheReclaim != nullptr && (cacheReclaimFutile == nullptr || !cacheReclaimFutile())) released = cacheReclaim(ReclaimTarget(allocation.allocationSize), newImage);
         if (reuse && reuse(allocation.memoryTypeIndex)) return VK_NULL_HANDLE;
         if (released != 0) {
             reclaimed += trim();
