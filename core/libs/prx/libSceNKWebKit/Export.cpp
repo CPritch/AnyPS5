@@ -6245,10 +6245,6 @@ int APS5_VABI _ZN7WebCore30enclosingTextUnitOfGranularityERKNS_15VisiblePosition
     NotImplemented_nid_no_patch(__func__);
 }
 
-int APS5_VABI _ZN7WebCore15AsyncFileStream7getSizeERKN3WTF6StringENS1_8OptionalINS1_8WallTimeEEE() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI _ZN7WebCore22HTMLPlugInImageElement24restartSnapshottedPlugInEv() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -7632,10 +7628,6 @@ int APS5_VABI _ZN7WebCore10ISOFullBoxD0Ev() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-int APS5_VABI _ZN7WebCore15AsyncFileStream4readEPci() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI _ZN7WebCore9FrameView29layoutOrVisualViewportChangedEv() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -8855,18 +8847,6 @@ int APS5_VABI WKPageGetSessionHistoryURLValueType() {
 }
 
 int APS5_VABI WKPageGetSourceForFrame() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKPageGoBack() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKPageGoForward() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKPageGoToBackForwardListItem() {
     NotImplemented_nid_no_patch(__func__);
 }
 
@@ -14837,34 +14817,6 @@ int APS5_VABI _ZN7WebCore15ActiveDOMObjectD1Ev() {
 }
 
 int APS5_VABI _ZN7WebCore15ActiveDOMObjectD2Ev() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI _ZN7WebCore15AsyncFileStream11openForReadERKN3WTF6StringExx() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI _ZN7WebCore15AsyncFileStream5closeEv() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI _ZN7WebCore15AsyncFileStream7performEON3WTF8FunctionIFNS2_IFvRNS_16FileStreamClientEEEERNS_10FileStreamEEEE() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI _ZN7WebCore15AsyncFileStreamC1ERNS_16FileStreamClientE() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI _ZN7WebCore15AsyncFileStreamC2ERNS_16FileStreamClientE() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI _ZN7WebCore15AsyncFileStreamD1Ev() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI _ZN7WebCore15AsyncFileStreamD2Ev() {
     NotImplemented_nid_no_patch(__func__);
 }
 
