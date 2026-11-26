@@ -382,6 +382,13 @@ void RefusalTeachesHeapCeiling() {
     } catch (const std::exception&) {
     }
     Expect(pool->RefusedHeapCeiling(1, 4 * MiB) == 0, "a refusal in a host type set a ceiling on the host heap");
+    allocation.memoryTypeIndex = 0;
+    allocation.allocationSize = 16 * MiB;
+    reportedUsage = 1550 * MiB;
+    mock.results = {VK_ERROR_OUT_OF_DEVICE_MEMORY};
+    memory = pool->AllocateMemory(allocation, "test larger refusal", 1u, &type);
+    mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
+    Expect(pool->RefusedHeapCeiling(0, 4 * MiB) == 1500 * MiB, "a larger refusal at a higher usage raised the ceiling or the refused size while the first was live");
     std::this_thread::sleep_for(BufferPool::RefusedCeilingWindow + std::chrono::milliseconds(20));
     Expect(pool->RefusedHeapCeiling(0, 4 * MiB) == 0, "a learned heap ceiling outlived its window");
     Expect(mock.liveBytes == 0, "the heap ceiling test leaked memory");

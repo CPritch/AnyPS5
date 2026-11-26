@@ -99,9 +99,14 @@ void BufferPool::noteDeviceRefusal(std::uint32_t memoryType, VkDeviceSize bytes)
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
     memoryProperties2(physical, &properties);
     if (reported.heapUsage[heap] == 0) return;
-    refusedCeiling[heap].store(reported.heapUsage[heap], std::memory_order_relaxed);
-    refusedCeilingBytes[heap].store(bytes, std::memory_order_relaxed);
-    refusedCeilingAt[heap].store(PoolSteadyNanoseconds(), std::memory_order_release);
+    const auto now = PoolSteadyNanoseconds();
+    const auto at = refusedCeilingAt[heap].load(std::memory_order_acquire);
+    const bool live = at != 0 && now - at < std::chrono::duration_cast<std::chrono::nanoseconds>(RefusedCeilingWindow).count();
+    const auto ceiling = live ? std::min<std::uint64_t>(refusedCeiling[heap].load(std::memory_order_relaxed), reported.heapUsage[heap]) : reported.heapUsage[heap];
+    const auto smallest = live ? std::min<std::uint64_t>(refusedCeilingBytes[heap].load(std::memory_order_relaxed), bytes) : bytes;
+    refusedCeiling[heap].store(ceiling, std::memory_order_relaxed);
+    refusedCeilingBytes[heap].store(smallest, std::memory_order_relaxed);
+    refusedCeilingAt[heap].store(now, std::memory_order_release);
 }
 
 VkDeviceSize BufferPool::RefusedHeapCeiling(std::uint32_t heap, VkDeviceSize bytes) const {
