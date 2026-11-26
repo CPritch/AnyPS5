@@ -1,8 +1,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <string>
+#include <thread>
 
 using namespace AgcDriver::Graphics;
 
@@ -91,6 +95,49 @@ void ReclaimTests() {
     choose("a partial release that the budget then shows", 3000 * MiB, 2990 * MiB, 32 * MiB, 2900 * MiB, DeviceType, 64 * MiB);
     choose("a partial release the budget does not show", 3000 * MiB, 2990 * MiB, 32 * MiB, 2990 * MiB, HostType, 64 * MiB);
     choose("caches release nothing", 3000 * MiB, 2990 * MiB, 0, 2990 * MiB, HostType, 64 * MiB);
+}
+
+bool futile = false;
+
+bool mockFutile() {
+    return futile;
+}
+
+void FutileReclaimTests() {
+    const std::uint32_t both = (1u << HostType) | (1u << DeviceType);
+    Context context = mockContext(true);
+    context.cacheReclaim = mockReclaim;
+    context.cacheReclaimFutile = mockFutile;
+    reportedBudget = 3000 * MiB;
+    reportedUsage = 2990 * MiB;
+    reclaimReturns = 64 * MiB;
+    reclaimUsageAfter = 2990 * MiB;
+    futile = true;
+    reclaimAsked = 0;
+    auto type = context.DeviceMemoryType(both, 64 * MiB, "test");
+    Expect(type == HostType, "an allocation over the budget after a futile reclaim chose memory type " + std::to_string(type) + ", expected the host type");
+    Expect(reclaimAsked == 0, "the caches were asked for " + std::to_string(reclaimAsked) + " bytes after a futile reclaim");
+    futile = false;
+    type = context.DeviceMemoryType(both, 64 * MiB, "test");
+    Expect(type == DeviceType, "an allocation over the budget once the futile reclaim lapsed chose memory type " + std::to_string(type) + ", expected the device-local type");
+    Expect(reclaimAsked == 64 * MiB, "the caches were asked for " + std::to_string(reclaimAsked) + " bytes once the futile reclaim lapsed, expected 64 MiB");
+    reportedUsage = 2000 * MiB;
+    futile = true;
+    reclaimAsked = 0;
+    type = context.DeviceMemoryType(both, 64 * MiB, "test");
+    Expect(type == DeviceType && reclaimAsked == 0, "an allocation with room in the budget did not stay device-local without the caches");
+
+    Expect(!TextureCacheReclaimFutile(), "a reclaim was futile before any ran");
+    Expect(ReleaseTextureCaches(MiB) == 0, "empty texture caches released memory");
+    Expect(TextureCacheReclaimFutile(), "a reclaim over empty caches was not futile");
+    Recorder::CountPresent();
+    Expect(!TextureCacheReclaimFutile(), "a futile reclaim outlived a present");
+    Expect(ReleaseTextureCaches(0) == 0, "a reclaim of no bytes released memory");
+    Expect(!TextureCacheReclaimFutile(), "a reclaim of no bytes was counted as futile");
+    Expect(ReleaseTextureCaches(MiB) == 0, "empty texture caches released memory after a present");
+    Expect(TextureCacheReclaimFutile(), "a reclaim over empty caches after a present was not futile");
+    std::this_thread::sleep_for(FutileReclaimWindow + std::chrono::milliseconds(20));
+    Expect(!TextureCacheReclaimFutile(), "a futile reclaim outlived its window");
 }
 
 void RefusedFallbackTests() {
@@ -204,6 +251,7 @@ int main() {
         BufferPlacementTests();
         RefusedFallbackTests();
         ReclaimTests();
+        FutileReclaimTests();
         HeadroomTests();
         SecondHeapHeadroomTests();
     } catch (const std::exception& error) {

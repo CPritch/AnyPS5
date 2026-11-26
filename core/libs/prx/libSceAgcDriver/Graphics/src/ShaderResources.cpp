@@ -1997,6 +1997,25 @@ void ClearCachedTextures(VkDevice device) {
     }
 }
 
+namespace {
+
+constexpr std::int64_t NoFutileReclaim = std::numeric_limits<std::int64_t>::min();
+std::atomic<std::int64_t> futileReclaimAt{NoFutileReclaim};
+std::atomic<std::uint64_t> futileReclaimPresent{0};
+
+std::int64_t SteadyNanoseconds() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+}
+
+bool TextureCacheReclaimFutile() {
+    const auto at = futileReclaimAt.load(std::memory_order_acquire);
+    if (at == NoFutileReclaim) return false;
+    if (futileReclaimPresent.load(std::memory_order_relaxed) != Recorder::Presents()) return false;
+    return SteadyNanoseconds() - at < std::chrono::duration_cast<std::chrono::nanoseconds>(FutileReclaimWindow).count();
+}
+
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
     thread_local bool releasing = false;
     if (releasing) return 0;
@@ -2139,6 +2158,12 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
         }
     }
     freed = ImageMemoryReleasedBytes() - releasedBefore;
+    if (freed != 0) {
+        futileReclaimAt.store(NoFutileReclaim, std::memory_order_release);
+    } else if (bytes != 0 && !sampledSkipped && !storageSkipped) {
+        futileReclaimPresent.store(Recorder::Presents(), std::memory_order_relaxed);
+        futileReclaimAt.store(SteadyNanoseconds(), std::memory_order_release);
+    }
     char kept[192] = "";
     if (storageScanned) std::snprintf(kept, sizeof(kept), "; of the %zu cached storage images, %zu with pending results and %zu used in this or the previous present were kept", storageCached, storagePending, storageRecent);
     std::fprintf(stderr, "[gpu] texture caches released %llu MiB of the %llu MiB asked for: %zu sampled entries%s, %zu cached builds holding sampled textures dropped, %zu sampled textures still held (%zu charged to the open batch), %zu storage images%s%s\n", static_cast<unsigned long long>(freed >> 20u), static_cast<unsigned long long>(bytes >> 20u), sampledEntries, sampledSkipped ? " (cache busy, skipped)" : "", sampledBuilds, held.size(), charged, storageEntries, storageSkipped ? " (cache or device busy, skipped)" : "", kept);

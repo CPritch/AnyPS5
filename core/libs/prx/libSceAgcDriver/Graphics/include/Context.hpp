@@ -252,6 +252,7 @@ struct Context {
     std::mutex* settleQueueMutex = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes, bool newImage) = nullptr;
+    bool (*cacheReclaimFutile)() = nullptr;
     VkDeviceSize (*retainedImageReclaim)(const Context& context, VkDeviceSize bytes) = nullptr;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;
@@ -469,7 +470,7 @@ struct Context {
                 wanted -= released;
             }
         }
-        if (cacheReclaim != nullptr) {
+        if (cacheReclaim != nullptr && (cacheReclaimFutile == nullptr || !cacheReclaimFutile())) {
             const auto released = cacheReclaim(wanted, true);
             if (released >= wanted) return type;
             if (released != 0 && ReportedHeap(heap).Fits(bytes)) return type;

@@ -46,6 +46,8 @@ struct WriteIndexOutcomes {
 };
 WriteIndexOutcomes WriteIndexOutcomesCounted();
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false);
+bool TextureCacheReclaimFutile();
+inline constexpr std::chrono::milliseconds FutileReclaimWindow{100};
 struct StorageTextureBudgetSnapshot {
     std::optional<std::uint32_t> heap;
     std::uint64_t sampledBytes = 0;
