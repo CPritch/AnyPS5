@@ -235,11 +235,12 @@ int main(int argc, char** argv) {
                 Require(AgcDriver::Graphics::ReleaseTextureCaches(~std::uint64_t{0}) == allocated, "a release after presents stopped did not take exactly the oldest image before stopping at the held one");
                 device->WaitIdle();
                 Require(StorageTexture::FindLive(base + 5u * Stride, SurfaceBytes) == nullptr, "surface 5 survived a release while presents had stopped for longer than the keep window");
-                Require(StorageTexture::FindLive(base + 7u * Stride, SurfaceBytes) != nullptr, "a release went on evicting after an evicted image stayed alive outside the cache");
+                Require(StorageTexture::FindLive(base + 6u * Stride, SurfaceBytes) != nullptr, "an image held outside the cache was evicted, so its next lookup would make a second one");
+                Require(StorageTexture::FindLive(base + 7u * Stride, SurfaceBytes) != nullptr, "a release went on evicting past an image held outside the cache");
                 heldSix.reset();
-                Require(AgcDriver::Graphics::ReleaseTextureCaches(~std::uint64_t{0}) == allocated, "the next release did not take the image left after the stop");
+                Require(AgcDriver::Graphics::ReleaseTextureCaches(~std::uint64_t{0}) == 2 * allocated, "the next release did not take both images once nothing outside the cache held them");
                 device->WaitIdle();
-                Require(StorageTexture::FindLive(base + 7u * Stride, SurfaceBytes) == nullptr, "surface 7 survived the next release");
+                Require(StorageTexture::FindLive(base + 6u * Stride, SurfaceBytes) == nullptr && StorageTexture::FindLive(base + 7u * Stride, SurfaceBytes) == nullptr, "surfaces 6 and 7 survived the next release");
                 {
                     const auto kept = StorageTexture::FindLive(base + 3u * Stride, SurfaceBytes);
                     Require(kept != nullptr && kept->Dirty(), "a release of everything took the image with pending results");

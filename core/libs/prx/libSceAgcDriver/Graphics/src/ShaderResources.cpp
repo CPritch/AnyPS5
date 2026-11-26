@@ -2105,6 +2105,8 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
             try {
                 while (freed < bytes) {
                     std::shared_ptr<StorageTexture> image;
+                    std::shared_ptr<StorageTexture> candidate;
+                    VkDevice candidateDevice = VK_NULL_HANDLE;
                     {
                         std::unique_lock lock(cache.mutex, std::defer_lock);
                         if (!inherited && !lock.try_lock()) {
@@ -2132,13 +2134,48 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
                                 spared = true;
                                 continue;
                             }
+                            if (!presenting) {
+                                candidate = it->texture;
+                                candidateDevice = it->key.device;
+                                break;
+                            }
                             image = evictStorage(cache, it);
                             break;
                         }
-                        if (image == nullptr) {
+                        if (image == nullptr && candidate == nullptr) {
                             if (spared) continue;
                             break;
                         }
+                    }
+                    if (candidate != nullptr) {
+                        std::vector<std::shared_ptr<ShaderResources>> dropped;
+                        const bool removedBuilds = SharedResourceCache().TryRemoveImage(candidate.get(), &dropped);
+                        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) {
+                            for (auto& resource : dropped) recorder->Keep(std::move(resource));
+                        }
+                        dropped.clear();
+                        if (!removedBuilds) {
+                            storageSkipped = true;
+                            break;
+                        }
+                        if (candidate.use_count() > 2) {
+                            ++storageHeld;
+                            break;
+                        }
+                        {
+                            std::unique_lock lock(cache.mutex, std::defer_lock);
+                            if (!inherited && !lock.try_lock()) {
+                                storageSkipped = true;
+                                break;
+                            }
+                            const auto found = findStorageByImage(cache, candidateDevice, candidate.get());
+                            if (found != cache.entries.end()) image = evictStorage(cache, found);
+                        }
+                        candidate.reset();
+                        if (image != nullptr) ++storageEntries;
+                        image.reset();
+                        freed = ImageMemoryReleasedBytes() - releasedBefore;
+                        continue;
                     }
                     std::vector<std::shared_ptr<ShaderResources>> resources;
                     const bool removed = SharedResourceCache().TryRemoveImage(image.get(), &resources);
@@ -2147,15 +2184,10 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
                     }
                     resources.clear();
                     ++storageEntries;
-                    const std::weak_ptr<StorageTexture> evicted = image;
                     image.reset();
                     freed = ImageMemoryReleasedBytes() - releasedBefore;
                     if (!removed) {
                         storageSkipped = true;
-                        break;
-                    }
-                    if (!Recorder::PresentedWithin(StoragePresentKeepWindow) && !evicted.expired()) {
-                        ++storageHeld;
                         break;
                     }
                 }
@@ -2171,8 +2203,8 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
         futileReclaimPresent.store(Recorder::Presents(), std::memory_order_relaxed);
         futileReclaimAt.store(SteadyNanoseconds(), std::memory_order_release);
     }
-    char kept[256] = "";
-    if (storageScanned) std::snprintf(kept, sizeof(kept), "; of the %zu cached storage images, %zu with pending results, %zu used in this or the previous present were kept, and the release stopped at %zu image still held after its eviction", storageCached, storagePending, storageRecent, storageHeld);
+    char kept[320] = "";
+    if (storageScanned) std::snprintf(kept, sizeof(kept), "; of the %zu cached storage images, %zu with pending results, %zu used in this or the previous present were kept, and the release stopped at %zu image held outside the cache once its cached builds were dropped", storageCached, storagePending, storageRecent, storageHeld);
     std::fprintf(stderr, "[gpu] texture caches released %llu MiB of the %llu MiB asked for: %zu sampled entries%s, %zu cached builds holding sampled textures dropped, %zu sampled textures still held (%zu charged to the open batch), %zu storage images%s%s\n", static_cast<unsigned long long>(freed >> 20u), static_cast<unsigned long long>(bytes >> 20u), sampledEntries, sampledSkipped ? " (cache busy, skipped)" : "", sampledBuilds, held.size(), charged, storageEntries, storageSkipped ? " (cache or device busy, skipped)" : "", kept);
     return freed;
 }
