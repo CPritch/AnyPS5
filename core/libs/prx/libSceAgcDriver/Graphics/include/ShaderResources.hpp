@@ -612,7 +612,7 @@ private:
         bool storage = false;
         std::vector<std::size_t> elementTextures;
         std::vector<std::uint32_t> representatives;
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> samplerRejections;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> samplerOverrides;
         bool heap = false;
         std::vector<std::size_t> elementStorage;
         std::vector<std::size_t> tableSamplers;
