@@ -473,8 +473,6 @@ struct TableCounters {
     std::atomic<std::uint64_t> selected{0};
     std::atomic<std::uint64_t> reusedUnwritten{0};
     std::atomic<std::uint64_t> reusedCompared{0};
-    std::atomic<std::uint64_t> layoutOnly{0};
-    std::atomic<std::uint64_t> layoutReused{0};
     std::atomic<std::uint64_t> nanoseconds{0};
     std::atomic<long long> lastReport{0};
 };
@@ -492,7 +490,6 @@ struct TableReuseTotals {
     std::atomic<std::uint64_t> columns{0};
     std::atomic<std::uint64_t> resolutions{0};
     std::atomic<std::uint64_t> resolutionsShared{0};
-    std::atomic<std::uint64_t> layoutShared{0};
 };
 
 TableReuseTotals& tableReuseTotals() {
@@ -525,10 +522,9 @@ void reportTables() {
         skips += " " + std::string(NarrowSkipNames[reason]) + "=" + std::to_string(count);
         if (reason == static_cast<std::size_t>(NarrowSkip::KeyScan)) skips += " (up to " + std::to_string(counters.narrowPositions.exchange(0, std::memory_order_relaxed)) + " positions, APS5_IMAGE_TABLE_KEY_SCAN " + std::to_string(TableKeyScanLimit()) + ")";
     }
-    std::fprintf(stderr, "[image-table] (10 s): %llu snapshots, %llu tables, %llu keys, %llu selected records, structural poison:%s, narrowing %llu applied / %llu skipped%s%s, reused %llu unwritten / %llu compared, %llu layout-only bindless columns (%llu reused), %.1f ms\n",
+    std::fprintf(stderr, "[image-table] (10 s): %llu snapshots, %llu tables, %llu keys, %llu selected records, structural poison:%s, narrowing %llu applied / %llu skipped%s%s, reused %llu unwritten / %llu compared, %.1f ms\n",
         static_cast<unsigned long long>(snapshots), static_cast<unsigned long long>(counters.tables.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.keys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.selected.exchange(0, std::memory_order_relaxed)), poison.empty() ? " none" : poison.c_str(),
-        static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowSkipped.exchange(0, std::memory_order_relaxed)), skips.empty() ? "" : ":", skips.c_str(), static_cast<unsigned long long>(counters.reusedUnwritten.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.reusedCompared.exchange(0, std::memory_order_relaxed)),
-        static_cast<unsigned long long>(counters.layoutOnly.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.layoutReused.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.nanoseconds.exchange(0, std::memory_order_relaxed)) / 1e6);
+        static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowSkipped.exchange(0, std::memory_order_relaxed)), skips.empty() ? "" : ":", skips.c_str(), static_cast<unsigned long long>(counters.reusedUnwritten.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.reusedCompared.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.nanoseconds.exchange(0, std::memory_order_relaxed)) / 1e6);
 }
 
 enum class RecordState : std::uint8_t { OutsideDomain, Read, Unmapped, Carried };
@@ -622,29 +618,6 @@ constexpr std::size_t ColumnMemoWords = std::size_t{1} << 22u;
 
 std::vector<ColumnMemo>& ColumnMemos() {
     thread_local std::vector<ColumnMemo>* slot = nullptr;
-    return ThreadOwned(slot);
-}
-
-bool BindlessLayoutOnly() {
-    static const bool enabled = std::getenv("APS5_NO_BINDLESS_UNREAD_TABLES") == nullptr;
-    return enabled;
-}
-
-struct LayoutMemo {
-    ColumnKey key;
-    std::vector<std::pair<std::uint64_t, bool>> pages;
-    std::vector<std::pair<std::uint64_t, bool>> words;
-    ColumnContents contents;
-    std::uint64_t low = 0;
-    std::uint64_t high = 0;
-
-    std::size_t Footprint() const {
-        return (pages.size() + words.size()) * 3u + contents.codes.size() + contents.words.size() * 9u + contents.readRanges.size() * 4u;
-    }
-};
-
-std::vector<LayoutMemo>& LayoutMemos() {
-    thread_local std::vector<LayoutMemo>* slot = nullptr;
     return ThreadOwned(slot);
 }
 
@@ -1184,7 +1157,7 @@ private:
             }
         }
         if (!column.buffer) {
-            ReadColumn(column, records, ImageTableAbi::MaxKeys, LayoutOnlyColumn(column, source));
+            ReadColumn(column, records, ImageTableAbi::MaxKeys);
             return;
         }
         auto scan = column;
@@ -1194,26 +1167,15 @@ private:
             return known.base == records.base && known.size == records.size && known.column == scan && known.column.maxKey == scan.maxKey && known.column.unkeyed == scan.unkeyed && known.column.keyDomains == scan.keyDomains;
         });
         if (scanned != parentScans.end()) {
-            ReadColumn(column, records, scanned->keys, LayoutOnlyColumn(column, source));
+            ReadColumn(column, records, scanned->keys);
             return;
         }
-        ReadColumn(column, records, parentKeysRemaining, LayoutOnlyColumn(column, source));
+        ReadColumn(column, records, parentKeysRemaining);
         parentKeysRemaining -= records.keys;
         parentScans.push_back({std::move(scan), records.base, records.size, records.keys});
     }
 
-    bool LayoutOnlyColumn(const TableColumn& column, std::uint32_t source) const {
-        if (!runtime.bindlessImages || !BindlessLayoutOnly() || !column.address || column.buffer || column.sampler || column.indirect) return false;
-        bool used = false;
-        for (std::uint32_t resource = 0; resource < plan.info.images.size(); ++resource) {
-            if (plan.info.images[resource].source != source) continue;
-            if (!ResourceMaterializer::BindlessImage(plan.info, plan.stage, resource)) return false;
-            used = true;
-        }
-        return used && std::ranges::none_of(plan.info.samplers, [&](const SamplerResource& sampler) { return sampler.source == source; });
-    }
-
-    void ReadColumn(const TableColumn& column, ColumnRecords& records, std::uint32_t limit, bool layoutOnly) {
+    void ReadColumn(const TableColumn& column, ColumnRecords& records, std::uint32_t limit) {
         stamp = {};
         comparedRuns.clear();
         comparedWords.clear();
@@ -1320,12 +1282,8 @@ private:
             }
             return;
         }
-        if (layoutOnly && !records.narrowed && records.outside) {
-            ReadLayout(column, records);
-            return;
-        }
         const bool memoized = TableSnapshotReuse() && !records.narrowed && records.keys != 0u;
-        const auto key = KeyOf(column, records);
+        const ColumnKey key{records.base, records.size, records.records, records.keys, column.stride, column.addend, column.offset, column.dwordCount, column.maxKey, column.foldedAddend, column.foldedCarry, column.address, column.sampler};
         if (memoized && Reuse(key, column, records, false)) return;
         if (memoized && !column.address && records.size != 0u && runtime.stampWrites != nullptr) {
             const auto span = std::min<std::uint64_t>(records.size, static_cast<std::uint64_t>(column.addend) + column.offset + static_cast<std::uint64_t>(records.keys) * column.stride + column.dwordCount * 4u);
@@ -1337,50 +1295,17 @@ private:
         }
         if (memoized && Reuse(key, column, records, true)) return;
         unread();
-        auto walk = WalkColumn(column, records, nullptr);
-        std::vector<std::uint32_t> read;
-        if (!comparedWords.empty() && walk.runs == comparedRuns) {
-            read = std::move(comparedWords);
-        } else {
-            read.resize(walk.total);
-            ReadRuns(walk.runs, read, column.dwordCount);
-        }
-        IndexRecords(column, records, walk, &read);
-        const bool ranged = column.address && walk.low < walk.high;
-        if (ranged) tables.ranges.emplace_back(walk.low, walk.high - walk.low);
-        MergeReadRanges(records);
-        Seal(records);
-        if (memoized) Remember(key, records, std::move(walk.runs), std::move(read), ranged ? walk.low : 0u, ranged ? walk.high : 0u);
-    }
-
-    static constexpr auto Untaken = std::numeric_limits<std::uint32_t>::max();
-
-    struct ColumnWalk {
-        std::vector<std::uint32_t> whole;
+        constexpr auto Unread = std::numeric_limits<std::uint32_t>::max();
+        std::vector<std::uint32_t> whole(records.keys, Unread);
         std::vector<std::pair<std::uint32_t, std::array<std::uint32_t, 8>>> split;
         std::vector<std::pair<std::uint64_t, std::uint32_t>> runs;
         std::uint32_t total = 0;
         std::uint64_t low = std::numeric_limits<std::uint64_t>::max();
         std::uint64_t high = 0;
-    };
-
-    struct LayoutChecks {
-        std::vector<std::pair<std::uint64_t, bool>> pages;
-        std::vector<std::pair<std::uint64_t, bool>> words;
-    };
-
-    static ColumnKey KeyOf(const TableColumn& column, const ColumnRecords& records) {
-        return {records.base, records.size, records.records, records.keys, column.stride, column.addend, column.offset, column.dwordCount, column.maxKey, column.foldedAddend, column.foldedCarry, column.address, column.sampler};
-    }
-
-    ColumnWalk WalkColumn(const TableColumn& column, ColumnRecords& records, LayoutChecks* checks) {
-        ColumnWalk walk;
-        walk.whole.assign(records.keys, Untaken);
-        const auto end = records.base + records.size;
         std::uint64_t checkedPage = std::numeric_limits<std::uint64_t>::max();
         bool checkedAccessible = false;
         const auto accessible = [&](std::uint64_t address) {
-            if (column.address) return checks != nullptr ? CheckedAddressAccessible(address, *checks) : AddressAccessible(address);
+            if (column.address) return AddressAccessible(address);
             if ((address & ~(PageBytes - 1u)) != checkedPage) {
                 checkedPage = address & ~(PageBytes - 1u);
                 checkedAccessible = PageAccessible(address, records.base, end);
@@ -1389,7 +1314,9 @@ private:
         };
         const auto wholeAccessible = [&](std::uint64_t address) {
             if (!column.address) return accessible(address);
-            return checks != nullptr ? CheckedPageAccessible(address, *checks) : WholePageAccessible(address);
+            const auto [found, inserted] = wholePages.try_emplace(address & ~(PageBytes - 1u), false);
+            if (inserted) found->second = Accessible(address & ~(PageBytes - 1u), PageBytes);
+            return found->second;
         };
         const auto locate = [&](std::uint32_t offset, std::uint32_t immediate) -> std::optional<std::uint64_t> {
             if (column.address) return ImageTableAbi::ScalarAddressDword(records.base, offset, immediate);
@@ -1397,16 +1324,16 @@ private:
             return position.has_value() ? std::optional<std::uint64_t>(records.base + *position) : std::nullopt;
         };
         const auto take = [&](std::uint64_t address, std::uint32_t words) {
-            if (!walk.runs.empty() && address > walk.runs.back().first && address - walk.runs.back().first == static_cast<std::uint64_t>(walk.runs.back().second) * 4u) {
-                walk.runs.back().second += words;
+            if (!runs.empty() && address > runs.back().first && address - runs.back().first == static_cast<std::uint64_t>(runs.back().second) * 4u) {
+                runs.back().second += words;
             } else {
-                walk.runs.emplace_back(address, words);
+                runs.emplace_back(address, words);
             }
             if (column.address) records.readRanges.emplace_back(address, static_cast<std::uint64_t>(words) * sizeof(std::uint32_t));
-            walk.low = std::min(walk.low, address);
-            walk.high = std::max(walk.high, address + static_cast<std::uint64_t>(words) * sizeof(std::uint32_t));
-            walk.total += words;
-            return walk.total - words;
+            low = std::min(low, address);
+            high = std::max(high, address + static_cast<std::uint64_t>(words) * sizeof(std::uint32_t));
+            total += words;
+            return total - words;
         };
         const auto last = (column.dwordCount - 1u) * 4u;
         for (std::uint32_t record = 0; record < records.keys; record++) {
@@ -1419,11 +1346,11 @@ private:
             const auto head = locate(offset, column.offset);
             const auto tail = locate(offset, column.offset + last);
             if (head.has_value() && tail.has_value() && (*head & 3u) == 0u && *tail > *head && *tail - *head == last && wholeAccessible(*head) && wholeAccessible(*tail)) {
-                walk.whole[record] = take(*head, column.dwordCount);
+                whole[record] = take(*head, column.dwordCount);
                 continue;
             }
             std::array<std::uint32_t, 8> slots;
-            slots.fill(Untaken);
+            slots.fill(Unread);
             for (std::uint32_t dword = 0; dword < column.dwordCount; dword++) {
                 auto address = locate(offset, column.offset + dword * 4u);
                 if (column.address && address.has_value() && (*address & 3u) != 0u) address.reset();
@@ -1434,47 +1361,35 @@ private:
                 }
                 slots[dword] = take(*address, 1u);
             }
-            if (records.states[record] == RecordState::Read) walk.split.emplace_back(record, slots);
+            if (records.states[record] == RecordState::Read) split.emplace_back(record, slots);
         }
-        return walk;
-    }
-
-    bool CheckedPageAccessible(std::uint64_t address, LayoutChecks& checks) {
-        const auto page = address & ~(PageBytes - 1u);
-        const bool accessible = WholePageAccessible(page);
-        if (checks.pages.empty() || checks.pages.back().first != page) checks.pages.emplace_back(page, accessible);
-        return accessible;
-    }
-
-    bool CheckedAddressAccessible(std::uint64_t address, LayoutChecks& checks) {
-        if (CheckedPageAccessible(address, checks)) return true;
-        const bool accessible = Accessible(address, sizeof(std::uint32_t));
-        checks.words.emplace_back(address, accessible);
-        return accessible;
-    }
-
-    void IndexRecords(const TableColumn& column, ColumnRecords& records, const ColumnWalk& walk, const std::vector<std::uint32_t>* read) {
-        auto next = walk.split.begin();
+        std::vector<std::uint32_t> read;
+        if (!comparedWords.empty() && runs == comparedRuns) {
+            read = std::move(comparedWords);
+        } else {
+            read.resize(total);
+            ReadRuns(runs, read, column.dwordCount);
+        }
+        auto next = split.begin();
         for (std::uint32_t record = 0; record < records.keys; record++) {
             if (records.states[record] != RecordState::Read) continue;
             DescriptorValue value;
             value.dwordCount = column.sampler || column.buffer ? 4u : 8u;
-            if (walk.whole[record] != Untaken) {
-                if (read != nullptr) std::copy_n(read->begin() + walk.whole[record], column.dwordCount, value.dwords.begin());
+            if (whole[record] != Unread) {
+                std::copy_n(read.begin() + whole[record], column.dwordCount, value.dwords.begin());
                 value.availableDwordMask = static_cast<std::uint8_t>((1u << column.dwordCount) - 1u);
             } else {
                 for (std::uint32_t dword = 0; dword < column.dwordCount; dword++) {
-                    if (next->second[dword] == Untaken) continue;
-                    if (read != nullptr) value.dwords[dword] = (*read)[next->second[dword]];
-                    value.availableDwordMask |= static_cast<std::uint8_t>(1u << dword);
+                    if (next->second[dword] != Unread) {
+                        value.dwords[dword] = read[next->second[dword]];
+                        value.availableDwordMask |= static_cast<std::uint8_t>(1u << dword);
+                    }
                 }
                 ++next;
             }
             records.words[record] = WordsIndex(records, value);
         }
-    }
-
-    static void MergeReadRanges(ColumnRecords& records) {
+        if (column.address && low < high) tables.ranges.emplace_back(low, high - low);
         std::sort(records.readRanges.begin(), records.readRanges.end());
         std::size_t ranges = 0;
         for (const auto& range : records.readRanges) {
@@ -1486,69 +1401,8 @@ private:
             }
         }
         records.readRanges.resize(ranges);
-    }
-
-    void ReadLayout(const TableColumn& column, ColumnRecords& records) {
-        tableCounters().layoutOnly.fetch_add(1, std::memory_order_relaxed);
-        const bool memoized = TableSnapshotReuse() && records.keys != 0u;
-        const auto key = KeyOf(column, records);
-        if (memoized && ReuseLayout(key, records)) return;
-        records.states.assign(records.keys, RecordState::Read);
-        records.words.assign(records.keys, 0u);
-        LayoutChecks checks;
-        const auto walk = WalkColumn(column, records, &checks);
-        IndexRecords(column, records, walk, nullptr);
-        const bool ranged = walk.low < walk.high;
-        if (ranged) tables.ranges.emplace_back(walk.low, walk.high - walk.low);
-        MergeReadRanges(records);
         Seal(records);
-        if (memoized) RememberLayout(key, records, std::move(checks), ranged ? walk.low : 0u, ranged ? walk.high : 0u);
-    }
-
-    bool LayoutHolds(const LayoutMemo& memo) {
-        for (const auto& [page, accessible] : memo.pages) {
-            if (WholePageAccessible(page) != accessible) return false;
-        }
-        for (const auto& [address, accessible] : memo.words) {
-            if (Accessible(address, sizeof(std::uint32_t)) != accessible) return false;
-        }
-        return true;
-    }
-
-    bool ReuseLayout(const ColumnKey& key, ColumnRecords& records) {
-        auto& memos = LayoutMemos();
-        const auto found = std::find_if(memos.begin(), memos.end(), [&](const LayoutMemo& entry) { return entry.key == key; });
-        if (found == memos.end() || !LayoutHolds(*found)) return false;
-        records.contents = found->contents;
-        records.sealed = true;
-        if (found->low < found->high) tables.ranges.emplace_back(found->low, found->high - found->low);
-        tableCounters().layoutReused.fetch_add(1, std::memory_order_relaxed);
-        tableReuseTotals().layoutShared.fetch_add(1, std::memory_order_relaxed);
-        std::rotate(memos.begin(), found, found + 1);
-        return true;
-    }
-
-    void RememberLayout(const ColumnKey& key, const ColumnRecords& records, LayoutChecks&& checks, std::uint64_t low, std::uint64_t high) {
-        auto& memos = LayoutMemos();
-        auto found = std::find_if(memos.begin(), memos.end(), [&](const LayoutMemo& entry) { return entry.key == key; });
-        if (found == memos.end()) found = memos.emplace(memos.end());
-        std::sort(checks.pages.begin(), checks.pages.end());
-        checks.pages.erase(std::unique(checks.pages.begin(), checks.pages.end()), checks.pages.end());
-        found->key = key;
-        found->pages = std::move(checks.pages);
-        found->words = std::move(checks.words);
-        found->contents = records.contents;
-        found->low = low;
-        found->high = high;
-        if (found->Footprint() > ColumnMemoWords) {
-            memos.erase(found);
-            return;
-        }
-        std::rotate(memos.begin(), found, found + 1);
-        std::size_t kept = 0;
-        std::size_t footprint = 0;
-        while (kept < memos.size() && kept < ColumnMemoEntries && footprint + memos[kept].Footprint() <= ColumnMemoWords) footprint += memos[kept++].Footprint();
-        memos.resize(kept);
+        if (memoized) Remember(key, records, std::move(runs), std::move(read), column.address && low < high ? low : 0u, column.address && low < high ? high : 0u);
     }
 
     void ReadRuns(const std::vector<std::pair<std::uint64_t, std::uint32_t>>& runs, std::vector<std::uint32_t>& read, std::uint32_t descriptorDwords) const {
@@ -1734,7 +1588,7 @@ private:
                     tables.ranges.emplace_back(child.base, child.size);
                     records.readRanges.emplace_back(child.base, child.size);
                 }
-                ReadColumn(column, child, nestedKeysRemaining, false);
+                ReadColumn(column, child, nestedKeysRemaining);
                 nestedKeysRemaining -= child.keys;
             }
             const auto index = static_cast<std::uint32_t>(tables.nested.size());
@@ -3476,7 +3330,7 @@ std::uint64_t ResourceMaterializer::SpecializationNanoseconds() {
 
 ImageTableReuseCounts ResourceMaterializer::TableReuse() {
     auto& totals = tableReuseTotals();
-    return {totals.unwritten.load(std::memory_order_relaxed), totals.compared.load(std::memory_order_relaxed), totals.wordsRead.load(std::memory_order_relaxed), totals.shared.load(std::memory_order_relaxed), totals.columns.load(std::memory_order_relaxed), totals.resolutions.load(std::memory_order_relaxed), totals.resolutionsShared.load(std::memory_order_relaxed), totals.layoutShared.load(std::memory_order_relaxed)};
+    return {totals.unwritten.load(std::memory_order_relaxed), totals.compared.load(std::memory_order_relaxed), totals.wordsRead.load(std::memory_order_relaxed), totals.shared.load(std::memory_order_relaxed), totals.columns.load(std::memory_order_relaxed), totals.resolutions.load(std::memory_order_relaxed), totals.resolutionsShared.load(std::memory_order_relaxed)};
 }
 
 std::uint64_t ResourceMaterializer::EvaluateNanoseconds() {
