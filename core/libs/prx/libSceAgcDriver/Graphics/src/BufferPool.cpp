@@ -124,7 +124,8 @@ VkDeviceSize RefusedDeviceHeapCeiling(const Context& context, std::uint32_t heap
 VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage, const std::function<bool(std::uint32_t)>& reuse) {
     if (allocatedType != nullptr) *allocatedType = allocation.memoryTypeIndex;
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    const bool skipDevice = hostType.has_value() && *hostType != allocation.memoryTypeIndex && deviceRefusedWhileFutile(allocation.memoryTypeIndex);
+    thread_local bool retryingFullPath = false;
+    const bool skipDevice = !retryingFullPath && hostType.has_value() && *hostType != allocation.memoryTypeIndex && deviceRefusedWhileFutile(allocation.memoryTypeIndex);
     auto result = skipDevice ? VK_ERROR_OUT_OF_DEVICE_MEMORY : allocateMemory(device, &allocation, nullptr, &memory);
     const auto initialResult = result;
     unsigned attempts = skipDevice ? 0u : 1u;
@@ -172,6 +173,11 @@ VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& a
     }
     if (skipDevice && result != VK_SUCCESS) {
         deviceRefusedAt[allocation.memoryTypeIndex].store(0, std::memory_order_release);
+        retryingFullPath = true;
+        struct RetryGuard {
+            bool& flag;
+            ~RetryGuard() { flag = false; }
+        } guard{retryingFullPath};
         return allocateMemoryWithReuse(allocation, operation, hostType, allocatedType, newImage, reuse);
     }
     if (result == VK_SUCCESS) {
