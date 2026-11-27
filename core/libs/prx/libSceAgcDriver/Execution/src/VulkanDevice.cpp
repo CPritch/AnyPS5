@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/SplitSelect_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "ShaderCacheDirectory.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "HeapCacheSwitch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
@@ -7016,7 +7017,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     if (objects->descriptorHeap) objects->heapMappings = std::move(heapMappings);
     if (trace.Active()) {
         const std::array identity{Graphics::DescribedPipelineIdentity(shader)};
-        trace.Report({state->probingFloatControls ? "compute-probe" : unoptimized ? "compute-unoptimized" : "compute", programAddress, identity[0], shader.spirv.size(), shader.specialization.size(), Graphics::PipelineSpecializationHash(specialization.Info()), state->probingFloatControls || identity[0].Empty() ? Graphics::PipelineBuildJournal::Unrecorded : Graphics::PipelineBuildJournalOf(identity)});
+        trace.Report({state->probingFloatControls ? "compute-probe" : unoptimized ? "compute-unoptimized" : "compute", programAddress, identity[0], shader.spirv.size(), shader.specialization.size(), Graphics::PipelineSpecializationHash(specialization.Info()), state->probingFloatControls || identity[0].Empty() ? Graphics::PipelineBuildJournal::Unrecorded : Graphics::PipelineBuildJournalOf(identity), ShaderRecompiler::HashBytes(std::as_bytes(std::span(shader.spirv.data(), shader.spirv.size())))});
     }
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;

@@ -187,7 +187,7 @@ void PipelineBuildTrace::Report(const PipelineBuildSubject& subject) {
     const auto microseconds = counters.microseconds.fetch_add(spent, std::memory_order_relaxed) + spent;
     const auto at = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
     const auto thread = ThreadName();
-    std::fprintf(stderr, "[pipeline-build] at=%.3f thread=\"%s\" kind=%s ms=%.1f cache=%s journal=%s gpu-mutex=%s program=0x%" PRIx64 " identity=%016" PRIx64 "%016" PRIx64 " words=%zu spec=%zu:%016" PRIx64 " repeat=%u program-builds=%u total=%" PRIu64 ":%.0fms\n", at, thread.c_str(), subject.kind, ms, cache, JournalName(subject.journal), GuestMemory::GpuMutex().HeldByThisThread() ? "held" : "free", subject.program, subject.identity.high, subject.identity.low, subject.words, subject.specializationValues, subject.specialization, repeat, programBuilds, builds, static_cast<double>(microseconds) / 1000.0);
+    std::fprintf(stderr, "[pipeline-build] at=%.3f thread=\"%s\" kind=%s ms=%.1f cache=%s journal=%s gpu-mutex=%s program=0x%" PRIx64 " identity=%016" PRIx64 "%016" PRIx64 " words=%zu spec=%zu:%016" PRIx64 " module=%016" PRIx64 " repeat=%u program-builds=%u total=%" PRIu64 ":%.0fms\n", at, thread.c_str(), subject.kind, ms, cache, JournalName(subject.journal), GuestMemory::GpuMutex().HeldByThisThread() ? "held" : "free", subject.program, subject.identity.high, subject.identity.low, subject.words, subject.specializationValues, subject.specialization, subject.module, repeat, programBuilds, builds, static_cast<double>(microseconds) / 1000.0);
 }
 
 }

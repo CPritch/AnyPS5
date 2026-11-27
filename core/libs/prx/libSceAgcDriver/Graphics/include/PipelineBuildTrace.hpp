@@ -20,6 +20,7 @@ struct PipelineBuildSubject {
     std::size_t specializationValues = 0;
     std::uint64_t specialization = 0;
     PipelineBuildJournal journal = PipelineBuildJournal::Unrecorded;
+    std::uint64_t module = 0;
 };
 
 struct PipelineBuildCounters {
