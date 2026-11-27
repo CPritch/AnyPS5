@@ -16182,6 +16182,164 @@ void uploadScratchReuseTests(const Device& device, Recorder& recorder) {
     }
 }
 
+bool storageUploadScratchTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    Require(Recorder::Active() == &recorder, "the storage upload scratch test needs the active recorder");
+    if (base.hostImportAlignment == 0 || 65536 % base.hostImportAlignment != 0 || !StorageFormatAvailable(base, 56)) {
+        std::cout << "host imports or RGBA8 storage images unavailable: storage upload scratch not tested\n";
+        return false;
+    }
+    struct Upload {
+        std::uint32_t size;
+        bool grows;
+    };
+    constexpr std::array<Upload, 5> uploads{{{64, true}, {32, false}, {64, false}, {128, true}, {128, false}}};
+    constexpr std::size_t slot = 65536;
+    constexpr std::size_t bytes = uploads.size() * slot;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(slot, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the storage upload scratch surfaces");
+    auto* memory = static_cast<std::uint8_t*>(block);
+    std::uint32_t seed = 0x2468ace1u;
+    for (std::size_t i = 0; i < bytes; ++i) {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        memory[i] = static_cast<std::uint8_t>(seed >> 9);
+    }
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::uint64_t address;
+        std::size_t bytes;
+        ~Unregister() {
+            recorder.Sync();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } unregister{base, recorder, block, address, bytes};
+    if (HostImportFor(base, address, bytes) == nullptr) {
+        std::cout << "host import refused: storage upload scratch not tested\n";
+        return false;
+    }
+    auto context = base;
+    context.singlePassStorage = false;
+    TextureDetiler detiler(base);
+    context.detiler = &detiler;
+    SampleProgram program(base, recorder);
+    const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+    constexpr std::uint8_t sampledValue = 0x90;
+    std::vector<std::byte> sampledSnapshot;
+    std::unique_ptr<Texture> sampled;
+    std::vector<std::shared_ptr<StorageTexture>> images;
+    std::vector<std::uint64_t> pitches;
+    std::vector<std::unique_ptr<Buffer>> readbacks;
+    std::shared_ptr<DeviceBuffer> scratch;
+    std::vector<std::weak_ptr<DeviceBuffer>> outgrown;
+    const auto linearScratch = [&] { return recorder.UploadScratchBuffer(Recorder::UploadScratch::Linear, 1); };
+    recorder.Sync();
+    const auto submissions = recorder.Submissions();
+    for (std::size_t index = 0; index < uploads.size(); ++index) {
+        GuestTextureResource resource{};
+        resource.baseAddress = address + index * slot;
+        resource.width = uploads[index].size;
+        resource.height = uploads[index].size;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kLinear;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        const auto geometry = DescribeSurface(resource);
+        Require(geometry.guestBytes <= slot && geometry.mips.size() == 1, "a storage upload scratch surface does not fit its slot");
+        images.push_back(StorageTexture::Create(context, detiler, resource, 0));
+        pitches.push_back(geometry.mips[0].pitchBytes);
+        const auto read = recorder.DescribePendingRead(resource.baseAddress, static_cast<std::size_t>(geometry.guestBytes));
+        Require(read.has_value() && read->kind == Recorder::ReadKind::StorageUpload, "a storage upload was not detiled from its import in the open batch");
+        const auto current = linearScratch();
+        Require(current->Size() >= geometry.mips[0].linearSize, "a storage upload did not take its linear scratch from its batch");
+        if (uploads[index].grows) {
+            Require(current != scratch, "a storage upload larger than its batch's linear scratch did not grow it");
+            if (scratch != nullptr) outgrown.push_back(scratch);
+        } else {
+            Require(current == scratch, "a storage upload no larger than an earlier one of its batch allocated a linear scratch of its own");
+        }
+        scratch = current;
+        if (index == 1) {
+            GuestTextureResource sampledResource{};
+            sampledResource.baseAddress = 0x100000;
+            sampledResource.width = 32;
+            sampledResource.height = 32;
+            sampledResource.mipCount = 1;
+            sampledResource.tileMode = TextureTileMode::kLinear;
+            sampledResource.dimension = TextureDimension::k2D;
+            sampledResource.format = 56;
+            sampledResource.dstSelX = 4;
+            sampledResource.dstSelY = 5;
+            sampledResource.dstSelZ = 6;
+            sampledResource.dstSelW = 7;
+            sampledSnapshot.assign(static_cast<std::size_t>(DescribeSurface(sampledResource).guestBytes), std::byte{sampledValue});
+            sampled = std::make_unique<Texture>(context, detiler, sampledResource, identity, sampledSnapshot);
+            Require(linearScratch() == scratch, "a sampled upload after a storage upload did not reuse its batch's linear scratch");
+        }
+    }
+    Require(recorder.Submissions() == submissions, "the storage uploads did not share one batch");
+    for (const auto& released : outgrown) Require(!released.expired(), "a linear scratch outgrown in its batch was released before the batch ran");
+    scratch.reset();
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    for (std::size_t index = 0; index < uploads.size(); ++index) {
+        const auto size = uploads[index].size;
+        readbacks.push_back(std::make_unique<Buffer>(base, static_cast<std::size_t>(size) * size * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT));
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {size, size, 1};
+        base.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, images[index]->Image(), VK_IMAGE_LAYOUT_GENERAL, readbacks.back()->Handle(), 1, &copy);
+    }
+    RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    Require(recorder.Submissions() == submissions, "the storage uploads and their readback did not share one batch");
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    std::string failures;
+    for (std::size_t index = 0; index < uploads.size(); ++index) {
+        const auto size = uploads[index].size;
+        const auto rowBytes = static_cast<std::size_t>(size) * 4u;
+        const auto* read = reinterpret_cast<const std::uint8_t*>(readbacks[index]->Bytes().data());
+        const auto* guest = memory + index * slot;
+        std::size_t wrong = 0;
+        for (std::size_t row = 0; row < size; ++row) {
+            for (std::size_t at = 0; at < rowBytes; ++at) wrong += read[row * rowBytes + at] != guest[row * pitches[index] + at] ? 1 : 0;
+        }
+        if (wrong != 0) failures += "upload " + std::to_string(index) + " (" + std::to_string(size) + "x" + std::to_string(size) + "): " + std::to_string(wrong) + " of " + std::to_string(rowBytes * size) + " bytes differ from the guest surface\n";
+    }
+    expectRed(program.Red(sampled->View(), sampled->Layout(), 0.0f), sampledValue / 255.0f, "a sampled texture uploaded between storage uploads through their linear scratch sampled another upload's bytes");
+    if (!failures.empty()) throw std::runtime_error("storage upload scratch:\n" + failures);
+    images.clear();
+    sampled.reset();
+    std::cout << "storage upload scratch: " << uploads.size() << " storage uploads and a sampled upload in one batch used " << outgrown.size() + 1 << " linear scratch buffers, every surface read back intact\n";
+    return true;
+}
+
 void singleCubeTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
     TextureDetiler detiler(context);
@@ -19218,6 +19376,7 @@ int main(int argc, char** argv) {
             std::cout << "Texture upload scratch reuse tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--storage-upload-scratch-only") return storageUploadScratchTests(device, recorder) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--sampled-storage-base-level-usage-only") {
             sampledStorageBaseLevelUsageTests(device, recorder);
             return 0;
@@ -19750,6 +19909,7 @@ int main(int argc, char** argv) {
         imageMemoTests(device, recorder);
         minLodTests(device, recorder);
         uploadScratchReuseTests(device, recorder);
+        static_cast<void>(storageUploadScratchTests(device, recorder));
         firstLayerViewTests(device, recorder);
         sampledStorageBaseLevelUsageTests(device, recorder);
         singleCubeTests(device, recorder);
