@@ -2452,12 +2452,23 @@ std::vector<ImportPiece> budgetedImportPieces(const Context& context, HostImport
     return pieces;
 }
 
+void traceJoinSkipped(ImportRequester requester, std::uint64_t base, std::uint64_t bytes, const char* reason) {
+    static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
+    if (trace && requester == ImportRequester::Join) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx not made: %s, requested by join\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), reason);
+}
+
 const HostImport* importJoined(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease, bool straddling = false) {
     if (const auto* low = peekImport(state, begin, begin + 1); low != nullptr && low->joined) begin = low->base;
     if (const auto* high = peekImport(state, end - 1, end); high != nullptr && high->joined) end = high->base + high->bytes;
     auto run = joinedRun(lease, begin, end, straddling);
-    if (run.ranges.empty()) return nullptr;
-    if (const auto failed = state.failedJoins.find(run.base); failed != state.failedJoins.end() && sameRun(failed->second, run)) return nullptr;
+    if (run.ranges.empty()) {
+        traceJoinSkipped(ImportRequester::Join, begin, end - begin, "the ranges it crosses form no joinable run");
+        return nullptr;
+    }
+    if (const auto failed = state.failedJoins.find(run.base); failed != state.failedJoins.end() && sameRun(failed->second, run)) {
+        traceJoinSkipped(ImportRequester::Join, run.base, run.bytes, "the same join failed before");
+        return nullptr;
+    }
     const auto existing = state.imports.find(run.base);
     const bool existed = existing != state.imports.end() && sameRun(existing->second, run);
     const auto* entry = importRunAt(context, state, std::move(run), true, begin, lease, end, true, ImportRequester::Join);
@@ -2495,6 +2506,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     const auto alignment = context.hostImportAlignment;
     if (joined && (alignment == 0 || base % alignment != 0 || bytes % alignment != 0)) {
         failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(run.ranges.begin(), run.ranges.end())});
+        traceJoinSkipped(requester, base, bytes, "the run is not aligned to the import alignment");
         return nullptr;
     }
     if (const auto found = state.imports.find(base); found != state.imports.end() && sameRun(found->second, run)) {
@@ -2502,9 +2514,15 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         return &found->second;
     }
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return nullptr;
-    if (const auto limit = importMaxBytes.load(std::memory_order_relaxed); limit != 0 && bytes > limit) return nullptr;
+    if (const auto limit = importMaxBytes.load(std::memory_order_relaxed); limit != 0 && bytes > limit) {
+        traceJoinSkipped(requester, base, bytes, "the run is larger than the import size limit");
+        return nullptr;
+    }
     if (const auto failed = failures.find(base); !stepDown && failed != failures.end()) {
-        if (sameRun(failed->second, run)) return nullptr;
+        if (sameRun(failed->second, run)) {
+            traceJoinSkipped(requester, base, bytes, "the same run failed before");
+            return nullptr;
+        }
         failures.erase(failed);
     }
     const auto budget = effectiveBudget(context, state);
@@ -2517,6 +2535,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
             if (!joined) oweGrowth(context, state, lease, base, bytes, GrowthBlock::Budget, budget);
             const auto room = remembered->second.room - std::min(remembered->second.room, remembered->second.budget - budget);
             if (stepDown && containing != run.ranges.end() && room >= (*containing)->bytes) return importAllocation(context, state, address, lease, requester, end, evict, std::min(bytes / 2, room));
+            traceJoinSkipped(requester, base, bytes, "a remembered budget refusal still holds");
             return nullptr;
         }
         state.evictingRefusals.erase(remembered);
@@ -2611,7 +2630,10 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         return nullptr;
     }
     const UntrappedImport untrapped(base, bytes);
-    if (!untrapped.Held()) return nullptr;
+    if (!untrapped.Held()) {
+        traceJoinSkipped(requester, base, bytes, "pages of the run are read-trapped");
+        return nullptr;
+    }
     if (!label && live + bytes > budget) retireLeastRecent(context, state, lease, live + bytes - budget, base, base + bytes);
     ImportConstruction owner(context, base, bytes);
     auto& entry = owner.entry;
@@ -7361,11 +7383,21 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
         if (importsStale(context, state)) refreshImports(context, state, importRanges());
         importsRefreshed = true;
         const bool straddleJoins = joinStraddleEnabled();
+        static const bool traceSkips = std::getenv("APS5_TRACE_BIGBUF") != nullptr;
+        const auto skipped = [](const auto& region, const char* reason) {
+            if (traceSkips && region.end - region.begin >= (std::uint64_t{64} << 20u)) std::fprintf(stderr, "[bigbuf] join pre-pass skips 0x%llx+0x%llx: %s\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end - region.begin), reason);
+        };
         for (const auto& region : regions) {
-            if (!region.pending || region.mirror != nullptr || region.direct != nullptr || sparseHeapCandidate(region)) continue;
+            if (!region.pending || region.mirror != nullptr || region.direct != nullptr || sparseHeapCandidate(region)) {
+                skipped(region, !region.pending ? "not pending" : region.mirror != nullptr ? "mirrored" : region.direct != nullptr ? "direct" : "sparse heap candidate");
+                continue;
+            }
             if (findImport(state, region.begin, region.end) != nullptr) continue;
-            if (runCovers(importRanges(), region.begin, region.end) && crossedRun(importRanges(), region.begin, region.end).ranges.empty()) continue;
-            static_cast<void>(importJoined(context, state, region.begin, region.end, importRanges(), straddleJoins && !region.sparse && (region.hostBacked || region.writable)));
+            if (runCovers(importRanges(), region.begin, region.end) && crossedRun(importRanges(), region.begin, region.end).ranges.empty()) {
+                skipped(region, "one registered range covers it");
+                continue;
+            }
+            if (importJoined(context, state, region.begin, region.end, importRanges(), straddleJoins && !region.sparse && (region.hostBacked || region.writable)) == nullptr) skipped(region, "the join made no import");
         }
     }
     if (space != nullptr && context.hostImportAlignment != 0) {
