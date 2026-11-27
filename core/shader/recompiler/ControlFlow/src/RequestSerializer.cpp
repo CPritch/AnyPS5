@@ -920,13 +920,22 @@ GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGr
     return graphics;
 }
 
+bool ExtendedTarget(const SpirvTarget& target) {
+    const SpirvTarget defaults{};
+    return target.gpuResolvedImages != defaults.gpuResolvedImages || target.descriptorMemory != defaults.descriptorMemory || target.heapDataUniformDwords != defaults.heapDataUniformDwords ||
+           target.ldsLockFences != defaults.ldsLockFences || target.meshWindowBuffer != defaults.meshWindowBuffer || target.waveLdsMemoryBarriers != defaults.waveLdsMemoryBarriers ||
+           target.deviceScopeLdsMemoryBarriers != defaults.deviceScopeLdsMemoryBarriers || target.exactRobustLoads != defaults.exactRobustLoads || target.robustBufferAccess2 != defaults.robustBufferAccess2 ||
+           target.uniformConstantBuffers != defaults.uniformConstantBuffers;
+}
+
 }
 
 std::string RequestSerializer::Serialize(const RecompileRequest& request) const {
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(request.context.linkedTableLiterals.empty() ? 64u : 66u);
+    const bool extended = ExtendedTarget(request.target) || !request.context.linkedTableLiterals.empty();
+    writer.WriteU32(extended ? 66u : 64u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -973,16 +982,18 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.shaderImageMinLod);
     writer.WriteBool(request.target.float16WidenNans);
     writer.WriteBool(request.target.float16NarrowNans);
-    writer.WriteBool(request.target.gpuResolvedImages);
-    writer.WriteBool(request.target.descriptorMemory);
-    writer.WriteU32(request.target.heapDataUniformDwords);
-    writer.WriteBool(request.target.ldsLockFences);
-    writer.WriteBool(request.target.meshWindowBuffer);
-    writer.WriteBool(request.target.waveLdsMemoryBarriers);
-    writer.WriteBool(request.target.deviceScopeLdsMemoryBarriers);
-    writer.WriteBool(request.target.exactRobustLoads);
-    writer.WriteBool(request.target.robustBufferAccess2);
-    writer.WriteBool(request.target.uniformConstantBuffers);
+    if (extended) {
+        writer.WriteBool(request.target.gpuResolvedImages);
+        writer.WriteBool(request.target.descriptorMemory);
+        writer.WriteU32(request.target.heapDataUniformDwords);
+        writer.WriteBool(request.target.ldsLockFences);
+        writer.WriteBool(request.target.meshWindowBuffer);
+        writer.WriteBool(request.target.waveLdsMemoryBarriers);
+        writer.WriteBool(request.target.deviceScopeLdsMemoryBarriers);
+        writer.WriteBool(request.target.exactRobustLoads);
+        writer.WriteBool(request.target.robustBufferAccess2);
+        writer.WriteBool(request.target.uniformConstantBuffers);
+    }
     if (request.context.compute.has_value()) {
         writer.WriteU32(request.context.compute->granulatedVgprCount);
         writer.WriteU32(request.context.compute->sharedVgprBlocks);
@@ -991,7 +1002,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.fixedPushSlots);
     writer.WriteBool(request.target.spannedAnySubgroup);
     writer.WriteU32Span(request.context.splitState);
-    if (!request.context.linkedTableLiterals.empty()) writer.WriteU32Span(request.context.linkedTableLiterals);
+    if (extended) writer.WriteU32Span(request.context.linkedTableLiterals);
     if (request.graphics.has_value() && request.graphics->emulateBarycentrics) writer.WriteBool(true);
     return base64Encode(buffer);
 }
@@ -1068,7 +1079,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.request.target.float16WidenNans = reader.ReadBool();
         result.request.target.float16NarrowNans = reader.ReadBool();
     }
-    if (version >= 65u) {
+    if (version == 66u) {
         result.request.target.gpuResolvedImages = reader.ReadBool();
         result.request.target.descriptorMemory = reader.ReadBool();
         result.request.target.heapDataUniformDwords = reader.ReadU32();
