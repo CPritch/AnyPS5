@@ -583,6 +583,8 @@ struct TextureCounters {
     std::atomic<std::uint64_t> tablesRemembered{0};
     std::atomic<std::uint64_t> viewedKept{0};
     std::atomic<std::uint64_t> viewedLookedUp{0};
+    std::atomic<std::uint64_t> tablesPartial{0};
+    std::atomic<std::uint64_t> partialEntries{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ImageTableUnremembered::Count)> tablesUnremembered{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ImageTableUnreused::Count)> tablesUnreused{};
     // Snapshot hits over memory outside the write watch: kept by an unchanged UntrackedHint key, or
@@ -625,7 +627,7 @@ void reportTextureCounters() {
     };
     const auto unremembered = reasons(counters.tablesUnremembered, unrememberedNames);
     const auto unreused = reasons(counters.tablesUnreused, unreusedNames);
-    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu cleared on the GPU, %llu uploaded on the GPU from host imports, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused (%llu replayed, %llu found cached by the entry memo), %llu resolved, %llu remembered; tables not remembered by reason:%s; tables not reused by reason:%s; storage-viewed table entries %llu kept, %llu looked up again; dynamic-resolution variants: %llu surfaces, %llu entries substituted, %llu entries rejected; %llu one-layer 2D array entries bound to the 2D texture of their surface; untracked snapshots %llu kept by the write-watch hint, %llu compared; views kept through a pending alias: %llu lookups, %llu revalidations\n", count(counters.fromStorage), count(counters.cleared), count(counters.imported), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused) + count(counters.tablesReplayed), count(counters.tablesReplayed), count(counters.tableEntryMemoHits), count(counters.tablesResolved), count(counters.tablesRemembered), unremembered.c_str(), unreused.c_str(), count(counters.viewedKept), count(counters.viewedLookedUp), count(counters.variantSurfaces), count(counters.variantSubstituted), count(counters.variantRejected), count(counters.arrayViewsShared), count(counters.untrackedKept), count(counters.untrackedCompared), count(counters.aliasViews), count(counters.aliasRefreshes));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu cleared on the GPU, %llu uploaded on the GPU from host imports, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused (%llu replayed, %llu found cached by the entry memo), %llu partly resolved again (%llu entries looked up again), %llu resolved, %llu remembered; tables not remembered by reason:%s; tables not reused by reason:%s; storage-viewed table entries %llu kept, %llu looked up again; dynamic-resolution variants: %llu surfaces, %llu entries substituted, %llu entries rejected; %llu one-layer 2D array entries bound to the 2D texture of their surface; untracked snapshots %llu kept by the write-watch hint, %llu compared; views kept through a pending alias: %llu lookups, %llu revalidations\n", count(counters.fromStorage), count(counters.cleared), count(counters.imported), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused) + count(counters.tablesReplayed), count(counters.tablesReplayed), count(counters.tableEntryMemoHits), count(counters.tablesPartial), count(counters.partialEntries), count(counters.tablesResolved), count(counters.tablesRemembered), unremembered.c_str(), unreused.c_str(), count(counters.viewedKept), count(counters.viewedLookedUp), count(counters.variantSurfaces), count(counters.variantSubstituted), count(counters.variantRejected), count(counters.arrayViewsShared), count(counters.untrackedKept), count(counters.untrackedCompared), count(counters.aliasViews), count(counters.aliasRefreshes));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -2677,6 +2679,8 @@ struct ReusedTableElement {
     GuestTextureResource representativeResource{};
     bool viewed = false;
     std::weak_ptr<StorageTexture> source;
+    std::uint64_t generation = 0;
+    std::pair<std::uint64_t, std::uint64_t> surface{};
 };
 
 struct ReplayedBinds {
@@ -2702,12 +2706,50 @@ struct ReusedTable {
     AgcDriver::Mutex mutex;
     TableState proved;
     std::shared_ptr<const ReplayedBinds> replay;
-    std::vector<std::list<CachedTexture>::iterator> cachedEntries;
+    std::vector<std::pair<std::uint32_t, std::list<CachedTexture>::iterator>> cachedEntries;
     std::vector<std::pair<std::uint32_t, std::list<CachedTexture>::iterator>> viewedEntries;
     std::uint64_t cachedErasures = std::numeric_limits<std::uint64_t>::max();
 };
 
 constexpr std::size_t ReusedTableCount = 16;
+constexpr std::size_t PartialResolveDivisor = 2;
+
+bool KeptEntry(const ReusedTableElement& element) {
+    return !element.rejected && !element.live && !element.substitute;
+}
+
+void IndexTable(ReusedTable& table) {
+    table.queries.clear();
+    table.ranges.clear();
+    table.mapped.clear();
+    for (const auto& element : table.elements) {
+        if (element.surface.first < element.surface.second) table.mapped.push_back(element.surface);
+        if (!KeptEntry(element)) continue;
+        table.queries.push_back({element.resource.baseAddress, static_cast<std::size_t>(element.guestBytes), element.generation});
+        table.ranges.emplace_back(element.resource.baseAddress, element.resource.baseAddress + element.guestBytes);
+    }
+    auto& mapped = table.mapped;
+    std::sort(mapped.begin(), mapped.end());
+    std::size_t merged = 0;
+    for (std::size_t index = 0; index < mapped.size(); ++index) {
+        const auto range = mapped[index];
+        if (merged != 0 && range.first <= mapped[merged - 1].second) mapped[merged - 1].second = std::max(mapped[merged - 1].second, range.second);
+        else mapped[merged++] = range;
+    }
+    mapped.resize(merged);
+}
+
+struct AffectedEntries {
+    std::vector<std::uint8_t> mask;
+    std::size_t count = 0;
+    bool Has(std::uint32_t element) const { return !mask.empty() && mask[element] != 0; }
+    bool Mark(std::uint32_t element, std::size_t elements) {
+        if (mask.empty()) mask.assign(elements, 0);
+        if (mask[element] != 0) return true;
+        mask[element] = 1;
+        return ++count <= elements / PartialResolveDivisor;
+    }
+};
 
 struct ReusedTableCache {
     AgcDriver::Mutex mutex;
@@ -2732,18 +2774,38 @@ std::shared_ptr<ReusedTable> FindReusedTable(VkDevice device, const ShaderRecomp
     return cache.tables.front();
 }
 
-bool MappingUnchangedSince(const ReusedTable& table, std::uint64_t since) {
+bool MappingUnchangedSince(const ReusedTable& table, std::uint64_t since, AffectedEntries* affected) {
     struct SpansTag {};
     auto& spans = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, SpansTag>();
     spans.clear();
     std::uint64_t current = 0;
     if (!GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(since, spans, current)) return false;
     std::sort(spans.begin(), spans.end());
+    bool overlapped = false;
     auto range = table.mapped.begin();
     for (const auto& [begin, end] : spans) {
         while (range != table.mapped.end() && range->second <= begin) ++range;
-        if (range == table.mapped.end()) return true;
-        if (range->first < end) return false;
+        if (range == table.mapped.end()) break;
+        if (range->first < end) {
+            overlapped = true;
+            break;
+        }
+    }
+    if (!overlapped) return true;
+    if (affected == nullptr) return false;
+    std::size_t merged = 0;
+    for (std::size_t index = 0; index < spans.size(); ++index) {
+        const auto span = spans[index];
+        if (merged != 0 && span.first <= spans[merged - 1].second) spans[merged - 1].second = std::max(spans[merged - 1].second, span.second);
+        else spans[merged++] = span;
+    }
+    spans.resize(merged);
+    for (std::uint32_t element = 0; element < table.elements.size(); ++element) {
+        const auto& entry = table.elements[element];
+        const auto [begin, end] = entry.surface;
+        if (entry.substitute || (entry.live && !entry.viewed) || begin >= end) continue;
+        const auto span = std::upper_bound(spans.begin(), spans.end(), begin, [](std::uint64_t address, const std::pair<std::uint64_t, std::uint64_t>& changed) { return address < changed.second; });
+        if (span != spans.end() && span->first < end && !affected->Mark(element, table.elements.size())) return false;
     }
     return true;
 }
@@ -2756,7 +2818,7 @@ bool TablePendingFree(ReusedTable& table) {
     return true;
 }
 
-ImageTableUnreused ProveTable(ReusedTable& table, const TableState& current) {
+ImageTableUnreused ProveTable(ReusedTable& table, const TableState& current, AffectedEntries* affected = nullptr) {
     if (current.epoch == 0) return ImageTableUnreused::NoEpoch;
     TableState proved;
     {
@@ -2764,30 +2826,46 @@ ImageTableUnreused ProveTable(ReusedTable& table, const TableState& current) {
         proved = table.proved;
     }
     const bool same = SameCollects(current, proved);
+    const auto elements = static_cast<std::uint32_t>(table.elements.size());
+    const auto skipped = [&](std::uint32_t element) { return affected != nullptr && affected->Has(element); };
     if (!same) {
         if (table.stateBound) return ImageTableUnreused::StateBound;
         if (current.depthSurfaces != proved.depthSurfaces) return ImageTableUnreused::DepthSurfaces;
         if (current.multisample != proved.multisample) return ImageTableUnreused::MultisampleTargets;
-        if (current.allocations != proved.allocations && !MappingUnchangedSince(table, proved.allocations)) return ImageTableUnreused::Mapping;
-        for (const auto& query : table.queries) {
-            if (!FlushDepthPlanes(query.address, query.bytes).empty()) return ImageTableUnreused::Changed;
-            if (GuestMemory::CollectWrites(query.address, query.bytes) == 0) return ImageTableUnreused::Collect;
+        if (current.allocations != proved.allocations && !MappingUnchangedSince(table, proved.allocations, affected)) return ImageTableUnreused::Mapping;
+        for (std::uint32_t element = 0, query = 0; element < elements; ++element) {
+            if (!KeptEntry(table.elements[element])) continue;
+            const auto& range = table.queries[query++];
+            if (skipped(element)) continue;
+            if (!FlushDepthPlanes(range.address, range.bytes).empty()) {
+                if (affected == nullptr || !affected->Mark(element, elements)) return ImageTableUnreused::Changed;
+                continue;
+            }
+            if (GuestMemory::CollectWrites(range.address, range.bytes) == 0) return ImageTableUnreused::Collect;
         }
     }
     if (!TablePendingFree(table)) return ImageTableUnreused::Pending;
-    if (!GuestMemory::UnchangedSinceAll(table.queries)) return ImageTableUnreused::Changed;
-    if (!same) {
+    if (!GuestMemory::UnchangedSinceAll(table.queries)) {
+        if (affected == nullptr) return ImageTableUnreused::Changed;
+        for (std::uint32_t element = 0, query = 0; element < elements; ++element) {
+            if (!KeptEntry(table.elements[element])) continue;
+            const auto& range = table.queries[query++];
+            if (!skipped(element) && !GuestMemory::UnchangedSince(range.address, range.bytes, range.generation) && !affected->Mark(element, elements)) return ImageTableUnreused::Changed;
+        }
+    }
+    if (!same && (affected == nullptr || affected->count == 0)) {
         std::lock_guard lock(table.mutex);
         table.proved = current;
     }
     return ImageTableUnreused::Count;
 }
 
-bool CachedTableTextures(ReusedTable& table, std::vector<std::shared_ptr<Texture>>& cached, std::vector<std::shared_ptr<Texture>>* viewed) {
+bool CachedTableTextures(ReusedTable& table, std::vector<std::shared_ptr<Texture>>& cached, std::vector<std::shared_ptr<Texture>>* viewed, const AffectedEntries* affected = nullptr) {
     auto& cache = Textures();
     std::lock_guard lock(cache.mutex);
     auto& entries = table.cachedEntries;
     auto& views = table.viewedEntries;
+    const auto skipped = [&](std::uint32_t element) { return affected != nullptr && affected->Has(element); };
     if (table.cachedErasures == cache.erasures && !RuntimeSwitches::Set(RuntimeSwitch::NoTableEntryMemo)) {
         TextureCounts().tableEntryMemoHits.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -2795,16 +2873,21 @@ bool CachedTableTextures(ReusedTable& table, std::vector<std::shared_ptr<Texture
         entries.clear();
         views.clear();
         entries.reserve(table.queries.size());
-        bool viewsFound = true;
+        bool complete = true;
         for (std::uint32_t element = 0; element < table.elements.size(); ++element) {
             const auto& entry = table.elements[element];
             if (entry.rejected || entry.substitute || (entry.live && !entry.viewed)) continue;
+            if (skipped(element)) {
+                (entry.viewed ? views : entries).emplace_back(element, cache.entries.end());
+                complete = false;
+                continue;
+            }
             const auto it = findTexture(cache, entry.key);
             const bool found = it != cache.entries.end() && it->texture == entry.texture.lock();
             if (entry.viewed) {
                 const bool same = found && it->source != nullptr && it->source == entry.source.lock();
                 views.emplace_back(element, same ? it : cache.entries.end());
-                viewsFound = viewsFound && same;
+                complete = complete && same;
                 continue;
             }
             if (!found) {
@@ -2812,20 +2895,24 @@ bool CachedTableTextures(ReusedTable& table, std::vector<std::shared_ptr<Texture
                 views.clear();
                 return false;
             }
-            entries.push_back(it);
+            entries.emplace_back(element, it);
         }
-        if (viewsFound) table.cachedErasures = cache.erasures;
+        if (complete) table.cachedErasures = cache.erasures;
     }
     cached.reserve(entries.size());
     const auto now = std::chrono::steady_clock::now();
-    for (const auto it : entries) {
+    for (const auto& [element, it] : entries) {
+        if (skipped(element) || it == cache.entries.end()) {
+            cached.push_back(nullptr);
+            continue;
+        }
         cached.push_back(it->texture);
         touchTexture(cache, it, now);
     }
     if (viewed != nullptr) {
         viewed->assign(table.elements.size(), nullptr);
         for (const auto& [element, it] : views) {
-            if (it == cache.entries.end()) continue;
+            if (skipped(element) || it == cache.entries.end()) continue;
             (*viewed)[element] = it->texture;
             touchTexture(cache, it, now);
         }
@@ -2872,7 +2959,7 @@ void logTableLookups(const ReusedTable& table, const std::vector<std::shared_ptr
     for (const auto& element : table.elements) {
         if (element.rejected || element.live || element.substitute) continue;
         if (kept >= cached.size() || kept >= table.queries.size()) return;
-        logLookup({cached[kept].get(), element.resource, element.guestBytes, DccKeys::Uncompressed, table.queries[kept].generation, nullptr});
+        if (cached[kept] != nullptr) logLookup({cached[kept].get(), element.resource, element.guestBytes, DccKeys::Uncompressed, table.queries[kept].generation, nullptr});
         ++kept;
     }
 }
@@ -2897,6 +2984,19 @@ void RememberTable(std::shared_ptr<ReusedTable> table, const ShaderRecompiler::D
         dropped.push_back(std::move(cache.tables.back()));
         cache.tables.pop_back();
     }
+}
+
+ImageTableUnremembered KeepTable(std::shared_ptr<ReusedTable> table, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state, std::shared_ptr<const ReplayedBinds> binds) {
+    if (std::none_of(table->elements.begin(), table->elements.end(), [](const ReusedTableElement& element) { return !element.live || element.viewed; })) return ImageTableUnremembered::NothingKept;
+    IndexTable(*table);
+    const auto serial = StorageTexture::PendingSerial();
+    if (StorageTexture::AnyPendingOverlaps(table->ranges) || StorageTexture::PendingSerial() != serial) return ImageTableUnremembered::Pending;
+    table->state = state;
+    table->proved = state;
+    table->pendingSerial.store(serial, std::memory_order_release);
+    table->replay = std::move(binds);
+    RememberTable(std::move(table), binding);
+    return ImageTableUnremembered::Count;
 }
 
 std::string HexText(std::uint64_t value) {
@@ -7129,7 +7229,33 @@ void ShaderResources::resolveImageTables() {
             Require(context.imageViewMinLod || EffectiveMinLod(sampled.resource) == 0.0f, "a sampled image table entry has a minimum LOD clamp, which needs VK_EXT_image_view_min_lod");
             return cachedTexture(context, sampled.words, sampled.resource, sampled.components, sampled.guestBytes, sampled.depthCompare, multisampleViewType);
         };
-        const auto resolveLive = [&](std::uint32_t element, std::span<const std::uint32_t> words) -> std::string {
+        const auto decodedSurface = [](const DecodedEntry& decoded) { return decoded.guestBytes != 0 ? std::pair<std::uint64_t, std::uint64_t>{decoded.resource.baseAddress, decoded.resource.baseAddress + decoded.guestBytes} : std::pair<std::uint64_t, std::uint64_t>{}; };
+        const auto rejectedEntry = [](const std::string& message, std::pair<std::uint64_t, std::uint64_t> surface) {
+            ReusedTableElement entry{{}, {}, {}, 0, false, true, message};
+            entry.surface = surface;
+            return entry;
+        };
+        const auto lookedUpEntry = [&](const SampledEntry& sampled, const std::shared_ptr<Texture>& texture, const DecodedEntry& decoded) {
+            const auto& log = lookupLog();
+            const auto* looked = log.empty() ? nullptr : &log.back();
+            const bool plain = looked != nullptr && looked->object == texture.get() && looked->keys == DccKeys::Uncompressed && sampled.resource.dccAddress == 0;
+            const bool view = plain && looked->source != nullptr && looked->resource.baseAddress == sampled.resource.baseAddress && looked->bytes == sampled.guestBytes && looked->source->Descriptor().dccAddress == 0 && texture->StorageSource() == looked->source && texture->CopyKind() == Texture::PerUseCopy::None && !texture->HasReuseLookup();
+            ReusedTableElement entry{{}, {}, {}, 0, decoded.firstLayer, false, {}, true};
+            if ((plain && looked->source == nullptr && looked->generation != 0) || view) {
+                entry.key = MakeTextureKey(context.device, sampled.words, sampled.components, sampled.depthCompare);
+                entry.texture = texture;
+                entry.resource = sampled.resource;
+                entry.guestBytes = sampled.guestBytes;
+                entry.live = view;
+                entry.viewed = view;
+                if (view) entry.source = texture->SharedStorageSource();
+                else entry.generation = looked->generation;
+            }
+            entry.surface = decodedSurface(decoded);
+            return entry;
+        };
+        bool reresolvedStateBound = false;
+        const auto resolveLive = [&](std::uint32_t element, std::span<const std::uint32_t> words, ReusedTableElement* recorded) -> std::string {
             DecodedEntry decoded;
             try {
                 decoded = decodeEntry(element, words);
@@ -7138,6 +7264,7 @@ void ShaderResources::resolveImageTables() {
             }
             if (!decoded.rejected.empty()) {
                 table.map[faults + element] = rejectTableElement(table, words, decoded.rejected);
+                if (recorded != nullptr) *recorded = rejectedEntry(decoded.rejected, decodedSurface(decoded));
                 return decoded.rejected;
             }
             const auto sampled = prepareSampled(element, words, decoded);
@@ -7146,13 +7273,19 @@ void ShaderResources::resolveImageTables() {
                 texture = lookupSampled(element, sampled);
             } catch (const std::runtime_error& error) {
                 table.map[faults + element] = rejectTableElement(table, words, error.what());
+                if (recorded != nullptr) {
+                    *recorded = rejectedEntry(error.what(), {});
+                    reresolvedStateBound = true;
+                }
                 return error.what();
             }
+            if (recorded != nullptr) *recorded = lookedUpEntry(sampled, texture, decoded);
             return bind(element, sampled.words, std::move(texture), sampled.resource, sampled.guestBytes, decoded.firstLayer);
         };
         const auto state = CurrentTableState();
         std::vector<std::shared_ptr<Texture>> cached;
         std::vector<std::shared_ptr<Texture>> viewed;
+        AffectedEntries affected;
         const bool storageTable = std::find(binding.imageWritten.begin(), binding.imageWritten.end(), true) != binding.imageWritten.end();
         auto unreused = storageTable ? ImageTableUnreused::StoredElements : item == nullptr ? ImageTableUnreused::NoSampledBinding : state.epoch == 0 ? ImageTableUnreused::NoEpoch : ImageTableUnreused::Count;
         auto reused = unreused == ImageTableUnreused::Count ? FindReusedTable(context.device, binding) : nullptr;
@@ -7163,8 +7296,11 @@ void ShaderResources::resolveImageTables() {
             }
         }
         if (reused != nullptr && !reused->representatives.empty() && reused->representatives != variantRepresentatives(context.device, binding, table.elementBase, context.imageTableCapacity)) unreused = ImageTableUnreused::Variants;
-        if (unreused == ImageTableUnreused::Count && reused != nullptr) unreused = ProveTable(*reused, CurrentTableState());
-        if (unreused == ImageTableUnreused::Count && reused != nullptr && !CachedTableTextures(*reused, cached, &viewed)) unreused = ImageTableUnreused::Evicted;
+        const auto proving = CurrentTableState();
+        const bool partialAllowed = !RuntimeSwitches::Set(RuntimeSwitch::NoPartialTableResolve) && static_cast<std::uint64_t>(table.elementBase) + binding.count <= context.imageTableCapacity;
+        if (unreused == ImageTableUnreused::Count && reused != nullptr) unreused = ProveTable(*reused, proving, partialAllowed ? &affected : nullptr);
+        const bool partial = unreused == ImageTableUnreused::Count && reused != nullptr && affected.count != 0;
+        if (unreused == ImageTableUnreused::Count && reused != nullptr && !CachedTableTextures(*reused, cached, &viewed, partial ? &affected : nullptr)) unreused = ImageTableUnreused::Evicted;
         if (unreused == ImageTableUnreused::Count && reused != nullptr) {
             ProveViewed(*reused, viewed);
             logTableLookups(*reused, cached);
@@ -7175,16 +7311,21 @@ void ShaderResources::resolveImageTables() {
                 memo = reused->replay;
             }
             const bool replay = TableReplay() && memo != nullptr && memo->replayable && memo->imageSamplers == binding.imageSamplers && memo->samplers == samplerKey;
-            auto binds = replay ? nullptr : std::make_shared<ReplayedBinds>();
+            auto binds = replay && !partial ? nullptr : std::make_shared<ReplayedBinds>();
             if (binds != nullptr) binds->bound.assign(binding.count, {});
+            std::vector<ReusedTableElement> reresolved;
+            reresolved.reserve(affected.count);
             bool viewsLookedUp = false;
             auto next = cached.begin();
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
                 const auto& entry = reused->elements[element];
                 if (static_cast<std::uint64_t>(table.elementBase) + element >= context.imageTableCapacity) {
-                    if (!entry.rejected && !entry.live && !entry.substitute) ++next;
+                    if (KeptEntry(entry)) ++next;
                     table.map[faults + element] = rejectTableElement(table, words, capacityMessage());
+                } else if (affected.Has(element)) {
+                    if (KeptEntry(entry)) ++next;
+                    binds->bound[element] = resolveLive(element, words, &reresolved.emplace_back());
                 } else if (entry.rejected) {
                     table.map[faults + element] = rejectTableElement(table, words, entry.message);
                 } else if (entry.substitute) {
@@ -7196,6 +7337,7 @@ void ShaderResources::resolveImageTables() {
                         binds->bound[element] = bind(element, words, std::move(viewed[element]), entry.resource, entry.guestBytes, entry.firstLayer);
                     } else if (!memo->bound[element].empty()) {
                         table.map[faults + element] = rejectTableElement(table, words, memo->bound[element]);
+                        if (binds != nullptr) binds->bound[element] = memo->bound[element];
                     } else {
                         place(element, std::move(viewed[element]), entry.resource, entry.guestBytes, entry.firstLayer);
                     }
@@ -7204,14 +7346,15 @@ void ShaderResources::resolveImageTables() {
                         viewsLookedUp = true;
                         counters.viewedLookedUp.fetch_add(1, std::memory_order_relaxed);
                     }
-                    auto message = resolveLive(element, words);
-                    if (!replay) binds->bound[element] = std::move(message);
+                    auto message = resolveLive(element, words, nullptr);
+                    if (binds != nullptr) binds->bound[element] = std::move(message);
                 } else {
                     if (!replay) {
                         binds->bound[element] = bind(element, words, std::move(*next++), entry.resource, entry.guestBytes, entry.firstLayer);
                     } else if (!memo->bound[element].empty()) {
                         ++next;
                         table.map[faults + element] = rejectTableElement(table, words, memo->bound[element]);
+                        if (binds != nullptr) binds->bound[element] = memo->bound[element];
                     } else {
                         place(element, std::move(*next++), entry.resource, entry.guestBytes, entry.firstLayer);
                     }
@@ -7232,6 +7375,28 @@ void ShaderResources::resolveImageTables() {
                 table.elementTextures[element] = index;
                 item->imageAllocations[static_cast<std::size_t>(table.elementBase) + element] = index;
                 counters.variantSubstituted.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (partial) {
+                counters.tablesPartial.fetch_add(1, std::memory_order_relaxed);
+                counters.partialEntries.fetch_add(reresolved.size(), std::memory_order_relaxed);
+                auto rebuilt = std::make_shared<ReusedTable>();
+                rebuilt->device = reused->device;
+                rebuilt->stateBound = reused->stateBound || reresolvedStateBound;
+                rebuilt->representatives = reused->representatives;
+                rebuilt->elements.reserve(reused->elements.size());
+                auto taken = reresolved.begin();
+                for (std::uint32_t element = 0; element < reused->elements.size(); ++element) rebuilt->elements.push_back(affected.Has(element) ? std::move(*taken++) : reused->elements[element]);
+                const auto& elements = rebuilt->elements;
+                auto why = std::any_of(elements.begin(), elements.end(), [&](const ReusedTableElement& element) { return element.substitute && elements[element.representative].rejected; }) ? ImageTableUnremembered::RejectedVariant : ImageTableUnremembered::Count;
+                if (why == ImageTableUnremembered::Count) {
+                    binds->imageSamplers = binding.imageSamplers;
+                    binds->samplers = samplerKey;
+                    binds->replayable = !viewsLookedUp;
+                    why = KeepTable(std::move(rebuilt), binding, proving, std::move(binds));
+                }
+                if (why == ImageTableUnremembered::Count) counters.tablesRemembered.fetch_add(1, std::memory_order_relaxed);
+                else counters.tablesUnremembered[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+                continue;
             }
             if (binds != nullptr) {
                 binds->imageSamplers = binding.imageSamplers;
@@ -7316,10 +7481,7 @@ void ShaderResources::resolveImageTables() {
             }
             if (!decoded.rejected.empty()) {
                 table.map[faults + element] = rejectTableElement(table, words, decoded.rejected);
-                if (reusable) {
-                    fresh.elements.push_back({{}, {}, {}, 0, false, true, decoded.rejected});
-                    if (decoded.guestBytes != 0) fresh.mapped.emplace_back(decoded.resource.baseAddress, decoded.resource.baseAddress + decoded.guestBytes);
-                }
+                if (reusable) fresh.elements.push_back(rejectedEntry(decoded.rejected, decodedSurface(decoded)));
                 continue;
             }
             const auto& resource = decoded.resource;
@@ -7375,30 +7537,12 @@ void ShaderResources::resolveImageTables() {
             } catch (const std::runtime_error& error) {
                 table.map[faults + element] = rejectTableElement(table, words, error.what());
                 if (reusable) {
-                    fresh.elements.push_back({{}, {}, {}, 0, false, true, error.what()});
+                    fresh.elements.push_back(rejectedEntry(error.what(), {}));
                     fresh.stateBound = true;
                 }
                 continue;
             }
-            if (reusable) {
-                const auto& log = lookupLog();
-                const auto* looked = log.empty() ? nullptr : &log.back();
-                const bool plain = looked != nullptr && looked->object == texture.get() && looked->keys == DccKeys::Uncompressed && sampled.resource.dccAddress == 0;
-                const bool view = plain && looked->source != nullptr && looked->resource.baseAddress == sampled.resource.baseAddress && looked->bytes == sampled.guestBytes && looked->source->Descriptor().dccAddress == 0 && texture->StorageSource() == looked->source && texture->CopyKind() == Texture::PerUseCopy::None && !texture->HasReuseLookup();
-                if (plain && looked->source == nullptr && looked->generation != 0) {
-                    fresh.elements.push_back({MakeTextureKey(context.device, sampled.words, sampled.components, sampled.depthCompare), texture, sampled.resource, sampled.guestBytes, firstLayer, false, {}});
-                    fresh.queries.push_back({sampled.resource.baseAddress, static_cast<std::size_t>(sampled.guestBytes), looked->generation});
-                    fresh.ranges.emplace_back(sampled.resource.baseAddress, sampled.resource.baseAddress + sampled.guestBytes);
-                } else if (view) {
-                    ReusedTableElement viewedElement{MakeTextureKey(context.device, sampled.words, sampled.components, sampled.depthCompare), texture, sampled.resource, sampled.guestBytes, firstLayer, false, {}, true};
-                    viewedElement.viewed = true;
-                    viewedElement.source = texture->SharedStorageSource();
-                    fresh.elements.push_back(std::move(viewedElement));
-                } else {
-                    fresh.elements.push_back({{}, {}, {}, 0, firstLayer, false, {}, true});
-                }
-                fresh.mapped.emplace_back(resource.baseAddress, resource.baseAddress + guestBytes);
-            }
+            if (reusable) fresh.elements.push_back(lookedUpEntry(sampled, texture, decoded));
             if (!representativeNeeded.empty() && representativeNeeded[element]) representativeSources.emplace(element, sampled.resource);
             freshBound[element] = bind(element, sampled.words, std::move(texture), sampled.resource, sampled.guestBytes, firstLayer);
         }
@@ -7422,34 +7566,16 @@ void ShaderResources::resolveImageTables() {
             counters.variantSubstituted.fetch_add(1, std::memory_order_relaxed);
         }
         counters.tablesResolved.fetch_add(1, std::memory_order_relaxed);
-        if (reusable && std::none_of(fresh.elements.begin(), fresh.elements.end(), [](const ReusedTableElement& element) { return !element.live || element.viewed; })) forget(ImageTableUnremembered::NothingKept);
         if (reusable) {
-            const auto serial = StorageTexture::PendingSerial();
-            if (StorageTexture::AnyPendingOverlaps(fresh.ranges) || StorageTexture::PendingSerial() != serial) forget(ImageTableUnremembered::Pending);
-            else {
-                fresh.device = context.device;
-                fresh.state = state;
-                fresh.proved = state;
-                fresh.pendingSerial.store(serial, std::memory_order_release);
-                auto binds = std::make_shared<ReplayedBinds>();
-                binds->imageSamplers = binding.imageSamplers;
-                binds->samplers = std::move(samplerKey);
-                binds->replayable = static_cast<std::uint64_t>(table.elementBase) + binding.count <= context.imageTableCapacity;
-                binds->bound = std::move(freshBound);
-                fresh.replay = std::move(binds);
-                fresh.representatives = table.representatives;
-                auto& mapped = fresh.mapped;
-                std::sort(mapped.begin(), mapped.end());
-                std::size_t merged = 0;
-                for (std::size_t index = 0; index < mapped.size(); ++index) {
-                    const auto range = mapped[index];
-                    if (merged != 0 && range.first <= mapped[merged - 1].second) mapped[merged - 1].second = std::max(mapped[merged - 1].second, range.second);
-                    else mapped[merged++] = range;
-                }
-                mapped.resize(merged);
-                RememberTable(remembered, binding);
-                counters.tablesRemembered.fetch_add(1, std::memory_order_relaxed);
-            }
+            fresh.device = context.device;
+            fresh.representatives = table.representatives;
+            auto binds = std::make_shared<ReplayedBinds>();
+            binds->imageSamplers = binding.imageSamplers;
+            binds->samplers = std::move(samplerKey);
+            binds->replayable = static_cast<std::uint64_t>(table.elementBase) + binding.count <= context.imageTableCapacity;
+            binds->bound = std::move(freshBound);
+            if (const auto kept = KeepTable(remembered, binding, state, std::move(binds)); kept != ImageTableUnremembered::Count) forget(kept);
+            else counters.tablesRemembered.fetch_add(1, std::memory_order_relaxed);
         }
         if (!reusable) counters.tablesUnremembered[static_cast<std::size_t>(unremembered)].fetch_add(1, std::memory_order_relaxed);
     }
@@ -7474,7 +7600,7 @@ std::uint64_t SampledTexturesImported() {
 
 ImageTableReuseCounts ImageTableReuses() {
     const auto& counters = TextureCounts();
-    ImageTableReuseCounts counts{counters.tablesReused.load(std::memory_order_relaxed) + counters.tablesReplayed.load(std::memory_order_relaxed), counters.tablesResolved.load(std::memory_order_relaxed), counters.tablesReplayed.load(std::memory_order_relaxed), counters.tableWritesKept.load(std::memory_order_relaxed), counters.tableWritesMade.load(std::memory_order_relaxed), counters.variantSurfaces.load(std::memory_order_relaxed), counters.variantSubstituted.load(std::memory_order_relaxed), counters.variantRejected.load(std::memory_order_relaxed), counters.arrayViewsShared.load(std::memory_order_relaxed), counters.tableEntryMemoHits.load(std::memory_order_relaxed), counters.tablesRemembered.load(std::memory_order_relaxed), counters.viewedKept.load(std::memory_order_relaxed), counters.viewedLookedUp.load(std::memory_order_relaxed)};
+    ImageTableReuseCounts counts{counters.tablesReused.load(std::memory_order_relaxed) + counters.tablesReplayed.load(std::memory_order_relaxed), counters.tablesResolved.load(std::memory_order_relaxed), counters.tablesReplayed.load(std::memory_order_relaxed), counters.tableWritesKept.load(std::memory_order_relaxed), counters.tableWritesMade.load(std::memory_order_relaxed), counters.variantSurfaces.load(std::memory_order_relaxed), counters.variantSubstituted.load(std::memory_order_relaxed), counters.variantRejected.load(std::memory_order_relaxed), counters.arrayViewsShared.load(std::memory_order_relaxed), counters.tableEntryMemoHits.load(std::memory_order_relaxed), counters.tablesRemembered.load(std::memory_order_relaxed), counters.viewedKept.load(std::memory_order_relaxed), counters.viewedLookedUp.load(std::memory_order_relaxed), counters.tablesPartial.load(std::memory_order_relaxed), counters.partialEntries.load(std::memory_order_relaxed)};
     for (std::size_t reason = 0; reason < counts.unremembered.size(); ++reason) counts.unremembered[reason] = counters.tablesUnremembered[reason].load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < counts.unreused.size(); ++reason) counts.unreused[reason] = counters.tablesUnreused[reason].load(std::memory_order_relaxed);
     return counts;

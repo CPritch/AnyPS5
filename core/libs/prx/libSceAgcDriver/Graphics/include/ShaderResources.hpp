@@ -209,6 +209,8 @@ struct ImageTableReuseCounts {
     std::uint64_t remembered = 0;
     std::uint64_t viewedKept = 0;
     std::uint64_t viewedLookedUp = 0;
+    std::uint64_t partial = 0;
+    std::uint64_t partialEntries = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ImageTableUnremembered::Count)> unremembered{};
     std::array<std::uint64_t, static_cast<std::size_t>(ImageTableUnreused::Count)> unreused{};
 };

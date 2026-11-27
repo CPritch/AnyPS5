@@ -52,6 +52,8 @@ constexpr std::size_t BlockBytes = TexturesOffset + 2 * 65536;
 constexpr std::size_t UnimportableBytes = BlockBytes - 256;
 constexpr std::uint64_t CpuWriteResolutions = 1;
 constexpr std::uint32_t RetakenEntry = 0;
+constexpr std::uint32_t LoneEntry = 30;
+constexpr std::uint32_t KeptEntry = 12;
 constexpr float RetakenClearDepth = 0.0625f;
 constexpr float LoadedDepth = 0.75f;
 
@@ -208,6 +210,12 @@ std::vector<std::uint32_t> Dispatch(AgcDriver::VulkanDevice& device, const Shade
     return red;
 }
 
+std::uint64_t WrittenEntries(const GuestBlock& block, std::uint64_t generation) {
+    std::uint64_t written = 0;
+    for (std::uint32_t texture = 0; texture < Records; ++texture) written += AgcDriver::GuestMemory::UnchangedSince(AddressOf(block.Texels(texture)), TextureBytes, generation) ? 0u : 1u;
+    return written;
+}
+
 std::vector<std::uint32_t> Row(const float* texels) {
     std::vector<std::uint32_t> row(Lanes);
     for (std::uint32_t lane = 0; lane < Lanes; ++lane) row[lane] = std::bit_cast<std::uint32_t>(texels[lane % Width]);
@@ -217,11 +225,13 @@ std::vector<std::uint32_t> Row(const float* texels) {
 struct Step {
     std::uint64_t reused;
     std::uint64_t resolved;
+    std::uint64_t partial;
+    std::uint64_t partialEntries;
 };
 
 Step Since(const AgcDriver::Graphics::ImageTableReuseCounts& before) {
     const auto now = AgcDriver::Graphics::ImageTableReuses();
-    return {now.reused - before.reused, now.resolved - before.resolved};
+    return {now.reused - before.reused, now.resolved - before.resolved, now.partial - before.partial, now.partialEntries - before.partialEntries};
 }
 
 void ExpectWrites(const AgcDriver::Graphics::ImageTableReuseCounts& before, std::uint64_t kept, std::uint64_t made, const std::string& what) {
@@ -240,9 +250,13 @@ void ExpectWrites(const AgcDriver::Graphics::ImageTableReuseCounts& before, std:
     Require(keptNow == kept && madeNow == made, "image table reuse: " + what + ": " + std::to_string(keptNow) + " table descriptor writes kept and " + std::to_string(madeNow) + " made, expected " + std::to_string(kept) + " and " + std::to_string(made));
 }
 
-void Expect(const AgcDriver::Graphics::ImageTableReuseCounts& before, std::uint64_t reused, std::uint64_t resolved, const std::string& what) {
+void ExpectPartly(const AgcDriver::Graphics::ImageTableReuseCounts& before, std::uint64_t reused, std::uint64_t partial, std::uint64_t entries, std::uint64_t resolved, const std::string& what) {
     const auto step = Since(before);
-    Require(step.reused == reused && step.resolved == resolved, "image table reuse: " + what + ": " + std::to_string(step.reused) + " reused and " + std::to_string(step.resolved) + " resolved tables, expected " + std::to_string(reused) + " and " + std::to_string(resolved));
+    Require(step.reused == reused && step.partial == partial && step.partialEntries == entries && step.resolved == resolved, "image table reuse: " + what + ": " + std::to_string(step.reused) + " reused, " + std::to_string(step.partial) + " partly resolved again with " + std::to_string(step.partialEntries) + " entries looked up again, and " + std::to_string(step.resolved) + " resolved tables, expected " + std::to_string(reused) + ", " + std::to_string(partial) + " with " + std::to_string(entries) + ", and " + std::to_string(resolved));
+}
+
+void Expect(const AgcDriver::Graphics::ImageTableReuseCounts& before, std::uint64_t reused, std::uint64_t resolved, const std::string& what) {
+    ExpectPartly(before, reused, 0, 0, resolved, what);
 }
 
 std::uint64_t Unreused(const AgcDriver::Graphics::ImageTableReuseCounts& before, AgcDriver::Graphics::ImageTableUnreused why) {
@@ -250,11 +264,21 @@ std::uint64_t Unreused(const AgcDriver::Graphics::ImageTableReuseCounts& before,
     return AgcDriver::Graphics::ImageTableReuses().unreused[index] - before.unreused[index];
 }
 
-void ExpectUnreused(const AgcDriver::Graphics::ImageTableReuseCounts& before, AgcDriver::Graphics::ImageTableUnreused why, const std::string& what) {
+std::uint64_t Refusals(const AgcDriver::Graphics::ImageTableReuseCounts& before) {
     const auto now = AgcDriver::Graphics::ImageTableReuses();
     std::uint64_t total = 0;
     for (std::size_t reason = 0; reason < now.unreused.size(); ++reason) total += now.unreused[reason] - before.unreused[reason];
+    return total;
+}
+
+void ExpectUnreused(const AgcDriver::Graphics::ImageTableReuseCounts& before, AgcDriver::Graphics::ImageTableUnreused why, const std::string& what) {
+    const auto total = Refusals(before);
     Require(total == 1u && Unreused(before, why) == 1u, "image table reuse: " + what + ": the table was not refused once for the expected reason (" + std::to_string(Unreused(before, why)) + " of " + std::to_string(total) + " refusals)");
+}
+
+void ExpectNoRefusal(const AgcDriver::Graphics::ImageTableReuseCounts& before, const std::string& what) {
+    const auto total = Refusals(before);
+    Require(total == 0u, "image table reuse: " + what + ": the table was refused " + std::to_string(total) + " times");
 }
 
 std::vector<std::uint32_t> DispatchOnThread(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResult& result, std::uint32_t record) {
@@ -439,6 +463,7 @@ void RunPendingWriteBack(AgcDriver::VulkanDevice& device, const GuestBlock& bloc
     Require(Dispatch(device, result, 13) == old, "image table reuse: the table reused before a write-back was left pending sampled the wrong entry");
     Expect(before, 2 - CpuWriteResolutions, CpuWriteResolutions, "two dispatches of a table before a write-back is left pending");
     Keys[0] = 13;
+    const auto unwritten = AgcDriver::GuestMemory::TrackerGeneration();
     device.Dispatch(writer, 1, 1, 1, {}, AddressOf(TableCode.data()));
     const auto& context = device.graphicsContext();
     if (AgcDriver::Graphics::HostImportCovers(context, AddressOf(block.Texels(13)), TextureBytes) || !AgcDriver::Graphics::AnyPendingCpuWrites(context) || Row(block.Texels(13)) != old) {
@@ -450,8 +475,10 @@ void RunPendingWriteBack(AgcDriver::VulkanDevice& device, const GuestBlock& bloc
     const auto written = Row(block.Texels(13));
     Require(written != old && written[4] == old[1], "image table reuse: the dispatch writing into an entry's texels with its write-back left pending stored the wrong values");
     const auto step = Since(before);
-    Require(sampled == written, std::string("image table reuse: a table used while a dispatch's write-back was pending over an entry sampled ") + (sampled == old ? "the entry's old texels" : "neither the entry's old texels nor the written ones") + " (" + std::to_string(step.reused) + " reused and " + std::to_string(step.resolved) + " resolved tables in the step)");
-    Expect(before, 3 - CpuWriteResolutions, CpuWriteResolutions + 1, "a write-back pending over an entry when its table is used again");
+    Require(sampled == written, std::string("image table reuse: a table used while a dispatch's write-back was pending over an entry sampled ") + (sampled == old ? "the entry's old texels" : "neither the entry's old texels nor the written ones") + " (" + std::to_string(step.reused) + " reused, " + std::to_string(step.partial) + " partly resolved again and " + std::to_string(step.resolved) + " resolved tables in the step)");
+    const auto writtenEntries = WrittenEntries(block, unwritten);
+    Require(writtenEntries != 0u && writtenEntries * 2u <= Records, "image table reuse: a write-back over one entry stamped " + std::to_string(writtenEntries) + " of the table's entries");
+    ExpectPartly(before, 3 - CpuWriteResolutions, 1, writtenEntries, CpuWriteResolutions, "a write-back pending over an entry when its table is used again, which looks up the entries it landed over again");
 }
 
 void RunViewedStore(AgcDriver::VulkanDevice& device, const GuestBlock& block, const GuestBlock& plain) {
@@ -759,11 +786,14 @@ bool RunAcrossThreads(AgcDriver::VulkanDevice& device, const GuestBlock& block) 
     Require(DispatchOnThread(device, moved, 9) == Row(block.Texels(Moved)), "image table reuse across threads: the table with the record's new words sampled the wrong entry when reused");
     Expect(before, 2, 0, "the tables with a record's old and new words, each reused on another thread");
 
+    const auto unwritten = AgcDriver::GuestMemory::TrackerGeneration();
     Fill(block, 7, 0.875f);
     before = AgcDriver::Graphics::ImageTableReuses();
     Require(DispatchOnThread(device, result, 7) == Row(block.Texels(7)), "image table reuse across threads: an entry the CPU wrote kept its old texels on another thread");
-    Expect(before, 0, 1, "a CPU write under an entry, then a dispatch on another thread");
-    ExpectUnreused(before, ImageTableUnreused::Changed, "a CPU write under an entry");
+    const auto writtenEntries = WrittenEntries(block, unwritten);
+    Require(writtenEntries != 0u && writtenEntries * 2u <= Records, "image table reuse across threads: a CPU write over one entry stamped " + std::to_string(writtenEntries) + " of the table's entries");
+    ExpectPartly(before, 0, 1, writtenEntries, 0, "a CPU write under an entry, then a dispatch on another thread, which looks up the written entries again");
+    ExpectNoRefusal(before, "a CPU write under an entry");
 
     before = AgcDriver::Graphics::ImageTableReuses();
     Require(Dispatch(device, result, 15) == Row(block.Texels(15)), "image table reuse across threads: the table resolved after a CPU write sampled the wrong entry");
@@ -781,6 +811,159 @@ bool RunAcrossThreads(AgcDriver::VulkanDevice& device, const GuestBlock& block) 
     ExpectUnreused(before, ImageTableUnreused::Mapping, "the guest mapping under the entries changed");
     Require(DispatchOnThread(device, result, 21) == Row(block.Texels(21)), "image table reuse across threads: the table remembered after a mapping change sampled the wrong entry on another thread");
     Expect(before, 1, 1, "the table remembered again after its mapping changed, reused on another thread");
+    return true;
+}
+
+bool RunPartialResolve(AgcDriver::VulkanDevice& device, const GuestBlock& block, const GuestBlock& lone, const GuestBlock& importable) {
+    using AgcDriver::Graphics::ImageTableUnreused;
+    using AgcDriver::Graphics::ShaderResources;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::puts("guest memory has no write watch: partly resolving a remembered image table again is not tested");
+        return false;
+    }
+    const auto& context = device.graphicsContext();
+    for (std::uint32_t texture = 0; texture < Records; ++texture) {
+        Fill(block, texture, 0.25f);
+        SetRecord(block, texture, texture);
+    }
+    Fill(block, Moved, 0.5f);
+    Fill(lone, 0, 0.375f);
+    SetRecord(block, LoneEntry, 0, &lone);
+    const auto srt = Buffer(block.Table(), Records * Stride);
+    const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+    std::copy(srt.begin(), srt.end(), Srt.begin());
+    std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
+    SetOutput(Output.data());
+    const auto program = Compile(device, block);
+    const AgcDriver::Graphics::CompiledShader shader{ShaderStage::Compute, &program, 0};
+    using Textures = std::vector<std::shared_ptr<AgcDriver::Graphics::Texture>>;
+    struct Built {
+        Textures textures;
+        Step step;
+        std::uint64_t refusals = 0;
+        AgcDriver::Graphics::ImageTableReuseCounts before;
+    };
+    const auto build = [&](const AgcDriver::Graphics::CompiledShader& compiled) {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Built built;
+        built.before = AgcDriver::Graphics::ImageTableReuses();
+        const auto resources = std::make_shared<ShaderResources>(context, compiled);
+        built.textures = resources->SampledTextures();
+        built.step = Since(built.before);
+        built.refusals = Refusals(built.before);
+        return built;
+    };
+    const auto resolveFully = [&](const AgcDriver::Graphics::CompiledShader& compiled, const std::string& what) {
+        Built built;
+        std::exception_ptr failure;
+        std::thread worker([&] {
+            try {
+                built = build(compiled);
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        });
+        worker.join();
+        if (failure != nullptr) std::rethrow_exception(failure);
+        Require(built.step.resolved == 1u && built.step.reused == 0u && built.step.partial == 0u && Unreused(built.before, ImageTableUnreused::NoEpoch) == 1u, "image table partial resolve: " + what + ": the build on a thread without a collect epoch did not resolve the whole table");
+        return built.textures;
+    };
+    const auto describe = [](const Step& step) { return std::to_string(step.reused) + " reused, " + std::to_string(step.partial) + " partly resolved again with " + std::to_string(step.partialEntries) + " entries looked up again, " + std::to_string(step.resolved) + " resolved"; };
+    const auto partly = [&](const AgcDriver::Graphics::CompiledShader& compiled, std::uint64_t entries, const std::string& what) {
+        const auto built = build(compiled);
+        Require(built.step.reused == 0u && built.step.partial == 1u && built.step.partialEntries == entries && built.step.resolved == 0u, "image table partial resolve: " + what + ": " + describe(built.step) + "; expected one table partly resolved again with " + std::to_string(entries) + " entries looked up again");
+        Require(built.refusals == 0u, "image table partial resolve: " + what + ": the table partly resolved again was also counted as refused");
+        Require(built.textures == resolveFully(compiled, what), "image table partial resolve: " + what + ": the table partly resolved again binds other textures than a whole resolve of it");
+        const auto reused = build(compiled);
+        Require(reused.step.reused == 1u && reused.step.partial == 0u && reused.step.resolved == 0u && reused.textures == built.textures, "image table partial resolve: " + what + ": the table remembered after it was partly resolved again was not reused whole (" + describe(reused.step) + ")");
+        return built.textures;
+    };
+    const auto keptExcept = [&](const Textures& before, const Textures& after, std::uint32_t changed, const std::string& what) {
+        Require(before.size() == Records && after.size() == Records, "image table partial resolve: " + what + ": the builds do not hold one texture per entry");
+        for (std::uint32_t entry = 0; entry < Records; ++entry) {
+            if (entry != changed) Require(after[entry] == before[entry], "image table partial resolve: " + what + ": entry " + std::to_string(entry) + " outside the change was bound to another texture");
+        }
+    };
+    const auto sampledBy = [&](const ShaderRecompiler::RecompileResult& compiled, const std::string& what, const float* lonely) {
+        Require(Dispatch(device, compiled, LoneEntry) == Row(lonely), "image table partial resolve: " + what + ": the entry looked up again sampled the wrong texels");
+        Require(Dispatch(device, compiled, KeptEntry) == Row(block.Texels(KeptEntry)), "image table partial resolve: " + what + ": an entry kept from the remembered table sampled the wrong texels");
+    };
+    const auto sampled = [&](const std::string& what, const float* lonely) { sampledBy(program, what, lonely); };
+    const auto settle = [&](const AgcDriver::Graphics::CompiledShader& compiled, const std::string& what) {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        for (std::uint64_t attempt = 0; attempt <= CpuWriteResolutions + 1u; ++attempt) {
+            const auto built = build(compiled);
+            if (built.step.reused == 1u) return built;
+        }
+        Require(false, "image table partial resolve: " + what + ": the table was not reused whole after it was resolved");
+        return Built{};
+    };
+
+    const auto baseline = settle(shader, "a table of one block and one lone entry").textures;
+    sampled("the table before any change", lone.Texels(0));
+
+    lone.Remap();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto remapped = partly(shader, 1, "the guest mapping changed under one entry");
+    keptExcept(baseline, remapped, LoneEntry, "the guest mapping changed under one entry");
+    sampled("the guest mapping changed under one entry", lone.Texels(0));
+
+    Fill(lone, 0, 0.875f);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto written = partly(shader, 1, "the CPU wrote under one entry");
+    keptExcept(remapped, written, LoneEntry, "the CPU wrote under one entry");
+    Require(written[LoneEntry] != remapped[LoneEntry], "image table partial resolve: the entry the CPU wrote under kept its texture");
+    sampled("the CPU wrote under one entry", lone.Texels(0));
+
+    Fill(lone, 0, 0.125f);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    RuntimeSwitches::Assign(RuntimeSwitch::NoPartialTableResolve, true);
+    const auto control = build(shader);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoPartialTableResolve, false);
+    Require(control.step.resolved == 1u && control.step.partial == 0u, "image table partial resolve: under APS5_NO_PARTIAL_TABLE_RESOLVE a CPU write under one entry did not resolve the whole table (" + describe(control.step) + ")");
+    ExpectUnreused(control.before, ImageTableUnreused::Changed, "a CPU write under one entry under APS5_NO_PARTIAL_TABLE_RESOLVE");
+    keptExcept(written, control.textures, LoneEntry, "a CPU write under one entry under APS5_NO_PARTIAL_TABLE_RESOLVE");
+    sampled("a CPU write under one entry under APS5_NO_PARTIAL_TABLE_RESOLVE", lone.Texels(0));
+
+    const auto unwritten = AgcDriver::GuestMemory::TrackerGeneration();
+    for (std::uint32_t texture = 0; texture <= Records / 2u; ++texture) Fill(block, texture, 0.625f);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto wide = build(shader);
+    Require(WrittenEntries(block, unwritten) * 2u > Records, "image table partial resolve: the CPU writes over more than half the entries stamped only " + std::to_string(WrittenEntries(block, unwritten)) + " of them");
+    Require(wide.step.resolved == 1u && wide.step.partial == 0u && wide.step.reused == 0u, "image table partial resolve: CPU writes over more than half the entries did not resolve the whole table (" + describe(wide.step) + ")");
+    ExpectUnreused(wide.before, ImageTableUnreused::Changed, "CPU writes over more than half the entries");
+    Require(wide.textures == resolveFully(shader, "CPU writes over more than half the entries"), "image table partial resolve: the whole resolve after CPU writes over more than half the entries binds other textures than another whole resolve");
+    Require(Dispatch(device, program, 3) == Row(block.Texels(3)), "image table partial resolve: an entry the CPU wrote with more than half the others sampled the wrong texels");
+    sampled("CPU writes over more than half the entries", lone.Texels(0));
+
+    SetRecord(block, LoneEntry + 1u, Moved);
+    const auto movedProgram = Compile(device, block);
+    const AgcDriver::Graphics::CompiledShader movedShader{ShaderStage::Compute, &movedProgram, 0};
+    const auto moved = build(movedShader);
+    Require(moved.step.resolved == 1u && moved.step.partial == 0u && moved.step.reused == 0u, "image table partial resolve: a table whose record was pointed at another texture was not resolved whole (" + describe(moved.step) + ")");
+    ExpectUnreused(moved.before, ImageTableUnreused::NotRemembered, "a table whose record was pointed at another texture");
+    Require(Dispatch(device, movedProgram, LoneEntry + 1u) == Row(block.Texels(Moved)), "image table partial resolve: a record pointed at another texture sampled the old one");
+
+    if (context.hostImportAlignment == 0 || AgcDriver::Graphics::HostImportFor(context, AddressOf(importable.Table()), BlockBytes) == nullptr) {
+        Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "image table partial resolve: a storage-viewed entry requires host imports");
+        std::puts("host imports are unavailable: partly resolving a table again over a storage-viewed entry is not tested");
+        return true;
+    }
+    SetRecord(block, LoneEntry + 1u, LoneEntry + 1u);
+    Fill(importable, 0, 0.75f);
+    SetRecord(block, LoneEntry, 0, &importable);
+    const auto viewProgram = Compile(device, block);
+    const AgcDriver::Graphics::CompiledShader viewShader{ShaderStage::Compute, &viewProgram, 0};
+    const auto views = settle(viewShader, "a table with one storage-viewed entry");
+    Require(AgcDriver::Graphics::ImageTableReuses().viewedKept - views.before.viewedKept == 1u, "image table partial resolve: the lone entry in host-imported memory was not kept as a storage-viewed entry");
+    sampledBy(viewProgram, "a table with one storage-viewed entry", importable.Texels(0));
+    importable.Remap();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto viewRemapped = partly(viewShader, 1, "the guest mapping changed under a storage-viewed entry");
+    keptExcept(views.textures, viewRemapped, LoneEntry, "the guest mapping changed under a storage-viewed entry");
+    sampledBy(viewProgram, "the guest mapping changed under a storage-viewed entry", importable.Texels(0));
     return true;
 }
 
@@ -837,18 +1020,24 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const Gu
     before = AgcDriver::Graphics::ImageTableReuses();
     std::vector<float> stored(Width * Height);
     for (std::uint32_t texel = 0; texel < Width * Height; ++texel) stored[texel] = -1.0f - static_cast<float>(texel);
+    const auto unstored = AgcDriver::GuestMemory::TrackerGeneration();
     AgcDriver::GuestMemory::Write(AddressOf(block.Texels(11)), std::as_bytes(std::span(stored)));
+    const auto storedEntries = WrittenEntries(block, unstored);
+    Require(storedEntries != 0u && storedEntries * 2u <= Records, "image table reuse: a driver store over one entry stamped " + std::to_string(storedEntries) + " of the table's entries");
     Require(Dispatch(device, result, 11) == Row(stored.data()), "image table reuse: an entry the driver stored over in the epoch kept its old texels");
     Require(Dispatch(device, result, 11) == Row(stored.data()), "image table reuse: the table resolved after a driver store sampled the wrong entry");
-    Expect(before, 1, 1, "a driver store over an entry");
+    ExpectPartly(before, 1, 1, storedEntries, 0, "a driver store over an entry");
 
     before = AgcDriver::Graphics::ImageTableReuses();
+    const auto unwritten = AgcDriver::GuestMemory::TrackerGeneration();
     Fill(block, 17, 0.75f);
     AgcDriver::GuestMemory::BumpCollectEpoch();
     Require(Dispatch(device, result, 17) == Row(block.Texels(17)), "image table reuse: an entry the CPU wrote before the epoch kept its old texels");
+    const auto writtenEntries = WrittenEntries(block, unwritten);
+    Require(writtenEntries != 0u && writtenEntries * 2u <= Records, "image table reuse: a CPU write over one entry stamped " + std::to_string(writtenEntries) + " of the table's entries");
     Require(Dispatch(device, result, 3) == Row(block.Texels(3)), "image table reuse: an entry stamped by another entry's collect sampled the wrong texels");
     Require(Dispatch(device, result, 17) == Row(block.Texels(17)), "image table reuse: the table of the new epoch sampled the wrong entry");
-    Expect(before, 3 - CpuWriteResolutions, CpuWriteResolutions, "a CPU write collected in a new epoch, then two dispatches");
+    ExpectPartly(before, 3 - CpuWriteResolutions, CpuWriteResolutions, CpuWriteResolutions * writtenEntries, 0, "a CPU write collected in a new epoch, then two dispatches");
 
     before = AgcDriver::Graphics::ImageTableReuses();
     SetRecord(block, 19, Moved);
@@ -913,6 +1102,16 @@ int main(int argc, char** argv) {
             if (!device) return VulkanTestSkipped;
             if (!RunEntryMemo(*device, shared, plain)) return VulkanTestSkipped;
             std::puts("image table entry memo tests passed");
+            return 0;
+        }
+        if (argc > 1 && std::string(argv[1]) == "partial") {
+            GuestBlock block(UnimportableBytes);
+            GuestBlock lone(UnimportableBytes);
+            GuestBlock importable;
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            if (!RunPartialResolve(*device, block, lone, importable)) return VulkanTestSkipped;
+            std::puts("image table partial resolve tests passed");
             return 0;
         }
         if (argc > 1 && std::string(argv[1]) == "records") {
