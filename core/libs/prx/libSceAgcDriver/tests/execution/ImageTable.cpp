@@ -1010,7 +1010,7 @@ void RunBorderSwizzleTests(AgcDriver::VulkanDevice& device) {
         Keys[0] = 0;
         Keys[1] = 1;
         const auto inactive = RunDirectCode(device, TableCode, PointClamp, floatImage);
-        Require(Holds(inactive.samplerTable, sampler) && !Faulted(inactive), "inactive half-border or mirrored-border sampler faulted");
+        Require((BindlessHeap() || Holds(inactive.samplerTable, sampler)) && !Faulted(inactive), "inactive half-border or mirrored-border sampler faulted");
         Keys[0] = 1;
         Keys[1] = 0;
         requireFault(RunDirectCode(device, TableCode, PointClamp, floatImage), "guest border coordinate handling", "unsupported border coordinate mode " + std::to_string(clamp));
@@ -3304,6 +3304,10 @@ int main(int argc, char** argv) {
         if (BindlessHeap() && !device->BindlessImagesEnabled()) {
             std::puts("image table: skipped, the device lacks the descriptor indexing features for the bindless descriptor heap");
             return VulkanTestSkipped;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--border") == 0) {
+            RunBorderSwizzleTests(*device);
+            return 0;
         }
         if (argc == 2 && std::strcmp(argv[1], "--nested") == 0) {
             RunNestedRecordTests(*device, NestedCase::Basic);

@@ -7483,7 +7483,7 @@ void ShaderResources::addSamplerTable(const ShaderRecompiler::DescriptorBinding&
                     }
                 }
                 Require(!border || resource.borderColor == VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, "a sampler table entry with an opaque white border needs texture-format-aware border conversion, which is not implemented");
-                Require(!border || binding.count + integerBorderSamplers.size() < context.samplerTableCapacity, "the sampler table has no room for its integer border sampler");
+                Require(!border || table.heap || binding.count + integerBorderSamplers.size() < context.samplerTableCapacity, "the sampler table has no room for its integer border sampler");
                 Require(!resource.nonSeamlessCube || context.nonSeamlessCubeMap, "a sampler table entry that disables seamless cube filtering needs VK_EXT_non_seamless_cube_map because dynamic texture/sampler pairing is not implemented");
                 Require(!SingleLevelSamplerWords(elementWords, true, false).has_value(), "a sampler table entry with anisotropic ANISO_OVERRIDE needs dynamic texture mip-level pairing, which is not implemented");
             } catch (const std::runtime_error& error) {
@@ -9348,6 +9348,7 @@ void ShaderResources::buildHeapTableMap(std::vector<std::uint32_t>& map, Bindles
         }
         return false;
     };
+    map[TableAbi::HeaderSamplerCount] = std::max<std::uint32_t>(map[TableAbi::HeaderSamplerCount], static_cast<std::uint32_t>(table.tableSamplers.size()));
     const auto samplerSpan = std::max<std::size_t>(elements, map[TableAbi::HeaderSamplerCount]);
     Require(table.tableSamplers.size() <= samplerSpan, "an image table map has more table samplers than its header counts");
     const auto extraBase = base + 2u * elements + samplerSpan;
