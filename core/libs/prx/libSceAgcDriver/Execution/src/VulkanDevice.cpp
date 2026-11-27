@@ -344,7 +344,13 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     if (subgroupSize != 0) info.stage.pNext = &subgroup;
     info.layout = layout;
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto started = std::chrono::steady_clock::now();
     check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
+    if (profiled) {
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        if (ms >= 1000.0) std::fprintf(stderr, "[pipeline] compute pipeline built in %.0f ms%s\n", ms, cache == VK_NULL_HANDLE ? " without a pipeline cache" : "");
+    }
     PerformanceCounters::CountPipeline();
 }
 
