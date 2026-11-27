@@ -124,6 +124,7 @@ int main(int argc, char** argv) {
     Check(argc == 2, "expected startup, now, busy, destructor, worker or read-retry");
     const std::string_view mode(argv[1]);
     Check(mode == "startup" || mode == "now" || mode == "busy" || mode == "destructor" || mode == "worker" || mode == "read-retry", "unknown mode");
+    Check(!AgcDriver::Graphics::PipelineCache::WaitsForPipelines(0) && !AgcDriver::Graphics::PipelineCache::WaitsForPipelines(AgcDriver::Graphics::PipelineCache::BusySavesBeforeWait - 1u) && AgcDriver::Graphics::PipelineCache::WaitsForPipelines(AgcDriver::Graphics::PipelineCache::BusySavesBeforeWait), "the periodic save did not wait for running pipeline builds only after enough saves were skipped as busy");
 #ifndef _WIN32
     if (mode == "read-retry") return 77;
 #endif

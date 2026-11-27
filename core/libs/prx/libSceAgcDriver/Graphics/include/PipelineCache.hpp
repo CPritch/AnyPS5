@@ -17,6 +17,8 @@ namespace AgcDriver::Graphics {
 class PipelineCache {
 public:
     static constexpr int SaveIntervalSeconds = 10;
+    static constexpr unsigned BusySavesBeforeWait = 3;
+    static constexpr bool WaitsForPipelines(unsigned busySaves) { return busySaves >= BusySavesBeforeWait; }
 
     PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool loadFromFile = true);
     ~PipelineCache();
@@ -50,7 +52,7 @@ private:
     File readFile() const;
     std::optional<FileHeader> readHeader() const;
     void load(std::vector<std::byte>& initialData);
-    void save(bool final, bool waitForPipelines);
+    bool save(bool final, bool waitForPipelines);
     void run();
 
     Context context;
