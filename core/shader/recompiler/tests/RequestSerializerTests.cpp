@@ -229,7 +229,7 @@ void VerifyHeapProfile(const ShaderRecompiler::RequestSerializer& serializer) {
         try {
             static_cast<void>(serializer.Deserialize(EncodeBase64(bytes)));
         } catch (const std::runtime_error& error) {
-            trailing = std::string_view(error.what()) == "RequestSerializer: unexpected trailing data";
+            trailing = std::string_view(error.what()) == "RequestSerializer: a written emulated barycentrics flag is clear";
         }
         Require(trailing);
     }

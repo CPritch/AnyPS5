@@ -8506,11 +8506,11 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedD
             if (size > context.limits.maxStorageBufferRange) return refuse(MoveRefusal::Limit);
             MovedBuffer entry{kept->allocations[element], address, static_cast<std::size_t>(size)};
             bool inPlace = false;
-            if (item.adjustment == 0 && recorder == nullptr) {
+            if (!heapStage && item.adjustment == 0 && recorder == nullptr) {
                 VkDescriptorBufferInfo view{};
                 std::uint64_t serial = 0;
                 inPlace = HostImportView(context, address, static_cast<std::size_t>(size), view, serial);
-            } else if (item.adjustment == 0) {
+            } else if (!heapStage && item.adjustment == 0) {
                 inPlace = movedInPlace(*recorder, item, address, size, entry, false) && entry.adjustment == 0;
                 if (!inPlace) entry = MovedBuffer{kept->allocations[element], address, static_cast<std::size_t>(size)};
             }
@@ -8582,7 +8582,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
-        if (heapStage && override != moved.end() && override->words.empty()) {
+        if (override != moved.end() && override->words.empty()) {
             if (result == nullptr) result = std::make_shared<DrawBindings>();
             result->movedReads.emplace_back(override->address, override->address + override->size);
         }

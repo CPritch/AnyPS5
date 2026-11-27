@@ -21,4 +21,5 @@ endif()
 
 if(BUILD_TESTING)
     agc_add_gpu_heap_test(agc_driver_prepared_graphics)
+    set_property(TEST agc_driver_prepared_graphics_gpu_heap APPEND PROPERTY ENVIRONMENT "APS5_LIBRARY_PREBUILD=1")
 endif()
