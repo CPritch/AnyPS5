@@ -22,6 +22,7 @@
 #include <set>
 #include <span>
 #include <system_error>
+#include <optional>
 #include <thread>
 #include <type_traits>
 #include <zstd.h>
@@ -807,12 +808,17 @@ public:
         {
             std::lock_guard lock(mutex);
             std::error_code error;
-            if (!indexed && (read || !std::filesystem::exists(path, error))) {
+            const bool readable = read || !std::filesystem::exists(path, error);
+            if (!indexed && readable) {
                 indexed = true;
                 validBytes = loaded.validBytes;
                 headerValid = loaded.headerValid;
                 writtenModules = loaded.indexModules;
                 writtenRecords = loaded.indexRecords;
+            }
+            if (readable) {
+                loadedModules = loaded.indexModules;
+                loadedKnown = true;
             }
             counters.loadedRecipes.store(loaded.entries.size(), std::memory_order_relaxed);
             counters.loadedModules.store(loaded.modules.size(), std::memory_order_relaxed);
@@ -849,6 +855,12 @@ public:
         writer.U64(identity.high);
         writer.Bool(pushConstants);
         enqueue(std::move(pending));
+    }
+
+    std::optional<bool> Loaded(const ShaderRecompiler::PipelineIdentity& identity) {
+        std::lock_guard lock(mutex);
+        if (!loadedKnown) return std::nullopt;
+        return loadedModules.contains(identity);
     }
 
     void Flush() {
@@ -1043,6 +1055,8 @@ private:
         indexed = true;
         validBytes = index.validBytes;
         headerValid = index.headerValid;
+        if (!loadedKnown) loadedModules = index.indexModules;
+        loadedKnown = true;
         writtenModules = std::move(index.indexModules);
         writtenRecords = std::move(index.indexRecords);
         return true;
@@ -1327,6 +1341,8 @@ private:
     std::uint64_t validBytes = 0;
     std::set<ShaderRecompiler::PipelineIdentity> writtenModules;
     std::set<std::uint64_t> writtenRecords;
+    std::set<ShaderRecompiler::PipelineIdentity> loadedModules;
+    bool loadedKnown = false;
     Counters counters;
     std::atomic<double> loadMs{0};
 };
@@ -1674,6 +1690,10 @@ bool PipelineJournalEnabled() {
 
 bool PipelineJournalReplaying() {
     return replayingHere;
+}
+
+std::optional<bool> PipelineJournalLoaded(const ShaderRecompiler::PipelineIdentity& identity) {
+    return Journal::Instance().Enabled() ? Journal::Instance().Loaded(identity) : std::nullopt;
 }
 
 std::filesystem::path PipelineJournalPath() {

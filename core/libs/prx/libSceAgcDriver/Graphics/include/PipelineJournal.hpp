@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -76,6 +77,7 @@ struct PipelineJournalCounters {
 [[nodiscard]] bool PipelineJournalEnabled();
 // True on a replay thread while it builds an entry: what it builds is already in the file.
 [[nodiscard]] bool PipelineJournalReplaying();
+[[nodiscard]] std::optional<bool> PipelineJournalLoaded(const ShaderRecompiler::PipelineIdentity& identity);
 [[nodiscard]] std::filesystem::path PipelineJournalPath();
 [[nodiscard]] PipelineJournalCounters PipelineJournalTotals();
 void RecordGraphicsPipeline(const GraphicsPipelineRecipe& recipe, std::span<const CompiledShader> shaders);

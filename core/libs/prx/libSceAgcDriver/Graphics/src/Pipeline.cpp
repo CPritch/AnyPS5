@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineBuildTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -1156,20 +1157,44 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             return;
         }
         const VkPipelineCache pipelineCache = (state.stages.tessellation || barycentricPatches || state.rectList) && !context.tessellationPipelineCache ? VK_NULL_HANDLE : context.pipelineCache;
+        PipelineBuildTrace trace(context.pipelineCreationFeedback);
+        const auto report = [&](const char* kind) {
+            if (!trace.Active()) return;
+            std::vector<ShaderRecompiler::PipelineIdentity> stages;
+            std::size_t words = 0;
+            for (const auto& shader : shaders) {
+                if (shader.program == nullptr) continue;
+                stages.push_back(shader.program->Identity());
+                words += shader.program->spirv.size();
+            }
+            trace.Report({kind, 0, CombinedPipelineIdentity(stages), words, 0, 0, PipelineBuildJournalOf(stages)});
+        };
         if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
         else {
-            auto pipelineCacheLock = context.LockPipelineCacheForUse();
-            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+            {
+                auto pipelineCacheLock = context.LockPipelineCacheForUse();
+                trace.Chain(pipelineInfo.pNext);
+                Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+            }
+            report(pipelineCache == VK_NULL_HANDLE ? "graphics-uncached" : "graphics");
         }
         if (alternateAlpha) {
             blend.pAttachments = secondChannels.data();
-            auto pipelineCacheLock = context.LockPipelineCacheForUse();
-            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &secondChannel), "vkCreateGraphicsPipelines");
+            {
+                auto pipelineCacheLock = context.LockPipelineCacheForUse();
+                trace.Chain(pipelineInfo.pNext);
+                Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &secondChannel), "vkCreateGraphicsPipelines");
+            }
+            report("graphics-alpha");
         }
         if (state.depthBiasPerFace) {
             raster.cullMode = VK_CULL_MODE_FRONT_BIT;
-            auto pipelineCacheLock = context.LockPipelineCacheForUse();
-            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &backFaces), "vkCreateGraphicsPipelines");
+            {
+                auto pipelineCacheLock = context.LockPipelineCacheForUse();
+                trace.Chain(pipelineInfo.pNext);
+                Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &backFaces), "vkCreateGraphicsPipelines");
+            }
+            report("graphics-back-faces");
         }
         for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         _modules.clear();

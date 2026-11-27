@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
+#include "ShaderCacheDirectory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineBuildTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
@@ -39,6 +41,12 @@ constexpr std::array<VkDynamicState, 15> dynamicStates{
 };
 
 using Key = std::vector<std::byte>;
+
+constexpr std::array<const char*, 4> PartKinds{"library-vertex-input", "library-pre-rasterization", "library-fragment", "library-output"};
+
+ShaderRecompiler::PipelineIdentity BytesIdentity(std::span<const std::byte> bytes) {
+    return {ShaderRecompiler::HashBytes(bytes, 1), ShaderRecompiler::HashBytes(bytes, 2)};
+}
 
 struct DeviceLibraries {
     PFN_vkDestroyPipeline destroyPipeline = nullptr;
@@ -248,10 +256,13 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         // journal replay) run at once; a part another thread built meanwhile is kept, this one dropped.
         lock.unlock();
         VkResult created;
+        PipelineBuildTrace trace(context.pipelineCreationFeedback);
         {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            trace.Chain(create.pNext);
             created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
         }
+        if (created == VK_SUCCESS && trace.Active()) trace.Report({PartKinds[part], 0, BytesIdentity(key), 0, 0, 0, PipelineBuildJournalOf({})});
         lock.lock();
         Check(created, "vkCreateGraphicsPipelines library");
         if (const auto raced = cache.find(key); raced != cache.end()) {
@@ -298,10 +309,13 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     create.layout = info.layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
     lock.unlock();
+    PipelineBuildTrace linkTrace(context.pipelineCreationFeedback);
     {
         auto pipelineCacheLock = context.LockPipelineCacheForUse();
+        linkTrace.Chain(create.pNext);
         Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline), "vkCreateGraphicsPipelines link");
     }
+    if (linkTrace.Active()) linkTrace.Report({"graphics-link", 0, BytesIdentity(std::as_bytes(std::span(libraries))), 0, 0, 0, PipelineBuildJournalOf({})});
     lock.lock();
     ++device.counters.linked;
     if (GuestMemory::GpuMutex().HeldByThisThread()) ++device.counters.linkedLocked;
@@ -314,7 +328,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         const auto cache = context.pipelineCache;
         const auto cacheSynchronization = context.pipelineCacheSynchronization;
         const auto libraryLayout = fullLayout;
-        std::function<void()> relink = [slot, createPipelines, cache, cacheSynchronization, libraryLayout, libraries, sampleCounts, attachmentSamples, &store, devicePointer = &device] {
+        std::function<void()> relink = [slot, createPipelines, cache, cacheSynchronization, libraryLayout, libraries, sampleCounts, attachmentSamples, &store, devicePointer = &device, feedback = context.pipelineCreationFeedback] {
             if (slot->released.load()) return;
             auto linkedSamples = sampleCounts ? attachmentSamples(*sampleCounts) : VkAttachmentSampleCountInfoNV{};
             VkPipelineLibraryCreateInfoKHR linked{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
@@ -328,11 +342,14 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             create.flags = VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
             create.layout = libraryLayout;
             VkPipeline result = VK_NULL_HANDLE;
+            PipelineBuildTrace trace(feedback);
             const auto pipelineCreationResult = [&] {
                 auto pipelineCacheLock = cacheSynchronization != nullptr ? cacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
+                trace.Chain(create.pNext);
                 return createPipelines(slot->device, cache, 1, &create, nullptr, &result);
             }();
             if (pipelineCreationResult != VK_SUCCESS) return;
+            if (trace.Active()) trace.Report({"graphics-relink", 0, BytesIdentity(std::as_bytes(std::span(libraries))), 0, 0, 0, PipelineBuildJournal::Unrecorded});
             slot->handle.store(result);
             if (slot->released.load()) {
                 if (const auto handle = slot->handle.exchange(VK_NULL_HANDLE)) slot->destroy(slot->device, handle, nullptr);
