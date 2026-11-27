@@ -49,11 +49,13 @@ public:
     PipelineBuildTrace& operator=(const PipelineBuildTrace&) = delete;
     void Chain(const void*& next);
     void Report(const PipelineBuildSubject& subject);
+    void NoteBinary(const char* outcome) { binary = outcome; }
     [[nodiscard]] bool Active() const { return active; }
 
 private:
     bool active;
     bool feedback;
+    const char* binary = "none";
     VkPipelineCreationFeedback created{};
     VkPipelineCreationFeedbackCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
     std::chrono::steady_clock::time_point started{};

@@ -97,6 +97,8 @@ public:
     void PrimeBindlessDraw(std::span<const std::shared_ptr<const ShaderRecompiler::RecompileResult>> programs) const;
     std::string DriverInfo() const;
     VkDriverId DriverId() const;
+    enum class PipelineBinaryStatus { Unavailable, Disabled, DisabledByDriver, Ready };
+    PipelineBinaryStatus PipelineBinariesStatus() const;
     bool SupportsImageFormat(VkFormat format, VkImageUsageFlags usage) const;
     bool SupportsVertexBufferFormat(VkFormat format) const;
     bool BdaAtomicsUsable() const;
