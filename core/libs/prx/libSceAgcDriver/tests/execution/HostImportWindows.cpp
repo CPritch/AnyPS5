@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -14,6 +17,7 @@
 #else
 #include <sys/mman.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -21,11 +25,13 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -47,6 +53,9 @@ constexpr std::uint64_t BlockBytes = 2 * WindowBytes;
 constexpr std::uint64_t OtherBytes = 64 * 1024;
 constexpr std::uint64_t GuestAlignment = 64 * 1024;
 constexpr std::uint64_t ProbeBytes = 4096;
+constexpr std::uint32_t Format32UInt = 20;
+constexpr std::uint32_t TileR64KBX = 0x1b;
+constexpr std::uint32_t Type2D = 9;
 
 std::string Hex(std::uint64_t value) {
     char text[32];
@@ -428,6 +437,112 @@ void PartialResidentAliasDispatch(AgcDriver::VulkanDevice& device, bool left) {
 
 }
 
+std::array<std::uint32_t, 8> SurfaceWords(std::uint64_t address, std::uint32_t side) {
+    return {
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((side - 1u) & 3u) << 30u),
+        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+        0xfacu | (TileR64KBX << 20u) | (Type2D << 28u),
+        0u,
+        0u,
+        0u,
+        0u,
+    };
+}
+
+struct SurfaceAt {
+    std::uint64_t address;
+    std::uint32_t side;
+};
+
+std::array<SurfaceAt, 5> SegmentSurfaces(std::uint64_t first, std::uint64_t piece) {
+    return {{{first, 1024}, {first + piece - piece / 4, 512}, {first + piece / 2, 512}, {first + 2 * piece, 128}, {first + piece / 2, 1024}}};
+}
+
+bool SamePieces(const std::vector<Graphics::RegisteredPiece>& left, const std::vector<Graphics::RegisteredPiece>& right) {
+    return std::equal(left.begin(), left.end(), right.begin(), right.end(), [](const Graphics::RegisteredPiece& a, const Graphics::RegisteredPiece& b) { return a.address == b.address && a.bytes == b.bytes && a.writable == b.writable && a.gpu == b.gpu; });
+}
+
+std::vector<bool> HeldLeaseAnswersAsLeasing(const Graphics::Context& context, std::uint64_t first, std::uint64_t piece, Graphics::RegisteredLease& held, std::uint64_t leases, const std::string& state) {
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 7> ranges{{{first + piece / 2, piece}, {first, 2 * piece}, {first, piece / 2}, {first + piece / 2, piece + piece / 2 + GuestAlignment}, {first + piece - GuestAlignment, 2 * GuestAlignment}, {first + 2 * piece, GuestAlignment}, {first, 0}}};
+    const auto surfaces = SegmentSurfaces(first, piece);
+    std::vector<bool> answers;
+    std::vector<std::vector<Graphics::RegisteredPiece>> pieces(ranges.size());
+    const auto before = Graphics::RegisteredLeasesTakenOnThisThread();
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        const auto [address, bytes] = ranges[index];
+        answers.push_back(Graphics::RegisteredReadableCovers(held, address, static_cast<std::size_t>(bytes), &pieces[index]));
+        answers.push_back(Graphics::HostImportSegmentsCover(context, held, address, static_cast<std::size_t>(bytes)));
+    }
+    for (const auto& surface : surfaces) {
+        const auto resource = Graphics::DecodeTextureResource(SurfaceWords(surface.address, surface.side));
+        answers.push_back(Graphics::StorageSegmentsServe(context, held, resource, Graphics::DescribeSurface(resource).guestBytes));
+    }
+    const auto taken = Graphics::RegisteredLeasesTakenOnThisThread() - before;
+    Require(taken == leases, "held registered lease (" + state + "): " + std::to_string(ranges.size() * 2 + surfaces.size()) + " lookups took " + std::to_string(taken) + " registry leases, not " + std::to_string(leases));
+    std::size_t at = 0;
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        const auto [address, bytes] = ranges[index];
+        const auto name = " for " + Hex(address) + "+" + Hex(bytes) + " (" + state + ")";
+        std::vector<Graphics::RegisteredPiece> leasing;
+        Require(Graphics::RegisteredReadableCovers(address, static_cast<std::size_t>(bytes), &leasing) == answers[at++] && SamePieces(leasing, pieces[index]), "held registered lease: the registered coverage or its pieces differ from a leasing lookup" + name);
+        Require(Graphics::HostImportSegmentsCover(context, address, static_cast<std::size_t>(bytes)) == answers[at++], "held registered lease: the import segments answer differs from a leasing lookup" + name);
+    }
+    for (const auto& surface : surfaces) {
+        const auto resource = Graphics::DecodeTextureResource(SurfaceWords(surface.address, surface.side));
+        const auto bytes = Graphics::DescribeSurface(resource).guestBytes;
+        Require(Graphics::StorageSegmentsServe(context, resource, bytes) == answers[at++], "held registered lease: the storage segments answer differs from a leasing lookup for the surface at " + Hex(surface.address) + " of side " + std::to_string(surface.side) + " (" + state + ")");
+    }
+    return std::vector<bool>(answers.end() - static_cast<std::ptrdiff_t>(surfaces.size()), answers.end());
+}
+
+void PresyncTakesOneLease(const Graphics::Context& context, std::uint64_t first, std::uint64_t piece) {
+    Require(Graphics::StorageFormatAvailable(context, Format32UInt), "presync lease: the device has no storage form of R32_UINT");
+    const bool segmented = std::getenv("APS5_NO_IMPORT_SEGMENT_VIEWS") == nullptr;
+    const auto placed = SegmentSurfaces(first, piece);
+    std::vector<SurfaceAt> records(placed.begin(), placed.begin() + 4);
+    records.push_back(placed[0]);
+    records.push_back(placed[3]);
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + Graphics::PlaceholderDimensionsPerClass + 2u;
+    binding.count = static_cast<std::uint32_t>(records.size());
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageWritten.assign(records.size(), false);
+    binding.imageSamplers.assign(records.size(), 0u);
+    for (const auto& record : records) {
+        const auto words = SurfaceWords(record.address, record.side);
+        binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
+    }
+    ShaderRecompiler::RecompileResult program;
+    program.bindings.push_back(std::move(binding));
+    const Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const auto resources = std::make_shared<Graphics::ShaderResources>(context, shader, std::span<const Graphics::GuestMemorySnapshot>{}, true);
+    std::vector<Graphics::PresyncSurface> expected;
+    std::uint64_t leasing = 0;
+    const auto leasingBefore = Graphics::RegisteredLeasesTakenOnThisThread();
+    for (const auto& record : records) {
+        const auto resource = Graphics::DecodeTextureResource(SurfaceWords(record.address, record.side));
+        const auto bytes = Graphics::DescribeSurface(resource).guestBytes;
+        bool direct = Graphics::HostImportCovers(context, record.address, static_cast<std::size_t>(bytes));
+        if (!direct) {
+            ++leasing;
+            direct = Graphics::StorageSegmentsServe(context, resource, bytes);
+        }
+        if (!direct) expected.push_back({record.address, bytes, false});
+    }
+    const auto leased = Graphics::RegisteredLeasesTakenOnThisThread() - leasingBefore;
+    Require(leasing >= 4 && leased == (segmented ? leasing : 0u), "presync lease: " + std::to_string(leasing) + " leasing segment lookups took " + std::to_string(leased) + " registry leases");
+    if (segmented) Require(expected.size() == 2 && expected[0].address == first + 2 * piece && expected[1].address == first + 2 * piece, "presync lease: the surfaces outside a host import are not just the two over unregistered memory");
+    const auto before = Graphics::RegisteredLeasesTakenOnThisThread();
+    const auto surfaces = resources->PresyncSurfaces();
+    const auto taken = Graphics::RegisteredLeasesTakenOnThisThread() - before;
+    Require(taken == (segmented ? 1u : 0u), "presync lease: the pre-sync of " + std::to_string(records.size()) + " image records took " + std::to_string(taken) + " registry leases");
+    Require(std::equal(surfaces.begin(), surfaces.end(), expected.begin(), expected.end(), [](const Graphics::PresyncSurface& a, const Graphics::PresyncSurface& b) { return a.address == b.address && a.bytes == b.bytes && a.dccKeys == b.dccKeys; }), "presync lease: the pre-sync with one registry lease lists " + std::to_string(surfaces.size()) + " surfaces, not the " + std::to_string(expected.size()) + " the leasing lookups give");
+}
+
 Outcome SegmentsCoverAdjacentImports() {
     constexpr std::uint64_t piece = 2 * MiB;
     GuestBlock guest(2 * piece + GuestAlignment);
@@ -455,17 +570,36 @@ Outcome SegmentsCoverAdjacentImports() {
         const auto second = first + piece;
         const auto across = first + piece / 2;
         Require(!Graphics::HostImportSegmentsCover(context, across, piece), "import segments: two unimported allocations count as covered");
+        {
+            Graphics::RegisteredLease held;
+            static_cast<void>(HeldLeaseAnswersAsLeasing(context, first, piece, held, 1, "no imports"));
+        }
         Require(Fill(*device, first), "import segments: cannot fill the first allocation");
         Require(!Graphics::HostImportSegmentsCover(context, across, piece), "import segments: an unimported second allocation counts as covered");
-        Require(Fill(*device, second), "import segments: cannot fill the second allocation");
+        {
+            Graphics::RegisteredLease early(GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix());
+            static_cast<void>(HeldLeaseAnswersAsLeasing(context, first, piece, early, 0, "first allocation imported, lease given"));
+            Require(Fill(*device, second), "import segments: cannot fill the second allocation");
+            static_cast<void>(HeldLeaseAnswersAsLeasing(context, first, piece, early, 0, "second allocation imported under a lease held from before"));
+        }
         Require(Graphics::HostImportCovers(context, first, piece) && Graphics::HostImportCovers(context, second, piece), "import segments: an allocation was not imported whole");
         Require(!Graphics::HostImportCovers(context, across, piece), "import segments: one import covers both allocations, so nothing straddles");
         Require(Graphics::HostImportSegmentsCover(context, across, piece), "import segments: the imports of two adjacent allocations do not cover the range across them");
         Require(Graphics::HostImportSegmentsCover(context, first, 2 * piece), "import segments: the imports do not cover both allocations whole");
         Require(!Graphics::HostImportSegmentsCover(context, first, piece / 2), "import segments: a range inside one allocation counts as segments");
         Require(!Graphics::HostImportSegmentsCover(context, across, piece + piece / 2 + GuestAlignment), "import segments: a range past the registered allocations counts as covered");
+        {
+            Graphics::RegisteredLease held;
+            const auto served = HeldLeaseAnswersAsLeasing(context, first, piece, held, 1, "both allocations imported");
+            if (std::getenv("APS5_NO_IMPORT_SEGMENT_VIEWS") == nullptr) Require(served == std::vector<bool>{true, true, false, false, false}, "import segments: the storage segments of the surfaces across both imports are not served, or a surface inside one allocation, over unregistered memory or past the allocations is");
+        }
+        PresyncTakesOneLease(context, first, piece);
         Graphics::ClearHostImports(device->Device());
         Require(!Graphics::HostImportSegmentsCover(context, across, piece), "import segments: cleared imports still cover the range");
+        {
+            Graphics::RegisteredLease held;
+            static_cast<void>(HeldLeaseAnswersAsLeasing(context, first, piece, held, 1, "imports cleared"));
+        }
     } catch (...) {
         restore();
         throw;

@@ -195,6 +195,19 @@ struct RegisteredPiece {
 // registry lease): a storage image whose memory was freed or re-registered has nothing to store to.
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes, std::vector<RegisteredPiece>* pieces = nullptr);
 std::uint64_t RegisteredReadableEnd(std::uint64_t address);
+class RegisteredLease {
+public:
+    RegisteredLease() = default;
+    explicit RegisteredLease(GuestAllocations::Lease lease) : lease(std::move(lease)), held(true) {}
+    const GuestAllocations::Lease& Ranges();
+
+private:
+    GuestAllocations::Lease lease;
+    bool held = false;
+};
+std::uint64_t RegisteredLeasesTakenOnThisThread();
+bool RegisteredReadableCovers(RegisteredLease& registered, std::uint64_t address, std::size_t bytes, std::vector<RegisteredPiece>* pieces = nullptr);
+bool HostImportSegmentsCover(const Context& context, RegisteredLease& registered, std::uint64_t address, std::size_t bytes);
 
 // A persistent device copy of one registered range of the main guest image (which cannot be host
 // imported); see GuestBufferMemory.cpp.

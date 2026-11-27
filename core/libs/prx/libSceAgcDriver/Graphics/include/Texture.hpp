@@ -43,6 +43,7 @@ private:
 };
 
 class StorageTexture;
+class RegisteredLease;
 struct HostImportCopy;
 
 bool LabelTrapBypassed();
@@ -56,6 +57,8 @@ VkFormat StorageFormatForGuest(const Context& context, std::uint32_t guestFormat
 bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat);
 bool StorageSegmentsServe(const Context& context, const GuestTextureResource& descriptor, std::uint64_t guestBytes);
 bool StorageSegmentsServe(const Context& context, const StorageTexture& image);
+bool StorageSegmentsServe(const Context& context, RegisteredLease& registered, const GuestTextureResource& descriptor, std::uint64_t guestBytes);
+bool StorageSegmentsServe(const Context& context, RegisteredLease& registered, const StorageTexture& image);
 VkFormat HostStorageFormat(const Context& context, VkFormat format);
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys);
 std::uint64_t SampledTextureMemory();

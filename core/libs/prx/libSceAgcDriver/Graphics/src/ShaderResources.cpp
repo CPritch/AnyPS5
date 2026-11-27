@@ -699,11 +699,16 @@ bool SampledFromStorageEligible(const Context& context, std::uint32_t format, st
     return HostImportCovers(context, address, static_cast<std::size_t>(guestBytes));
 }
 
-bool SampledFromStorageEligible(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes) {
+bool SampledFromStorageEligible(const Context& context, RegisteredLease& registered, const GuestTextureResource& resource, std::uint64_t guestBytes) {
     if (SampledFromStorageEligible(context, resource.format, resource.baseAddress, guestBytes)) return true;
     static const bool disabled = std::getenv("APS5_NO_SAMPLED_FROM_STORAGE") != nullptr;
     if (disabled || !sampledFromStorageForTest.load(std::memory_order_relaxed) || IsBlockCompressed(resource.format) || !StorageFormatAvailable(context, resource.format)) return false;
-    return StorageSegmentsServe(context, resource, guestBytes);
+    return StorageSegmentsServe(context, registered, resource, guestBytes);
+}
+
+bool SampledFromStorageEligible(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes) {
+    RegisteredLease registered;
+    return SampledFromStorageEligible(context, registered, resource, guestBytes);
 }
 
 bool ImportGpuWrittenSampledSurface(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -7249,6 +7254,7 @@ void ShaderResources::finishImageTables() {
 
 std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
     std::vector<PresyncSurface> surfaces;
+    RegisteredLease registered;
     // A surface's lookup reads guest memory on the CPU unless it is served GPU-direct from a host
     // import: a storage image of imported memory uploads and refreshes from the import, and a
     // sampled texture of one views that image (SampledFromStorageEligible), so neither waits for
@@ -7258,11 +7264,11 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
         if (!gpuDirect) surfaces.push_back({address, guestBytes, false});
     };
     const auto considerResource = [&](const GuestTextureResource& resource, std::uint64_t guestBytes, bool sampled) {
-        const bool gpuDirect = sampled ? SampledFromStorageEligible(context, resource, guestBytes) : HostImportCovers(context, resource.baseAddress, static_cast<std::size_t>(guestBytes)) || StorageSegmentsServe(context, resource, guestBytes);
+        const bool gpuDirect = sampled ? SampledFromStorageEligible(context, registered, resource, guestBytes) : HostImportCovers(context, resource.baseAddress, static_cast<std::size_t>(guestBytes)) || StorageSegmentsServe(context, registered, resource, guestBytes);
         if (!gpuDirect) surfaces.push_back({resource.baseAddress, guestBytes, false});
     };
     const auto considerImage = [&](const StorageTexture& image, std::uint64_t address, std::uint64_t guestBytes) {
-        if (!HostImportCovers(context, address, static_cast<std::size_t>(guestBytes)) && !StorageSegmentsServe(context, image)) surfaces.push_back({address, guestBytes, false});
+        if (!HostImportCovers(context, address, static_cast<std::size_t>(guestBytes)) && !StorageSegmentsServe(context, registered, image)) surfaces.push_back({address, guestBytes, false});
     };
     static const bool keyRanges = std::getenv("APS5_NO_DCC_PRESYNC") == nullptr;
     const auto considerKeys = [&](std::uint64_t dccAddress, std::uint64_t guestBytes) {

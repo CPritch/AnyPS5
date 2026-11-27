@@ -5626,10 +5626,32 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
     return true;
 }
 
+namespace {
+thread_local std::uint64_t registeredLeasesTaken = 0;
+}
+
+const GuestAllocations::Lease& RegisteredLease::Ranges() {
+    if (!held) {
+        lease = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
+        held = true;
+        ++registeredLeasesTaken;
+    }
+    return lease;
+}
+
+std::uint64_t RegisteredLeasesTakenOnThisThread() {
+    return registeredLeasesTaken;
+}
+
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes, std::vector<RegisteredPiece>* pieces) {
+    RegisteredLease registered;
+    return RegisteredReadableCovers(registered, address, bytes, pieces);
+}
+
+bool RegisteredReadableCovers(RegisteredLease& registered, std::uint64_t address, std::size_t bytes, std::vector<RegisteredPiece>* pieces) {
     if (pieces != nullptr) pieces->clear();
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
-    const auto lease = GuestAllocations::GuestAllocationsAcquireRegistered_nid_postfix();
+    const auto& lease = registered.Ranges();
     const auto end = address + bytes;
     for (auto at = address; at < end;) {
         const auto* range = containingRange(lease, at, at + 1);
@@ -5678,9 +5700,14 @@ bool ReadTrappableHostImportCovers(const Context& context, std::uint64_t address
 }
 
 bool HostImportSegmentsCover(const Context& context, std::uint64_t address, std::size_t bytes) {
+    RegisteredLease registered;
+    return HostImportSegmentsCover(context, registered, address, bytes);
+}
+
+bool HostImportSegmentsCover(const Context& context, RegisteredLease& registered, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     std::vector<RegisteredPiece> pieces;
-    if (!RegisteredReadableCovers(address, bytes, &pieces) || pieces.size() < 2) return false;
+    if (!RegisteredReadableCovers(registered, address, bytes, &pieces) || pieces.size() < 2) return false;
     if (std::any_of(pieces.begin(), pieces.end(), [&](const RegisteredPiece& piece) { return piece.writable != pieces.front().writable || piece.gpu != pieces.front().gpu; })) return false;
     const auto end = address + bytes;
     auto& state = Imports();
