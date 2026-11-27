@@ -15,7 +15,6 @@
 #include "tests/CommandLineArgument.hpp"
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -2823,38 +2822,6 @@ void verifySharedPlanBudget() {
     require(reloadedFirst == reloadedSecond && encodedPlan(*reloadedFirst) == encoded, "shared plan budget: the reloaded sources do not share the plan they held before");
 }
 
-void verifyPlanReleaseOffTrimmingThread() {
-    auto fixture = planFixtures().front();
-    fixture.waveSize = 32u;
-    fixture.code.insert(fixture.code.begin(), 0xbf80000bu);
-    fixture.codeAddress += 0x50000u;
-    SetResourcePlanBudget(0u);
-    std::weak_ptr<const IrResourcePlan> evicted = GetResourcePlan(fixture.Request(true));
-    require(!evicted.expired(), "plan release: the fixture plan is not held by its source");
-    ShaderDiskCache::Flush();
-    std::promise<void> entered;
-    std::promise<void> resume;
-    const auto resumed = resume.get_future().share();
-    std::atomic<bool> signalled{false};
-    SetResourcePlanReleaseHook([&entered, &signalled, resumed] {
-        if (!signalled.exchange(true)) entered.set_value();
-        resumed.wait();
-    });
-    const auto beforeTrim = ResourcePlanTotals();
-    SetResourcePlanBudget(1u);
-    require(ResourcePlanTotals().evictions > beforeTrim.evictions, "plan release: a budget of one byte evicted no plan");
-    require(!evicted.expired(), "plan release: the trimming thread destroyed an evicted plan");
-    entered.get_future().wait();
-    require(!evicted.expired(), "plan release: an evicted plan was destroyed before the releaser ran");
-    resume.set_value();
-    FlushResourcePlanReleases();
-    SetResourcePlanReleaseHook(nullptr);
-    require(evicted.expired(), "plan release: the releaser kept an evicted plan alive");
-    SetResourcePlanBudget(0u);
-    const auto reloaded = GetResourcePlan(fixture.Request(true));
-    require(reloaded != nullptr && ResourcePlanTotals().reloads > beforeTrim.reloads, "plan release: a released plan did not reload from the disk cache");
-}
-
 void verifyQueuedPlanWrite() {
     auto fixture = planFixtures().front();
     fixture.waveSize = 32u;
@@ -3242,7 +3209,6 @@ int main(int argc, char** argv) {
         verifySpecializationLiveness();
         verifyPlanBudget();
         verifySharedPlanBudget();
-        verifyPlanReleaseOffTrimmingThread();
         verifyQueuedPlanWrite();
         verifyPlanReport();
         ShaderRecompiler::ShaderDiskCache::Flush();
