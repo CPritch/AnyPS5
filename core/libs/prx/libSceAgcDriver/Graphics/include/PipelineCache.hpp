@@ -17,7 +17,7 @@ namespace AgcDriver::Graphics {
 class PipelineCache {
 public:
     static constexpr int SaveIntervalSeconds = 10;
-    static constexpr unsigned BusySavesBeforeWait = 3;
+    static constexpr unsigned BusySavesBeforeWait = 1;
     static constexpr bool WaitsForPipelines(unsigned busySaves) { return busySaves >= BusySavesBeforeWait; }
 
     PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool loadFromFile = true);
