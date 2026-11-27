@@ -1103,6 +1103,57 @@ void failedJoinWrittenViewTests(const Context& context, const BdaTestAccess& acc
     ::operator delete(block, std::align_val_t{2 * piece});
 }
 
+void heldJoinBudgetTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t large = 3 * piece;
+    auto* block = static_cast<std::uint8_t*>(::operator new(3 * large, std::align_val_t{2 * piece}));
+    std::memset(block, 0x5a, 3 * large);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    const auto second = first + large;
+    const auto third = second + large;
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    ClearHostImports(importing.device);
+    SetHostImportWindow(2 * piece);
+    SetHostImportBudget(2 * large + piece);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, large, true, false, true);
+        mutation.Add(block + large, large, true, false, true);
+        mutation.Add(block + 2 * large, large, true, false, true);
+    }
+    Require(HostImportFor(importing, first, 16) != nullptr && HostImportFor(importing, second, 16) != nullptr && HostImportLiveBytes() == 2 * large, "the held join fixture did not import its first two ranges apart");
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(importing);
+        recorder.Activate();
+        {
+            GuestBufferMemory memory(importing);
+            memory.AddReadable(third - 16, 32);
+            memory.Upload(false);
+            Require(ExistingHostImportFor(importing, third - 16, 32) == nullptr, "a join that pins a whole new range was admitted past the import budget");
+            memory.WriteBack();
+        }
+        {
+            GuestBufferMemory memory(importing);
+            memory.AddReadable(second - 16, 32);
+            memory.Upload(false);
+            Require(ExistingHostImportFor(importing, second - 16, 32) != nullptr, "a join over two live imports was refused although it pins no memory they do not already pin");
+            memory.WriteBack();
+        }
+    }
+    ClearHostImports(importing.device);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        mutation.Remove(block + large);
+        mutation.Remove(block + 2 * large);
+    }
+    SetHostImportBudget(0);
+    SetHostImportWindow(0);
+    ::operator delete(block, std::align_val_t{2 * piece});
+}
+
 void failedJoinDissolvedOverlayTests(const Context& context, const BdaTestAccess& access) {
     constexpr std::size_t piece = 65536;
     constexpr std::size_t large = 3 * piece;
@@ -6041,6 +6092,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     failedImportJoinProbeBudgetTests(context, access);
     failedJoinWrittenViewTests(context, access);
     failedJoinDissolvedOverlayTests(context, access);
+    heldJoinBudgetTests(context);
     importWholeRangeOverWindowTests(context);
     importMappedFailureGenerationTests(context);
     importStaleProbeTests(context, access);
