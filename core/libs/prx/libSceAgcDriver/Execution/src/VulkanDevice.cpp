@@ -7012,7 +7012,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     if (objects->descriptorHeap) objects->heapMappings = std::move(heapMappings);
     if (trace.Active()) {
         const std::array identity{Graphics::DescribedPipelineIdentity(shader)};
-        trace.Report({state->probingFloatControls ? "compute-probe" : "compute", programAddress, identity[0], shader.spirv.size(), shader.specialization.size(), Graphics::PipelineSpecializationHash(specialization.Info()), state->probingFloatControls ? Graphics::PipelineBuildJournal::Unrecorded : Graphics::PipelineBuildJournalOf(identity)});
+        trace.Report({state->probingFloatControls ? "compute-probe" : "compute", programAddress, identity[0], shader.spirv.size(), shader.specialization.size(), Graphics::PipelineSpecializationHash(specialization.Info()), state->probingFloatControls || identity[0].Empty() ? Graphics::PipelineBuildJournal::Unrecorded : Graphics::PipelineBuildJournalOf(identity)});
     }
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
