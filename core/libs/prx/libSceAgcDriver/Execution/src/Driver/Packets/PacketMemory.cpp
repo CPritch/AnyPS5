@@ -530,12 +530,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
         }, std::move(writes), address, std::move(stored));
     };
     if (queue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
-        DrawFinisher::Pending held;
-        held.unknown = false;
-        held.writes = std::move(writes);
-        held.labelAddress = address;
-        held.labelBytes = std::move(labelBytes);
-        DrawFinisher::Get().Enqueue(std::move(enqueue), std::move(held));
+        DrawFinisher::Get().EnqueueBeside(std::move(enqueue), std::move(writes), address, std::move(labelBytes));
         return true;
     }
     enqueue();

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "PipelineSpecialization.hpp"
 #include <algorithm>
@@ -26,17 +27,11 @@ namespace AgcDriver::Graphics {
         }
     }
 
-    Sampler::Sampler(const Context& context, const GuestSamplerResource& descriptor) : context(context) {
+    VkSamplerCreateInfo Sampler::CreateInfo(const Context& context, const GuestSamplerResource& descriptor, VkSamplerReductionModeCreateInfoEXT& reduction) {
         Validate(context, descriptor);
-        forcesDegamma = descriptor.forceDegamma;
-        disablesDegamma = descriptor.disableDegamma;
-
         VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-        VkSamplerReductionModeCreateInfoEXT reduction{VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO_EXT, nullptr, descriptor.reductionMode};
-        if (descriptor.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT) {
-            info.pNext = &reduction;
-            requiresFilterMinmax = descriptor.magFilter == VK_FILTER_LINEAR || descriptor.minFilter == VK_FILTER_LINEAR;
-        }
+        reduction = {VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO_EXT, nullptr, descriptor.reductionMode};
+        if (descriptor.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT) info.pNext = &reduction;
         info.magFilter = descriptor.magFilter;
         info.minFilter = descriptor.minFilter;
         info.mipmapMode = descriptor.mipmapMode;
@@ -51,12 +46,19 @@ namespace AgcDriver::Graphics {
         info.minLod = descriptor.minLod;
         info.maxLod = descriptor.maxLod;
         info.borderColor = descriptor.borderColor;
-        opaqueBlackBorder = ReadsOpaqueBlackBorder(descriptor);
         info.unnormalizedCoordinates = descriptor.unnormalizedCoordinates ? VK_TRUE : VK_FALSE;
-        if (descriptor.nonSeamlessCube) {
-            if (context.nonSeamlessCubeMap) info.flags |= VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT;
-            else requiresNonSeamlessCube = true;
-        }
+        if (descriptor.nonSeamlessCube && context.nonSeamlessCubeMap) info.flags |= VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT;
+        return info;
+    }
+
+    Sampler::Sampler(const Context& context, const GuestSamplerResource& descriptor) : context(context) {
+        VkSamplerReductionModeCreateInfoEXT reduction{};
+        auto info = CreateInfo(context, descriptor, reduction);
+        forcesDegamma = descriptor.forceDegamma;
+        disablesDegamma = descriptor.disableDegamma;
+        requiresFilterMinmax = descriptor.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT && (descriptor.magFilter == VK_FILTER_LINEAR || descriptor.minFilter == VK_FILTER_LINEAR);
+        opaqueBlackBorder = ReadsOpaqueBlackBorder(descriptor);
+        requiresNonSeamlessCube = descriptor.nonSeamlessCube && !context.nonSeamlessCubeMap;
         VkSamplerCustomBorderColorCreateInfoEXT custom{VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
         if (descriptor.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT) {
             Require(context.customBorderColorSamplers != nullptr, "custom border color samplers are not counted on this device");
@@ -83,6 +85,7 @@ namespace AgcDriver::Graphics {
     }
 
     void Sampler::release() noexcept {
+        ReleaseHeapSlots(context);
         if (sampler) context.Function<PFN_vkDestroySampler>("vkDestroySampler")(context.device, sampler, nullptr);
         if (customBorder) context.customBorderColorSamplers->fetch_sub(1);
     }
@@ -134,6 +137,7 @@ namespace AgcDriver::Graphics {
             if (oldest != entries.end()) entries.erase(oldest);
         }
         auto sampler = std::make_shared<Sampler>(context, resource);
+        sampler->SetCacheKey(key);
         // The cap keeps live samplers well below the device's limit (NVIDIA: ~4000); a set in flight
         // still holds the evicted sampler through its own shared_ptr.
         while (entries.size() >= capacity) {

@@ -87,7 +87,7 @@ alignas(4096) std::array<std::byte, 4 * PlaneBytes> MultisampleBlock{};
 const std::span<std::byte, PlaneBytes> SourceStorage{reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(SourceBlock.data()) + PlaneBytes - 1u) & ~std::uintptr_t{PlaneBytes - 1u}), PlaneBytes};
 alignas(4096) std::array<std::byte, 2 * PlaneBytes> StencilBlock{};
 const std::span<std::byte, PlaneBytes> StencilStorage{reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(StencilBlock.data()) + PlaneBytes - 1u) & ~std::uintptr_t{PlaneBytes - 1u}), PlaneBytes};
-const std::span<std::byte, 2 * PlaneBytes> MultisampleStorage{reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(MultisampleBlock.data()) + PlaneBytes - 1u) & ~std::uintptr_t{PlaneBytes - 1u}), 2 * PlaneBytes};
+const std::span<std::byte, 2 * PlaneBytes> MultisampleSurfaceStorage{reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(MultisampleBlock.data()) + PlaneBytes - 1u) & ~std::uintptr_t{PlaneBytes - 1u}), 2 * PlaneBytes};
 
 std::uint64_t address(const void* data) {
     return reinterpret_cast<std::uintptr_t>(data);
@@ -608,7 +608,7 @@ void copyBetween(AgcDriver::VulkanDevice& device) {
 
 void resolveBetween(AgcDriver::VulkanDevice& device) {
     auto multisampled = colorTarget();
-    multisampled.address = address(MultisampleStorage.data());
+    multisampled.address = address(MultisampleSurfaceStorage.data());
     multisampled.surfaceAddress = multisampled.address;
     multisampled.samples = 4;
     multisampled.coverageSamples = 4;
@@ -992,7 +992,7 @@ void surfaceCreatedElsewhere(AgcDriver::VulkanDevice& device) {
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         auto other = depthTarget(false);
-        other.address = address(MultisampleStorage.data());
+        other.address = address(MultisampleSurfaceStorage.data());
         other.htileAddress = 0;
         static_cast<void>(DepthSurfaceView(AgcDriver::VulkanDeviceTestAccess::ContextOf(device), other));
     }
@@ -1029,7 +1029,7 @@ void colorMemoWithMsaaDepth(AgcDriver::VulkanDevice& device) {
     const auto color = colorTarget();
     reset(device, color);
     auto depth = depthTarget(false);
-    depth.address = address(MultisampleStorage.data());
+    depth.address = address(MultisampleSurfaceStorage.data());
     depth.samples = 4;
     depth.htileAddress = 0;
     arm(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true});
@@ -1336,7 +1336,7 @@ void depthProofAfterMetadataWrite(AgcDriver::VulkanDevice& device) {
 
 void claimAfterAbsorbedFill(AgcDriver::VulkanDevice& device) {
     auto multisampled = colorTarget();
-    multisampled.address = address(MultisampleStorage.data());
+    multisampled.address = address(MultisampleSurfaceStorage.data());
     multisampled.surfaceAddress = multisampled.address;
     multisampled.samples = 4;
     multisampled.coverageSamples = 4;
@@ -1558,7 +1558,7 @@ void unchangedMemo(AgcDriver::VulkanDevice& device) {
             options.depth = depthTarget(false);
             options.depth->samples = samples;
             if (samples != 1u) {
-                options.depth->address = address(MultisampleStorage.data());
+                options.depth->address = address(MultisampleSurfaceStorage.data());
                 options.depth->htileAddress = 0;
                 options.prepareOnly = true;
             }
@@ -1793,7 +1793,7 @@ int main(int argc, char** argv) {
             mutation.Add(Htile.data(), HtileBytes, true, true, true);
             mutation.Add(SourceStorage.data(), SourceStorage.size(), true, true, true);
             mutation.Add(OuterStorage.data(), OuterStorage.size(), true, true, true);
-            mutation.Add(MultisampleStorage.data(), MultisampleStorage.size(), true, true, true);
+            mutation.Add(MultisampleSurfaceStorage.data(), MultisampleSurfaceStorage.size(), true, true, true);
             mutation.Add(StencilStorage.data(), StencilStorage.size(), true, true, true);
         }
         AgcDriver::GuestMemory::MarkProofThread();
@@ -1824,7 +1824,7 @@ int main(int argc, char** argv) {
             mutation.Remove(Htile.data());
             mutation.Remove(SourceStorage.data());
             mutation.Remove(OuterStorage.data());
-            mutation.Remove(MultisampleStorage.data());
+            mutation.Remove(MultisampleSurfaceStorage.data());
             mutation.Remove(StencilStorage.data());
         }
         std::cout << "target state memo tests passed\n";

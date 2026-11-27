@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -155,7 +156,7 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
     if (!Busy() || !finisherProducer) return false;
     std::lock_guard lock(mutex);
-    return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return held.key == key || (shape != 0 && held.shape == shape); });
+    return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return (held.key != 0 && held.key == key) || (shape != 0 && held.shape == shape); });
 }
 
 namespace {
@@ -176,7 +177,7 @@ void DrawFinisher::NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits) {
 }
 
 std::string DrawFinisher::DrainText() {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw", "dispatch"};
     std::string text = "; worker drains of the finisher (drained/skipped):";
     for (std::size_t i = 0; i < names.size(); ++i) {
         char item[64];
@@ -204,6 +205,15 @@ bool DrawFinisher::OnFinisherThread() {
 
 void DrawFinisher::Enqueue(Job job) {
     Enqueue(std::move(job), Pending{});
+}
+
+void DrawFinisher::EnqueueBeside(Job job, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
+    Pending held;
+    held.unknown = false;
+    held.writes = std::move(writes);
+    held.labelAddress = labelAddress;
+    held.labelBytes = std::move(labelBytes);
+    Enqueue(std::move(job), std::move(held));
 }
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
@@ -422,6 +432,11 @@ void DrawPipeline::enqueue(Item item) {
         }
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
+        if (closing) {
+            lock.unlock();
+            item.commit();
+            return;
+        }
     }
     depthSum += items.size();
     ++enqueued;
@@ -565,6 +580,7 @@ void DrawPipeline::Stop() {
         committer = std::move(thread);
     }
     wake.notify_all();
+    idle.notify_all();
     if (!committer.joinable()) return;
     if (committer.get_id() == std::this_thread::get_id()) committer.detach();
     else committer.join();
@@ -769,7 +785,14 @@ bool DrawPipeline::Busy() const {
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(ranges)) return true;
     std::lock_guard lock(mutex);
+    if (queuedWrites.empty() || ranges.empty()) return false;
+    std::pair<std::uint64_t, std::uint64_t> hull{~std::uint64_t{0}, 0};
+    for (const auto& [address, end] : ranges) {
+        hull.first = std::min(hull.first, address);
+        hull.second = std::max(hull.second, end);
+    }
     for (const auto& [range, count] : queuedWrites) {
+        if (!(hull.first < range.second && range.first < hull.second)) continue;
         for (const auto& [address, end] : ranges) {
             if (address < range.second && range.first < end) return true;
         }

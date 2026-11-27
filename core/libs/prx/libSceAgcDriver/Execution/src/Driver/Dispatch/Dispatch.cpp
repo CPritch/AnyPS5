@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/HeapStages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -100,7 +102,7 @@ void ReportDispatchItems(bool profile) {
         std::snprintf(item, sizeof(item), " %s %llu", ItemFallbackNames[i], static_cast<unsigned long long>(itemFallbacks[i].load(std::memory_order_relaxed)));
         drained += item;
     }
-    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer, %llu queued after a cache miss, %llu queued without a recipe, %llu cached ones kept off the queue as not plain); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemMisses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRecipeLess.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlain.load(std::memory_order_relaxed)), drained.c_str());
+    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer, %llu queued after a cache miss, %llu queued without a recipe, %llu cached ones kept off the queue as not plain); drained instead, cumulative:%s; recipes refused:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemMisses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRecipeLess.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlain.load(std::memory_order_relaxed)), drained.c_str(), VulkanDevice::DispatchRecipeRefusalText().c_str());
 }
 
 }
@@ -485,8 +487,35 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto vectorGranule = request.context.waveSize == 32u ? 8u : 4u;
         if (const auto split = SplitTableCallPartsFor(request, ((rsrc1->second & 0x3fu) + 1u) * vectorGranule)) {
             if (resolving) return;
-            dispatchSplitTableCall(queue, packet, submission, indirectArguments, *split, request, memory, address, compute, threadGroup, localDevice);
+            auto perDispatch = request;
+            if (perDispatch.target.gpuResolvedImages) {
+                Graphics::NoteHeapExcluded(Graphics::HeapExcluded::Dispatch);
+                perDispatch.target.gpuResolvedImages = false;
+            }
+            dispatchSplitTableCall(queue, packet, submission, indirectArguments, *split, perDispatch, memory, address, compute, threadGroup, localDevice);
             return;
+        }
+    }
+    if (request.target.gpuResolvedImages && HeapStageExcluded(ShaderRecompiler::ShaderStage::Compute)) request.target.gpuResolvedImages = false;
+    if (request.target.gpuResolvedImages && HeapClassesExcluded()) {
+        try {
+            const auto invocation = InvocationFor(snapshot, codeOffset, request);
+            if (HeapExcludedFor(invocation)) {
+                Graphics::NoteHeapExcluded(Graphics::HeapExcluded::Dispatch);
+                request.target.gpuResolvedImages = false;
+            }
+        } catch (const DrawCompilePending&) {
+            return;
+        } catch (const std::exception& error) {
+            std::string reason = error.what();
+            if (const auto newline = reason.find('\n'); newline != std::string::npos) reason.resize(newline);
+            if (SkipRefusedDispatches()) {
+                ReportRefusedDispatch(address, reason);
+                return;
+            }
+            char where[96];
+            std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
+            throw std::runtime_error(where + reason);
         }
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -599,6 +628,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    mix(request.target.gpuResolvedImages);
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
@@ -709,6 +739,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
             timing.Mark("capture_resources");
             compiledResult = MaterializeInBackground(invocation, capture, request.context.memory, address);
+            if (compiledResult->gpuResolvedImages) RequireHeapStageMappable(*compiledResult, compiledResult->workgroupMemoryDwords != 0);
             timing.Mark("materialize");
             if (profile && compiledResult->cacheHit) cacheHits.fetch_add(1, std::memory_order_relaxed);
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();

@@ -6,6 +6,7 @@
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "IntermediateRepresentation/IrOpcode.hpp"
 #include "RdnaDecoder/RdnaInstruction.hpp"
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -160,6 +161,8 @@ struct SamplerResource {
     std::uint16_t uses = 0;
     bool foldTexelOffsetsOnly = false;
     std::uint32_t table = NoTable;
+    bool constant = false;
+    std::array<std::uint32_t, 4> constantWords{};
 
     bool operator==(const SamplerResource& other) const = default;
 };

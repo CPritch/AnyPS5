@@ -29,6 +29,8 @@ public:
     std::span<const std::byte> TableBytes() const;
     bool TableGuardCurrent(VkDevice device, std::span<const ShaderRecompiler::BdaAbi::Range> ranges);
     VkDescriptorBufferInfo Fault() const;
+    VkDeviceAddress TableAddress() const;
+    VkDeviceAddress FaultAddress() const;
     void CheckFault() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> TakeWrittenPages() const;
     std::vector<GuestBufferMemory::StorePage> TakeStorePages() const;

@@ -22,6 +22,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "ShaderCacheDirectory.hpp"
@@ -1612,6 +1613,7 @@ VkImageView Texture::BaseLevelView() const {
 }
 
 void Texture::release() noexcept {
+    ReleaseHeapSlots(context);
     upload.reset();
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     view = VK_NULL_HANDLE;
@@ -2532,6 +2534,13 @@ VkImageView StorageTexture::StorageView(std::uint32_t mip, bool firstLayer, bool
     const auto created = createView(mip, firstLayer, format);
     uintViews.emplace(std::pair{mip, firstLayer}, created);
     return created;
+}
+
+VkImageView StorageTexture::UintStorageViewOrDefault(std::uint32_t mip, bool firstLayer) {
+    const auto uintFormat = UintStorageViewFormat(storageFormat);
+    const bool available = PackedStorageViewFormat(storageFormat) == VK_FORMAT_UNDEFINED && uintFormat != VK_FORMAT_UNDEFINED &&
+                           StorageFormatOrUndefined(context, uintFormat) == uintFormat;
+    return StorageView(mip, firstLayer, available);
 }
 
 VkImageView StorageTexture::ElementView() {
@@ -3739,7 +3748,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 for (std::uint32_t level = 0; level < mips.size(); ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
-                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestOffset(layer, mip), elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
+                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestOffset(layer, mip), elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor}, this);
                 }
             }
             recordDirectUploadDone(commands);
@@ -4307,10 +4316,10 @@ std::uint64_t StorageTexture::uploadWindows(std::span<const ImportSegment> segme
             detile.pipeBankXor = descriptor.pipeBankXor;
             const auto view = elementLayerView(window.level, window.layer);
             if (source.shadow) {
-                detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, source.buffer, source.offset + (window.tiledBegin - source.begin), view, mip, false, window.layer, detile);
+                detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, source.buffer, source.offset + (window.tiledBegin - source.begin), view, mip, false, window.layer, detile, this);
             } else {
                 detile.tiledBase = 0;
-                detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import.buffer, importOffset + geometry.GuestOffset(window.layer, mip), view, mip, false, window.layer, detile);
+                detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import.buffer, importOffset + geometry.GuestOffset(window.layer, mip), view, mip, false, window.layer, detile, this);
             }
         }
         recordDirectUploadDone(commands);
@@ -4673,9 +4682,9 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
             for (auto k = directRanges[i].first; k < directRanges[i].second; ++k) {
                 auto piece = directPieces[k].window;
                 piece.pipeBankXor = descriptor.pipeBankXor;
-                detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, directPieces[k].slab, directPieces[k].offset, elementLayerView(window.level, window.layer), mips[window.level], true, window.layer, piece);
+                detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, directPieces[k].slab, directPieces[k].offset, elementLayerView(window.level, window.layer), mips[window.level], true, window.layer, piece, this);
             }
-            if (directRanges[i].first == directRanges[i].second) detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, tiledScratch->Handle(), scratchPositions[i], elementLayerView(window.level, window.layer), mips[window.level], true, window.layer, retile);
+            if (directRanges[i].first == directRanges[i].second) detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, tiledScratch->Handle(), scratchPositions[i], elementLayerView(window.level, window.layer), mips[window.level], true, window.layer, retile, this);
         }
         singlePassMoves.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -8777,6 +8786,7 @@ StorageTexture::~StorageTexture() {
 }
 
 void StorageTexture::release() noexcept {
+    ReleaseHeapSlots(context);
     for (const auto& [mip, extra] : extraViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, extra, nullptr);
     extraViews.clear();
     for (const auto& [mip, extra] : firstLayerViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, extra, nullptr);

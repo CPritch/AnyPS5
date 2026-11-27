@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DescriptorHeap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "BindlessImageAbi.hpp"
 #include <algorithm>
 #include <string>
@@ -255,7 +256,7 @@ std::uint32_t DescriptorHeap::PendingReleases() const {
 
 void DescriptorHeap::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout pipelineLayout, VkShaderStageFlags stages) {
     const auto set = Set(stages);
-    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, pipelineLayout, Abi::HeapDescriptorSet, 1, &set, 0, nullptr);
+    CmdBindDescriptorSets(context, commands, bindPoint, pipelineLayout, Abi::HeapDescriptorSet, 1, &set, bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE ? SetBindSite::Dispatch : SetBindSite::Draw);
 }
 
 }

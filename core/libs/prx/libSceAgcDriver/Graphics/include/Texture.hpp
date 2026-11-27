@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -89,7 +90,7 @@ struct OwnedImage {
     ImageAllocation allocation;
 };
 
-class Texture {
+class Texture : public HeapSlotOwner {
 public:
     Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, bool layerRows = false, const VkClearColorValue* clear = nullptr, std::optional<std::span<const std::uint32_t>> packedSlabs = std::nullopt, std::span<const HostImportCopy> sources = {});
     Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::shared_ptr<Buffer> staging, bool depthCompare = false, bool layerRows = false, std::optional<std::span<const std::uint32_t>> packedSlabs = std::nullopt);
@@ -139,6 +140,7 @@ public:
     ViewRange SampledViewRange(bool firstLayer) const { return firstLayer ? firstLayerRange : viewRange; }
     // The layout the image is kept in while sampled.
     VkImageLayout Layout() const { return layout; }
+    VkImage Image() const { return image; }
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
     VkFormat ViewFormat() const { return viewFormat; }
     // Whether this texture is a view of a storage image (no snapshot of its own).
@@ -301,7 +303,7 @@ private:
 // either at once (WriteBack) or deferred: MarkDirty keeps them on the GPU until something reads that
 // memory (FlushPending, through the GuestMemory flush hook), the image is refreshed after a CPU write,
 // or it leaves the cache. Dispatches reusing the image meanwhile skip the round trip entirely.
-class StorageTexture : public std::enable_shared_from_this<StorageTexture> {
+class StorageTexture : public std::enable_shared_from_this<StorageTexture>, public HeapSlotOwner {
 public:
     struct CreationHandOver {
         DccKeys keys = DccKeys::Uncompressed;
@@ -326,6 +328,7 @@ public:
     VkImageView View(std::uint32_t mip);
     VkImageView FirstLayerView(std::uint32_t mip);
     VkImageView StorageView(std::uint32_t mip, bool firstLayer, bool uintStorage = false);
+    VkImageView UintStorageViewOrDefault(std::uint32_t mip, bool firstLayer);
     VkImageView ElementView();
     VkImageView AtomicView(std::uint32_t mip, bool firstLayer);
     VkImageView Atomic64View(std::uint32_t mip, bool firstLayer);

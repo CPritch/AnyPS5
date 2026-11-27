@@ -45,6 +45,11 @@ inline constexpr std::uint32_t WorkgroupOffsetBase = 8241u;
 inline constexpr std::uint32_t WorkgroupOffsetWords = 3u;
 inline constexpr std::uint32_t AtomicLockTableBase = 8244u;
 inline constexpr std::uint32_t AtomicLockTableWords = 2u;
+inline constexpr std::uint32_t PushedDataBase = 8246u;
+inline constexpr std::uint32_t PushedDataCount = 8247u;
+inline constexpr std::uint32_t HeapImageSlots = 8248u;
+inline constexpr std::uint32_t RootItemPositionBase = 8448u;
+inline constexpr std::uint32_t RootItemPositions = 16u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
 inline constexpr std::uint32_t StoreQuantizeBase = 12288u;
@@ -62,10 +67,19 @@ inline constexpr std::uint32_t GatherLodBiasBase = 57856u;
 inline constexpr std::uint32_t GatherImageMinLodBase = 57920u;
 inline constexpr std::uint32_t FmaskFormatBase = 58048u;
 inline constexpr std::uint32_t VolumeGatherBase = 58176u;
+inline constexpr std::uint32_t BufferRootPosition = 58304u;
+inline constexpr std::uint32_t BufferRootCount = 16u;
+inline constexpr std::uint32_t BufferOverflowPosition = BufferRootPosition + BufferRootCount;
 inline constexpr std::uint32_t GatherImageShapeBase = 58432u;
 
 inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {
     return DescriptorIndexBase + binding * DescriptorIndexStride + element;
+}
+
+static_assert(MipCountBase < RootItemPositionBase && RootItemPositionBase + RootItemPositions <= StoreQuantizeBase);
+
+inline constexpr bool IsPushPlacement(std::uint32_t id) {
+    return id == PushedDataBase || id == PushedDataCount || (id >= BufferRootPosition && id <= BufferOverflowPosition) || (id >= RootItemPositionBase && id < RootItemPositionBase + RootItemPositions);
 }
 
 inline constexpr bool IsWorkgroupOffset(std::uint32_t id) {

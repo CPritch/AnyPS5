@@ -121,7 +121,6 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/NanPayloadEliminator.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/VectorWindowStoreEliminator.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/RedundantValueEliminator.cpp
-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtAddressArithmetic.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtDescriptorEvaluation.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtDiagnostics.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/SrtWalker/SrtEvaluator.cpp
@@ -256,10 +255,28 @@ function(add_shader_recompiler target runtimeTarget)
         string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
     endif()
     set(shaderCacheReviewedNames
+            HeapCache
+            HeapCacheEnabled
+            HeapCacheLegacyBypassed
+            HeapCacheBypassMask
+            HeapCacheNames
+            HeapVerifyEnabled
+            HeapVerifyEvery
+            HeapOnlyCacheCount
+            ParseHeapCacheBypass
             BdaAbi::OtherFaults
             BdaAbi::RangesOrdered
+            RuntimeAbi::GpuHeapStorageKind
+            RuntimeAbi::StageGroup
+            StagePushFeatures
+            RuntimeAbi::UintStorageImageKind
+            StorageElementPointer
+            FirstAtomicStorageImageBinding
             BuildBarycentricGeometryShader
             BuildBarycentricTessellationShaders
+            CompleteHeapDataWords
+            OverlayUserWords
+            HeapTemplateCounts
             BuildPreparedShaderKey
             BuildRectListShaders
             BuildTessellationCaptureGeometryShader
@@ -285,6 +302,9 @@ function(add_shader_recompiler target runtimeTarget)
             PixelInput
             PointFilteredSamplerWord
             PixelInputBit
+            PlacePushData
+            PushBytesMask
+            PushPartOf
             RayTracingStrict
             RayTracingMiss
             ReadWholeFile
