@@ -590,6 +590,8 @@ struct TextureCounters {
     std::atomic<std::uint64_t> largestMappingRefusal{0};
     std::atomic<std::uint64_t> proofSpans{0};
     std::atomic<std::uint64_t> proofEntries{0};
+    std::atomic<std::uint64_t> tablesRememberedMarked{0};
+    std::atomic<std::uint64_t> entriesMarked{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ImageTableUnremembered::Count)> tablesUnremembered{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ImageTableUnreused::Count)> tablesUnreused{};
     // Snapshot hits over memory outside the write watch: kept by an unchanged UntrackedHint key, or
@@ -621,7 +623,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    static constexpr std::array<const char*, static_cast<std::size_t>(ImageTableUnremembered::Count)> unrememberedNames{"no collect epoch", "array partners", "past the table capacity", "stored elements", "no sampled table binding", "rejected variant", "nothing kept", "pending results"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(ImageTableUnremembered::Count)> unrememberedNames{"no collect epoch", "array partners", "past the table capacity", "stored elements", "no sampled table binding", "rejected variant", "nothing kept", "pending results over more than half the entries"};
     static constexpr std::array<const char*, static_cast<std::size_t>(ImageTableUnreused::Count)> unreusedNames{"no collect epoch", "stored elements", "no sampled table binding", "not remembered (new records)", "not remembered (records remembered with other image shapes)", "not remembered (evicted from the remembered tables)", "variants moved", "depth surfaces moved", "multisample targets moved", "rejections bound to their state", "mapping changed (change log incomplete)", "mapping changed (change log overflowed)", "mapping changed (proof ahead of the change log)", "mapping changed (no partial resolve)", "mapping changed under over half the entries", "collect refused", "pending results", "memory changed", "textures evicted"};
     const auto reasons = [&](const auto& counts, const auto& names) {
         std::string text;
@@ -633,7 +635,7 @@ void reportTextureCounters() {
     const auto unremembered = reasons(counters.tablesUnremembered, unrememberedNames);
     const auto unreused = reasons(counters.tablesUnreused, unreusedNames);
     const auto largestMapping = counters.largestMappingRefusal.load(std::memory_order_relaxed);
-    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu cleared on the GPU, %llu uploaded on the GPU from host imports, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused (%llu replayed, %llu found cached by the entry memo), %llu partly resolved again (%llu entries looked up again), %llu resolved, %llu remembered; tables not remembered by reason:%s; tables not reused by reason:%s; %llu mapping proofs made while a guest mapping change waited for a lease; largest mapping refusal over half the entries: %llu affected of %llu; reuse proofs: %llu merged entry ranges collected or checked whole, %llu entries collected or checked one by one; storage-viewed table entries %llu kept, %llu looked up again; dynamic-resolution variants: %llu surfaces, %llu entries substituted, %llu entries rejected; %llu one-layer 2D array entries bound to the 2D texture of their surface; untracked snapshots %llu kept by the write-watch hint, %llu compared; views kept through a pending alias: %llu lookups, %llu revalidations\n", count(counters.fromStorage), count(counters.cleared), count(counters.imported), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused) + count(counters.tablesReplayed), count(counters.tablesReplayed), count(counters.tableEntryMemoHits), count(counters.tablesPartial), count(counters.partialEntries), count(counters.tablesResolved), count(counters.tablesRemembered), unremembered.c_str(), unreused.c_str(), count(counters.mappingWaited), static_cast<unsigned long long>(largestMapping >> 32u), static_cast<unsigned long long>(largestMapping & 0xffffffffu), count(counters.proofSpans), count(counters.proofEntries), count(counters.viewedKept), count(counters.viewedLookedUp), count(counters.variantSurfaces), count(counters.variantSubstituted), count(counters.variantRejected), count(counters.arrayViewsShared), count(counters.untrackedKept), count(counters.untrackedCompared), count(counters.aliasViews), count(counters.aliasRefreshes));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu cleared on the GPU, %llu uploaded on the GPU from host imports, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused (%llu replayed, %llu found cached by the entry memo), %llu partly resolved again (%llu entries looked up again), %llu resolved, %llu remembered (%llu with %llu entries marked to be looked up again over pending results); tables not remembered by reason:%s; tables not reused by reason:%s; %llu mapping proofs made while a guest mapping change waited for a lease; largest mapping refusal over half the entries: %llu affected of %llu; reuse proofs: %llu merged entry ranges collected or checked whole, %llu entries collected or checked one by one; storage-viewed table entries %llu kept, %llu looked up again; dynamic-resolution variants: %llu surfaces, %llu entries substituted, %llu entries rejected; %llu one-layer 2D array entries bound to the 2D texture of their surface; untracked snapshots %llu kept by the write-watch hint, %llu compared; views kept through a pending alias: %llu lookups, %llu revalidations\n", count(counters.fromStorage), count(counters.cleared), count(counters.imported), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused) + count(counters.tablesReplayed), count(counters.tablesReplayed), count(counters.tableEntryMemoHits), count(counters.tablesPartial), count(counters.partialEntries), count(counters.tablesResolved), count(counters.tablesRemembered), count(counters.tablesRememberedMarked), count(counters.entriesMarked), unremembered.c_str(), unreused.c_str(), count(counters.mappingWaited), static_cast<unsigned long long>(largestMapping >> 32u), static_cast<unsigned long long>(largestMapping & 0xffffffffu), count(counters.proofSpans), count(counters.proofEntries), count(counters.viewedKept), count(counters.viewedLookedUp), count(counters.variantSurfaces), count(counters.variantSubstituted), count(counters.variantRejected), count(counters.arrayViewsShared), count(counters.untrackedKept), count(counters.untrackedCompared), count(counters.aliasViews), count(counters.aliasRefreshes));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -2719,6 +2721,7 @@ struct ReusedTable {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> mapped;
     std::vector<std::uint32_t> representatives;
+    std::vector<std::uint32_t> pendingEntries;
     std::atomic<std::uint64_t> pendingSerial{0};
     AgcDriver::Mutex mutex;
     TableState proved;
@@ -3154,16 +3157,48 @@ void RememberTable(std::shared_ptr<ReusedTable> table, const ShaderRecompiler::D
     }
 }
 
+void MarkPendingEntries(ReusedTable& table) {
+    struct ExtentsTag {};
+    auto& extents = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ExtentsTag>();
+    extents.clear();
+    table.pendingEntries.clear();
+    StorageTexture::AppendPendingExtents(extents);
+    if (extents.empty()) return;
+    std::sort(extents.begin(), extents.end());
+    for (std::size_t index = 1; index < extents.size(); ++index) extents[index].second = std::max(extents[index].second, extents[index - 1].second);
+    for (std::size_t at = 0; at < table.queries.size(); ++at) {
+        const auto& query = table.queries[at];
+        if (query.bytes == 0) continue;
+        const auto end = query.address + query.bytes;
+        const auto bound = std::lower_bound(extents.begin(), extents.end(), end, [](const std::pair<std::uint64_t, std::uint64_t>& extent, std::uint64_t limit) { return extent.first < limit; });
+        if (bound != extents.begin() && std::prev(bound)->second > query.address) table.pendingEntries.push_back(table.queryElements[at]);
+    }
+    std::sort(table.pendingEntries.begin(), table.pendingEntries.end());
+}
+
 ImageTableUnremembered KeepTable(std::shared_ptr<ReusedTable> table, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state, std::shared_ptr<const ReplayedBinds> binds) {
-    if (std::none_of(table->elements.begin(), table->elements.end(), [](const ReusedTableElement& element) { return !element.live || element.viewed; })) return ImageTableUnremembered::NothingKept;
+    const auto keeps = [](const ReusedTable& kept) { return std::any_of(kept.elements.begin(), kept.elements.end(), [](const ReusedTableElement& element) { return !element.live || element.viewed; }); };
+    if (!keeps(*table)) return ImageTableUnremembered::NothingKept;
     IndexTable(*table);
     const auto serial = StorageTexture::PendingSerial();
-    if (StorageTexture::AnyPendingOverlaps(table->ranges) || StorageTexture::PendingSerial() != serial) return ImageTableUnremembered::Pending;
+    MarkPendingEntries(*table);
+    const auto marked = table->pendingEntries.size();
+    if (marked > table->elements.size() / PartialResolveDivisor) return ImageTableUnremembered::Pending;
+    if (marked != 0) {
+        for (const auto element : table->pendingEntries) table->elements[element].live = true;
+        if (!keeps(*table)) return ImageTableUnremembered::NothingKept;
+        IndexTable(*table);
+    }
     table->state = state;
     table->proved = state;
     table->pendingSerial.store(serial, std::memory_order_release);
     table->replay = std::move(binds);
     RememberTable(std::move(table), binding);
+    if (marked != 0) {
+        auto& counters = TextureCounts();
+        counters.tablesRememberedMarked.fetch_add(1, std::memory_order_relaxed);
+        counters.entriesMarked.fetch_add(marked, std::memory_order_relaxed);
+    }
     return ImageTableUnremembered::Count;
 }
 
@@ -7466,6 +7501,9 @@ void ShaderResources::resolveImageTables() {
         if (reused != nullptr && !reused->representatives.empty() && reused->representatives != variantRepresentatives(context.device, binding, table.elementBase, context.imageTableCapacity)) unreused = ImageTableUnreused::Variants;
         const auto proving = CurrentTableState();
         const bool partialAllowed = !RuntimeSwitches::Set(RuntimeSwitch::NoPartialTableResolve) && static_cast<std::uint64_t>(table.elementBase) + binding.count <= context.imageTableCapacity;
+        if (unreused == ImageTableUnreused::Count && reused != nullptr && partialAllowed) {
+            for (const auto element : reused->pendingEntries) static_cast<void>(affected.Mark(element, reused->elements.size()));
+        }
         if (unreused == ImageTableUnreused::Count && reused != nullptr) unreused = ProveTable(*reused, proving, partialAllowed ? &affected : nullptr);
         const bool partial = unreused == ImageTableUnreused::Count && reused != nullptr && affected.count != 0;
         if (unreused == ImageTableUnreused::Count && reused != nullptr && !CachedTableTextures(*reused, cached, &viewed, partial ? &affected : nullptr)) unreused = ImageTableUnreused::Evicted;
@@ -7769,7 +7807,7 @@ std::uint64_t SampledTexturesImported() {
 ImageTableReuseCounts ImageTableReuses() {
     const auto& counters = TextureCounts();
     const auto largestMapping = counters.largestMappingRefusal.load(std::memory_order_relaxed);
-    ImageTableReuseCounts counts{counters.tablesReused.load(std::memory_order_relaxed) + counters.tablesReplayed.load(std::memory_order_relaxed), counters.tablesResolved.load(std::memory_order_relaxed), counters.tablesReplayed.load(std::memory_order_relaxed), counters.tableWritesKept.load(std::memory_order_relaxed), counters.tableWritesMade.load(std::memory_order_relaxed), counters.variantSurfaces.load(std::memory_order_relaxed), counters.variantSubstituted.load(std::memory_order_relaxed), counters.variantRejected.load(std::memory_order_relaxed), counters.arrayViewsShared.load(std::memory_order_relaxed), counters.tableEntryMemoHits.load(std::memory_order_relaxed), counters.tablesRemembered.load(std::memory_order_relaxed), counters.viewedKept.load(std::memory_order_relaxed), counters.viewedLookedUp.load(std::memory_order_relaxed), counters.tablesPartial.load(std::memory_order_relaxed), counters.partialEntries.load(std::memory_order_relaxed), counters.mappingWaited.load(std::memory_order_relaxed), largestMapping >> 32u, largestMapping & 0xffffffffu, counters.proofSpans.load(std::memory_order_relaxed), counters.proofEntries.load(std::memory_order_relaxed)};
+    ImageTableReuseCounts counts{counters.tablesReused.load(std::memory_order_relaxed) + counters.tablesReplayed.load(std::memory_order_relaxed), counters.tablesResolved.load(std::memory_order_relaxed), counters.tablesReplayed.load(std::memory_order_relaxed), counters.tableWritesKept.load(std::memory_order_relaxed), counters.tableWritesMade.load(std::memory_order_relaxed), counters.variantSurfaces.load(std::memory_order_relaxed), counters.variantSubstituted.load(std::memory_order_relaxed), counters.variantRejected.load(std::memory_order_relaxed), counters.arrayViewsShared.load(std::memory_order_relaxed), counters.tableEntryMemoHits.load(std::memory_order_relaxed), counters.tablesRemembered.load(std::memory_order_relaxed), counters.viewedKept.load(std::memory_order_relaxed), counters.viewedLookedUp.load(std::memory_order_relaxed), counters.tablesPartial.load(std::memory_order_relaxed), counters.partialEntries.load(std::memory_order_relaxed), counters.mappingWaited.load(std::memory_order_relaxed), largestMapping >> 32u, largestMapping & 0xffffffffu, counters.proofSpans.load(std::memory_order_relaxed), counters.proofEntries.load(std::memory_order_relaxed), counters.tablesRememberedMarked.load(std::memory_order_relaxed), counters.entriesMarked.load(std::memory_order_relaxed)};
     for (std::size_t reason = 0; reason < counts.unremembered.size(); ++reason) counts.unremembered[reason] = counters.tablesUnremembered[reason].load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < counts.unreused.size(); ++reason) counts.unreused[reason] = counters.tablesUnreused[reason].load(std::memory_order_relaxed);
     return counts;

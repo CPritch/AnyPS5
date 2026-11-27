@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <span>
@@ -1272,6 +1273,229 @@ bool RunRememberedReasons(AgcDriver::VulkanDevice& device, const GuestBlock& blo
     return true;
 }
 
+bool RunPendingRemembered(AgcDriver::VulkanDevice& device, const GuestBlock& block, const GuestBlock& lone, const GuestBlock& marks) {
+    using AgcDriver::Graphics::ImageTableUnremembered;
+    using AgcDriver::Graphics::ImageTableUnreused;
+    using AgcDriver::Graphics::ShaderResources;
+    using AgcDriver::Graphics::StorageTexture;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::puts("guest memory has no write watch: remembering an image table over pending results is not tested");
+        return false;
+    }
+    const auto& context = device.graphicsContext();
+    for (std::uint32_t texture = 0; texture < Records; ++texture) {
+        Fill(block, texture, 0.25f);
+        SetRecord(block, texture, texture);
+    }
+    Fill(lone, 0, 0.375f);
+    SetRecord(block, LoneEntry, 0, &lone);
+    const auto srt = Buffer(block.Table(), Records * Stride);
+    const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
+    std::copy(srt.begin(), srt.end(), Srt.begin());
+    std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
+    SetOutput(Output.data());
+    const auto program = Compile(device, block);
+    const AgcDriver::Graphics::CompiledShader shader{ShaderStage::Compute, &program, 0};
+    using Textures = std::vector<std::shared_ptr<AgcDriver::Graphics::Texture>>;
+    struct Built {
+        Textures textures;
+        Step step{};
+        std::uint64_t refusals = 0;
+        std::uint64_t pendingRefusals = 0;
+        std::uint64_t newRecords = 0;
+        std::uint64_t remembered = 0;
+        std::uint64_t rememberedMarked = 0;
+        std::uint64_t markedEntries = 0;
+        std::uint64_t unremembered = 0;
+        std::uint64_t unrememberedPending = 0;
+        std::uint64_t spans = 0;
+        std::uint64_t entries = 0;
+    };
+    const auto buildHeld = [&](const AgcDriver::Graphics::CompiledShader& compiled) {
+        Built built;
+        const auto before = AgcDriver::Graphics::ImageTableReuses();
+        const auto resources = std::make_shared<ShaderResources>(context, compiled);
+        built.textures = resources->SampledTextures();
+        built.step = Since(before);
+        built.refusals = Refusals(before);
+        built.pendingRefusals = Unreused(before, ImageTableUnreused::Pending);
+        built.newRecords = Unreused(before, ImageTableUnreused::NotRemembered);
+        const auto after = AgcDriver::Graphics::ImageTableReuses();
+        built.remembered = after.remembered - before.remembered;
+        built.rememberedMarked = after.rememberedMarked - before.rememberedMarked;
+        built.markedEntries = after.markedEntries - before.markedEntries;
+        for (std::size_t reason = 0; reason < after.unremembered.size(); ++reason) built.unremembered += after.unremembered[reason] - before.unremembered[reason];
+        const auto pending = static_cast<std::size_t>(ImageTableUnremembered::Pending);
+        built.unrememberedPending = after.unremembered[pending] - before.unremembered[pending];
+        built.spans = after.proofSpans - before.proofSpans;
+        built.entries = after.proofEntries - before.proofEntries;
+        return built;
+    };
+    const auto build = [&](const AgcDriver::Graphics::CompiledShader& compiled) {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        return buildHeld(compiled);
+    };
+    const auto describe = [](const Built& built) { return std::to_string(built.step.reused) + " reused, " + std::to_string(built.step.partial) + " partly resolved again with " + std::to_string(built.step.partialEntries) + " entries looked up again, " + std::to_string(built.step.resolved) + " resolved, " + std::to_string(built.refusals) + " refused (" + std::to_string(built.pendingRefusals) + " over pending results), " + std::to_string(built.remembered) + " remembered (" + std::to_string(built.rememberedMarked) + " with " + std::to_string(built.markedEntries) + " entries marked), " + std::to_string(built.unremembered) + " not remembered (" + std::to_string(built.unrememberedPending) + " over pending results); the proof checked " + std::to_string(built.spans) + " merged ranges whole and " + std::to_string(built.entries) + " entries one by one"; };
+    const auto keptExcept = [&](const Textures& before, const Textures& after, std::uint32_t first, std::uint32_t count, const std::string& what) {
+        Require(before.size() == Records && after.size() == Records, "image table over pending results: " + what + ": the builds do not hold one texture per entry");
+        for (std::uint32_t entry = 0; entry < Records; ++entry) {
+            if (entry < first || entry >= first + count) Require(after[entry] == before[entry], "image table over pending results: " + what + ": entry " + std::to_string(entry) + " away from the pending results was bound to another texture");
+        }
+    };
+    const auto inFlight = [&](std::uint32_t first, std::uint32_t count, const GuestBlock& owner, const std::function<void()>& during) {
+        const auto address = AddressOf(owner.Texels(first));
+        const auto bytes = static_cast<std::size_t>(count) * TextureBytes;
+        const auto selected = [&] {
+            for (std::uint32_t texture = first; texture < first + count; ++texture) {
+                if (StorageTexture::FindPending(AddressOf(owner.Texels(texture)), TextureBytes) != nullptr) return false;
+            }
+            return true;
+        };
+        std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+        std::exception_ptr flushFailure;
+        std::thread flusher([&] {
+            try {
+                StorageTexture::FlushPending(address, bytes, nullptr, "test");
+            } catch (...) {
+                flushFailure = std::current_exception();
+            }
+        });
+        std::exception_ptr failure;
+        try {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!selected()) {
+                Require(std::chrono::steady_clock::now() < deadline, "image table over pending results: a flush on another thread never took the pending results to store them");
+                std::this_thread::yield();
+            }
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
+            Require(StorageTexture::AnyPendingOverlaps(range), "image table over pending results: the results a flush on another thread waits to store do not count as pending");
+            during();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        gpu.unlock();
+        flusher.join();
+        device.WaitIdle();
+        if (failure != nullptr) std::rethrow_exception(failure);
+        if (flushFailure != nullptr) std::rethrow_exception(flushFailure);
+    };
+    constexpr std::uint32_t AwayEntry = Records - 1u;
+    const auto sampledBy = [&](const ShaderRecompiler::RecompileResult& compiled, const std::string& what, std::uint32_t entry, const std::vector<std::uint32_t>& expected) {
+        Require(Dispatch(device, compiled, entry) == expected, "image table over pending results: " + what + ": entry " + std::to_string(entry) + " sampled the wrong texels");
+        Require(Dispatch(device, compiled, AwayEntry) == Row(block.Texels(AwayEntry)), "image table over pending results: " + what + ": an entry away from the pending results sampled the wrong texels");
+    };
+    const auto sampled = [&](const std::string& what, std::uint32_t entry, const std::vector<std::uint32_t>& expected) { sampledBy(program, what, entry, expected); };
+    std::vector<float> stored(Width);
+    std::vector<float> restored(Width);
+    for (std::uint32_t x = 0; x < Width; ++x) {
+        stored[x] = -4.0f - static_cast<float>(x);
+        restored[x] = 4.0f - static_cast<float>(x);
+    }
+    const auto storedRow = Row(stored.data());
+    const auto restoredRow = Row(restored.data());
+
+    Store(device, lone, 0);
+    Require(StorageTexture::FindPending(AddressOf(lone.Texels(0)), TextureBytes) != nullptr, "image table over pending results: the image store left no results pending over the lone entry");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Built marked;
+    inFlight(0, 1, lone, [&] { marked = buildHeld(shader); });
+    Require(Row(lone.Texels(0)) == storedRow, "image table over pending results: the image store's results did not land in the lone entry's memory");
+    Require(marked.step.resolved == 1u && marked.step.reused == 0u && marked.step.partial == 0u && marked.refusals == 1u && marked.newRecords == 1u, "image table over pending results: the first build of a table was not resolved whole as new records (" + describe(marked) + ")");
+    Require(marked.remembered == 1u && marked.rememberedMarked == 1u && marked.markedEntries == 1u && marked.unremembered == 0u, "image table over pending results: a table resolved while results were pending over one entry was not remembered with that entry marked (" + describe(marked) + ")");
+
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto looked = build(shader);
+    Require(looked.step.reused == 0u && looked.step.partial == 1u && looked.step.partialEntries == 1u && looked.step.resolved == 0u && looked.refusals == 0u, "image table over pending results: the reuse after the results landed did not look up the marked entry alone (" + describe(looked) + ")");
+    Require(looked.spans == 1u && looked.entries == 0u, "image table over pending results: the reuse did not prove the entries kept away from the marked one by their one merged range (" + describe(looked) + ")");
+    Require(looked.remembered == 1u && looked.rememberedMarked == 0u, "image table over pending results: the table rebuilt after its marked entry was looked up again was not remembered without marks (" + describe(looked) + ")");
+    keptExcept(marked.textures, looked.textures, LoneEntry, 1, "the reuse after the results landed");
+    Require(looked.textures[LoneEntry] != marked.textures[LoneEntry], "image table over pending results: the marked entry kept the texture looked up before its results landed");
+    const auto whole = build(shader);
+    Require(whole.step.reused == 1u && whole.step.partial == 0u && whole.step.resolved == 0u && whole.refusals == 0u && whole.textures == looked.textures, "image table over pending results: the table was not reused whole once its marked entry was looked up again (" + describe(whole) + ")");
+    sampled("the entry looked up again after its results landed", LoneEntry, storedRow);
+
+    Store(device, lone, 0, RestoreCode);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Built first;
+    Built still;
+    inFlight(0, 1, lone, [&] {
+        first = buildHeld(shader);
+        still = buildHeld(shader);
+    });
+    Require(Row(lone.Texels(0)) == restoredRow, "image table over pending results: the second image store's results did not land in the lone entry's memory");
+    Require(first.step.resolved == 1u && first.pendingRefusals == 1u && first.refusals == 1u, "image table over pending results: the remembered table was not refused once over the results pending under one of its kept entries (" + describe(first) + ")");
+    Require(first.remembered == 1u && first.rememberedMarked == 1u && first.markedEntries == 1u && first.unremembered == 0u, "image table over pending results: the table resolved while a second store's results were pending over its entry was not remembered with that entry marked (" + describe(first) + ")");
+    Require(still.step.reused == 0u && still.step.partial == 1u && still.step.partialEntries == 1u && still.step.resolved == 0u && still.refusals == 0u, "image table over pending results: the reuse while the marked entry's results were still pending did not look that entry up again alone (" + describe(still) + ")");
+    Require(still.rememberedMarked == 1u && still.markedEntries == 1u, "image table over pending results: the entry whose results were still pending at the reuse was not marked again (" + describe(still) + ")");
+    keptExcept(first.textures, still.textures, LoneEntry, 1, "the reuse while the marked entry's results were still pending");
+
+    RuntimeSwitches::Assign(RuntimeSwitch::NoPartialTableResolve, true);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto live = build(shader);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoPartialTableResolve, false);
+    Require(live.step.reused == 1u && live.step.partial == 0u && live.step.resolved == 0u && live.refusals == 0u, "image table over pending results: under APS5_NO_PARTIAL_TABLE_RESOLVE the table with a marked entry was not reused whole (" + describe(live) + ")");
+    keptExcept(still.textures, live.textures, LoneEntry, 1, "under APS5_NO_PARTIAL_TABLE_RESOLVE");
+    Require(live.textures[LoneEntry] != still.textures[LoneEntry], "image table over pending results: under APS5_NO_PARTIAL_TABLE_RESOLVE the marked entry kept the texture looked up before its results landed");
+    const auto converted = build(shader);
+    Require(converted.step.reused == 0u && converted.step.partial == 1u && converted.step.partialEntries == 1u && converted.refusals == 0u && converted.rememberedMarked == 0u && converted.textures == live.textures, "image table over pending results: the entry left marked under APS5_NO_PARTIAL_TABLE_RESOLVE was not looked up again alone once partial resolves were back (" + describe(converted) + ")");
+    sampled("the entry looked up again after its second results landed", LoneEntry, restoredRow);
+
+    Store(device, lone, 0, RestoreCode);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Built markedAgain;
+    inFlight(0, 1, lone, [&] { markedAgain = buildHeld(shader); });
+    Require(markedAgain.rememberedMarked == 1u && markedAgain.markedEntries == 1u, "image table over pending results: the table resolved over a third store's results was not remembered with its entry marked (" + describe(markedAgain) + ")");
+    Store(device, lone, 0);
+    Require(StorageTexture::FindPending(AddressOf(lone.Texels(0)), TextureBytes) != nullptr, "image table over pending results: the fourth image store left no results pending over the lone entry");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto served = build(shader);
+    Require(served.step.reused == 0u && served.step.partial == 1u && served.step.partialEntries == 1u && served.step.resolved == 0u && served.refusals == 0u && served.rememberedMarked == 0u, "image table over pending results: the reuse while results were pending over the marked entry did not look it up again alone (" + describe(served) + ")");
+    keptExcept(markedAgain.textures, served.textures, LoneEntry, 1, "the reuse while results were pending over the marked entry");
+    Require(served.textures[LoneEntry] != markedAgain.textures[LoneEntry], "image table over pending results: the marked entry kept its texture while results were pending over it");
+    sampled("the marked entry looked up again while results were pending over it", LoneEntry, storedRow);
+    StorageTexture::FlushPending(AddressOf(lone.Texels(0)), TextureBytes, nullptr, "test");
+    device.WaitIdle();
+    Require(Row(lone.Texels(0)) == storedRow, "image table over pending results: the fourth image store wrote the wrong values");
+
+    constexpr std::uint32_t Half = Records / 2u;
+    for (std::uint32_t texture = 0; texture <= Half; ++texture) Fill(marks, texture, 0.625f);
+    for (std::uint32_t texture = 0; texture < Half; ++texture) SetRecord(block, texture, texture, &marks);
+    const auto halfProgram = Compile(device, block);
+    const AgcDriver::Graphics::CompiledShader halfShader{ShaderStage::Compute, &halfProgram, 0};
+    for (std::uint32_t texture = 0; texture < Half; ++texture) Store(device, marks, texture);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto unlanded = AgcDriver::GuestMemory::TrackerGeneration();
+    Built half;
+    inFlight(0, Half, marks, [&] { half = buildHeld(halfShader); });
+    Require(half.step.resolved == 1u && half.newRecords == 1u && half.remembered == 1u && half.rememberedMarked == 1u && half.markedEntries == Half && half.unremembered == 0u, "image table over pending results: a table resolved while results were pending over half its entries was not remembered with them marked (" + describe(half) + ")");
+    std::uint64_t keptStamped = 0;
+    for (std::uint32_t entry = Half; entry < Records; ++entry) keptStamped += AgcDriver::GuestMemory::UnchangedSince(AddressOf(entry == LoneEntry ? lone.Texels(0) : block.Texels(entry)), TextureBytes, unlanded) ? 0u : 1u;
+    Require(keptStamped == 0u, "image table over pending results: the results landing over the marked entries' block stamped " + std::to_string(keptStamped) + " entries outside it");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto halfLooked = build(halfShader);
+    Require(halfLooked.step.reused == 0u && halfLooked.step.partial == 1u && halfLooked.step.partialEntries == Half && halfLooked.step.resolved == 0u && halfLooked.refusals == 0u && halfLooked.rememberedMarked == 0u, "image table over pending results: the reuse after results landed over half the entries did not look up the marked entries alone (" + describe(halfLooked) + ")");
+    keptExcept(half.textures, halfLooked.textures, 0, Half, "the reuse after results landed over half the entries");
+    Require(halfLooked.textures[3] != half.textures[3], "image table over pending results: an entry marked with half the table kept the texture looked up before its results landed");
+    sampledBy(halfProgram, "the entries looked up again after results landed over half of them", 3, storedRow);
+
+    SetRecord(block, Half, Half, &marks);
+    const auto overProgram = Compile(device, block);
+    const AgcDriver::Graphics::CompiledShader overShader{ShaderStage::Compute, &overProgram, 0};
+    for (std::uint32_t texture = 0; texture <= Half; ++texture) Store(device, marks, texture, RestoreCode);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Built over;
+    inFlight(0, Half + 1u, marks, [&] { over = buildHeld(overShader); });
+    Require(over.step.resolved == 1u && over.newRecords == 1u && over.remembered == 0u && over.rememberedMarked == 0u && over.markedEntries == 0u && over.unremembered == 1u && over.unrememberedPending == 1u, "image table over pending results: a table resolved while results were pending over more than half its entries was remembered, or not refused for its pending results (" + describe(over) + ")");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto after = build(overShader);
+    Require(after.step.resolved == 1u && after.newRecords == 1u && after.remembered == 1u && after.rememberedMarked == 0u, "image table over pending results: the table not remembered over results pending over more than half its entries was not resolved whole and remembered without marks once they landed (" + describe(after) + ")");
+    sampledBy(overProgram, "the table resolved after results landed over more than half its entries", Half, restoredRow);
+    Require(Dispatch(device, overProgram, 3) == restoredRow, "image table over pending results: an entry under the results that landed over more than half the entries sampled the wrong texels");
+    return true;
+}
+
 void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const GuestBlock& stores) {
     for (std::uint32_t texture = 0; texture < Records; ++texture) {
         Fill(block, texture, 0.25f);
@@ -1427,6 +1651,16 @@ int main(int argc, char** argv) {
             if (!device) return VulkanTestSkipped;
             if (!RunLargeTable(*device, block, records, viewed)) return VulkanTestSkipped;
             std::puts(viewed ? "image table reuse tests of a large storage-viewed table passed" : "image table reuse tests of a large table passed");
+            return 0;
+        }
+        if (argc > 1 && std::string(argv[1]) == "pending") {
+            GuestBlock block(UnimportableBytes);
+            GuestBlock lone(UnimportableBytes);
+            GuestBlock marks(UnimportableBytes);
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            if (!RunPendingRemembered(*device, block, lone, marks)) return VulkanTestSkipped;
+            std::puts("image table tests remembering a table over pending results passed");
             return 0;
         }
         if (argc > 1 && std::string(argv[1]) == "remembered") {

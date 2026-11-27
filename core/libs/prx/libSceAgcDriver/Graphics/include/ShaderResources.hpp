@@ -216,6 +216,8 @@ struct ImageTableReuseCounts {
     std::uint64_t largestMappingEntries = 0;
     std::uint64_t proofSpans = 0;
     std::uint64_t proofEntries = 0;
+    std::uint64_t rememberedMarked = 0;
+    std::uint64_t markedEntries = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ImageTableUnremembered::Count)> unremembered{};
     std::array<std::uint64_t, static_cast<std::size_t>(ImageTableUnreused::Count)> unreused{};
 };

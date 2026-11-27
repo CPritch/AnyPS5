@@ -6467,6 +6467,13 @@ bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t,
     return false;
 }
 
+void StorageTexture::AppendPendingExtents(std::vector<std::pair<std::uint64_t, std::uint64_t>>& extents) {
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    for (const auto* texture : pending.textures) extents.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+    for (const auto* texture : pending.flushing) extents.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+}
+
 void StorageTexture::AppendPendingRanges(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
     if (bytes == 0) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
