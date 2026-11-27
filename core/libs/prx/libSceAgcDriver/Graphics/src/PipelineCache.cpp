@@ -58,7 +58,7 @@ std::mutex& pathMutex(const std::filesystem::path& path) {
 
 }
 
-PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool loadFromFile) : context(context), properties(properties), synchronization(PipelineCacheSynchronization::SnapshotsExcludePipelineUse(properties)) {
+PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool loadFromFile) : context(context), properties(properties), synchronization(PipelineCacheSynchronization::SnapshotsExcludePipelineUse(properties) || std::getenv("APS5_PIPELINE_CACHE_EXCLUSIVE_SNAPSHOTS") != nullptr) {
     static_assert(sizeof(FileHeader) == 24);
     const auto directory = ShaderRecompiler::ShaderCacheDirectory();
     if (!directory.empty()) {
