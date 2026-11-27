@@ -2539,7 +2539,6 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     auto first = state.imports.lower_bound(base);
     if (first != state.imports.begin() && std::prev(first)->second.base + std::prev(first)->second.bytes > base) --first;
     std::uint64_t replaced = 0;
-    std::uint64_t covered = 0;
     // A join may replace imports this build already looked up: it runs before any region confirms an import
     // (UploadFinish's pre-pass re-resolves every pointer after it), and a retired import stays alive through the
     // hold (KeepThroughHold). Refusing it there would keep the run copied for good.
@@ -2553,11 +2552,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
             oweGrowth(context, state, lease, base, bytes, GrowthBlock::Held, budget);
             return stepDown ? importAllocation(context, state, address, lease, requester, end, evict, bytes / 2) : nullptr;
         }
-        if (it->second.label) continue;
-        replaced += it->second.pinnedBytes;
-        const auto overlapBegin = std::max(base, it->second.base);
-        const auto overlapEnd = std::min(base + bytes, it->second.base + it->second.bytes);
-        if (overlapBegin < overlapEnd) covered += std::min(it->second.pinnedBytes, overlapEnd - overlapBegin);
+        if (!it->second.label) replaced += it->second.pinnedBytes;
     }
     const bool freed = retireFreesAtOnce(true);
     const auto pinned = pinnedTotal(state);
@@ -2565,7 +2560,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     const auto allowance = !freed && importRetireCredit.load(std::memory_order_relaxed) ? budget / 4 : 0;
     const bool immediate = freed || (allowance != 0 && retired + replaced <= allowance);
     const auto reserved = state.heapOwedBytes != 0 && requester != ImportRequester::Build && (base + bytes <= state.heapOwedBase || base >= state.heapOwedBase + state.heapOwedBytes) ? state.heapOwedBytes : 0;
-    const auto live = pinned - std::min(pinned, immediate ? replaced : covered) + reserved;
+    const auto live = pinned - (immediate ? replaced : 0) + reserved;
     auto ready = std::numeric_limits<std::uint64_t>::max();
     auto readyHeld = std::numeric_limits<std::uint64_t>::max();
     const bool label = requester == ImportRequester::Label;
