@@ -488,6 +488,41 @@ inline std::vector<std::string> DeviceFaultResidencyLines(std::uint64_t va, std:
     return lines;
 }
 
+inline constexpr std::size_t HungBatchTokensListed = 24;
+
+inline std::vector<std::string> HungBatchLines(std::uint64_t submitSerial, const FaultTokenRing& ring) noexcept {
+    std::vector<std::string> lines;
+    try {
+        std::vector<FaultTokenEntry> held;
+        const FaultToken newest = ring.Newest();
+        const FaultToken span = newest < FaultTokenRing::Capacity ? newest : static_cast<FaultToken>(FaultTokenRing::Capacity);
+        for (FaultToken offset = span; offset > 0; --offset) {
+            const auto found = ring.Find(newest - offset + 1u);
+            if (found.has_value() && found->submitSerial == submitSerial) held.push_back(*found);
+        }
+        char line[320];
+        if (held.empty()) {
+            std::snprintf(line, sizeof(line), "[gpu-hang] batch %llu: none of its guest commands is in the fault token ring (APS5_GPU_CHECKPOINTS records them)", static_cast<unsigned long long>(submitSerial));
+            lines.emplace_back(line);
+            return lines;
+        }
+        const std::size_t listed = std::min(held.size(), HungBatchTokensListed);
+        std::snprintf(line, sizeof(line), "[gpu-hang] batch %llu holds %zu guest commands in the fault token ring; the last %zu:", static_cast<unsigned long long>(submitSerial), held.size(), listed);
+        lines.emplace_back(line);
+        for (std::size_t index = held.size() - listed; index < held.size(); ++index) {
+            const auto& entry = held[index];
+            const std::size_t descLength = strnlen(entry.desc, sizeof(entry.desc));
+            int used = std::snprintf(line, sizeof(line), "[gpu-hang] token %u %s program 0x%llx variant %llu %.*s", static_cast<unsigned>(entry.token), DeviceFaultStageName(entry.stage), static_cast<unsigned long long>(entry.programAddress), static_cast<unsigned long long>(entry.variantId), static_cast<int>(descLength), entry.desc);
+            const std::uint32_t words = entry.argCount < DeviceFaultMaxIndirectWords ? entry.argCount : DeviceFaultMaxIndirectWords;
+            if (words != 0 && used > 0 && static_cast<std::size_t>(used) < sizeof(line)) used += std::snprintf(line + used, sizeof(line) - static_cast<std::size_t>(used), " args from 0x%llx+%u:", static_cast<unsigned long long>(entry.argBuffer), static_cast<unsigned>(entry.argOffset));
+            for (std::uint32_t word = 0; word < words && used > 0 && static_cast<std::size_t>(used) < sizeof(line); ++word) used += std::snprintf(line + used, sizeof(line) - static_cast<std::size_t>(used), " %u", static_cast<unsigned>(entry.argWords[word]));
+            lines.emplace_back(line);
+        }
+    } catch (...) {
+    }
+    return lines;
+}
+
 struct DeviceFaultStageLinesTag {};
 
 inline std::vector<std::string> DeviceFaultBracketLines(const SubmitBracket& bracket, const FaultTokenRing& ring, VkQueue queue, DeviceFaultStageLinesTag) noexcept {

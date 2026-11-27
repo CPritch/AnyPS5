@@ -56,6 +56,9 @@ public:
             return candidate;
         }
     }
+    FaultToken Newest() const noexcept {
+        return next.load(std::memory_order_acquire) - 1u;
+    }
     FaultTokenEntry* Mutable(FaultToken token) noexcept {
         if (token == 0) return nullptr;
         return &entries[static_cast<std::size_t>(token) % Capacity];

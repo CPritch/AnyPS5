@@ -22,6 +22,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DeviceFault.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/StagingCopyBack_spv.h"
@@ -5200,6 +5201,10 @@ struct RestoreSyncSite {
 // The timeline wait itself, on handles copied out of the recorder: the caller holds no mutex, and
 // the recorder may be torn down meanwhile (its destructor waits for the registered waiters to
 // leave after completing every batch, so the handles stay valid until this returns).
+void ReportHungBatch(std::uint64_t serial) noexcept {
+    for (const auto& line : AgcDriver::HungBatchLines(serial, AgcDriver::FaultTokenRing::Instance())) std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial) {
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;
@@ -5209,6 +5214,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
         // As for the fence wait in finish(): a hung batch is reported every 5 s.
         std::fprintf(stderr, "[gpu] recorded batch %llu still running on the GPU after %d s (timeline wait)\n", static_cast<unsigned long long>(serial), waited);
+        if (waited == 5) ReportHungBatch(serial);
         result = waitSemaphores(device, &wait, 5'000'000'000ull);
     }
     return result;
@@ -5632,6 +5638,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
+            if (waited == 5) ReportHungBatch(batch->serial);
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
