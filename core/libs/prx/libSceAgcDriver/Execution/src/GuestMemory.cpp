@@ -13,6 +13,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include <cerrno>
+#include <charconv>
 #include <mutex>
 #include <array>
 #include <chrono>
@@ -3567,19 +3568,66 @@ namespace {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
 }
 
+namespace {
+
+std::uint64_t HandoffAfterNanoseconds() {
+    static const std::uint64_t after = [] {
+        const char* text = std::getenv("APS5_GPU_MUTEX_HANDOFF_MS");
+        if (text == nullptr || *text == 0) return std::uint64_t{20'000'000};
+        std::uint32_t ms = 0;
+        const auto* end = text + std::strlen(text);
+        const auto parsed = std::from_chars(text, end, ms);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || ms > 600'000u) throw std::invalid_argument("APS5_GPU_MUTEX_HANDOFF_MS must be a whole number of milliseconds from 0 through 600000");
+        return static_cast<std::uint64_t>(ms) * 1'000'000u;
+    }();
+    return after;
+}
+
+}
+
+bool GpuMutexType::open(const void* token) {
+    const auto* first = priority.load(std::memory_order_acquire);
+    return (first == nullptr || first == token) && mutex.try_lock();
+}
+
 void GpuMutexType::enter() {
-    if (HeldByThisThread() || mutex.try_lock()) return;
+    if (HeldByThisThread() || open(CurrentThreadToken())) return;
     block();
 }
 
 void GpuMutexType::block() {
-    waiters.fetch_add(1, std::memory_order_relaxed);
-    LockSpinning(mutex, HandoffSpinWindow());
+    waiters.fetch_add(1, std::memory_order_seq_cst);
+    const auto* token = CurrentThreadToken();
+    const bool queued = HandoffAfterNanoseconds() != 0;
+    if (queued) {
+        std::lock_guard lock(queueMutex);
+        queue.emplace_back(token, SteadyNanoseconds());
+    }
+    for (;;) {
+        const auto seen = released.load(std::memory_order_acquire);
+        if (SpinUntil(HandoffSpinWindow(), [&] { return open(token); })) break;
+        WaitWhile(released, seen);
+    }
+    if (queued) leave(token);
     waiters.fetch_sub(1, std::memory_order_relaxed);
 }
 
+void GpuMutexType::choosePriority() {
+    const auto now = SteadyNanoseconds();
+    std::lock_guard lock(queueMutex);
+    const void* first = nullptr;
+    if (!queue.empty() && queue.front().second <= now && now - queue.front().second >= HandoffAfterNanoseconds()) first = queue.front().first;
+    priority.store(first, std::memory_order_release);
+}
+
+void GpuMutexType::leave(const void* token) {
+    std::lock_guard lock(queueMutex);
+    if (const auto found = std::find_if(queue.begin(), queue.end(), [&](const auto& entry) { return entry.first == token; }); found != queue.end()) queue.erase(found);
+    if (priority.load(std::memory_order_relaxed) == token) priority.store(nullptr, std::memory_order_release);
+}
+
 bool GpuMutexType::tryEnter() {
-    return HeldByThisThread() || mutex.try_lock();
+    return HeldByThisThread() || open(CurrentThreadToken());
 }
 
 void GpuMutexType::acquired() {
@@ -3628,7 +3676,10 @@ void GpuMutexType::unlock() {
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
+        if (HandoffAfterNanoseconds() != 0 && waiters.load(std::memory_order_seq_cst) != 0) choosePriority();
         mutex.unlock();
+        released.fetch_add(1, std::memory_order_release);
+        WakeAll(released);
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
     // of the hold nor waited for by the next holder.
