@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <tuple>
 #include <utility>
 
 namespace AgcDriver::Graphics {
@@ -50,8 +51,7 @@ constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
 }
 
 BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 8u))), cacheReclaim(context.cacheReclaim), cacheReclaimFutile(context.cacheReclaimFutile), device(context.device), unmap(context.Resolved(&DeviceFunctions::unmapMemory, "vkUnmapMemory")), destroyBuffer(context.Resolved(&DeviceFunctions::destroyBuffer, "vkDestroyBuffer")), freeMemory(context.Resolved(&DeviceFunctions::freeMemory, "vkFreeMemory")), allocateMemory(context.Resolved(&DeviceFunctions::allocateMemory, "vkAllocateMemory")), mapMemory(context.Resolved(&DeviceFunctions::mapMemory, "vkMapMemory")), physical(context.physical), memoryProperties(context.memory), memoryProperties2(context.memoryProperties2) {
-    smallTier.budget = smallBudget;
-    largeTier.budget = budget;
+    std::tie(smallTier.budget, largeTier.budget) = HostTierBudgets(context.memory);
     deviceTier.budget = deviceBudget(context);
     smallDeviceTier.budget = std::max<VkDeviceSize>(smallBudget, deviceTier.budget / 8u);
     memoryProperties = context.memory;
@@ -208,6 +208,16 @@ VkDeviceSize BufferPool::ImageBudget(VkDeviceSize deviceBudget) {
     static const char* value = std::getenv("APS5_IMAGE_POOL_MIB");
     if (value != nullptr) return static_cast<VkDeviceSize>(std::strtoull(value, nullptr, 10)) << 20u;
     return deviceBudget / 4u;
+}
+
+std::pair<VkDeviceSize, VkDeviceSize> BufferPool::HostTierBudgets(const VkPhysicalDeviceMemoryProperties& memory) {
+    VkDeviceSize host = 0;
+    for (std::uint32_t heap = 0; heap < memory.memoryHeapCount && heap < VK_MAX_MEMORY_HEAPS; ++heap) {
+        if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) host = std::max(host, memory.memoryHeaps[heap].size);
+    }
+    constexpr VkDeviceSize smallCeiling = VkDeviceSize{512} << 20u;
+    constexpr VkDeviceSize largeCeiling = VkDeviceSize{2048} << 20u;
+    return {std::clamp(host / 32u, smallBudget, smallCeiling), std::clamp(host / 16u, budget, largeCeiling)};
 }
 
 VkDeviceSize BufferPool::HostImageBudget() {

@@ -359,6 +359,20 @@ void RefusedDeviceSkippedWhileFutile() {
     Expect(mock.liveBytes == 0, "the refused device placement test leaked memory");
 }
 
+void HostTierBudgetsFollowHostHeap() {
+    const auto budgets = [](VkDeviceSize host) {
+        VkPhysicalDeviceMemoryProperties memory{};
+        memory.memoryHeapCount = 2;
+        memory.memoryHeaps[0] = {VkDeviceSize{8} << 30u, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        memory.memoryHeaps[1] = {host, 0};
+        return BufferPool::HostTierBudgets(memory);
+    };
+    Expect(budgets(VkDeviceSize{1} << 30u) == std::pair<VkDeviceSize, VkDeviceSize>{64 * MiB, 512 * MiB}, "a small host heap changed the host tier budgets from their floors");
+    Expect(budgets(VkDeviceSize{8} << 30u) == std::pair<VkDeviceSize, VkDeviceSize>{256 * MiB, 512 * MiB}, "an 8 GiB host heap did not give the small host tier a thirty-second of it");
+    Expect(budgets(VkDeviceSize{24} << 30u) == std::pair<VkDeviceSize, VkDeviceSize>{512 * MiB, 1536 * MiB}, "a 24 GiB host heap did not give the large host tier a sixteenth of it");
+    Expect(budgets(VkDeviceSize{256} << 30u) == std::pair<VkDeviceSize, VkDeviceSize>{512 * MiB, 2048 * MiB}, "a large host heap raised the host tier budgets past their ceilings");
+}
+
 void RefusalTeachesHeapCeiling() {
     mock = MockDevice{};
     auto context = budgetContext();
@@ -1960,6 +1974,7 @@ int main(int argc, char** argv) {
         HostPlacement();
         RefusedDeviceSkippedWhileFutile();
         RefusalTeachesHeapCeiling();
+        HostTierBudgetsFollowHostHeap();
         HostSlotBeforeCacheRelease();
         RefusedDevicePlacement();
         IdleReclaimSkipsHostPlaced();

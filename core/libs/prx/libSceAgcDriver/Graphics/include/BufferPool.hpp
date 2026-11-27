@@ -61,6 +61,7 @@ public:
     explicit BufferPool(const Context& context);
     static VkDeviceSize DeviceBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported = nullptr, bool integratedGpu = false);
     static VkDeviceSize ReclaimTarget(VkDeviceSize bytes);
+    static std::pair<VkDeviceSize, VkDeviceSize> HostTierBudgets(const VkPhysicalDeviceMemoryProperties& memory);
     ~BufferPool();
     BufferPool(const BufferPool&) = delete;
     BufferPool& operator=(const BufferPool&) = delete;
