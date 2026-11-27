@@ -62,6 +62,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "BdaAbi.hpp"
 #include "ShaderCacheSourceVersion.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineBinaryStore.hpp"
 #include "WatchedBlock.hpp"
 #include "ShaderDiskCache.hpp"
 #include <SDL_loadso.h>
@@ -424,7 +425,7 @@ void deviceSelectionTests() {
 // them, as the driver creates its own; the recorder's batches need a real queue and real fences.
 class Device {
 public:
-    explicit Device(bool settleOnOtherFamily = false) {
+    explicit Device(bool settleOnOtherFamily = false, bool pipelineBinaries = false) {
 #ifdef _WIN32
         library = SDL_LoadObject("vulkan-1.dll");
 #elif defined(__APPLE__)
@@ -472,6 +473,14 @@ public:
                 }
                 return false;
             };
+            if (selected.apiVersion >= VK_API_VERSION_1_2 || hasExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+                VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+                VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+                function<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(context.physical, &properties);
+                driverId = driver.driverID;
+            }
+            binaryPolicy = PipelineBinaryStore::PolicyForDriver(driverId);
+            binaryAvailable = hasExtension(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
             memoryBudget = hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
             pushDescriptors = hasExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
             auto bytes = AgcDriver::QueryBdaByteFeatures(context.physical, function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"), available);
@@ -636,6 +645,35 @@ public:
                 robustness.pNext = address.pNext;
                 address.pNext = &robustness;
             }
+            VkPhysicalDeviceMaintenance5FeaturesKHR maintenance{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+            VkPhysicalDevicePipelineBinaryFeaturesKHR binaryFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
+            VkDevicePipelineBinaryInternalCacheControlKHR internalCache{VK_STRUCTURE_TYPE_DEVICE_PIPELINE_BINARY_INTERNAL_CACHE_CONTROL_KHR};
+            const std::array binaryDependencies{VK_KHR_MAINTENANCE_5_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME};
+            const bool wantPipelineBinaries = pipelineBinaries && binaryPolicy == PipelineBinaryPolicy::Enabled && binaryAvailable && std::ranges::all_of(binaryDependencies, hasExtension) &&
+                PipelineBinaryStore::LayersCompatible(context.physical, function<PFN_vkEnumerateDeviceLayerProperties>("vkEnumerateDeviceLayerProperties"));
+            if (wantPipelineBinaries) {
+                maintenance.pNext = &binaryFeatures;
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                binaryEnabled = maintenance.maintenance5 == VK_TRUE && binaryFeatures.pipelineBinaries == VK_TRUE;
+                if (binaryEnabled) {
+                    for (const auto* extension : binaryDependencies) {
+                        if (std::ranges::none_of(extensionsEnabled, [&](const char* enabled) { return std::strcmp(enabled, extension) == 0; })) extensionsEnabled.push_back(extension);
+                    }
+                    extensionsEnabled.push_back(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+                    binaryFeatures.pNext = address.pNext;
+                    address.pNext = &maintenance;
+                    VkPhysicalDevicePipelineBinaryPropertiesKHR properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_PROPERTIES_KHR};
+                    VkPhysicalDeviceProperties2 queried{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &properties};
+                    function<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(context.physical, &queried);
+                    if (properties.pipelineBinaryInternalCacheControl == VK_TRUE) {
+                        internalCache.disableInternalCache = VK_TRUE;
+                        internalCache.pNext = address.pNext;
+                        address.pNext = &internalCache;
+                    }
+                    std::cout << "pipeline binary internal_cache_disabled=" << internalCache.disableInternalCache << " prefers_internal_cache=" << properties.pipelineBinaryPrefersInternalCache << " driver=" << queried.properties.driverVersion << '\n';
+                }
+            }
             if (pushDescriptors) extensionsEnabled.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             const std::array<VkDeviceQueueCreateInfo, 2> queueInfos{queue, settle};
@@ -679,6 +717,10 @@ public:
 
     ~Device() { release(); }
     bool NullDescriptors() const { return nullDescriptors; }
+    bool PipelineBinaries() const { return binaryEnabled; }
+    bool PipelineBinaryExtension() const { return binaryAvailable; }
+    PipelineBinaryPolicy BinaryPolicy() const { return binaryPolicy; }
+    VkDriverId DriverId() const { return driverId; }
     bool PushDescriptors() const { return pushDescriptors; }
     void UsePushDescriptors() { context.pushDescriptors = pushDescriptors; }
     const Context& GetContext() const { return context; }
@@ -739,6 +781,10 @@ private:
     VkInstance instance = VK_NULL_HANDLE;
     Context context{};
     bool graphics = false;
+    bool binaryEnabled = false;
+    bool binaryAvailable = false;
+    VkDriverId driverId = VK_DRIVER_ID_MAX_ENUM;
+    PipelineBinaryPolicy binaryPolicy = PipelineBinaryPolicy::Disabled;
     std::mutex settleMutex;
     bool nullDescriptors = false;
     bool memoryBudget = false;
@@ -18004,6 +18050,181 @@ void pipelineCacheHeaderTests(const Device& device) {
     std::cout << "long-path pipeline cache header reused without reloading\n";
 }
 
+std::vector<std::uint32_t> binaryStoreLargeSpirv(std::uint32_t operations) {
+    std::vector<std::uint32_t> code{0x07230203u, 0x00010000u, 0u, 0u, 0u};
+    std::uint32_t next = 1;
+    const auto id = [&] { return next++; };
+    const auto op = [&](std::uint32_t opcode, std::initializer_list<std::uint32_t> operands) {
+        code.push_back((static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | opcode);
+        code.insert(code.end(), operands);
+    };
+    const auto voidType = id(), functionType = id(), uintType = id(), vectorType = id(), inputPointer = id(), invocation = id();
+    const auto arrayType = id(), blockType = id(), blockPointer = id(), buffer = id(), elementPointer = id(), zero = id(), shift = id();
+    std::array<std::uint32_t, 64> constants{};
+    for (auto& constant : constants) constant = id();
+    const auto main = id(), label = id();
+    op(17, {1});
+    op(14, {0, 1});
+    op(15, {5, main, 0x6e69616du, 0u, invocation});
+    op(16, {main, 17, 64, 1, 1});
+    op(71, {invocation, 11, 28});
+    op(71, {arrayType, 6, 4});
+    op(72, {blockType, 0, 35, 0});
+    op(71, {blockType, 3});
+    op(71, {buffer, 34, 0});
+    op(71, {buffer, 33, 0});
+    op(19, {voidType});
+    op(33, {functionType, voidType});
+    op(21, {uintType, 32, 0});
+    op(23, {vectorType, uintType, 3});
+    op(32, {inputPointer, 1, vectorType});
+    op(29, {arrayType, uintType});
+    op(30, {blockType, arrayType});
+    op(32, {blockPointer, 2, blockType});
+    op(32, {elementPointer, 2, uintType});
+    op(59, {inputPointer, invocation, 1});
+    op(59, {blockPointer, buffer, 2});
+    op(43, {uintType, zero, 0});
+    op(43, {uintType, shift, 13});
+    for (std::size_t index = 0; index < constants.size(); ++index) op(43, {uintType, constants[index], static_cast<std::uint32_t>(0x9e3779b9u * (index + 1u)) | 1u});
+    op(54, {voidType, main, 0, functionType});
+    op(248, {label});
+    const auto loaded = id();
+    op(61, {vectorType, loaded, invocation});
+    const auto x = id();
+    op(81, {uintType, x, loaded, 0});
+    const auto element = id();
+    op(65, {elementPointer, element, buffer, zero, x});
+    const auto value = id();
+    op(61, {uintType, value, element});
+    std::array<std::uint32_t, 8> accumulators{};
+    for (std::size_t index = 0; index < accumulators.size(); ++index) {
+        accumulators[index] = id();
+        op(198, {uintType, accumulators[index], value, constants[index]});
+    }
+    for (std::uint32_t index = 0; index < operations; ++index) {
+        const auto lane = index % accumulators.size();
+        const auto result = id();
+        switch (index % 4u) {
+        case 0: op(132, {uintType, result, accumulators[lane], constants[(index * 7u) % constants.size()]}); break;
+        case 1: op(128, {uintType, result, accumulators[lane], accumulators[(lane + 3u) % accumulators.size()]}); break;
+        case 2: op(198, {uintType, result, accumulators[lane], constants[(index * 13u + 5u) % constants.size()]}); break;
+        default: op(194, {uintType, result, accumulators[lane], shift}); break;
+        }
+        accumulators[lane] = result;
+    }
+    auto combined = accumulators[0];
+    for (std::size_t index = 1; index < accumulators.size(); ++index) {
+        const auto result = id();
+        op(198, {uintType, result, combined, accumulators[index]});
+        combined = result;
+    }
+    op(62, {element, combined});
+    op(253, {});
+    op(56, {});
+    code[3] = next;
+    return code;
+}
+
+int pipelineBinaryTests(const Device& device, std::string_view pass) {
+    if (!device.PipelineBinaryExtension()) {
+        std::cout << "skipped, the device lacks VK_KHR_pipeline_binary\n";
+        return 77;
+    }
+    const bool gated = device.BinaryPolicy() == PipelineBinaryPolicy::DisabledByDriver;
+    Require(gated || device.PipelineBinaries(), "pipeline binary extension is present but was not enabled for an allowed driver");
+    auto context = device.GetContext();
+    std::unique_ptr<PipelineCache> cache;
+    if (gated) {
+        cache = std::make_unique<PipelineCache>(context, device.Properties());
+        context.pipelineCache = cache->Handle();
+        context.pipelineCacheSynchronization = &cache->Synchronization();
+        Require(context.pipelineCache != VK_NULL_HANDLE, "policy fallback has no ordinary pipeline cache");
+    }
+    struct Objects {
+        const Context& context;
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipelineLayout bufferLayout = VK_NULL_HANDLE;
+        VkShaderModule module = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        void Release() {
+            if (pipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+            if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            pipeline = VK_NULL_HANDLE;
+            module = VK_NULL_HANDLE;
+        }
+        ~Objects() {
+            Release();
+            if (layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+            if (bufferLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, bufferLayout, nullptr);
+            if (setLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, setLayout, nullptr);
+        }
+    } objects{context};
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &objects.layout), "vkCreatePipelineLayout");
+    const VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    setInfo.bindingCount = 1;
+    setInfo.pBindings = &binding;
+    Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &setInfo, nullptr, &objects.setLayout), "vkCreateDescriptorSetLayout");
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &objects.setLayout;
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &objects.bufferLayout), "vkCreatePipelineLayout");
+    PipelineBinaryStore store(context, device.Properties(), device.DriverId());
+    Require(gated ? store.PolicyStatus() == PipelineBinaryPolicy::DisabledByDriver : store.IsReady(), "unexpected pipeline binary store status");
+    const auto build = [&](std::span<const std::uint32_t> spirv, VkPipelineLayout layout, std::span<const std::uint32_t> layoutKey, VkPipelineCreationFeedback* feedback) {
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = spirv.size() * sizeof(std::uint32_t);
+        moduleInfo.pCode = spirv.data();
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &objects.module), "vkCreateShaderModule");
+        VkPipelineCreationFeedbackCreateInfo feedbackInfo{VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, nullptr, feedback, 0, nullptr};
+        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, feedback != nullptr ? &feedbackInfo : nullptr};
+        info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, objects.module, "main", nullptr};
+        info.layout = layout;
+        const auto started = std::chrono::steady_clock::now();
+        if (layoutKey.empty()) Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &info, nullptr, &objects.pipeline), "vkCreateComputePipelines");
+        else store.CreateComputePipeline(info, spirv, layoutKey, context.pipelineCache, context.pipelineCacheSynchronization, &objects.pipeline);
+        const auto milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        objects.Release();
+        return milliseconds;
+    };
+    const std::array<std::uint32_t, 2> layoutKey{0, 0};
+    for (const auto width : {4u, 8u}) {
+        const std::array spirv{0x07230203u, 0x00010000u, 0u, 6u, 0u,
+            0x00020011u, 1u, 0x0003000eu, 0u, 1u,
+            0x0005000fu, 5u, 4u, 0x6e69616du, 0u,
+            0x00060010u, 4u, 17u, width, 1u, 1u,
+            0x00020013u, 1u, 0x00030021u, 2u, 1u,
+            0x00050036u, 1u, 4u, 0u, 2u, 0x000200f8u, 5u, 0x000100fdu, 0x00010038u};
+        static_cast<void>(build(spirv, objects.layout, layoutKey, nullptr));
+    }
+    const auto large = binaryStoreLargeSpirv(60000);
+    const std::array<std::uint32_t, 4> bufferKey{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+    VkPipelineCreationFeedback stored{};
+    const auto storedMilliseconds = build(large, objects.bufferLayout, bufferKey, &stored);
+    std::printf("large pipeline through the store: pass=%.*s words=%zu ms=%.1f feedback_valid=%u feedback_ms=%.1f\n", static_cast<int>(pass.size()), pass.data(), large.size(), storedMilliseconds,
+        (stored.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) != 0 ? 1u : 0u, static_cast<double>(stored.duration) / 1e6);
+    if (gated) {
+        cache->SaveNow();
+        Require(PipelineCacheTestAccess::HasHeader(*cache), "ordinary pipeline cache was not persisted");
+        std::cout << "pipeline binary policy fallback: ordinary_pipelines=3 cache_saved=1; binary round-trip coverage was not exercised\n";
+        return 0;
+    }
+    if (pass == "restore") {
+        VkPipelineCreationFeedback cold{};
+        const auto coldMilliseconds = build(large, objects.bufferLayout, {}, &cold);
+        std::printf("large pipeline built without the store or a pipeline cache: ms=%.1f feedback_ms=%.1f\n", coldMilliseconds, static_cast<double>(cold.duration) / 1e6);
+        if (coldMilliseconds < 50.0) {
+            std::printf("timing evidence inconclusive: the driver builds the large pipeline in %.1f ms\n", coldMilliseconds);
+        } else {
+            Require(storedMilliseconds * 4.0 < coldMilliseconds, "restoring the large pipeline from its binary was not at least four times faster than building it");
+            std::printf("restored the large pipeline %.1fx faster than the driver builds it\n", coldMilliseconds / storedMilliseconds);
+        }
+    }
+    return 0;
+}
+
 int pipelineCacheFileTests(const Device& device) {
     const auto& context = device.GetContext();
     const auto directory = std::filesystem::temp_directory_path() / ("aps5-pipeline-cache-file-test-" + std::to_string(std::random_device{}()));
@@ -19769,9 +19990,25 @@ int main(int argc, char** argv) {
             std::cout << "queued write group tests passed\n";
             return 0;
         }
+        const bool binaryTest = argc == 4 && std::string_view(argv[1]) == "--pipeline-binary-only";
+        if (binaryTest) {
+#ifdef _WIN32
+            _putenv_s("ANYPS5_SHADER_CACHE_DIR", argv[2]);
+            _putenv_s("ANYPS5_NO_SHADER_CACHE", "0");
+            _putenv_s("APS5_PIPELINE_BINARY_MIN_WORDS", "0");
+            _putenv_s("APS5_PIPELINE_BINARY_MIN_MS", "0");
+            _putenv_s("APS5_NO_PIPELINE_BINARIES", "");
+#else
+            setenv("ANYPS5_SHADER_CACHE_DIR", argv[2], 1);
+            setenv("ANYPS5_NO_SHADER_CACHE", "0", 1);
+            setenv("APS5_PIPELINE_BINARY_MIN_WORDS", "0", 1);
+            setenv("APS5_PIPELINE_BINARY_MIN_MS", "0", 1);
+            unsetenv("APS5_NO_PIPELINE_BINARIES");
+#endif
+        }
         std::unique_ptr<Device> created;
         try {
-            created = std::make_unique<Device>(argc == 2 && (std::string_view(argv[1]) == "--import-watch-other-family-only" || std::string_view(argv[1]) == "--deferred-settle-other-family-only" || std::string_view(argv[1]) == "--host-import-lifetime-other-family-only" || std::string_view(argv[1]) == "--settle-write-order-other-family-only"));
+            created = std::make_unique<Device>(argc == 2 && (std::string_view(argv[1]) == "--import-watch-other-family-only" || std::string_view(argv[1]) == "--deferred-settle-other-family-only" || std::string_view(argv[1]) == "--host-import-lifetime-other-family-only" || std::string_view(argv[1]) == "--settle-write-order-other-family-only"), binaryTest);
         } catch (const TestConfigurationError&) {
             throw;
         } catch (const std::exception& error) {
@@ -19780,6 +20017,7 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (binaryTest) return pipelineBinaryTests(device, argv[3]);
         if (argc == 2 && std::string_view(argv[1]) == "--multisample-use-collect-only") return multisampleUseCollectTests(device) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-lifetime-only") return RunHostImportLifetimeTests(device.GetContext());
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-mutation-race-only") return RunHostImportMutationRaceTests(device.GetContext());
