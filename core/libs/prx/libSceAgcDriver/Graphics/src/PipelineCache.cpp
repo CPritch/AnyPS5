@@ -32,6 +32,11 @@ bool profiling() {
     return profile;
 }
 
+bool tracingSaves() {
+    static const bool traced = std::getenv("APS5_TRACE_PIPELINE_BUILDS") != nullptr;
+    return traced;
+}
+
 std::filesystem::path hostPath(const std::filesystem::path& path, std::error_code& error) {
 #ifdef _WIN32
     return ShaderRecompiler::NativeCachePath_nid_no_patch(path, error);
@@ -304,6 +309,7 @@ bool PipelineCache::save(bool final, bool waitForPipelines) try {
         settledFile = file;
     };
     auto disk = fileUnchanged ? File{} : readFile();
+    const std::uint64_t fileBefore = fileUnchanged ? settledFile->dataBytes : disk.header.dataBytes;
     if (disk.state == FileState::Unreadable) {
         std::fprintf(stderr, "[pipeline-cache] cannot read %s; not saving over it\n", path.string().c_str());
         return true;
@@ -357,6 +363,7 @@ bool PipelineCache::save(bool final, bool waitForPipelines) try {
         for (unsigned attempt = 0; attempt < attempts && result == VK_INCOMPLETE; ++attempt) {
             if (getData(context.device, source, &size, nullptr) != VK_SUCCESS || size == 0) return true;
             if (merged != VK_NULL_HANDLE && size == disk.header.dataBytes) {
+                if (tracingSaves()) std::fprintf(stderr, "[pipeline-cache] not saving %s: the file merged with the live cache (%.1f KiB) is as large as the file\n", path.string().c_str(), static_cast<double>(liveBytes) / 1024.0);
                 settle(disk.header);
                 return true;
             }
@@ -383,7 +390,7 @@ bool PipelineCache::save(bool final, bool waitForPipelines) try {
         return true;
     }
     settle(header);
-    if (final || profiling()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), mergedWithFile ? " (merged with the file)" : "", final ? " (teardown)" : "");
+    if (final || profiling() || tracingSaves()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms (live cache %.1f KiB, file before %.1f KiB)%s%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), static_cast<double>(liveBytes) / 1024.0, static_cast<double>(fileBefore) / 1024.0, mergedWithFile ? " (merged with the file)" : "", final ? " (teardown)" : "");
     return true;
 } catch (const std::bad_alloc&) {
     std::fputs("[pipeline-cache] save skipped: host memory exhausted\n", stderr);
