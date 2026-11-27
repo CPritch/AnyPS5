@@ -52,6 +52,8 @@ private:
     };
 
     File readFile() const;
+    File readFile(const std::filesystem::path& from) const;
+    void seedFromSibling();
     std::optional<FileHeader> readHeader() const;
     void load(std::vector<std::byte>& initialData);
     bool save(bool final, bool waitForPipelines);
