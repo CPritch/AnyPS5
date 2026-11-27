@@ -6746,7 +6746,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization, &trace);
     if (trace.Active()) {
         const std::array identity{Graphics::DescribedPipelineIdentity(shader)};
-        trace.Report({state->probingFloatControls ? "compute-probe" : "compute", programAddress, identity[0], shader.spirv.size(), shader.specialization.size(), Graphics::PipelineSpecializationHash(specialization.Info()), state->probingFloatControls ? Graphics::PipelineBuildJournal::Unrecorded : Graphics::PipelineBuildJournalOf(identity)});
+        trace.Report({state->probingFloatControls ? "compute-probe" : "compute", programAddress, identity[0], shader.spirv.size(), shader.specialization.size(), Graphics::PipelineSpecializationHash(specialization.Info()), state->probingFloatControls || identity[0].Empty() ? Graphics::PipelineBuildJournal::Unrecorded : Graphics::PipelineBuildJournalOf(identity)});
     }
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;

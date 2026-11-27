@@ -3724,7 +3724,12 @@ std::uint64_t HandoffAfterNanoseconds() {
 
 bool GpuMutexType::open(const void* token) {
     const auto* first = priority.load(std::memory_order_acquire);
-    return (first == nullptr || first == token) && mutex.try_lock();
+    if (first != nullptr && first != token) {
+        const auto now = SteadyNanoseconds();
+        const auto named = priorityNamed.load(std::memory_order_relaxed);
+        if (now < named || now - named < HandoffAfterNanoseconds()) return false;
+    }
+    return mutex.try_lock();
 }
 
 void GpuMutexType::enter() {
@@ -3734,9 +3739,13 @@ void GpuMutexType::enter() {
 
 void GpuMutexType::block() {
     waiters.fetch_add(1, std::memory_order_seq_cst);
+    if (HandoffAfterNanoseconds() == 0) {
+        LockSpinning(mutex, HandoffSpinWindow());
+        waiters.fetch_sub(1, std::memory_order_relaxed);
+        return;
+    }
     const auto* token = CurrentThreadToken();
-    const bool queued = HandoffAfterNanoseconds() != 0;
-    if (queued) {
+    {
         std::lock_guard lock(queueMutex);
         queue.emplace_back(token, SteadyNanoseconds());
     }
@@ -3745,16 +3754,18 @@ void GpuMutexType::block() {
         if (SpinUntil(HandoffSpinWindow(), [&] { return open(token); })) break;
         WaitWhile(released, seen);
     }
-    if (queued) leave(token);
+    leave(token);
     waiters.fetch_sub(1, std::memory_order_relaxed);
 }
 
-void GpuMutexType::choosePriority() {
+bool GpuMutexType::choosePriority() {
     const auto now = SteadyNanoseconds();
     std::lock_guard lock(queueMutex);
     const void* first = nullptr;
     if (!queue.empty() && queue.front().second <= now && now - queue.front().second >= HandoffAfterNanoseconds()) first = queue.front().first;
+    if (first != nullptr) priorityNamed.store(now, std::memory_order_relaxed);
     priority.store(first, std::memory_order_release);
+    return first != nullptr;
 }
 
 void GpuMutexType::leave(const void* token) {
@@ -3767,6 +3778,10 @@ bool GpuMutexType::tryEnter() {
     return HeldByThisThread() || open(CurrentThreadToken());
 }
 
+bool GpuMutexType::tryTake() {
+    return HeldByThisThread() || mutex.try_lock();
+}
+
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
@@ -3777,7 +3792,7 @@ void GpuMutexType::acquired() {
 
 bool GpuMutexType::try_lock() {
     if (!GpuLockProfiled()) {
-        if (!tryEnter()) return false;
+        if (!tryTake()) return false;
         acquired();
         return true;
     }
@@ -3786,7 +3801,7 @@ bool GpuMutexType::try_lock() {
     auto& stats = LockStats();
     const auto tagged = std::exchange(stats.nextSite, GpuLockSite::Other);
     ++stats.tries;
-    if (!tryEnter()) {
+    if (!tryTake()) {
         ++stats.triesFailed;
         return false;
     }
@@ -3813,10 +3828,15 @@ void GpuMutexType::unlock() {
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
-        if (HandoffAfterNanoseconds() != 0 && waiters.load(std::memory_order_seq_cst) != 0) choosePriority();
-        mutex.unlock();
-        released.fetch_add(1, std::memory_order_release);
-        WakeAll(released);
+        if (HandoffAfterNanoseconds() == 0) {
+            mutex.unlock();
+        } else {
+            const bool handing = waiters.load(std::memory_order_seq_cst) != 0 && choosePriority();
+            mutex.unlock();
+            released.fetch_add(1, std::memory_order_release);
+            if (handing) WakeAll(released);
+            else WakeOne(released);
+        }
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
     // of the hold nor waited for by the next holder.
@@ -3970,13 +3990,11 @@ std::uint32_t GpuLockThreadTag() {
 }
 
 GpuMutexType& GpuMutex() {
-#ifdef __APPLE__
-    static auto* mutex = new GpuMutexType;
+    static auto* mutex = [] {
+        static_cast<void>(HandoffAfterNanoseconds());
+        return new GpuMutexType;
+    }();
     return *mutex;
-#else
-    static GpuMutexType mutex;
-    return mutex;
-#endif
 }
 
 std::function<bool()> YieldToGpuMutexWaiters(std::function<bool()> stop) {

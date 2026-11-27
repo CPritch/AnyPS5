@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <string_view>
+#include <cstdlib>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -153,34 +155,28 @@ void GpuMutexRecursion() {
 }
 
 void GpuMutexHandoff() {
+    if (const char* text = std::getenv("APS5_GPU_MUTEX_HANDOFF_MS"); text != nullptr && std::string_view(text) == "0") return;
     auto& mutex = AgcDriver::GuestMemory::GpuMutex();
     int handed = 0;
     for (int round = 0; round < 20; ++round) {
-        std::atomic<int> order{0};
-        int oldest = 0;
-        int newcomer = 0;
-        std::atomic<bool> arriving{false};
+        std::atomic<int> entered{0};
+        std::atomic<bool> started{false};
         mutex.lock();
-        std::thread first([&] {
+        std::thread waiter([&] {
+            started.store(true);
             mutex.lock();
-            oldest = ++order;
+            entered.fetch_add(1);
             mutex.unlock();
         });
+        while (!started.load()) std::this_thread::yield();
         std::this_thread::sleep_for(std::chrono::milliseconds(60));
-        std::thread second([&] {
-            arriving.store(true);
-            mutex.lock();
-            newcomer = ++order;
-            mutex.unlock();
-        });
-        while (!arriving.load()) std::this_thread::yield();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
         mutex.unlock();
-        first.join();
-        second.join();
-        if (oldest == 1 && newcomer == 2) ++handed;
+        mutex.lock();
+        if (entered.load() == 1) ++handed;
+        mutex.unlock();
+        waiter.join();
     }
-    Check(handed == 20, "a thread that waited past the handoff time takes the GPU mutex before a thread that arrived later");
+    Check(handed == 20, "a thread that waited past the handoff time takes the GPU mutex before its releaser takes it again");
     Check(!mutex.HeldByThisThread() && mutex.try_lock(), "the GPU mutex is free after the handoffs");
     mutex.unlock();
 }
