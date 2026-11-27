@@ -49,12 +49,19 @@ public:
     using PipelineUseLock = std::shared_lock<std::shared_mutex>;
     using SnapshotLock = std::unique_lock<std::shared_mutex>;
 
-    PipelineUseLock LockForPipelineUse() const { return PipelineUseLock(mutex); }
+    explicit PipelineCacheSynchronization(bool excludesPipelineUse = true) : excludesPipelineUse(excludesPipelineUse) {}
+
+    static bool SnapshotsExcludePipelineUse(const VkPhysicalDeviceProperties& properties) { return properties.vendorID == IntelVendorId; }
+
+    bool ExcludesPipelineUse() const { return excludesPipelineUse; }
+    PipelineUseLock LockForPipelineUse() const { return excludesPipelineUse ? PipelineUseLock(mutex) : PipelineUseLock{}; }
     SnapshotLock LockForSnapshot() const { return SnapshotLock(mutex); }
     SnapshotLock TryLockForSnapshot() const { return SnapshotLock(mutex, std::try_to_lock); }
 
 private:
+    static constexpr std::uint32_t IntelVendorId = 0x8086u;
     mutable PrimedSharedMutex mutex;
+    const bool excludesPipelineUse;
 };
 
 [[noreturn, gnu::cold, gnu::noinline]] inline void RequireFailed(const std::string& reason) {

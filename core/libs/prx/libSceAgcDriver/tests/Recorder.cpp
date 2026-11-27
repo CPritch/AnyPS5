@@ -18210,7 +18210,10 @@ int pipelineCacheFileTests(const Device& device) {
 #endif
     }
     {
-        PipelineCache busy(context, properties);
+        auto intel = properties;
+        intel.vendorID = 0x8086u;
+        PipelineCache busy(context, intel);
+        Require(busy.Synchronization().ExcludesPipelineUse(), "a pipeline cache on an Intel device let snapshots overlap pipeline creation");
         build(busy.Handle(), 0);
         std::promise<void> held;
         std::promise<void> release;
@@ -18235,6 +18238,30 @@ int pipelineCacheFileTests(const Device& device) {
         saving.wait();
         Require(saveReturned, "a periodic pipeline cache save waited for a pipeline creation to finish");
         Require(otherCreationProceeded, "a pipeline creation waited behind a periodic pipeline cache save");
+    }
+    {
+        PipelineCache overlapping(context, properties);
+        Require(overlapping.Synchronization().ExcludesPipelineUse() == PipelineCacheSynchronization::SnapshotsExcludePipelineUse(properties), "the pipeline cache did not take its snapshot exclusion from the device's vendor");
+        if (!overlapping.Synchronization().ExcludesPipelineUse()) {
+            std::atomic<bool> stop{false};
+            std::promise<void> started;
+            std::thread creations([&] {
+                bool first = true;
+                while (!stop.load(std::memory_order_acquire)) {
+                    auto use = overlapping.Synchronization().LockForPipelineUse();
+                    build(overlapping.Handle(), 1);
+                    if (first) started.set_value();
+                    first = false;
+                }
+            });
+            started.get_future().wait();
+            auto saving = std::async(std::launch::async, [&] { overlapping.SaveNow(); });
+            const bool saveReturned = saving.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+            stop.store(true, std::memory_order_release);
+            creations.join();
+            saving.wait();
+            Require(saveReturned, "a waiting pipeline cache save did not finish while pipeline creations ran back to back on a driver that synchronizes the cache itself");
+        }
     }
     std::cout << "Pipeline cache file merge tests passed\n";
     return 0;

@@ -1,0 +1,5 @@
+# libSceAgcDriver
+
+## change [Periodic pipeline cache saves skip busy intervals]
+
+- [Pipeline cache saves on Intel devices](../../../core/libs/prx/libSceAgcDriver/Graphics/src/PipelineCache.cpp) (libSceAgcDriver) - on a device with Intel's vendor ID a snapshot still excludes pipeline creation, because Intel's Windows driver crashed in `vkGetPipelineCacheData` during creation ([#4781](https://github.com/boykopovar/AnyPS5/issues/4781)). There, creations that overlap without a gap keep the saver from saving, so a crash loses the pipelines built since the last save; and once one interval was skipped the saver waits, which on a writer-preferring `shared_mutex` holds later creations until a long compile ends (this froze Yōtei's (PPSA26344) loading). Other devices snapshot during creation, as the Vulkan specification allows for a cache that is not externally synchronized. Whether Intel's Linux driver needs the exclusion is not measured. Closes when: Intel's driver reads a cache safely during creation.

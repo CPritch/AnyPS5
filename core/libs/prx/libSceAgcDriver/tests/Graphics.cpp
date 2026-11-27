@@ -16196,6 +16196,19 @@ int main(int argc, char** argv) {
             pipelineUse.unlock();
             Require(synchronization.TryLockForSnapshot().owns_lock(), "pipeline cache snapshot stayed blocked after pipeline creation finished");
         }
+        {
+            AgcDriver::Graphics::PipelineCacheSynchronization synchronization(false);
+            auto pipelineUse = synchronization.LockForPipelineUse();
+            bool snapshotAcquired = false;
+            std::thread snapshot([&] { snapshotAcquired = synchronization.TryLockForSnapshot().owns_lock(); });
+            snapshot.join();
+            Require(!pipelineUse.owns_lock() && snapshotAcquired, "a pipeline cache snapshot waited for a pipeline creation on a driver that synchronizes the cache itself");
+            VkPhysicalDeviceProperties properties{};
+            for (const auto [vendor, excludes] : {std::pair{0x8086u, true}, std::pair{0x10deu, false}, std::pair{0x1002u, false}, std::pair{0x13b5u, false}, std::pair{0x106bu, false}}) {
+                properties.vendorID = vendor;
+                Require(AgcDriver::Graphics::PipelineCacheSynchronization::SnapshotsExcludePipelineUse(properties) == excludes, "pipeline cache snapshots of vendor " + std::to_string(vendor) + (excludes ? " overlap pipeline creation, which crashes Intel's driver" : " exclude pipeline creation, which the Vulkan specification synchronizes"));
+            }
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--undithered-alpha-to-coverage-state") {
             UnditheredAlphaToCoverageTests();
             std::cout << "Existing undithered alpha-to-coverage states passed\n";

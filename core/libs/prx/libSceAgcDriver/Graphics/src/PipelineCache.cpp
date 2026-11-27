@@ -44,7 +44,7 @@ std::mutex& pathMutex(const std::filesystem::path& path) {
 
 }
 
-PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool loadFromFile) : context(context), properties(properties) {
+PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool loadFromFile) : context(context), properties(properties), synchronization(PipelineCacheSynchronization::SnapshotsExcludePipelineUse(properties)) {
     static_assert(sizeof(FileHeader) == 24);
     const auto directory = ShaderRecompiler::ShaderCacheDirectory();
     if (!directory.empty()) {
@@ -272,14 +272,18 @@ bool PipelineCache::save(bool final, bool waitForPipelines) try {
     {
         auto synchronizationLock = source == cache ? snapshot() : PipelineCacheSynchronization::SnapshotLock{};
         if (source == cache && !synchronizationLock.owns_lock()) return false;
-        if (getData(context.device, source, &size, nullptr) != VK_SUCCESS || size == 0) return true;
-        if (merged != VK_NULL_HANDLE && size == disk.header.dataBytes) {
-            settle(disk.header);
-            return true;
+        VkResult result = VK_INCOMPLETE;
+        for (unsigned attempt = 0; attempt < SnapshotAttempts && result == VK_INCOMPLETE; ++attempt) {
+            if (getData(context.device, source, &size, nullptr) != VK_SUCCESS || size == 0) return true;
+            if (merged != VK_NULL_HANDLE && size == disk.header.dataBytes) {
+                settle(disk.header);
+                return true;
+            }
+            file.resize(sizeof(FileHeader) + size);
+            result = getData(context.device, source, &size, file.data() + sizeof(FileHeader));
+            if (result != VK_SUCCESS && result != VK_INCOMPLETE) return true;
         }
-        file.resize(sizeof(FileHeader) + size);
-        const auto result = getData(context.device, source, &size, file.data() + sizeof(FileHeader));
-        if (result != VK_SUCCESS && result != VK_INCOMPLETE) return true;
+        if (result != VK_SUCCESS) return false;
         file.resize(sizeof(FileHeader) + size);
     }
     destroyMerged.Reset();

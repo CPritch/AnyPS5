@@ -46,6 +46,7 @@ std::atomic<bool> armed{false};
 std::atomic<bool> failStartup{false};
 std::atomic<unsigned> queries{0};
 std::atomic<unsigned> faults{0};
+std::atomic<unsigned> growDuringSnapshot{0};
 std::size_t initialBytes = 64;
 
 std::vector<std::byte> Payload() {
@@ -84,12 +85,17 @@ VKAPI_ATTR VkResult VKAPI_CALL Merge(VkDevice, VkPipelineCache destination, std:
 
 VKAPI_ATTR VkResult VKAPI_CALL Data(VkDevice, VkPipelineCache cache, std::size_t* size, void* output) {
     std::lock_guard lock(mutex);
-    const auto& bytes = caches.at(cache);
-    if (output != nullptr) {
-        Check(*size >= bytes.size(), "cache snapshot buffer is too small");
-        std::memcpy(output, bytes.data(), bytes.size());
+    auto& bytes = caches.at(cache);
+    if (output != nullptr && *size < bytes.size()) {
+        std::memcpy(output, bytes.data(), *size);
+        return VK_INCOMPLETE;
     }
+    if (output != nullptr) std::memcpy(output, bytes.data(), bytes.size());
     *size = bytes.size();
+    if (output == nullptr && growDuringSnapshot != 0) {
+        --growDuringSnapshot;
+        bytes.resize(bytes.size() + 4096, std::byte{7});
+    }
     if (output == nullptr && armed && ++queries == 2) {
         armed = false;
         ++faults;
@@ -121,9 +127,9 @@ void Grow(VkPipelineCache cache, std::size_t bytes = 128) {
 }
 
 int main(int argc, char** argv) {
-    Check(argc == 2, "expected startup, now, busy, destructor, worker or read-retry");
+    Check(argc == 2, "expected startup, now, busy, destructor, worker, incomplete or read-retry");
     const std::string_view mode(argv[1]);
-    Check(mode == "startup" || mode == "now" || mode == "busy" || mode == "destructor" || mode == "worker" || mode == "read-retry", "unknown mode");
+    Check(mode == "startup" || mode == "now" || mode == "busy" || mode == "destructor" || mode == "worker" || mode == "incomplete" || mode == "read-retry", "unknown mode");
     Check(!AgcDriver::Graphics::PipelineCache::WaitsForPipelines(0) && !AgcDriver::Graphics::PipelineCache::WaitsForPipelines(AgcDriver::Graphics::PipelineCache::BusySavesBeforeWait - 1u) && AgcDriver::Graphics::PipelineCache::WaitsForPipelines(AgcDriver::Graphics::PipelineCache::BusySavesBeforeWait), "the periodic save did not wait for running pipeline builds only after enough saves were skipped as busy");
 #ifndef _WIN32
     if (mode == "read-retry") return 77;
@@ -171,6 +177,35 @@ int main(int argc, char** argv) {
     std::filesystem::path file;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) if (entry.path().extension() == ".bin") file = entry.path();
     Check(!file.empty(), "initial save created no cache file");
+    if (mode == "incomplete") {
+        Grow(cache->Handle(), 256);
+        std::filesystem::remove(file);
+        growDuringSnapshot = 2;
+        cache->SaveNow();
+        Check(growDuringSnapshot == 0, "the snapshot did not query the cache size again after the cache grew");
+        std::size_t live = 0;
+        {
+            std::lock_guard lock(mutex);
+            live = caches.at(cache->Handle()).size();
+        }
+        Check(Read(file).size() == 24 + live, "a cache that grew while it was snapshotted was saved truncated");
+        std::filesystem::remove(file);
+        growDuringSnapshot = 1000;
+        cache->SaveUnlessBusy();
+        Check(!std::filesystem::exists(file), "a snapshot that never completed wrote a cache file");
+        Check(growDuringSnapshot == 1000 - 1 - PipelineCache::SnapshotAttempts, "an incomplete snapshot was not retried as often as the saver allows");
+        growDuringSnapshot = 0;
+        {
+            std::lock_guard lock(mutex);
+            live = caches.at(cache->Handle()).size();
+        }
+        cache->SaveNow();
+        Check(Read(file).size() == 24 + live, "an incomplete snapshot prevented a later complete save");
+        cache.reset();
+        Check(caches.empty(), "incomplete snapshot test leaked Vulkan objects");
+        std::puts("incomplete: retried a snapshot the cache outgrew and wrote no truncated file");
+        return 0;
+    }
 #ifdef _WIN32
     if (mode == "read-retry") {
         {

@@ -527,8 +527,10 @@ int main(int argc, char** argv) {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
         originalDeviceProc = context.deviceProc;
+        Require(originalDeviceProc != nullptr && context.pipelineCacheSynchronization != nullptr, "readback fixture requires device functions and pipeline cache synchronization");
+        PipelineCacheSynchronization exclusive(true);
+        if (!context.pipelineCacheSynchronization->ExcludesPipelineUse()) context.pipelineCacheSynchronization = &exclusive;
         pipelineCacheSynchronization = context.pipelineCacheSynchronization;
-        Require(originalDeviceProc != nullptr && pipelineCacheSynchronization != nullptr, "readback fixture requires device functions and pipeline cache synchronization");
         context.deviceProc = CheckedDeviceProc;
         if (!context.sampleRateShading) {
             std::puts("skipped, the device does not support per-sample shading");
