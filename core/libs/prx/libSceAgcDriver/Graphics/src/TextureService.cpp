@@ -17,7 +17,7 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-namespace Abi = ShaderRecompiler::DeviceImageTableAbi;
+namespace Abi = ShaderRecompiler::BindlessImageTableAbi;
 namespace Heap = ShaderRecompiler::BindlessImageAbi;
 
 std::atomic<std::uint64_t> oldPathNanoseconds{0};
@@ -43,7 +43,7 @@ constexpr std::array<const char*, static_cast<std::size_t>(BindlessRefusalKind::
 
 static_assert(TextureService::MaxRejectionDetails + 1u < Abi::FaultFlag, "a fault record must be able to name every retained rejection");
 
-std::string RejectionDetail(const DeviceImageKeys::Key& key, const std::string& reason) {
+std::string RejectionDetail(const BindlessImageKeys::Key& key, const std::string& reason) {
     std::string message = "(words";
     for (std::uint32_t word = 0; word < Abi::DescriptorWords; ++word) {
         char text[12];
@@ -86,7 +86,7 @@ BindlessRefusalKind ClassifyBindlessRefusal(std::string_view reason) {
     return BindlessRefusalKind::Other;
 }
 
-std::size_t TextureService::KeyHash::operator()(const DeviceImageKeys::Key& key) const noexcept {
+std::size_t TextureService::KeyHash::operator()(const BindlessImageKeys::Key& key) const noexcept {
     return Abi::Hash(key);
 }
 
@@ -199,21 +199,21 @@ bool TextureService::WaitPrimed(std::uint64_t id, std::uint32_t milliseconds) {
     });
 }
 
-std::vector<DeviceImageKeys::Key> TextureService::recordKeys(const Tracked& tracked, std::uint32_t record) const {
+std::vector<BindlessImageKeys::Key> TextureService::recordKeys(const Tracked& tracked, std::uint32_t record) const {
     if (tracked.words.size() < (static_cast<std::size_t>(record) + 1u) * Abi::DescriptorWords) return {};
     const auto words = std::span<const std::uint32_t>(tracked.words).subspan(static_cast<std::size_t>(record) * Abi::DescriptorWords, Abi::DescriptorWords);
-    std::vector<DeviceImageKeys::Key> keys;
+    std::vector<BindlessImageKeys::Key> keys;
     keys.reserve(tracked.registration.uses.size());
     const auto descriptor = std::span<const std::uint32_t, Abi::DescriptorWords>(words.data(), Abi::DescriptorWords);
     for (const auto& use : tracked.registration.uses) keys.push_back(Heap::MakeKey(descriptor, use.interfaceId, use.samplerClass, use.sampler));
     return keys;
 }
 
-BindlessPrepared TextureService::prepare(const DeviceImageKeys::Key& key) {
+BindlessPrepared TextureService::prepare(const BindlessImageKeys::Key& key) {
     if (Abi::NullDescriptor(key[0], key[1])) {
         BindlessPrepared null;
         null.key = key;
-        null.settled = DeviceImageValue{};
+        null.settled = BindlessImageValue{};
         return null;
     }
     try {
@@ -252,9 +252,9 @@ void TextureService::readTable(Tracked& tracked) {
     Tracked shape;
     shape.registration = registration;
     shape.words = std::move(words);
-    std::vector<DeviceImageKeys::Key> wanted;
+    std::vector<BindlessImageKeys::Key> wanted;
     {
-        std::set<DeviceImageKeys::Key> seen;
+        std::set<BindlessImageKeys::Key> seen;
         for (std::uint32_t record = 0; record < registration.records; ++record) {
             for (const auto& key : recordKeys(shape, record)) {
                 if (seen.insert(key).second) wanted.push_back(key);
@@ -263,7 +263,7 @@ void TextureService::readTable(Tracked& tracked) {
     }
     {
         std::lock_guard lock(mutex);
-        std::erase_if(wanted, [&](const DeviceImageKeys::Key& key) { return entries.contains(key); });
+        std::erase_if(wanted, [&](const BindlessImageKeys::Key& key) { return entries.contains(key); });
     }
     std::vector<BindlessPrepared> prepared;
     prepared.reserve(wanted.size());
@@ -359,7 +359,7 @@ BindlessResolution TextureService::settle(const BindlessPrepared& prepared) {
     return resolver->Commit(prepared);
 }
 
-std::uint32_t TextureService::refuse(const DeviceImageKeys::Key& key, const std::string& reason, bool permanent) {
+std::uint32_t TextureService::refuse(const BindlessImageKeys::Key& key, const std::string& reason, bool permanent) {
     ++totals.refusals[static_cast<std::size_t>(ClassifyBindlessRefusal(reason))];
     if (permanent) {
         permanentRefusals.insert(key);
@@ -449,16 +449,16 @@ void TextureService::releaseResolution(const BindlessResolution& resolution, Rec
     if (resolution.samplerOwner != nullptr) recorder.Keep(resolution.samplerOwner);
 }
 
-void TextureService::insertValue(const DeviceImageKeys::Key& key, const DeviceImageValue& value, Recorder& recorder) {
-    if (table.Insert(key, value) != DeviceImageKeys::Insertion::Full) return;
+void TextureService::insertValue(const BindlessImageKeys::Key& key, const BindlessImageValue& value, Recorder& recorder) {
+    if (table.Insert(key, value) != BindlessImageKeys::Insertion::Full) return;
     ++totals.fullEvictions;
     const auto wanted = std::max<std::size_t>(1u, entries.size() / 4u);
-    if (evictIdle(recorder, wanted, recorder.OpenSerial(), 0u) && table.Insert(key, value) != DeviceImageKeys::Insertion::Full) return;
+    if (evictIdle(recorder, wanted, recorder.OpenSerial(), 0u) && table.Insert(key, value) != BindlessImageKeys::Insertion::Full) return;
     const auto counts = table.Totals();
     throw std::runtime_error("AGC graphics: the bindless key table is full (" + std::to_string(counts.entries) + " entries in " + std::to_string(counts.buckets) + " buckets) and every entry is used by the batch being recorded");
 }
 
-void TextureService::place(const DeviceImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder, std::uint64_t lastUsed) {
+void TextureService::place(const BindlessImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder, std::uint64_t lastUsed) {
     auto value = resolution.value;
     value.slot = acquireImage(resolution.view, resolution.layout);
     try {
@@ -491,7 +491,7 @@ void TextureService::place(const DeviceImageKeys::Key& key, BindlessResolution r
     if (perUse && perUseKeys.insert(key).second) ++perUseEpoch;
 }
 
-BindlessResolution TextureService::take(const DeviceImageKeys::Key& key) {
+BindlessResolution TextureService::take(const BindlessImageKeys::Key& key) {
     auto found = entries.find(key);
     Require(found != entries.end(), "the texture service dropped an entry it does not hold");
     auto resolution = std::move(found->second.resolution);
@@ -502,7 +502,7 @@ BindlessResolution TextureService::take(const DeviceImageKeys::Key& key) {
     return resolution;
 }
 
-void TextureService::install(const DeviceImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder) {
+void TextureService::install(const BindlessImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder) {
     if (entries.contains(key)) {
         discard(resolution, recorder);
         return;
@@ -511,7 +511,7 @@ void TextureService::install(const DeviceImageKeys::Key& key, BindlessResolution
     ++totals.created;
 }
 
-void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder, Lock& lock, const BindlessPrepared* early) {
+void TextureService::replace(const BindlessImageKeys::Key& key, Recorder& recorder, Lock& lock, const BindlessPrepared* early) {
     lock.unlock();
     const auto started = std::chrono::steady_clock::now();
     BindlessPrepared prepared;
@@ -657,7 +657,7 @@ void TextureService::redecode(Tracked& tracked, Recorder& recorder, Lock& lock) 
     tracked.oldest = *std::min_element(tracked.pageGenerations.begin(), tracked.pageGenerations.end());
     totals.pagesChanged += pagesChanged;
     totals.recordsRead += recordsRead;
-    std::set<DeviceImageKeys::Key> wanted;
+    std::set<BindlessImageKeys::Key> wanted;
     if (!rewritten.empty()) tracked.perUseEpoch = ~std::uint64_t{0};
     for (auto& [record, words] : rewritten) {
         std::copy(words.begin(), words.end(), tracked.words.begin() + static_cast<std::ptrdiff_t>(record) * Abi::DescriptorWords);
@@ -676,7 +676,7 @@ void TextureService::redecode(Tracked& tracked, Recorder& recorder, Lock& lock) 
 
 void TextureService::reverify(Tracked& tracked, Recorder& recorder, Lock& lock) {
     tracked.evictionEpoch = evictionEpoch;
-    std::set<DeviceImageKeys::Key> wanted;
+    std::set<BindlessImageKeys::Key> wanted;
     for (std::uint32_t record = 0; record < tracked.registration.records; ++record) {
         for (const auto& key : recordKeys(tracked, record)) {
             if (!entries.contains(key)) wanted.insert(key);
@@ -694,7 +694,7 @@ void TextureService::revalidateServed(Tracked& tracked, Recorder& recorder, Lock
     if (tracked.surfaceEpoch != surfaceEpoch) {
         tracked.surfaceKeys.clear();
         tracked.surfaces.clear();
-        std::set<DeviceImageKeys::Key> seen;
+        std::set<BindlessImageKeys::Key> seen;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
         for (std::uint32_t record = 0; record < tracked.registration.records; ++record) {
             for (const auto& key : recordKeys(tracked, record)) {
@@ -718,7 +718,7 @@ void TextureService::revalidateServed(Tracked& tracked, Recorder& recorder, Lock
     lock.unlock();
     for (const auto& [begin, end] : surfaces) memory->Collect(begin, static_cast<std::size_t>(end - begin));
     lock.lock();
-    std::vector<DeviceImageKeys::Key> stale;
+    std::vector<BindlessImageKeys::Key> stale;
     for (const auto& key : keys) {
         const auto found = entries.find(key);
         if (found == entries.end() || found->second.resolution.owner == nullptr) continue;
@@ -734,8 +734,8 @@ void TextureService::revalidateServed(Tracked& tracked, Recorder& recorder, Lock
     }
 }
 
-std::vector<DeviceImageMiss> TextureService::unresolved(std::span<const DeviceImageMiss> misses) const {
-    std::vector<DeviceImageMiss> fresh;
+std::vector<BindlessImageMiss> TextureService::unresolved(std::span<const BindlessImageMiss> misses) const {
+    std::vector<BindlessImageMiss> fresh;
     fresh.reserve(misses.size());
     for (const auto& miss : misses) {
         if (!entries.contains(miss.key)) fresh.push_back(miss);
@@ -762,7 +762,7 @@ void TextureService::resolveMisses(Recorder& recorder, Lock& lock) {
 
 void TextureService::refreshPerUse(std::span<const std::uint64_t> served, Recorder& recorder, Lock& lock) {
     if (perUseKeys.empty()) return;
-    std::set<DeviceImageKeys::Key> keys;
+    std::set<BindlessImageKeys::Key> keys;
     for (const auto id : served) {
         auto found = tables.find(id);
         if (found == tables.end()) continue;
@@ -795,14 +795,14 @@ std::uint64_t TextureService::currentBudget() {
 }
 
 bool TextureService::evictIdle(Recorder& recorder, std::size_t wanted, std::uint64_t idleBefore, std::uint64_t targetBytes) {
-    std::set<DeviceImageKeys::Key> protectedKeys;
+    std::set<BindlessImageKeys::Key> protectedKeys;
     for (const auto& [id, tracked] : tables) {
         if (tracked.lastUsed < idleBefore) continue;
         for (std::uint32_t record = 0; record < tracked.registration.records; ++record) {
             for (const auto& key : recordKeys(tracked, record)) protectedKeys.insert(key);
         }
     }
-    std::vector<std::pair<std::uint64_t, DeviceImageKeys::Key>> idle;
+    std::vector<std::pair<std::uint64_t, BindlessImageKeys::Key>> idle;
     for (const auto& [key, entry] : entries) {
         if (entry.lastUsed >= idleBefore || protectedKeys.contains(key) || retiring.contains(key)) continue;
         idle.emplace_back(entry.lastUsed, key);
@@ -828,7 +828,7 @@ bool TextureService::evictIdle(Recorder& recorder, std::size_t wanted, std::uint
 
 void TextureService::retireNow(Recorder& recorder) {
     if (retiring.empty()) return;
-    const auto dropped = table.Retire([&](const DeviceImageKeys::Key& key, const DeviceImageValue&) { return retiring.contains(key); });
+    const auto dropped = table.Retire([&](const BindlessImageKeys::Key& key, const BindlessImageValue&) { return retiring.contains(key); });
     static_cast<void>(dropped);
     for (const auto& key : retiring) {
         if (!entries.contains(key)) continue;
@@ -907,7 +907,7 @@ std::uint64_t TextureService::PresentSerial(Recorder& recorder) {
 void TextureService::PrepareRevalidation() {
     const auto started = std::chrono::steady_clock::now();
     struct Candidate {
-        DeviceImageKeys::Key key;
+        BindlessImageKeys::Key key;
         std::uint64_t address = 0;
         std::uint64_t bytes = 0;
         std::uint64_t generation = 0;
@@ -967,7 +967,7 @@ void TextureService::Revalidate(Recorder& recorder) {
     lock.lock();
     totals.revalidateCollectNanoseconds += collectNanoseconds;
     const auto checkStarted = std::chrono::steady_clock::now();
-    std::vector<DeviceImageKeys::Key> stale;
+    std::vector<BindlessImageKeys::Key> stale;
     for (const auto& [key, entry] : entries) {
         if (entry.resolution.owner == nullptr) continue;
         ++totals.revalidated;
@@ -1016,14 +1016,14 @@ void TextureService::AfterPresentWait(Recorder& recorder, std::uint64_t waitedNa
     totals.publishNanoseconds += Elapsed(started);
 }
 
-std::optional<DeviceImageValue> TextureService::Find(const DeviceImageKeys::Key& key) const {
+std::optional<BindlessImageValue> TextureService::Find(const BindlessImageKeys::Key& key) const {
     std::lock_guard lock(mutex);
     const auto found = entries.find(key);
     if (found == entries.end()) return std::nullopt;
     return found->second.value;
 }
 
-std::shared_ptr<void> TextureService::Owner(const DeviceImageKeys::Key& key) const {
+std::shared_ptr<void> TextureService::Owner(const BindlessImageKeys::Key& key) const {
     std::lock_guard lock(mutex);
     const auto found = entries.find(key);
     if (found == entries.end()) return nullptr;
@@ -1050,9 +1050,9 @@ void TextureService::hostBytes(Counts& counts) const {
         counts.tableHostBytes += sizeof(tracked) + vectorBytes(tracked.words) + vectorBytes(tracked.pageGenerations) + vectorBytes(tracked.pending) + vectorBytes(tracked.surfaceKeys);
         counts.tableHostBytes += vectorBytes(tracked.surfaces) + vectorBytes(tracked.perUse) + 2u * vectorBytes(tracked.registration.uses);
     }
-    counts.entryHostBytes = entries.size() * (sizeof(DeviceImageKeys::Key) + sizeof(Entry) + 2u * sizeof(void*)) + entries.bucket_count() * sizeof(void*);
+    counts.entryHostBytes = entries.size() * (sizeof(BindlessImageKeys::Key) + sizeof(Entry) + 2u * sizeof(void*)) + entries.bucket_count() * sizeof(void*);
     counts.rejections = rejections.size();
-    counts.rejectionHostBytes = (rejectionIndex.size() + permanentRefusals.size()) * (sizeof(DeviceImageKeys::Key) + 4u * sizeof(void*));
+    counts.rejectionHostBytes = (rejectionIndex.size() + permanentRefusals.size()) * (sizeof(BindlessImageKeys::Key) + 4u * sizeof(void*));
     for (const auto& rejection : rejections) counts.rejectionHostBytes += sizeof(rejection) + rejection.capacity();
 }
 

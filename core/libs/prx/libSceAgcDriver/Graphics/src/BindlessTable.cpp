@@ -2,7 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "BindlessImageAbi.hpp"
-#include "DeviceImageTableAbi.hpp"
+#include "BindlessImageTableAbi.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -16,7 +16,7 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-namespace Abi = ShaderRecompiler::DeviceImageTableAbi;
+namespace Abi = ShaderRecompiler::BindlessImageTableAbi;
 
 constexpr VkBufferUsageFlags DeviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 constexpr std::size_t UpdateBufferBytes = 65536u;
@@ -82,17 +82,17 @@ std::uint64_t BindlessTable::HeaderAddress() const {
     return header->DeviceAddress();
 }
 
-DeviceImageKeys::Insertion BindlessTable::Insert(const Key& key, const DeviceImageValue& value) {
+BindlessImageKeys::Insertion BindlessTable::Insert(const Key& key, const BindlessImageValue& value) {
     std::lock_guard lock(mutex);
     return keys.Insert(key, value);
 }
 
-std::optional<DeviceImageValue> BindlessTable::Find(const Key& key) const {
+std::optional<BindlessImageValue> BindlessTable::Find(const Key& key) const {
     std::lock_guard lock(mutex);
     return keys.Find(key);
 }
 
-std::uint32_t BindlessTable::Retire(const std::function<bool(const Key&, const DeviceImageValue&)>& drop) {
+std::uint32_t BindlessTable::Retire(const std::function<bool(const Key&, const BindlessImageValue&)>& drop) {
     std::lock_guard lock(mutex);
     const auto dropped = keys.Retain([&](const Key& key) {
         const auto value = keys.Find(key);
@@ -199,7 +199,7 @@ void BindlessTable::drain(const std::shared_ptr<Rings>& rings, const std::shared
     }
     drained->Invalidate();
     const auto bytes = drained->Bytes();
-    const auto decoded = DecodeDeviceImageRing(std::span<const std::uint32_t>(reinterpret_cast<const std::uint32_t*>(bytes.data()), RingWords(rings->capacity)), rings->capacity);
+    const auto decoded = DecodeBindlessImageRing(std::span<const std::uint32_t>(reinterpret_cast<const std::uint32_t*>(bytes.data()), RingWords(rings->capacity)), rings->capacity);
     std::lock_guard lock(rings->mutex);
     ++rings->drained;
     if (decoded.dropped != 0u) rings->clearSeen = true;
@@ -238,10 +238,10 @@ void BindlessTable::ForgetReportedMisses() {
     rings->clearSeen = true;
 }
 
-std::vector<DeviceImageMiss> BindlessTable::TakeMisses() {
+std::vector<BindlessImageMiss> BindlessTable::TakeMisses() {
     std::lock_guard lock(rings->mutex);
     const auto misses = std::exchange(rings->misses, {});
-    return DistinctDeviceImageMisses(misses);
+    return DistinctBindlessImageMisses(misses);
 }
 
 BindlessTable::Counts BindlessTable::Totals() const {

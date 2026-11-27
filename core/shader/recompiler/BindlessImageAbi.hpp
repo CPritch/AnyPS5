@@ -1,7 +1,7 @@
 #ifndef CORE_SHADER_RECOMPILER_BINDLESSIMAGEABI_HPP
 #define CORE_SHADER_RECOMPILER_BINDLESSIMAGEABI_HPP
 
-#include "DeviceImageTableAbi.hpp"
+#include "BindlessImageTableAbi.hpp"
 #include <array>
 #include <compare>
 #include <cstdint>
@@ -10,7 +10,7 @@
 
 namespace ShaderRecompiler::BindlessImageAbi {
 
-namespace Table = DeviceImageTableAbi;
+namespace Table = BindlessImageTableAbi;
 
 inline constexpr std::uint32_t HeapDescriptorSet = 4u;
 inline constexpr std::uint32_t SamplerBinding = 0u;

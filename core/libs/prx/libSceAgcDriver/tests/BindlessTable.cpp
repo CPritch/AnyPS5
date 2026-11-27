@@ -36,12 +36,12 @@ using AgcDriver::Graphics::Buffer;
 using AgcDriver::Graphics::Check;
 using AgcDriver::Graphics::Context;
 using AgcDriver::Graphics::DescriptorHeap;
-using AgcDriver::Graphics::DeviceImageKeys;
-using AgcDriver::Graphics::DeviceImageValue;
+using AgcDriver::Graphics::BindlessImageKeys;
+using AgcDriver::Graphics::BindlessImageValue;
 using AgcDriver::Graphics::Recorder;
 using AgcDriver::Graphics::Require;
 namespace Abi = ShaderRecompiler::BindlessImageAbi;
-namespace Table = ShaderRecompiler::DeviceImageTableAbi;
+namespace Table = ShaderRecompiler::BindlessImageTableAbi;
 
 constexpr int Skipped = 77;
 constexpr std::uint32_t Side = 64u;
@@ -469,7 +469,7 @@ struct Fixture {
     Fixture(const Device& device, std::uint32_t records, std::uint32_t missing, std::uint32_t list, std::uint32_t workingSet = 0u, std::uint32_t ringCapacity = BindlessTable::DefaultRingCapacity) : context(device.GetContext()) {
         const auto capacities = DescriptorHeap::DeviceCapacities(context);
         Require(capacities.sampledImages > records, "the device's update-after-bind sampled image limit is below the test's records: " + std::to_string(capacities.sampledImages));
-        table = std::make_unique<BindlessTable>(context, DescriptorHeap::Capacities{std::min(capacities.samplers, 64u), capacities.sampledImages, std::min(capacities.storageImages, 64u)}, DeviceImageKeys::InitialBuckets, DeviceImageKeys::MaxBuckets, ringCapacity);
+        table = std::make_unique<BindlessTable>(context, DescriptorHeap::Capacities{std::min(capacities.samplers, 64u), capacities.sampledImages, std::min(capacities.storageImages, 64u)}, BindlessImageKeys::InitialBuckets, BindlessImageKeys::MaxBuckets, ringCapacity);
         images = std::make_unique<Images>(context, DistinctImages);
         pipeline = std::make_unique<LookupPipeline>(context, table->Heap(), images->View(0));
         total = records + missing;
@@ -484,7 +484,7 @@ struct Fixture {
             std::copy(descriptor.begin(), descriptor.end(), words + static_cast<std::size_t>(record) * 8u);
             if (record < records) {
                 slots[record] = table->Heap().AllocateImage(DescriptorHeap::Array::SampledImages, images->View(record % DistinctImages), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                Require(table->Insert(RecordKey(record), DeviceImageValue{slots[record], RecordMode(record), 0u, 0u}) == DeviceImageKeys::Insertion::Inserted, "a bindless record was not inserted");
+                Require(table->Insert(RecordKey(record), BindlessImageValue{slots[record], RecordMode(record), 0u, 0u}) == BindlessImageKeys::Insertion::Inserted, "a bindless record was not inserted");
             }
             slotWords[record] = Abi::SlotIndex(slots[record]);
         }
@@ -577,8 +577,8 @@ void gpuTests(const Device& device) {
     for (auto& result : results) result = std::make_shared<Buffer>(context, Threads * 4u, AddressUsage);
     table.Publish(recorder);
     fixture.pipeline->Record(recorder.Commands(), table.Heap(), fixture.MakePush(2u, Iterations, *results[0], 0x111u), Groups);
-    Require(table.Insert(RecordKey(updated), DeviceImageValue{fixture.slots[updated + 1u], 0x42u, 0u, 0u}) == DeviceImageKeys::Insertion::Updated, "updating a bindless entry inserted it");
-    Require(table.Insert(RecordKey(late), DeviceImageValue{lateSlot, 0x5u, 0u, 0u}) == DeviceImageKeys::Insertion::Inserted, "a late bindless entry was not inserted");
+    Require(table.Insert(RecordKey(updated), BindlessImageValue{fixture.slots[updated + 1u], 0x42u, 0u, 0u}) == BindlessImageKeys::Insertion::Updated, "updating a bindless entry inserted it");
+    Require(table.Insert(RecordKey(late), BindlessImageValue{lateSlot, 0x5u, 0u, 0u}) == BindlessImageKeys::Insertion::Inserted, "a late bindless entry was not inserted");
     fixture.pipeline->Record(recorder.Commands(), table.Heap(), fixture.MakePush(2u, Iterations, *results[1], 0x222u), Groups);
     table.Publish(recorder);
     fixture.pipeline->Record(recorder.Commands(), table.Heap(), fixture.MakePush(2u, Iterations, *results[2], 0x333u), Groups);
@@ -629,7 +629,7 @@ void gpuTests(const Device& device) {
 
     const auto retiredSlot = fixture.slots[updated + 1u];
     const auto retiredIndex = Abi::SlotIndex(retiredSlot);
-    const auto dropped = table.Retire([&](const Table::Key&, const DeviceImageValue& value) { return value.slot == retiredSlot; });
+    const auto dropped = table.Retire([&](const Table::Key&, const BindlessImageValue& value) { return value.slot == retiredSlot; });
     Require(dropped == 2u && !table.Find(RecordKey(updated)).has_value() && !table.Find(RecordKey(updated + 1u)).has_value() && table.Find(RecordKey(updated + 2u)).has_value(), "retiring a heap slot did not drop exactly its two entries");
     const auto retireSerial = recorder.OpenSerial();
     table.Heap().Release(DescriptorHeap::Array::SampledImages, retiredSlot, retireSerial);
@@ -726,7 +726,7 @@ void dedupTests(const Device& device) {
             const auto record = found->second;
             recordOf.erase(found);
             const auto slot = table.Heap().AllocateImage(DescriptorHeap::Array::SampledImages, fixture.images->View(record % DistinctImages), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            Require(table.Insert(RecordKey(record), DeviceImageValue{slot, RecordMode(record), 0u, 0u}) == DeviceImageKeys::Insertion::Inserted, "a reported key was not inserted");
+            Require(table.Insert(RecordKey(record), BindlessImageValue{slot, RecordMode(record), 0u, 0u}) == BindlessImageKeys::Insertion::Inserted, "a reported key was not inserted");
             imageOf[record] = record % DistinctImages;
             modeOf[record] = RecordMode(record);
         }
@@ -738,7 +738,7 @@ void dedupTests(const Device& device) {
     auto failures = Mismatches(result->Bytes(), Threads, [&](std::uint32_t id) { return fixture.Expected(id, Iterations, false, imageOf, modeOf); }, "lookup after the miss storm was filled");
     Require(failures == 0u, std::to_string(failures) + " invocations read wrong results after the miss storm was filled");
     const auto victim = *missing.begin();
-    Require(table.Retire([&](const Table::Key& key, const DeviceImageValue&) { return key == RecordKey(victim); }) == 1u, "the victim entry was not retired");
+    Require(table.Retire([&](const Table::Key& key, const BindlessImageValue&) { return key == RecordKey(victim); }) == 1u, "the victim entry was not retired");
     auto [again, againDropped] = batch(0xb00u);
     Require(again == 1u && againDropped == 0u && table.TakeMisses().size() == 1u, "a key missed after its entry was retired was not reported again (" + std::to_string(again) + " records)");
     std::tie(again, againDropped) = batch(0xc00u);
@@ -785,7 +785,7 @@ void growthTests(const Device& device) {
     std::uint32_t bucketsAtMiddle = 0;
     for (std::uint32_t record = Present; record < Grown; ++record) {
         const auto slot = table.Heap().AllocateImage(DescriptorHeap::Array::SampledImages, fixture.images->View(record % DistinctImages), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        Require(table.Insert(RecordKey(record), DeviceImageValue{slot, RecordMode(record), 0u, 0u}) == DeviceImageKeys::Insertion::Inserted, "a bindless record inserted while earlier batches were in flight was not inserted");
+        Require(table.Insert(RecordKey(record), BindlessImageValue{slot, RecordMode(record), 0u, 0u}) == BindlessImageKeys::Insertion::Inserted, "a bindless record inserted while earlier batches were in flight was not inserted");
         grownImage[record] = record % DistinctImages;
         grownMode[record] = RecordMode(record);
         if (record + 1u != Middle) continue;

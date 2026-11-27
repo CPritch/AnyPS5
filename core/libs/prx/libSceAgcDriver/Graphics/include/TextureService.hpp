@@ -2,9 +2,9 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURESERVICE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/DeviceImageKeys.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessImageKeys.hpp"
 #include "BindlessImageAbi.hpp"
-#include "DeviceImageTableAbi.hpp"
+#include "BindlessImageTableAbi.hpp"
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -45,8 +45,8 @@ enum class BindlessRefusalKind : std::uint32_t { Storage, Multisample, ColorComp
 BindlessRefusalKind ClassifyBindlessRefusal(std::string_view reason);
 
 struct BindlessPrepared {
-    DeviceImageKeys::Key key{};
-    std::optional<DeviceImageValue> settled;
+    BindlessImageKeys::Key key{};
+    std::optional<BindlessImageValue> settled;
     std::string refusal;
     bool permanent = false;
     std::uint64_t address = 0;
@@ -56,7 +56,7 @@ struct BindlessPrepared {
 };
 
 struct BindlessResolution {
-    DeviceImageValue value;
+    BindlessImageValue value;
     std::shared_ptr<void> owner;
     VkImageView view = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
@@ -72,7 +72,7 @@ struct BindlessResolution {
 class BindlessResolver {
 public:
     virtual ~BindlessResolver() = default;
-    virtual BindlessPrepared Prepare(const DeviceImageKeys::Key& key) = 0;
+    virtual BindlessPrepared Prepare(const BindlessImageKeys::Key& key) = 0;
     virtual BindlessResolution Commit(const BindlessPrepared& prepared) = 0;
     virtual bool Current(const BindlessResolution& resolution) = 0;
     virtual bool RefreshGeneration(BindlessPrepared& prepared) {
@@ -178,8 +178,8 @@ public:
     void AfterPresentWait(Recorder& recorder, std::uint64_t waitedNanoseconds);
     void PrepareRevalidation();
     void Revalidate(Recorder& recorder);
-    std::optional<DeviceImageValue> Find(const DeviceImageKeys::Key& key) const;
-    std::shared_ptr<void> Owner(const DeviceImageKeys::Key& key) const;
+    std::optional<BindlessImageValue> Find(const BindlessImageKeys::Key& key) const;
+    std::shared_ptr<void> Owner(const BindlessImageKeys::Key& key) const;
     std::optional<std::string> Rejection(std::uint32_t fault) const;
     Counts Totals() const;
     std::string TakeFrameLine(std::uint64_t oldPathNanoseconds);
@@ -199,16 +199,16 @@ private:
         std::uint64_t lastUsed = 0;
         std::uint64_t evictionEpoch = 0;
         std::uint64_t surfaceEpoch = ~std::uint64_t{0};
-        std::vector<DeviceImageKeys::Key> surfaceKeys;
+        std::vector<BindlessImageKeys::Key> surfaceKeys;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> surfaces;
         std::uint64_t registeredAt = 0;
         std::uint64_t primerNanoseconds = 0;
         bool unmapped = false;
-        std::vector<DeviceImageKeys::Key> perUse;
+        std::vector<BindlessImageKeys::Key> perUse;
         std::uint64_t perUseEpoch = ~std::uint64_t{0};
     };
     struct Entry {
-        DeviceImageValue value;
+        BindlessImageValue value;
         BindlessResolution resolution;
         std::uint64_t lastUsed = 0;
     };
@@ -221,35 +221,35 @@ private:
         std::uint32_t references = 0;
     };
     struct KeyHash {
-        std::size_t operator()(const DeviceImageKeys::Key& key) const noexcept;
+        std::size_t operator()(const BindlessImageKeys::Key& key) const noexcept;
     };
     using Lock = std::unique_lock<std::mutex>;
 
     void workerLoop();
     void readTable(Tracked& table);
-    std::vector<DeviceImageKeys::Key> recordKeys(const Tracked& table, std::uint32_t record) const;
-    BindlessPrepared prepare(const DeviceImageKeys::Key& key);
+    std::vector<BindlessImageKeys::Key> recordKeys(const Tracked& table, std::uint32_t record) const;
+    BindlessPrepared prepare(const BindlessImageKeys::Key& key);
     void completeTable(Tracked& table, Recorder& recorder, Lock& lock);
     void commitTable(Tracked& table, Recorder& recorder, Lock& lock, std::size_t limit);
     void commitPrepared(std::vector<BindlessPrepared>& prepared, Recorder& recorder, Lock& lock);
-    void install(const DeviceImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder);
-    void place(const DeviceImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder, std::uint64_t lastUsed);
-    BindlessResolution take(const DeviceImageKeys::Key& key);
-    void replace(const DeviceImageKeys::Key& key, Recorder& recorder, Lock& lock, const BindlessPrepared* early = nullptr);
+    void install(const BindlessImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder);
+    void place(const BindlessImageKeys::Key& key, BindlessResolution resolution, Recorder& recorder, std::uint64_t lastUsed);
+    BindlessResolution take(const BindlessImageKeys::Key& key);
+    void replace(const BindlessImageKeys::Key& key, Recorder& recorder, Lock& lock, const BindlessPrepared* early = nullptr);
     BindlessResolution settle(const BindlessPrepared& prepared);
-    std::uint32_t refuse(const DeviceImageKeys::Key& key, const std::string& reason, bool permanent);
+    std::uint32_t refuse(const BindlessImageKeys::Key& key, const std::string& reason, bool permanent);
     std::uint32_t acquireImage(VkImageView view, VkImageLayout layout);
     std::uint32_t acquireSampler(VkSampler sampler);
     void releaseResolution(const BindlessResolution& resolution, Recorder& recorder);
     static void discard(const BindlessResolution& resolution, Recorder& recorder);
-    void insertValue(const DeviceImageKeys::Key& key, const DeviceImageValue& value, Recorder& recorder);
+    void insertValue(const BindlessImageKeys::Key& key, const BindlessImageValue& value, Recorder& recorder);
     bool evictIdle(Recorder& recorder, std::size_t wanted, std::uint64_t idleBefore, std::uint64_t targetBytes);
     std::uint64_t currentBudget();
     void redecode(Tracked& table, Recorder& recorder, Lock& lock);
     void reverify(Tracked& table, Recorder& recorder, Lock& lock);
     void revalidateServed(Tracked& table, Recorder& recorder, Lock& lock);
     void resolveMisses(Recorder& recorder, Lock& lock);
-    std::vector<DeviceImageMiss> unresolved(std::span<const DeviceImageMiss> misses) const;
+    std::vector<BindlessImageMiss> unresolved(std::span<const BindlessImageMiss> misses) const;
     void refreshPerUse(std::span<const std::uint64_t> served, Recorder& recorder, Lock& lock);
     void checkMapping(Recorder& recorder);
     void retireNow(Recorder& recorder);
@@ -267,16 +267,16 @@ private:
     std::map<BindlessTableRegistration, std::uint64_t> ids;
     std::deque<std::uint64_t> queue;
     std::vector<BindlessPrepared> missPending;
-    std::unordered_map<DeviceImageKeys::Key, Entry, KeyHash> entries;
+    std::unordered_map<BindlessImageKeys::Key, Entry, KeyHash> entries;
     std::map<VkImageView, SlotRef> imageSlots;
     std::map<VkSampler, SlotRef> samplerSlots;
     std::map<const void*, OwnerRef> owners;
-    std::set<DeviceImageKeys::Key> retiring;
-    std::set<DeviceImageKeys::Key> perUseKeys;
-    std::set<DeviceImageKeys::Key> permanentRefusals;
+    std::set<BindlessImageKeys::Key> retiring;
+    std::set<BindlessImageKeys::Key> perUseKeys;
+    std::set<BindlessImageKeys::Key> permanentRefusals;
     std::set<std::string> reportedReasons;
     std::vector<std::string> rejections;
-    std::map<DeviceImageKeys::Key, std::uint32_t> rejectionIndex;
+    std::map<BindlessImageKeys::Key, std::uint32_t> rejectionIndex;
     std::uint32_t cappedRejection = 0;
     std::uint64_t nextId = 1;
     std::uint64_t evictionEpoch = 0;
@@ -293,7 +293,7 @@ private:
     Counts totals;
     Counts reported;
     std::uint64_t reportedOldPath = 0;
-    std::unordered_map<DeviceImageKeys::Key, BindlessPrepared, KeyHash> early;
+    std::unordered_map<BindlessImageKeys::Key, BindlessPrepared, KeyHash> early;
     std::uint64_t earlyMapping = 0;
     bool stopping = false;
     bool takingMisses = false;

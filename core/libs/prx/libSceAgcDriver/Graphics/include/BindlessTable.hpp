@@ -3,7 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DescriptorHeap.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/DeviceImageKeys.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessImageKeys.hpp"
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -38,22 +38,22 @@ std::uint32_t BindlessRingRecords();
 
 class BindlessTable {
 public:
-    using Key = DeviceImageKeys::Key;
+    using Key = BindlessImageKeys::Key;
     static constexpr std::uint32_t DefaultRingCapacity = 65536u;
     static constexpr std::uint32_t MinSeenSlots = 1u << 22u;
 
-    BindlessTable(const Context& context, DescriptorHeap::Capacities capacities, std::uint32_t buckets = DeviceImageKeys::InitialBuckets, std::uint32_t maxBuckets = DeviceImageKeys::MaxBuckets, std::uint32_t ringCapacity = DefaultRingCapacity);
+    BindlessTable(const Context& context, DescriptorHeap::Capacities capacities, std::uint32_t buckets = BindlessImageKeys::InitialBuckets, std::uint32_t maxBuckets = BindlessImageKeys::MaxBuckets, std::uint32_t ringCapacity = DefaultRingCapacity);
     ~BindlessTable();
     BindlessTable(const BindlessTable&) = delete;
     BindlessTable& operator=(const BindlessTable&) = delete;
 
     DescriptorHeap& Heap() { return heap; }
     std::uint64_t HeaderAddress() const;
-    DeviceImageKeys::Insertion Insert(const Key& key, const DeviceImageValue& value);
-    std::optional<DeviceImageValue> Find(const Key& key) const;
-    std::uint32_t Retire(const std::function<bool(const Key&, const DeviceImageValue&)>& drop);
+    BindlessImageKeys::Insertion Insert(const Key& key, const BindlessImageValue& value);
+    std::optional<BindlessImageValue> Find(const Key& key) const;
+    std::uint32_t Retire(const std::function<bool(const Key&, const BindlessImageValue&)>& drop);
     void Publish(Recorder& recorder);
-    std::vector<DeviceImageMiss> TakeMisses();
+    std::vector<BindlessImageMiss> TakeMisses();
     std::shared_ptr<void> HoldRing();
     void ForgetReportedMisses();
     std::uint32_t RingCapacity() const { return ringCapacity; }
@@ -78,7 +78,7 @@ private:
     struct Rings {
         std::mutex mutex;
         std::vector<std::shared_ptr<Buffer>> free;
-        std::vector<DeviceImageMiss> misses;
+        std::vector<BindlessImageMiss> misses;
         std::uint64_t drained = 0;
         std::uint64_t written = 0;
         std::uint64_t dropped = 0;
@@ -93,7 +93,7 @@ private:
     Context context;
     DescriptorHeap heap;
     mutable std::mutex mutex;
-    DeviceImageKeys keys;
+    BindlessImageKeys keys;
     std::shared_ptr<Buffer> header;
     std::shared_ptr<Buffer> table;
     std::uint32_t tableBuckets = 0;

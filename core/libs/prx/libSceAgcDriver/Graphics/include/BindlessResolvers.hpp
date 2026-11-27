@@ -26,7 +26,7 @@ class DriverBindlessResolver final : public BindlessResolver {
 public:
     using InterfaceLookup = std::function<std::shared_ptr<const ShaderRecompiler::BindlessInterface>(std::uint64_t)>;
     explicit DriverBindlessResolver(const Context& context, InterfaceLookup lookup = {});
-    BindlessPrepared Prepare(const DeviceImageKeys::Key& key) override;
+    BindlessPrepared Prepare(const BindlessImageKeys::Key& key) override;
     BindlessResolution Commit(const BindlessPrepared& prepared) override;
     bool Current(const BindlessResolution& resolution) override;
     bool RefreshGeneration(BindlessPrepared& prepared) override;

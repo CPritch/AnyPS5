@@ -52,13 +52,13 @@ using AgcDriver::Graphics::Buffer;
 using AgcDriver::Graphics::Check;
 using AgcDriver::Graphics::Context;
 using AgcDriver::Graphics::DescriptorHeap;
-using AgcDriver::Graphics::DeviceImageKeys;
-using AgcDriver::Graphics::DeviceImageValue;
+using AgcDriver::Graphics::BindlessImageKeys;
+using AgcDriver::Graphics::BindlessImageValue;
 using AgcDriver::Graphics::Recorder;
 using AgcDriver::Graphics::Require;
 using AgcDriver::Graphics::TextureService;
 namespace Abi = ShaderRecompiler::BindlessImageAbi;
-namespace Table = ShaderRecompiler::DeviceImageTableAbi;
+namespace Table = ShaderRecompiler::BindlessImageTableAbi;
 
 constexpr int Skipped = 77;
 constexpr std::uint32_t Side = 64u;
@@ -513,7 +513,7 @@ public:
     TestResolver(const Images& images, HostMemory& memory, std::uint64_t surfaces) : images(images), memory(memory), surfaces(surfaces) {
         for (std::uint32_t image = 0; image < DistinctImages; ++image) owners.push_back(std::make_shared<std::uint32_t>(image));
     }
-    BindlessPrepared Prepare(const DeviceImageKeys::Key& key) override {
+    BindlessPrepared Prepare(const BindlessImageKeys::Key& key) override {
         ++prepares;
         const auto image = key[0] & 0xffffu;
         Require(image < DistinctImages, "the test T# names no test image");
@@ -532,7 +532,7 @@ public:
         auto image = *std::static_pointer_cast<std::uint32_t>(prepared.state);
         if (reused.contains(image)) image = (image + Remapped) % DistinctImages;
         BindlessResolution resolution;
-        resolution.value = DeviceImageValue{0u, prepared.key[2] & 0xffu, 0u, 0u};
+        resolution.value = BindlessImageValue{0u, prepared.key[2] & 0xffu, 0u, 0u};
         resolution.owner = owners[image];
         resolution.view = images.View(image);
         resolution.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -581,7 +581,7 @@ struct Fixture {
     static constexpr std::uint32_t Records = 4096u;
     static constexpr std::uint32_t Groups = Records / 64u;
 
-    Fixture(const Device& device, std::uint32_t buckets = DeviceImageKeys::InitialBuckets, std::uint32_t maxBuckets = DeviceImageKeys::MaxBuckets, std::uint32_t ringCapacity = BindlessTable::DefaultRingCapacity) : context(device.GetContext()) {
+    Fixture(const Device& device, std::uint32_t buckets = BindlessImageKeys::InitialBuckets, std::uint32_t maxBuckets = BindlessImageKeys::MaxBuckets, std::uint32_t ringCapacity = BindlessTable::DefaultRingCapacity) : context(device.GetContext()) {
         const auto capacities = DescriptorHeap::DeviceCapacities(context);
         table = std::make_unique<BindlessTable>(context, DescriptorHeap::Capacities{std::min(capacities.samplers, 64u), std::min(capacities.sampledImages, 16384u), std::min(capacities.storageImages, 64u)}, buckets, maxBuckets, ringCapacity);
         images = std::make_unique<Images>(context, DistinctImages);
@@ -687,7 +687,7 @@ void serviceTests(const Device& device) {
     const auto primed = service.Totals();
     Require(primed.primed == 1u && primed.workerPrepared == 1u && primed.workerCommitted == Fixture::Records && primed.created == Fixture::Records && primed.refused == 8u && primed.refusals[static_cast<std::size_t>(AgcDriver::Graphics::BindlessRefusalKind::Other)] == 8u, "the worker primer did not create every table entry off the GPU lock: created " + std::to_string(primed.created) + ", worker committed " + std::to_string(primed.workerCommitted) + ", refused " + std::to_string(primed.refused));
     Require(primed.imageSlots == DistinctImages, "the heap slots were not shared per image view: " + std::to_string(primed.imageSlots));
-    Require(primed.tables == 1u && primed.tableHostBytes >= Fixture::Records * Table::DescriptorWords * sizeof(std::uint32_t) && primed.entryHostBytes >= primed.entries * sizeof(DeviceImageKeys::Key), "the host bytes of the primed table and its entries are not counted: " + std::to_string(primed.tableHostBytes));
+    Require(primed.tables == 1u && primed.tableHostBytes >= Fixture::Records * Table::DescriptorWords * sizeof(std::uint32_t) && primed.entryHostBytes >= primed.entries * sizeof(BindlessImageKeys::Key), "the host bytes of the primed table and its entries are not counted: " + std::to_string(primed.tableHostBytes));
     Require(primed.rejections != 0u && primed.rejectionHostBytes != 0u, "the host bytes of the refusal reasons are not counted");
     const std::array<std::uint32_t, Table::DescriptorWords> nullWords{};
     const auto nullValue = service.Find(Abi::MakeKey(nullWords, InterfaceId, 0u));
@@ -818,7 +818,7 @@ void serviceTests(const Device& device) {
     Require(afterUnmap.unmapped - beforeUnmap.unmapped == usingSix && afterUnmap.retired - beforeUnmap.retired >= usingSix && !service.Find(fixture.Key(6u)).has_value(), "unmapping a surface did not retire its " + std::to_string(usingSix) + " entries");
     Require(fixture.table->Heap().PendingReleases() != 0u, "the unmapped entries' slot was not released through the retire serial");
     Require(!service.Find(fixture.Key(Refused)).has_value(), "a refusal that may depend on the mapping was not retried after the mapping changed");
-    Require(afterUnmap.keptRefusals - beforeUnmap.keptRefusals == 4u && service.Find(fixture.Key(Refused + 4u)).value_or(DeviceImageValue{}).fault != 0u, "a refusal fixed by its T# was retired by a mapping change: kept " + std::to_string(afterUnmap.keptRefusals - beforeUnmap.keptRefusals));
+    Require(afterUnmap.keptRefusals - beforeUnmap.keptRefusals == 4u && service.Find(fixture.Key(Refused + 4u)).value_or(BindlessImageValue{}).fault != 0u, "a refusal fixed by its T# was retired by a mapping change: kept " + std::to_string(afterUnmap.keptRefusals - beforeUnmap.keptRefusals));
     service.Serve(served, recorder);
     fixture.Dispatch(recorder, 0x500u);
     recorder.Submit();
@@ -873,7 +873,7 @@ void lazyTests(const Device& device) {
 
 void stormTests(const Device& device) {
     {
-        Fixture fixture(device, DeviceImageKeys::InitialBuckets, DeviceImageKeys::MaxBuckets, 64u);
+        Fixture fixture(device, BindlessImageKeys::InitialBuckets, BindlessImageKeys::MaxBuckets, 64u);
         fixture.mask = 15u;
         Recorder recorder(fixture.context, device.Timeline());
         recorder.Activate();
@@ -899,7 +899,7 @@ void stormTests(const Device& device) {
         std::cout << "lazy few keys: " << Fixture::Records * 2u << " invocations missing 16 keys -> 16 ring records, exact on the next frame\n";
     }
     constexpr std::uint32_t Ring = 256u;
-    Fixture fixture(device, DeviceImageKeys::InitialBuckets, DeviceImageKeys::MaxBuckets, Ring);
+    Fixture fixture(device, BindlessImageKeys::InitialBuckets, BindlessImageKeys::MaxBuckets, Ring);
     Recorder recorder(fixture.context, device.Timeline());
     recorder.Activate();
     TextureService::Options options;

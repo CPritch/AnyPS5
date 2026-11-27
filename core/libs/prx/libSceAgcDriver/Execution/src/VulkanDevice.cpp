@@ -3006,7 +3006,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         const auto capacities = Graphics::DescriptorHeap::DeviceCapacities(context);
         const auto& limits = state->descriptorIndexingProperties;
         std::fprintf(stderr, "[bindless] heap: %u sampled images, %u storage images, %u samplers (update-after-bind limits per stage: %u sampled, %u storage, %u samplers, %u resources; per set: %u sampled, %u storage, %u samplers; maxSamplerAllocationCount %u)\n", capacities.sampledImages, capacities.storageImages, capacities.samplers, limits.maxPerStageDescriptorUpdateAfterBindSampledImages, limits.maxPerStageDescriptorUpdateAfterBindStorageImages, limits.maxPerStageDescriptorUpdateAfterBindSamplers, limits.maxPerStageUpdateAfterBindResources, limits.maxDescriptorSetUpdateAfterBindSampledImages, limits.maxDescriptorSetUpdateAfterBindStorageImages, limits.maxDescriptorSetUpdateAfterBindSamplers, state->properties.limits.maxSamplerAllocationCount);
-        state->bindlessTable = std::make_unique<Graphics::BindlessTable>(context, capacities, Graphics::DeviceImageKeys::InitialBuckets, Graphics::DeviceImageKeys::MaxBuckets, Graphics::BindlessRingRecords());
+        state->bindlessTable = std::make_unique<Graphics::BindlessTable>(context, capacities, Graphics::BindlessImageKeys::InitialBuckets, Graphics::BindlessImageKeys::MaxBuckets, Graphics::BindlessRingRecords());
         std::fprintf(stderr, "[bindless] miss ring: %u records per batch, reported-miss set %u slots (each missing key reported once per clear)\n", state->bindlessTable->RingCapacity(), state->bindlessTable->SeenSlots());
     }
     state->context = buildContext();

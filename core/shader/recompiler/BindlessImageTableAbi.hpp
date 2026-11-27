@@ -1,11 +1,11 @@
-#ifndef CORE_SHADER_RECOMPILER_DEVICEIMAGETABLEABI_HPP
-#define CORE_SHADER_RECOMPILER_DEVICEIMAGETABLEABI_HPP
+#ifndef CORE_SHADER_RECOMPILER_BINDLESSIMAGETABLEABI_HPP
+#define CORE_SHADER_RECOMPILER_BINDLESSIMAGETABLEABI_HPP
 
 #include <array>
 #include <cstdint>
 #include <span>
 
-namespace ShaderRecompiler::DeviceImageTableAbi {
+namespace ShaderRecompiler::BindlessImageTableAbi {
 
 inline constexpr std::uint32_t Version = 2;
 

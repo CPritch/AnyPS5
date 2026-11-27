@@ -10,7 +10,7 @@
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "BindlessImageAbi.hpp"
-#include "DeviceImageTableAbi.hpp"
+#include "BindlessImageTableAbi.hpp"
 #include "ImageTableAbi.hpp"
 #include <algorithm>
 #include <atomic>
@@ -25,7 +25,7 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-namespace Abi = ShaderRecompiler::DeviceImageTableAbi;
+namespace Abi = ShaderRecompiler::BindlessImageTableAbi;
 namespace Heap = ShaderRecompiler::BindlessImageAbi;
 
 struct Prepared {
@@ -90,7 +90,7 @@ bool GuestBindlessMemory::Mapped(std::uint64_t address, std::size_t bytes) {
 DriverBindlessResolver::DriverBindlessResolver(const Context& context, InterfaceLookup lookup) : context(context), lookup(lookup != nullptr ? std::move(lookup) : InterfaceLookup(&ShaderRecompiler::ResourceMaterializer::FindBindlessInterface)) {
 }
 
-BindlessPrepared DriverBindlessResolver::Prepare(const DeviceImageKeys::Key& key) {
+BindlessPrepared DriverBindlessResolver::Prepare(const BindlessImageKeys::Key& key) {
     using Materializer = ShaderRecompiler::ResourceMaterializer;
     const auto id = static_cast<std::uint64_t>(key[Abi::InterfaceWord]) | (static_cast<std::uint64_t>(key[Abi::InterfaceWord + 1u]) << 32u);
     const auto found = lookup(id);
@@ -107,7 +107,7 @@ BindlessPrepared DriverBindlessResolver::Prepare(const DeviceImageKeys::Key& key
     BindlessPrepared prepared;
     prepared.key = key;
     if (mode.constantSwizzle) {
-        prepared.settled = DeviceImageValue{0u, *match.mode, 0u, 0u};
+        prepared.settled = BindlessImageValue{0u, *match.mode, 0u, 0u};
         return prepared;
     }
     if (found->image.resourceClass == ShaderRecompiler::ImageResourceClass::Storage) throw BindlessKeyRefusal("AGC graphics: a storage image read or written through the bindless heap is not implemented (storage tables stay on their per-draw binding)");
@@ -172,7 +172,7 @@ BindlessResolution DriverBindlessResolver::Commit(const BindlessPrepared& prepar
     Require(resolution.view != VK_NULL_HANDLE, "a bindless entry's texture has no view of the shape its mode reads");
     resolution.layout = texture->Layout();
     Require(resolution.layout == VK_IMAGE_LAYOUT_GENERAL || resolution.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, "a bindless entry's texture is in image layout " + std::to_string(static_cast<int>(resolution.layout)) + ", which the heap's sampled descriptors cannot read");
-    resolution.value = DeviceImageValue{0u, state->mode, 0u, 0u};
+    resolution.value = BindlessImageValue{0u, state->mode, 0u, 0u};
     resolution.address = prepared.address;
     resolution.bytes = prepared.bytes;
     resolution.generation = prepared.generation;

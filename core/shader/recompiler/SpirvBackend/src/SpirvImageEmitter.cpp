@@ -10,7 +10,7 @@
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "ImageTableAbi.hpp"
 #include "BindlessImageAbi.hpp"
-#include "DeviceImageTableAbi.hpp"
+#include "BindlessImageTableAbi.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvBufferAccess.hpp"
 #include <span>
 #include <initializer_list>
@@ -2991,7 +2991,7 @@ std::uint32_t BindlessQuadSelector(SpirvEmitterState& state, const BindlessAcces
 }
 
 std::uint32_t BindlessHash(SpirvEmitterState& state, std::span<const std::uint32_t> key) {
-    namespace Table = DeviceImageTableAbi;
+    namespace Table = BindlessImageTableAbi;
     const auto u32 = TypeU32(state);
     const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
     const auto rotate = [&](std::uint32_t value, std::uint32_t bits) {
@@ -3031,7 +3031,7 @@ std::uint32_t BindlessHeaderWord(SpirvEmitterState& state, std::uint32_t index) 
 }
 
 std::uint32_t DefineBindlessLookup(SpirvEmitterState& state, bool full, bool addressed) {
-    namespace Table = DeviceImageTableAbi;
+    namespace Table = BindlessImageTableAbi;
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto uvec4 = TypeU32Vector(state, 4u);
