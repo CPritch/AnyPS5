@@ -1213,7 +1213,8 @@ std::optional<VkDescriptorSetAndBindingMappingEXT> BindlessHeap::embeddedSampler
         auto resource = DecodeSamplerResource(words, unnormalized, true, integerBorder);
         resource.compareEnable = compare;
         EmbeddedSampler made;
-        made.info = Sampler::CreateInfo(context, resource, made.reduction);
+        VkSamplerBorderColorComponentMappingCreateInfoEXT unmappedBorder{};
+        made.info = Sampler::CreateInfo(context, resource, made.reduction, std::nullopt, unmappedBorder);
         if (embeddedSamplerCount < embeddedSamplerLimit(context)) ++embeddedSamplerCount;
         else made.heapSampler = std::make_shared<Sampler>(context, resource);
         found = embeddedSamplers.emplace(key, std::move(made)).first;
