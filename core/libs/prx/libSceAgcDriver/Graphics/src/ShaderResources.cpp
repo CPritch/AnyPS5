@@ -196,6 +196,7 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
+    std::chrono::steady_clock::time_point used{};
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
     // The untrackedKey the snapshot was last read or compared equal at, for a surface outside the
     // write watch; zero when none was taken.
@@ -383,9 +384,17 @@ void dropUncachedViews(TextureCache& cache) {
 }
 
 // Moves an entry to the front (most recently used).
-void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
+void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it, std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) {
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
     it->present = Recorder::Presents();
+    it->used = now;
+}
+
+std::atomic<std::int64_t> sampledKeepWindowOverride{0};
+
+std::chrono::nanoseconds sampledKeepWindow() {
+    const auto overridden = sampledKeepWindowOverride.load(std::memory_order_relaxed);
+    return overridden != 0 ? std::chrono::nanoseconds(overridden) : std::chrono::duration_cast<std::chrono::nanoseconds>(SampledReleaseKeepWindow);
 }
 
 constexpr std::uint64_t SpareSnapshotBytes = 256ull << 20;
@@ -1377,6 +1386,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 cache.transient.erase(found);
                 cache.bytes += entry.accounted;
                 entry.present = Recorder::Presents();
+                entry.used = std::chrono::steady_clock::now();
                 ++cache.counts.inserted;
                 const auto* viewed = entry.source.get();
                 cache.entries.push_front(std::move(entry));
@@ -1493,6 +1503,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     cache.bytes += entry.accounted;
     entry.present = Recorder::Presents();
+    entry.used = std::chrono::steady_clock::now();
     ++cache.counts.inserted;
     logLookup(madeRecord());
     cache.entries.push_front(std::move(entry));
@@ -1895,6 +1906,10 @@ void OverrideCacheBudgetForTest(std::uint64_t bytes) {
     budgetOverride.store(bytes, std::memory_order_relaxed);
 }
 
+void SampledReleaseKeepWindowForTest(std::chrono::nanoseconds window) {
+    sampledKeepWindowOverride.store(window.count(), std::memory_order_relaxed);
+}
+
 TextureCacheUse TextureCacheUsage() {
     TextureCacheUse use;
     {
@@ -2036,12 +2051,17 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
     bool sampledSkipped = false;
     bool storageSkipped = false;
     std::size_t sampledBuilds = 0;
+    std::size_t sampledRecent = 0;
     std::unordered_set<const Texture*> held;
     std::vector<std::pair<const Texture*, std::uint64_t>> heldBytes;
     std::size_t charged = 0;
+    const auto releasePresent = Recorder::Presents();
+    const auto keepWindow = sampledKeepWindow();
+    const bool keepRecent = bytes != ~std::uint64_t{0} && releasePresent != 0u;
     for (bool retry = false;; retry = true) {
         held.clear();
         heldBytes.clear();
+        sampledRecent = 0;
         auto& cache = Textures();
         std::unique_lock lock(cache.mutex, std::defer_lock);
         const bool inherited = sampledCacheHeld != 0;
@@ -2060,11 +2080,21 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
                 cache.transientAccounted -= it->second.accounted;
                 it = cache.transient.erase(it);
             }
+            const auto now = std::chrono::steady_clock::now();
+            std::size_t behind = 0;
             for (auto it = cache.entries.end(); it != cache.entries.begin() && freed < bytes;) {
                 --it;
-                if (it->source != nullptr && it->source->Dirty()) continue;
+                if (it->source != nullptr && it->source->Dirty()) {
+                    ++behind;
+                    continue;
+                }
+                if (keepRecent && it->present + 1u >= releasePresent && now - it->used < keepWindow) {
+                    sampledRecent = cache.entries.size() - behind;
+                    break;
+                }
                 if (it->texture.use_count() != 1) {
                     if (held.insert(it->texture.get()).second) heldBytes.emplace_back(it->texture.get(), it->texture->AllocationBytes());
+                    ++behind;
                     continue;
                 }
                 const auto next = std::next(it);
@@ -2205,7 +2235,7 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
     }
     char kept[320] = "";
     if (storageScanned) std::snprintf(kept, sizeof(kept), "; of the %zu cached storage images, %zu with pending results, %zu used in this or the previous present were kept, and the release stopped at %zu image held outside the cache once its cached builds were dropped", storageCached, storagePending, storageRecent, storageHeld);
-    std::fprintf(stderr, "[gpu] texture caches released %llu MiB of the %llu MiB asked for: %zu sampled entries%s, %zu cached builds holding sampled textures dropped, %zu sampled textures still held (%zu charged to the open batch), %zu storage images%s%s\n", static_cast<unsigned long long>(freed >> 20u), static_cast<unsigned long long>(bytes >> 20u), sampledEntries, sampledSkipped ? " (cache busy, skipped)" : "", sampledBuilds, held.size(), charged, storageEntries, storageSkipped ? " (cache or device busy, skipped)" : "", kept);
+    std::fprintf(stderr, "[gpu] texture caches released %llu MiB of the %llu MiB asked for: %zu sampled entries%s, %zu sampled entries used in this or the previous present and within the last %g s kept, %zu cached builds holding sampled textures dropped, %zu sampled textures still held (%zu charged to the open batch), %zu storage images%s%s\n", static_cast<unsigned long long>(freed >> 20u), static_cast<unsigned long long>(bytes >> 20u), sampledEntries, sampledSkipped ? " (cache busy, skipped)" : "", sampledRecent, std::chrono::duration<double>(keepWindow).count(), sampledBuilds, held.size(), charged, storageEntries, storageSkipped ? " (cache or device busy, skipped)" : "", kept);
     return freed;
 }
 
@@ -2690,9 +2720,10 @@ bool CachedTableTextures(ReusedTable& table, std::vector<std::shared_ptr<Texture
         table.cachedErasures = cache.erasures;
     }
     cached.reserve(entries.size());
+    const auto now = std::chrono::steady_clock::now();
     for (const auto it : entries) {
         cached.push_back(it->texture);
-        touchTexture(cache, it);
+        touchTexture(cache, it, now);
     }
     return true;
 }

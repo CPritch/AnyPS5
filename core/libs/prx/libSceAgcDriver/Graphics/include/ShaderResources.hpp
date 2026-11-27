@@ -49,6 +49,8 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false);
 bool TextureCacheReclaimFutile();
 inline constexpr std::chrono::milliseconds FutileReclaimWindow{100};
 inline constexpr std::chrono::milliseconds StoragePresentKeepWindow{1000};
+inline constexpr std::chrono::seconds SampledReleaseKeepWindow{60};
+void SampledReleaseKeepWindowForTest(std::chrono::nanoseconds window);
 struct StorageTextureBudgetSnapshot {
     std::optional<std::uint32_t> heap;
     std::uint64_t sampledBytes = 0;

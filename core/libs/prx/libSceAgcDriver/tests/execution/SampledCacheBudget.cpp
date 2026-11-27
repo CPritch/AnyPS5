@@ -1011,6 +1011,56 @@ void batchHeldReleaseTests(Context context) {
     std::puts("texture cache release of textures held by the open batch passed");
 }
 
+void releaseRecencyTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    ClearCachedTextures(context.device);
+    SharedResourceCache().Clear();
+    struct WindowReset {
+        ~WindowReset() { SampledReleaseKeepWindowForTest(std::chrono::nanoseconds{0}); }
+    } reset;
+    constexpr std::uint64_t Pressure = 1ull << 30u;
+    Block block(context);
+    const auto made = [&](std::size_t surface) {
+        const std::weak_ptr<Texture> texture = Sampled(context, block.Surface(surface));
+        Require(!texture.expired(), "surface " + std::to_string(surface) + " did not stay in the sampled texture cache");
+        return texture;
+    };
+    Recorder::CountPresent();
+    const auto played = made(0);
+    Recorder::CountPresent();
+    Recorder::CountPresent();
+    const auto shown = made(1);
+    ReleaseTextureCaches(Pressure);
+    Require(played.expired(), "a release for memory pressure kept a sampled texture last used two presents ago");
+    Require(!shown.expired() && TextureCacheUsage().sampledEntries == 1u, "a release for memory pressure evicted a sampled texture used in the current present");
+    ClearCachedTextures(context.device);
+    Recorder::CountPresent();
+    const auto first = made(2);
+    std::this_thread::sleep_for(StoragePresentKeepWindow + std::chrono::milliseconds(100));
+    Require(!Recorder::PresentedWithin(StoragePresentKeepWindow), "a present older than the storage keep window is still within it");
+    const auto second = made(3);
+    ReleaseTextureCaches(Pressure);
+    Require(!first.expired() && !second.expired() && TextureCacheUsage().sampledEntries == 2u, "with presents stopped, a release for memory pressure evicted a sampled texture used since the last present within " + std::to_string(SampledReleaseKeepWindow.count()) + " s");
+    SampledReleaseKeepWindowForTest(StoragePresentKeepWindow / 2);
+    ReleaseTextureCaches(Pressure);
+    Require(first.expired(), "with presents stopped, a release for memory pressure kept a sampled texture unused for longer than the keep window");
+    Require(!second.expired() && TextureCacheUsage().sampledEntries == 1u, "with presents stopped, a release for memory pressure evicted a sampled texture used within the keep window");
+    SampledReleaseKeepWindowForTest(std::chrono::nanoseconds{0});
+    ClearCachedTextures(context.device);
+    const auto old = made(4);
+    Recorder::CountPresent();
+    Recorder::CountPresent();
+    const auto recent = made(5);
+    ReleaseTextureCaches(~std::uint64_t{0});
+    Require(old.expired() && recent.expired() && TextureCacheUsage().sampledEntries == 0u, "a full release of the texture caches kept a sampled texture it does not hold");
+    SharedResourceCache().Clear();
+    ClearCachedTextures(context.device);
+    std::puts("texture cache release keeps recently used sampled textures under memory pressure passed");
+}
+
 void rescanTests(const Context& context) {
     constexpr std::uint32_t SmallSide = 128;
     constexpr std::size_t SmallBytes = std::size_t{SmallSide} * SmallSide * 4u;
@@ -2004,6 +2054,7 @@ int main(int argc, char** argv) {
             collidingKeyTests(context);
             allocationIdentityTests(context);
             spareAgeTests(context);
+            releaseRecencyTests(context);
             ClearCachedTextures(context.device);
         }
         std::puts("sampled texture cache budget tests passed");
