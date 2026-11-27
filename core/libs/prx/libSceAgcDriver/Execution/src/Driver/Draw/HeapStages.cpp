@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CpuImageTableTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeviceImageTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
@@ -536,7 +537,9 @@ captureWalk(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::s
     runtime.unchangedSince = walkUnchangedSince;
     runtime.supplyWords = supplyWalkWords;
     runtime.accessible = walkAccessible;
-    return invocation.Capture(runtime);
+    auto capture = invocation.Capture(runtime);
+    Graphics::NoteCpuImageTablePlan(invocation.Request(), capture->plan);
+    return capture;
 }
 
 }

@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeviceImageTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CpuImageTableTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -7610,6 +7611,13 @@ void ShaderResources::resolveImageTables() {
     }
     for (auto& table : tableStages) {
         if (table.images == nullptr) continue;
+        if (CpuImageTablesTraced()) {
+            const auto service = [this](std::uint64_t codeAddress) {
+                const auto* deviceTable = DeviceImageTable::Existing(context);
+                return deviceTable == nullptr ? DeviceImageService::NoTable : deviceTable->ServesProgram(codeAddress) ? DeviceImageService::Serves : DeviceImageService::FallenBack;
+            };
+            TraceCpuImageTable(service, table.stage, *table.program, *table.images, table.map, table.heap);
+        }
         auto* item = !table.heap && tableBindings[table.set] != std::numeric_limits<std::size_t>::max() ? &bindings[tableBindings[table.set]] : nullptr;
         const auto& binding = *table.images;
         const auto faults = table.map[ShaderRecompiler::ImageTableAbi::HeaderElementFaults];

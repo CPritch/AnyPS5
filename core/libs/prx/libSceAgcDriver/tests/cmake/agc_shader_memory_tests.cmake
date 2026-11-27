@@ -1,6 +1,7 @@
 add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
+        Graphics/src/CpuImageTableTrace.cpp
         Execution/src/GuestMemory.cpp
         Execution/src/PerformanceTraceThread.cpp
         Graphics/src/GuestTextureResource.cpp
