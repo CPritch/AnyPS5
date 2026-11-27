@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineBuildTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -1012,6 +1013,60 @@ void UndecodableModuleIsNotExpanded() {
 
 }
 
+struct TracedRun {
+    AgcDriver::Graphics::PipelineBuildCounters opened;
+    AgcDriver::Graphics::PipelineBuildCounters replayed;
+    AgcDriver::Graphics::PipelineBuildCounters dispatched;
+    std::uint64_t createdByDispatch = 0;
+};
+
+std::uint64_t Answered(const AgcDriver::Graphics::PipelineBuildCounters& counters) {
+    return counters.cacheHits + counters.cacheMisses + counters.unreported + counters.unasked;
+}
+
+TracedRun TracedDispatch(const std::vector<std::uint32_t>& code, const char* what) {
+    using namespace NarrowConstantStoreFixture;
+    Block compute(BlockBytes);
+    const auto words = AddressWords(compute);
+    TracedRun run;
+    run.opened = AgcDriver::Graphics::PipelineBuildTotals();
+    const auto device = OpenVulkanTestDevice();
+    Require(device != nullptr, std::string("no device for ") + what);
+    device->WaitForPipelineJournalReplay();
+    run.replayed = AgcDriver::Graphics::PipelineBuildTotals();
+    const auto created = device->ComputePipelinesCreated();
+    std::memset(compute.data, Fill, compute.bytes);
+    const auto result = CompileCompute(*device, code, words, 32);
+    device->Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+    device->WaitIdle();
+    AgcDriver::Graphics::FlushPipelineJournal();
+    run.dispatched = AgcDriver::Graphics::PipelineBuildTotals();
+    run.createdByDispatch = device->ComputePipelinesCreated() - created;
+    Require(Answered(run.dispatched) - Answered(run.opened) == run.dispatched.builds - run.opened.builds, std::string(what) + ": a traced build has no cache answer");
+    return run;
+}
+
+int BuildTraceTests() {
+    Require(AgcDriver::Graphics::PipelineBuildsTraced(), "the build trace test needs APS5_TRACE_PIPELINE_BUILDS");
+    const auto code = ComputeCode(61);
+    const auto fresh = TracedDispatch(code, "the first run");
+    Require(fresh.replayed.replayed == fresh.opened.replayed, "an empty journal replayed a traced build");
+    Require(fresh.createdByDispatch == 1 && fresh.dispatched.journalNew - fresh.replayed.journalNew == 1 && fresh.dispatched.journalHeld == fresh.replayed.journalHeld, "the first run's dispatch was not traced as one build the journal did not hold");
+    SetEnvironment("APS5_PIPELINE_JOURNAL_COMPUTE_ENTRIES", "0");
+    const auto held = TracedDispatch(code, "the run that replays no compute pipeline");
+    SetEnvironment("APS5_PIPELINE_JOURNAL_COMPUTE_ENTRIES", "");
+    Require(held.replayed.replayed == held.opened.replayed, "a replay bounded to no compute entries traced a replayed build");
+    Require(held.createdByDispatch == 1 && held.dispatched.journalHeld - held.replayed.journalHeld == 1 && held.dispatched.journalNew == held.replayed.journalNew, "a dispatch of a program the journal held but did not replay was not traced as held");
+    const auto replayed = TracedDispatch(code, "the run that replays the compute pipeline");
+    Require(replayed.replayed.replayed - replayed.opened.replayed == 1 && replayed.replayed.journalNew == replayed.opened.journalNew && replayed.replayed.journalHeld == replayed.opened.journalHeld, "the replay of the recorded compute pipeline was not traced as one replayed build");
+    Require(replayed.createdByDispatch == 0 && replayed.dispatched.builds == replayed.replayed.builds, "the dispatch after the replay traced a build of its own");
+    const auto answer = [](const AgcDriver::Graphics::PipelineBuildCounters& from, const AgcDriver::Graphics::PipelineBuildCounters& to) {
+        return std::to_string(to.cacheHits - from.cacheHits) + " hit, " + std::to_string(to.cacheMisses - from.cacheMisses) + " miss, " + std::to_string(to.unreported - from.unreported) + " unreported, " + std::to_string(to.unasked - from.unasked) + " unasked";
+    };
+    std::printf("pipeline build trace passed (held dispatch: %s; replay: %s)\n", answer(held.replayed, held.dispatched).c_str(), answer(replayed.opened, replayed.replayed).c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-pipeline-journal-test-" + std::to_string(std::random_device{}()));
@@ -1039,6 +1094,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc >= 2 && std::string(argv[1]) == "--bindless-switch") return BindlessSwitchTests();
+        if (argc >= 2 && std::string(argv[1]) == "--build-trace") return BuildTraceTests();
         if (argc >= 2 && std::string(argv[1]) == "--gpu-heap") {
             if (AgcDriver::Graphics::GpuHeapEnabled() && SkipWithoutDescriptorHeap()) return VulkanTestSkipped;
             HeapJournalTests();

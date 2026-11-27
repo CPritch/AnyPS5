@@ -168,14 +168,32 @@ void WaitingAfterChanges(const Region& region) {
     }
 }
 
-void Untracked() {
+void Untracked(const Region& region) {
     Spans spans;
     std::uint64_t current = 0;
-    const auto before = Generation();
     {
         GuestAllocations::Mutation mutation;
-        mutation.RegisterMainImage();
+        mutation.Add(region.base, 0x10000, true, true, false);
     }
+    const auto before = Generation();
+    auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    std::atomic<bool> done{false};
+    std::thread mutator([&] {
+        GuestAllocations::Mutation mutation;
+        mutation.RegisterMainImage();
+        mutation.Remove(region.base);
+        done.store(true);
+    });
+    auto answer = GuestAllocations::ChangesAnswer::Answered;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (answer == GuestAllocations::ChangesAnswer::Answered && std::chrono::steady_clock::now() < deadline) {
+        answer = Answer(before, spans, current);
+        if (answer == GuestAllocations::ChangesAnswer::Answered) std::this_thread::yield();
+    }
+    Require(answer == GuestAllocations::ChangesAnswer::Untracked, "changes are answered while a mutation that registered an image waits for a lease");
+    Require(!done.load(), "a leased range was removed");
+    lease.clear();
+    mutator.join();
     Require(Answer(before, spans, current) == GuestAllocations::ChangesAnswer::Untracked, "changes are answered across an image registration");
     const auto after = Generation();
     Require(Since(after, spans, current) && spans.empty(), "generations after an image registration are refused");
@@ -194,6 +212,6 @@ int main() {
     Overflow(region);
     Retiring(region);
     WaitingAfterChanges(region);
-    Untracked();
+    Untracked(region);
     return 0;
 }

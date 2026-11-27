@@ -13,6 +13,7 @@
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineBuildTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -375,7 +376,7 @@ bool CoreVulkanCapability(std::uint32_t capability) {
     }
 }
 
-void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr) {
+void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr, Graphics::PipelineBuildTrace* trace = nullptr) {
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.flags = flags;
     info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -391,6 +392,7 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
+    if (trace != nullptr) trace->Chain(info.pNext);
     check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
     if (profiled) {
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -409,7 +411,7 @@ static_assert(Graphics::ComputePushConstantBytes + sizeof(VkDeviceAddress) == Sh
               ShaderRecompiler::GpuScratchPoolAddressPushByte + sizeof(VkDeviceAddress) <= ShaderRecompiler::GpuScratchPoolDwordsPushByte &&
               (ShaderRecompiler::StagePushFeatures(ShaderRecompiler::ShaderStage::Compute, 0u) & ShaderRecompiler::PushBytesMask(Graphics::ComputePushConstantBytes, ShaderRecompiler::GpuScratchPoolDwordsPushByte + sizeof(std::uint32_t) - Graphics::ComputePushConstantBytes)) == ShaderRecompiler::PushBytesMask(Graphics::ComputePushConstantBytes, ShaderRecompiler::GpuScratchPoolDwordsPushByte + sizeof(std::uint32_t) - Graphics::ComputePushConstantBytes));
 
-void CreateComputeHeapPipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, std::span<const VkDescriptorSetAndBindingMappingEXT> mappings, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization) {
+void CreateComputeHeapPipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, std::span<const VkDescriptorSetAndBindingMappingEXT> mappings, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization, Graphics::PipelineBuildTrace* trace = nullptr) {
     auto flags2 = Graphics::DescriptorHeapFlags(static_cast<VkPipelineCreateFlags2KHR>(flags));
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, &flags2};
     info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -427,6 +429,7 @@ void CreateComputeHeapPipeline(VkDevice device, PFN_vkCreateComputePipelines cre
     if (subgroupSize != 0) mappingInfo.pNext = &subgroup;
     info.layout = VK_NULL_HANDLE;
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
+    if (trace != nullptr) trace->Chain(info.pNext);
     check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines (descriptor heap)");
 }
 
@@ -740,6 +743,7 @@ struct VulkanDevice::State {
     bool shaderResourceMinLod = false;
     bool shaderImageMinLod = false;
     bool pipelineExecutableInfo = false;
+    bool pipelineCreationFeedback = false;
     bool maintenance8 = false;
     bool pushDescriptors = false;
     bool depthUploadImage = false;
@@ -2699,6 +2703,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
         pipelineFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &pipelineFeatures;
+    }
+    if (Graphics::PipelineBuildsTraced() && hasExtension(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME)) {
+        state->pipelineCreationFeedback = true;
+        deviceExtensions.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+    } else if (Graphics::PipelineBuildsTraced()) {
+        std::fprintf(stderr, "[pipeline-build] the device lacks VK_EXT_pipeline_creation_feedback; builds are traced without the driver's cache answer\n");
     }
     VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     if (hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
@@ -5397,6 +5409,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.shaderResourceMinLod = state->shaderResourceMinLod;
     context.shaderImageMinLod = state->shaderImageMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
+    context.pipelineCreationFeedback = state->pipelineCreationFeedback;
     context.maintenance8 = state->maintenance8;
     context.pushDescriptors = state->pushDescriptors;
     context.depthUploadImage = state->depthUploadImage;
@@ -6925,10 +6938,15 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     const std::span<const std::uint32_t> spirv(shader.spirv.data(), shader.spirv.size());
     objects->descriptorHeap = heapDevice && Graphics::BindlessHeap::For(context).DescriptorHeapMappings(spirv, heapMappings, {.workgroupAddress = workgroupAddress, .gdsAddress = shader.dataAddressPush, .scratchPool = scratchPool}, &objects->pushPlacements.front(), &shader.bindings, workgroupAddressOffset);
     require(!gpuMode || objects->descriptorHeap, "a GPU-mode compute stage does not map onto VK_EXT_descriptor_heap");
+    Graphics::PipelineBuildTrace trace(context.pipelineCreationFeedback);
     const auto createPipelines = state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
-    if (objects->descriptorHeap) CreateComputeHeapPipeline(state->device, createPipelines, context.pipelineCache, objects->module, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, heapMappings, &objects->pipeline, context.pipelineCacheSynchronization);
-    else CreateComputePipeline(state->device, createPipelines, context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization);
+    if (objects->descriptorHeap) CreateComputeHeapPipeline(state->device, createPipelines, context.pipelineCache, objects->module, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, heapMappings, &objects->pipeline, context.pipelineCacheSynchronization, &trace);
+    else CreateComputePipeline(state->device, createPipelines, context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization, &trace);
     if (objects->descriptorHeap) objects->heapMappings = std::move(heapMappings);
+    if (trace.Active()) {
+        const std::array identity{Graphics::DescribedPipelineIdentity(shader)};
+        trace.Report({state->probingFloatControls ? "compute-probe" : "compute", programAddress, identity[0], shader.spirv.size(), shader.specialization.size(), Graphics::PipelineSpecializationHash(specialization.Info()), state->probingFloatControls ? Graphics::PipelineBuildJournal::Unrecorded : Graphics::PipelineBuildJournalOf(identity)});
+    }
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
     if (!state->probingFloatControls) {
@@ -6955,15 +6973,17 @@ VkPipeline VulkanDevice::specializedComputePipeline(const Graphics::Context& con
     if (objects.descriptorHeap) specialization.PlaceHeapImageSlots(Graphics::BindlessHeap::For(context).ImageSlots());
     VkShaderModule module = Graphics::CreateShaderModule(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule"), state->device, state->graphicsPipelineLibrary, shader.spirv.data(), shader.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule");
     VkPipeline pipeline = VK_NULL_HANDLE;
+    Graphics::PipelineBuildTrace trace(context.pipelineCreationFeedback);
     try {
         const auto createPipelines = state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
-        if (objects.descriptorHeap) CreateComputeHeapPipeline(state->device, createPipelines, context.pipelineCache, module, computePipelineFlags(), computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), objects.heapMappings, &pipeline, context.pipelineCacheSynchronization);
-        else CreateComputePipeline(state->device, createPipelines, context.pipelineCache, module, objects.layout, computePipelineFlags(), computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), &pipeline, context.pipelineCacheSynchronization);
+        if (objects.descriptorHeap) CreateComputeHeapPipeline(state->device, createPipelines, context.pipelineCache, module, computePipelineFlags(), computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), objects.heapMappings, &pipeline, context.pipelineCacheSynchronization, &trace);
+        else CreateComputePipeline(state->device, createPipelines, context.pipelineCache, module, objects.layout, computePipelineFlags(), computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), &pipeline, context.pipelineCacheSynchronization, &trace);
     } catch (...) {
         objects.destroyModule(objects.device, module, nullptr);
         throw;
     }
     objects.destroyModule(objects.device, module, nullptr);
+    if (trace.Active()) trace.Report({"compute-split", 0, Graphics::DescribedPipelineIdentity(shader), shader.spirv.size(), replaced.size(), Graphics::PipelineSpecializationHash(specialization.Info()), Graphics::PipelineBuildJournalOf({})});
     computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
     state->computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
     if (GuestMemory::GpuMutex().HeldByThisThread()) computePipelinesCreatedLocked.fetch_add(1, std::memory_order_relaxed);

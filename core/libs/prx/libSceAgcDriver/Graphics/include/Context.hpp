@@ -396,6 +396,7 @@ struct Context {
     bool shaderResourceMinLod = false;
     bool shaderImageMinLod = false;
     bool pipelineExecutableInfo = false;
+    bool pipelineCreationFeedback = false;
     bool maintenance8 = false;
     bool pushDescriptors = false;
     bool depthUploadImage = false;
