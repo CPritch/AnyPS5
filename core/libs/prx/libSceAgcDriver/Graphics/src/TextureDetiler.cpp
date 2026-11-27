@@ -255,11 +255,13 @@ void TextureDetiler::adopt(TextureDetiler& other) noexcept {
     descriptorLayout = std::exchange(other.descriptorLayout, VK_NULL_HANDLE);
     pipelineLayout = std::exchange(other.pipelineLayout, VK_NULL_HANDLE);
     module = std::exchange(other.module, VK_NULL_HANDLE);
+    bc1DecodePipeline = std::exchange(other.bc1DecodePipeline, VK_NULL_HANDLE);
     pipelines = std::exchange(other.pipelines, {});
     descriptorSets = std::exchange(other.descriptorSets, {});
     cmaskDescriptorLayout = std::exchange(other.cmaskDescriptorLayout, VK_NULL_HANDLE);
     cmaskPipelineLayout = std::exchange(other.cmaskPipelineLayout, VK_NULL_HANDLE);
     cmaskPipeline = std::exchange(other.cmaskPipeline, VK_NULL_HANDLE);
+    cmaskHeapPipeline = std::exchange(other.cmaskHeapPipeline, VK_NULL_HANDLE);
     cmaskDescriptorSets = std::exchange(other.cmaskDescriptorSets, {});
     cmaskErrors = std::move(other.cmaskErrors);
     imageDescriptorLayout = std::exchange(other.imageDescriptorLayout, VK_NULL_HANDLE);
@@ -267,6 +269,12 @@ void TextureDetiler::adopt(TextureDetiler& other) noexcept {
     imageModule = std::exchange(other.imageModule, VK_NULL_HANDLE);
     repackModule = std::exchange(other.repackModule, VK_NULL_HANDLE);
     repackPipeline = std::exchange(other.repackPipeline, VK_NULL_HANDLE);
+    heapRepackPipeline = std::exchange(other.heapRepackPipeline, VK_NULL_HANDLE);
+    addressedPipelineLayout = std::exchange(other.addressedPipelineLayout, VK_NULL_HANDLE);
+    addressedRepackLayout = std::exchange(other.addressedRepackLayout, VK_NULL_HANDLE);
+    addressedModule = std::exchange(other.addressedModule, VK_NULL_HANDLE);
+    addressedRepackModule = std::exchange(other.addressedRepackModule, VK_NULL_HANDLE);
+    addressedRepackPipeline = std::exchange(other.addressedRepackPipeline, VK_NULL_HANDLE);
     imageWordModule = std::exchange(other.imageWordModule, VK_NULL_HANDLE);
     wordModule = std::exchange(other.wordModule, VK_NULL_HANDLE);
     imageDescriptorSets = std::exchange(other.imageDescriptorSets, {});
