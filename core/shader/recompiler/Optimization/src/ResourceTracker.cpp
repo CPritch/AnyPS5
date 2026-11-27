@@ -235,10 +235,10 @@ public:
         }
         std::vector<const IrValue*> referenced;
         for (const auto& plan : m_tableColumns) {
-            if (DeviceColumn(plan)) continue;
+            const bool device = DeviceColumn(plan);
             const auto& column = *m_sources[plan.source].tableColumn;
             IrValue* offset = column.selected ? &m_builder.Constant(column.addend) : plan.offset;
-            for (std::uint32_t argument = 0; argument < plan.handle->ArgumentCount(); argument++) {
+            for (std::uint32_t argument = 0; !device && argument < plan.handle->ArgumentCount(); argument++) {
                 const auto value = plan.parentPointer != nullptr && (argument == 1u || argument == 2u) ? plan.parentPointer->Argument(argument - 1u) : offset;
                 plan.handle->ReplaceArgument(argument, value);
             }
@@ -246,7 +246,7 @@ public:
             if (column.selected) {
                 KeepSourceAlive(*plan.handle, m_sources[column.selection], referenced);
             }
-            if (m_bindlessHandles) KeepBindlessWords(*plan.handle, plan.heap);
+            if (m_bindlessHandles && !device) KeepBindlessWords(*plan.handle, plan.heap);
             if (plan.keyDomain.has_value()) {
                 KeepSourceAlive(*plan.handle, m_sources[plan.keyDomain->source], referenced);
             }

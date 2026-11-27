@@ -6715,6 +6715,43 @@ void verifyDeviceImageTables() {
     }
 }
 
+const std::vector<std::uint32_t> DeviceTableBranchComputeCode{0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000030u, 0xbe900302u, 0x8f108510u, 0xbf068003u, 0xbf850007u, 0xf4080100u, 0xfa000000u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xbf82000bu, 0xf4080100u, 0xfa000000u, 0xbe8c03ffu, 0x00008000u, 0xbe8d0380u, 0xbe8e0380u, 0xbe8f0380u, 0xf42c0502u, 0x20000020u, 0xf09c0f08u, 0x00650000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+const std::vector<std::uint32_t> DeviceTableBranchPixelCode{0xf4080200u, 0xfa000010u, 0x7e020300u, 0xbe900302u, 0x8f108510u, 0xbf068003u, 0xbf850007u, 0xf4080100u, 0xfa000000u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xbf82000bu, 0xf4080100u, 0xfa000000u, 0xbe8c03ffu, 0x00008000u, 0xbe8d0380u, 0xbe8e0380u, 0xbe8f0380u, 0xf42c0502u, 0x20000020u, 0xf09c0f08u, 0x00650000u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+
+void verifyDeviceImageTableBranchHeap() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Entries = 16;
+    static TableTexture textures[2];
+    alignas(4096) static std::array<std::array<std::uint32_t, 8>, Entries> heap{};
+    alignas(4096) static std::array<std::uint32_t, 16> srt{};
+    static std::array<std::uint32_t, 4> output{};
+    for (std::uint32_t entry = 0; entry < Entries; ++entry) heap[entry] = TableT(textures[entry % 2u].bytes.data(), TableFormat8888UNorm, TableType2D);
+    const auto heapV = TableV(heap.data(), 32u, Entries);
+    const auto outputV = TableV(output.data(), 0u, 16u);
+    std::copy(heapV.begin(), heapV.end(), srt.begin());
+    srt[4] = 6u;
+    srt[5] = 0u;
+    srt[6] = 0u;
+    srt[7] = 1u << 30u;
+    std::copy(outputV.begin(), outputV.end(), srt.begin() + 12);
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 4> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 3u, 1u};
+    for (const bool pixel : {false, true}) {
+        const auto request = DeviceTableRequest(pixel ? DeviceTableBranchPixelCode : DeviceTableBranchComputeCode, userData, pixel, true, true);
+        const auto plan = GetResourcePlan(request);
+        const auto device = std::ranges::count_if(plan->info.images, [](const ImageResource& image) { return image.table != NoTable && image.deviceTable; });
+        const auto cpu = std::ranges::count_if(plan->info.images, [](const ImageResource& image) { return image.table != NoTable && !image.deviceTable; });
+        require(plan->info.images.size() == 2u && device == 1 && cpu == 1, "device image table branches: the branches' columns of one V# are not one device column and one CPU column");
+        const auto compiled = CompileTable(request);
+        require(compiled.result->deviceImageTables && ScanDeviceTableSpirv(compiled.result->spirv.Words()).lookup, "device image table branches: the device column's branch does not look its image up in the device image table");
+        const auto& map = TableMap(*compiled.result);
+        require(map.at(ImageTableAbi::HeaderElementCount) != 0u, "device image table branches: the CPU column's branch has no records in the CPU map");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+        static_cast<void>(ValidateAndOptimizeSpirv(compiled.result->spirv, request.target.vulkanVersion, request.target.spirvVersion));
+#endif
+    }
+}
+
 void verifyTableTrailer() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -14412,6 +14449,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--device-image-tables") {
             verifyDeviceImageTables();
             std::cout << "GPU-mode stages read V# table columns through the device image table, whose addresses they take from the map trailer\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--device-image-table-branches") {
+            verifyDeviceImageTableBranchHeap();
+            std::cout << "A V# loaded again in each branch keeps a device column in one branch and a CPU column in the other\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--table-trailer") {
