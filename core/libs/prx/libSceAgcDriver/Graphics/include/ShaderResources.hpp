@@ -193,7 +193,7 @@ enum class ContentKeyComponent : std::size_t { Layout, BufferWord0, BufferWord1,
 using ContentKeyDiff = std::array<bool, static_cast<std::size_t>(ContentKeyComponent::Count)>;
 
 enum class ImageTableUnremembered : std::size_t { NoEpoch, ArrayPartners, Capacity, StoredElements, NoSampledBinding, RejectedVariant, NothingKept, Pending, Count };
-enum class ImageTableUnreused : std::size_t { NoEpoch, StoredElements, NoSampledBinding, NotRemembered, Variants, DepthSurfaces, MultisampleTargets, StateBound, MappingUntracked, MappingDropped, MappingAhead, MappingWhole, MappingOverHalf, Collect, Pending, Changed, Evicted, Count };
+enum class ImageTableUnreused : std::size_t { NoEpoch, StoredElements, NoSampledBinding, NotRemembered, NotRememberedShapes, NotRememberedEvicted, Variants, DepthSurfaces, MultisampleTargets, StateBound, MappingUntracked, MappingDropped, MappingAhead, MappingWhole, MappingOverHalf, Collect, Pending, Changed, Evicted, Count };
 
 struct ImageTableReuseCounts {
     std::uint64_t reused = 0;
@@ -214,6 +214,8 @@ struct ImageTableReuseCounts {
     std::uint64_t mappingWaited = 0;
     std::uint64_t largestMappingAffected = 0;
     std::uint64_t largestMappingEntries = 0;
+    std::uint64_t proofSpans = 0;
+    std::uint64_t proofEntries = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ImageTableUnremembered::Count)> unremembered{};
     std::array<std::uint64_t, static_cast<std::size_t>(ImageTableUnreused::Count)> unreused{};
 };

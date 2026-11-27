@@ -47,6 +47,7 @@
 #include <limits>
 #include <list>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <string>
@@ -587,6 +588,8 @@ struct TextureCounters {
     std::atomic<std::uint64_t> partialEntries{0};
     std::atomic<std::uint64_t> mappingWaited{0};
     std::atomic<std::uint64_t> largestMappingRefusal{0};
+    std::atomic<std::uint64_t> proofSpans{0};
+    std::atomic<std::uint64_t> proofEntries{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ImageTableUnremembered::Count)> tablesUnremembered{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ImageTableUnreused::Count)> tablesUnreused{};
     // Snapshot hits over memory outside the write watch: kept by an unchanged UntrackedHint key, or
@@ -619,7 +622,7 @@ void reportTextureCounters() {
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     static constexpr std::array<const char*, static_cast<std::size_t>(ImageTableUnremembered::Count)> unrememberedNames{"no collect epoch", "array partners", "past the table capacity", "stored elements", "no sampled table binding", "rejected variant", "nothing kept", "pending results"};
-    static constexpr std::array<const char*, static_cast<std::size_t>(ImageTableUnreused::Count)> unreusedNames{"no collect epoch", "stored elements", "no sampled table binding", "not remembered", "variants moved", "depth surfaces moved", "multisample targets moved", "rejections bound to their state", "mapping changed (change log incomplete)", "mapping changed (change log overflowed)", "mapping changed (proof ahead of the change log)", "mapping changed (no partial resolve)", "mapping changed under over half the entries", "collect refused", "pending results", "memory changed", "textures evicted"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(ImageTableUnreused::Count)> unreusedNames{"no collect epoch", "stored elements", "no sampled table binding", "not remembered (new records)", "not remembered (records remembered with other image shapes)", "not remembered (evicted from the remembered tables)", "variants moved", "depth surfaces moved", "multisample targets moved", "rejections bound to their state", "mapping changed (change log incomplete)", "mapping changed (change log overflowed)", "mapping changed (proof ahead of the change log)", "mapping changed (no partial resolve)", "mapping changed under over half the entries", "collect refused", "pending results", "memory changed", "textures evicted"};
     const auto reasons = [&](const auto& counts, const auto& names) {
         std::string text;
         for (std::size_t reason = 0; reason < counts.size(); ++reason) {
@@ -630,7 +633,7 @@ void reportTextureCounters() {
     const auto unremembered = reasons(counters.tablesUnremembered, unrememberedNames);
     const auto unreused = reasons(counters.tablesUnreused, unreusedNames);
     const auto largestMapping = counters.largestMappingRefusal.load(std::memory_order_relaxed);
-    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu cleared on the GPU, %llu uploaded on the GPU from host imports, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused (%llu replayed, %llu found cached by the entry memo), %llu partly resolved again (%llu entries looked up again), %llu resolved, %llu remembered; tables not remembered by reason:%s; tables not reused by reason:%s; %llu mapping proofs made while a guest mapping change waited for a lease; largest mapping refusal over half the entries: %llu affected of %llu; storage-viewed table entries %llu kept, %llu looked up again; dynamic-resolution variants: %llu surfaces, %llu entries substituted, %llu entries rejected; %llu one-layer 2D array entries bound to the 2D texture of their surface; untracked snapshots %llu kept by the write-watch hint, %llu compared; views kept through a pending alias: %llu lookups, %llu revalidations\n", count(counters.fromStorage), count(counters.cleared), count(counters.imported), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused) + count(counters.tablesReplayed), count(counters.tablesReplayed), count(counters.tableEntryMemoHits), count(counters.tablesPartial), count(counters.partialEntries), count(counters.tablesResolved), count(counters.tablesRemembered), unremembered.c_str(), unreused.c_str(), count(counters.mappingWaited), static_cast<unsigned long long>(largestMapping >> 32u), static_cast<unsigned long long>(largestMapping & 0xffffffffu), count(counters.viewedKept), count(counters.viewedLookedUp), count(counters.variantSurfaces), count(counters.variantSubstituted), count(counters.variantRejected), count(counters.arrayViewsShared), count(counters.untrackedKept), count(counters.untrackedCompared), count(counters.aliasViews), count(counters.aliasRefreshes));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu cleared on the GPU, %llu uploaded on the GPU from host imports, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused (%llu replayed, %llu found cached by the entry memo), %llu partly resolved again (%llu entries looked up again), %llu resolved, %llu remembered; tables not remembered by reason:%s; tables not reused by reason:%s; %llu mapping proofs made while a guest mapping change waited for a lease; largest mapping refusal over half the entries: %llu affected of %llu; reuse proofs: %llu merged entry ranges collected or checked whole, %llu entries collected or checked one by one; storage-viewed table entries %llu kept, %llu looked up again; dynamic-resolution variants: %llu surfaces, %llu entries substituted, %llu entries rejected; %llu one-layer 2D array entries bound to the 2D texture of their surface; untracked snapshots %llu kept by the write-watch hint, %llu compared; views kept through a pending alias: %llu lookups, %llu revalidations\n", count(counters.fromStorage), count(counters.cleared), count(counters.imported), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused) + count(counters.tablesReplayed), count(counters.tablesReplayed), count(counters.tableEntryMemoHits), count(counters.tablesPartial), count(counters.partialEntries), count(counters.tablesResolved), count(counters.tablesRemembered), unremembered.c_str(), unreused.c_str(), count(counters.mappingWaited), static_cast<unsigned long long>(largestMapping >> 32u), static_cast<unsigned long long>(largestMapping & 0xffffffffu), count(counters.proofSpans), count(counters.proofEntries), count(counters.viewedKept), count(counters.viewedLookedUp), count(counters.variantSurfaces), count(counters.variantSubstituted), count(counters.variantRejected), count(counters.arrayViewsShared), count(counters.untrackedKept), count(counters.untrackedCompared), count(counters.aliasViews), count(counters.aliasRefreshes));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -2693,6 +2696,13 @@ struct ReplayedBinds {
     std::vector<std::string> bound;
 };
 
+struct TableSpan {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint32_t first = 0;
+    std::uint32_t last = 0;
+};
+
 struct ReusedTable {
     VkDevice device = VK_NULL_HANDLE;
     TableState state;
@@ -2700,14 +2710,19 @@ struct ReusedTable {
     std::vector<std::uint32_t> words;
     std::vector<ShaderRecompiler::DescriptorImageShape> shapes;
     ShaderRecompiler::ElementFlags depthCompare;
+    std::uint64_t key = 0;
     std::vector<ReusedTableElement> elements;
     std::vector<GuestMemory::UnchangedQuery> queries;
+    std::vector<std::uint32_t> queryElements;
+    std::vector<TableSpan> spans;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> viewedSpans;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> mapped;
     std::vector<std::uint32_t> representatives;
     std::atomic<std::uint64_t> pendingSerial{0};
     AgcDriver::Mutex mutex;
     TableState proved;
+    std::uint64_t provedGeneration = 0;
     std::shared_ptr<const ReplayedBinds> replay;
     std::vector<std::pair<std::uint32_t, std::list<CachedTexture>::iterator>> cachedEntries;
     std::vector<std::pair<std::uint32_t, std::list<CachedTexture>::iterator>> viewedEntries;
@@ -2721,16 +2736,57 @@ bool KeptEntry(const ReusedTableElement& element) {
     return !element.rejected && !element.live && !element.substitute;
 }
 
+bool SpanJoins(const TableSpan& span, std::uint64_t begin, std::uint64_t end) {
+    return span.begin < span.end && begin < end && GuestMemory::WriteBlockOf(begin) <= GuestMemory::WriteBlockOf(span.end - 1) + 1;
+}
+
 void IndexTable(ReusedTable& table) {
     table.queries.clear();
+    table.queryElements.clear();
+    table.spans.clear();
+    table.viewedSpans.clear();
     table.ranges.clear();
     table.mapped.clear();
-    for (const auto& element : table.elements) {
+    std::vector<TableSpan> viewed;
+    for (std::uint32_t index = 0; index < table.elements.size(); ++index) {
+        const auto& element = table.elements[index];
         if (element.surface.first < element.surface.second) table.mapped.push_back(element.surface);
+        if (element.viewed) viewed.push_back({element.resource.baseAddress, element.resource.baseAddress + element.guestBytes, index, index + 1});
         if (!KeptEntry(element)) continue;
         table.queries.push_back({element.resource.baseAddress, static_cast<std::size_t>(element.guestBytes), element.generation});
+        table.queryElements.push_back(index);
         table.ranges.emplace_back(element.resource.baseAddress, element.resource.baseAddress + element.guestBytes);
     }
+    std::vector<std::uint32_t> order(table.queries.size());
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) { return table.queries[left].address < table.queries[right].address; });
+    std::vector<GuestMemory::UnchangedQuery> queries;
+    std::vector<std::uint32_t> queryElements;
+    queries.reserve(order.size());
+    queryElements.reserve(order.size());
+    for (const auto query : order) {
+        const auto& range = table.queries[query];
+        const auto at = static_cast<std::uint32_t>(queries.size());
+        const auto end = range.address + range.bytes;
+        if (!table.spans.empty() && SpanJoins(table.spans.back(), range.address, end)) {
+            table.spans.back().end = std::max(table.spans.back().end, end);
+            table.spans.back().last = at + 1;
+        } else {
+            table.spans.push_back({range.address, end, at, at + 1});
+        }
+        queries.push_back(range);
+        queryElements.push_back(table.queryElements[query]);
+    }
+    table.queries = std::move(queries);
+    table.queryElements = std::move(queryElements);
+    std::sort(viewed.begin(), viewed.end(), [](const TableSpan& left, const TableSpan& right) { return left.begin < right.begin; });
+    for (const auto& range : viewed) {
+        if (!table.viewedSpans.empty() && SpanJoins({table.viewedSpans.back().first, table.viewedSpans.back().second}, range.begin, range.end)) table.viewedSpans.back().second = std::max(table.viewedSpans.back().second, range.end);
+        else table.viewedSpans.emplace_back(range.begin, range.end);
+    }
+    table.provedGeneration = std::numeric_limits<std::uint64_t>::max();
+    for (const auto& query : table.queries) table.provedGeneration = std::min(table.provedGeneration, query.generation);
+    if (table.queries.empty()) table.provedGeneration = 0;
     auto& mapped = table.mapped;
     std::sort(mapped.begin(), mapped.end());
     std::size_t merged = 0;
@@ -2754,9 +2810,13 @@ struct AffectedEntries {
     }
 };
 
+constexpr std::size_t EvictedTableKeys = 1024;
+
 struct ReusedTableCache {
     AgcDriver::Mutex mutex;
     std::vector<std::shared_ptr<ReusedTable>> tables;
+    std::vector<std::uint64_t> evicted;
+    std::size_t nextEvicted = 0;
 };
 
 ReusedTableCache& ReusedTables() {
@@ -2766,6 +2826,22 @@ ReusedTableCache& ReusedTables() {
 
 bool SameTable(const ReusedTable& table, VkDevice device, const ShaderRecompiler::DescriptorBinding& binding) {
     return table.device == device && table.words == binding.guestDescriptor && table.shapes == binding.imageShapes && table.depthCompare == binding.imageDepthCompare;
+}
+
+std::uint64_t TableKey(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding) {
+    auto hash = hashWords(14695981039346656037ull ^ reinterpret_cast<std::uintptr_t>(device), binding.guestDescriptor.data(), binding.guestDescriptor.size());
+    for (const auto shape : binding.imageShapes) hash = (hash ^ static_cast<std::uint64_t>(shape)) * 1099511628211ull;
+    for (const bool flag : binding.imageDepthCompare) hash = (hash ^ (flag ? 1u : 2u)) * 1099511628211ull;
+    return hash;
+}
+
+ImageTableUnreused WhyNotRemembered(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding) {
+    const auto key = TableKey(device, binding);
+    auto& cache = ReusedTables();
+    std::lock_guard lock(cache.mutex);
+    if (std::any_of(cache.tables.begin(), cache.tables.end(), [&](const std::shared_ptr<ReusedTable>& table) { return table->device == device && table->words == binding.guestDescriptor; })) return ImageTableUnreused::NotRememberedShapes;
+    if (std::find(cache.evicted.begin(), cache.evicted.end(), key) != cache.evicted.end()) return ImageTableUnreused::NotRememberedEvicted;
+    return ImageTableUnreused::NotRemembered;
 }
 
 std::shared_ptr<ReusedTable> FindReusedTable(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding) {
@@ -2836,16 +2912,45 @@ bool TablePendingFree(ReusedTable& table) {
     return true;
 }
 
+bool OverlapsFlushed(std::span<const std::pair<std::uint64_t, std::uint64_t>> flushed, std::uint64_t address, std::size_t bytes) {
+    return std::any_of(flushed.begin(), flushed.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return range.first < address + bytes && address < range.first + range.second; });
+}
+
+struct ProofCounts {
+    std::uint64_t spans = 0;
+    std::uint64_t entries = 0;
+    ProofCounts() = default;
+    ProofCounts(const ProofCounts&) = delete;
+    ProofCounts& operator=(const ProofCounts&) = delete;
+    ~ProofCounts() {
+        auto& counters = TextureCounts();
+        if (spans != 0) counters.proofSpans.fetch_add(spans, std::memory_order_relaxed);
+        if (entries != 0) counters.proofEntries.fetch_add(entries, std::memory_order_relaxed);
+    }
+};
+
+bool SpansUnchangedSince(const ReusedTable& table, std::uint64_t since) {
+    if (since == 0) return false;
+    struct SpanQueriesTag {};
+    auto& queries = ThreadScratch<std::vector<GuestMemory::UnchangedQuery>, SpanQueriesTag>();
+    queries.clear();
+    for (const auto& span : table.spans) queries.push_back({span.begin, static_cast<std::size_t>(span.end - span.begin), since});
+    return GuestMemory::UnchangedSinceAll(queries);
+}
+
 ImageTableUnreused ProveTable(ReusedTable& table, const TableState& current, AffectedEntries* affected = nullptr) {
     if (current.epoch == 0) return ImageTableUnreused::NoEpoch;
     TableState proved;
+    std::uint64_t since = 0;
     {
         std::lock_guard lock(table.mutex);
         proved = table.proved;
+        since = table.provedGeneration;
     }
     const bool same = SameCollects(current, proved);
     const auto elements = static_cast<std::uint32_t>(table.elements.size());
     const auto skipped = [&](std::uint32_t element) { return affected != nullptr && affected->Has(element); };
+    ProofCounts proofs;
     if (!same) {
         if (table.stateBound) return ImageTableUnreused::StateBound;
         if (current.depthSurfaces != proved.depthSurfaces) return ImageTableUnreused::DepthSurfaces;
@@ -2853,29 +2958,48 @@ ImageTableUnreused ProveTable(ReusedTable& table, const TableState& current, Aff
         if (current.allocations != proved.allocations) {
             if (const auto mapping = MappingUnchangedSince(table, proved.allocations, affected); mapping != ImageTableUnreused::Count) return mapping;
         }
-        for (std::uint32_t element = 0, query = 0; element < elements; ++element) {
-            if (!KeptEntry(table.elements[element])) continue;
-            const auto& range = table.queries[query++];
-            if (skipped(element)) continue;
-            if (!FlushDepthPlanes(range.address, range.bytes).empty()) {
-                if (affected == nullptr || !affected->Mark(element, elements)) return ImageTableUnreused::Changed;
-                continue;
+        proofs.spans += table.spans.size();
+        for (const auto& span : table.spans) {
+            const auto bytes = static_cast<std::size_t>(span.end - span.begin);
+            const auto flushed = FlushDepthPlanes(span.begin, bytes);
+            const bool collected = GuestMemory::CollectWrites(span.begin, bytes) != 0;
+            if (flushed.empty() && collected) continue;
+            for (auto at = span.first; at < span.last; ++at) {
+                const auto element = table.queryElements[at];
+                const auto& range = table.queries[at];
+                ++proofs.entries;
+                if (skipped(element)) continue;
+                if (OverlapsFlushed(flushed, range.address, range.bytes)) {
+                    if (affected == nullptr || !affected->Mark(element, elements)) return ImageTableUnreused::Changed;
+                    continue;
+                }
+                if (!collected && GuestMemory::CollectWrites(range.address, range.bytes) == 0) return ImageTableUnreused::Collect;
             }
-            if (GuestMemory::CollectWrites(range.address, range.bytes) == 0) return ImageTableUnreused::Collect;
         }
+    } else {
+        proofs.spans += table.spans.size();
     }
     if (!TablePendingFree(table)) return ImageTableUnreused::Pending;
-    if (!GuestMemory::UnchangedSinceAll(table.queries)) {
-        if (affected == nullptr) return ImageTableUnreused::Changed;
-        for (std::uint32_t element = 0, query = 0; element < elements; ++element) {
-            if (!KeptEntry(table.elements[element])) continue;
-            const auto& range = table.queries[query++];
-            if (!skipped(element) && !GuestMemory::UnchangedSince(range.address, range.bytes, range.generation) && !affected->Mark(element, elements)) return ImageTableUnreused::Changed;
+    const auto generation = GuestMemory::TrackerGeneration();
+    if (table.spans.empty()) {
+        if (!GuestMemory::UnchangedSinceAll(table.queries) && affected == nullptr) return ImageTableUnreused::Changed;
+    } else if (!SpansUnchangedSince(table, since)) {
+        for (const auto& span : table.spans) {
+            if (since != 0 && GuestMemory::UnchangedSince(span.begin, static_cast<std::size_t>(span.end - span.begin), since)) continue;
+            proofs.entries += span.last - span.first;
+            if (GuestMemory::UnchangedSinceAll(std::span<const GuestMemory::UnchangedQuery>(table.queries).subspan(span.first, span.last - span.first))) continue;
+            if (affected == nullptr) return ImageTableUnreused::Changed;
+            for (auto at = span.first; at < span.last; ++at) {
+                const auto element = table.queryElements[at];
+                const auto& range = table.queries[at];
+                if (!skipped(element) && !GuestMemory::UnchangedSince(range.address, range.bytes, range.generation) && !affected->Mark(element, elements)) return ImageTableUnreused::Changed;
+            }
         }
     }
-    if (!same && (affected == nullptr || affected->count == 0)) {
+    if (affected == nullptr || affected->count == 0) {
         std::lock_guard lock(table.mutex);
-        table.proved = current;
+        if (!same) table.proved = current;
+        table.provedGeneration = std::max(table.provedGeneration, generation);
     }
     return ImageTableUnreused::Count;
 }
@@ -2941,15 +3065,32 @@ bool CachedTableTextures(ReusedTable& table, std::vector<std::shared_ptr<Texture
 }
 
 void ProveViewed(const ReusedTable& table, std::vector<std::shared_ptr<Texture>>& viewed) {
+    if (std::none_of(viewed.begin(), viewed.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr; })) return;
     struct PendingTag {};
     auto& pending = ThreadScratch<std::vector<StorageTexture::PendingQuery>, PendingTag>();
     struct QueriesTag {};
     auto& queries = ThreadScratch<std::vector<GuestMemory::UnchangedQuery>, QueriesTag>();
     struct OwnersTag {};
     auto& owners = ThreadScratch<std::vector<std::uint32_t>, OwnersTag>();
+    struct FlushedTag {};
+    auto& flushed = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, FlushedTag>();
     pending.clear();
     queries.clear();
     owners.clear();
+    flushed.clear();
+    ProofCounts proofs;
+    proofs.spans += table.viewedSpans.size();
+    bool collected = !table.viewedSpans.empty();
+    for (const auto& [begin, end] : table.viewedSpans) {
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        const auto stored = FlushDepthPlanes(begin, bytes);
+        flushed.insert(flushed.end(), stored.begin(), stored.end());
+        if (GuestMemory::CollectWrites(begin, bytes) == 0) collected = false;
+    }
+    const auto proveAlone = [&](std::uint64_t address, std::size_t bytes) {
+        ++proofs.entries;
+        return FlushDepthPlanes(address, bytes).empty() && GuestMemory::CollectWrites(address, bytes) != 0;
+    };
     for (std::uint32_t element = 0; element < viewed.size(); ++element) {
         auto& texture = viewed[element];
         if (texture == nullptr) continue;
@@ -2957,7 +3098,7 @@ void ProveViewed(const ReusedTable& table, std::vector<std::shared_ptr<Texture>>
         const auto source = entry.source.lock();
         const auto address = entry.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(entry.guestBytes);
-        if (source == nullptr || texture->Released() || texture->SharedStorageSource() != source || !source->Cached() || !FlushDepthPlanes(address, bytes).empty() || GuestMemory::CollectWrites(address, bytes) == 0) {
+        if (source == nullptr || texture->Released() || texture->SharedStorageSource() != source || !source->Cached() || OverlapsFlushed(flushed, address, bytes) || (!collected && !proveAlone(address, bytes))) {
             texture.reset();
             continue;
         }
@@ -2979,7 +3120,7 @@ void logTableLookups(const ReusedTable& table, const std::vector<std::shared_ptr
     for (const auto& element : table.elements) {
         if (element.rejected || element.live || element.substitute) continue;
         if (kept >= cached.size() || kept >= table.queries.size()) return;
-        if (cached[kept] != nullptr) logLookup({cached[kept].get(), element.resource, element.guestBytes, DccKeys::Uncompressed, table.queries[kept].generation, nullptr});
+        if (cached[kept] != nullptr) logLookup({cached[kept].get(), element.resource, element.guestBytes, DccKeys::Uncompressed, element.generation, nullptr});
         ++kept;
     }
 }
@@ -2988,6 +3129,7 @@ void RememberTable(std::shared_ptr<ReusedTable> table, const ShaderRecompiler::D
     table->words = binding.guestDescriptor;
     table->shapes = binding.imageShapes;
     table->depthCompare = binding.imageDepthCompare;
+    table->key = TableKey(table->device, binding);
     std::vector<std::shared_ptr<ReusedTable>> dropped;
     auto& cache = ReusedTables();
     std::lock_guard lock(cache.mutex);
@@ -2999,8 +3141,14 @@ void RememberTable(std::shared_ptr<ReusedTable> table, const ShaderRecompiler::D
         dropped.push_back(std::move(*it));
         it = cache.tables.erase(it);
     }
+    cache.evicted.erase(std::remove(cache.evicted.begin(), cache.evicted.end(), table->key), cache.evicted.end());
+    cache.nextEvicted = std::min(cache.nextEvicted, cache.evicted.size());
     cache.tables.insert(cache.tables.begin(), std::move(table));
     while (cache.tables.size() > ReusedTableCount) {
+        const auto key = cache.tables.back()->key;
+        if (cache.evicted.size() < EvictedTableKeys) cache.evicted.push_back(key);
+        else cache.evicted[cache.nextEvicted] = key;
+        cache.nextEvicted = (cache.nextEvicted + 1) % EvictedTableKeys;
         dropped.push_back(std::move(cache.tables.back()));
         cache.tables.pop_back();
     }
@@ -7309,7 +7457,7 @@ void ShaderResources::resolveImageTables() {
         const bool storageTable = std::find(binding.imageWritten.begin(), binding.imageWritten.end(), true) != binding.imageWritten.end();
         auto unreused = storageTable ? ImageTableUnreused::StoredElements : item == nullptr ? ImageTableUnreused::NoSampledBinding : state.epoch == 0 ? ImageTableUnreused::NoEpoch : ImageTableUnreused::Count;
         auto reused = unreused == ImageTableUnreused::Count ? FindReusedTable(context.device, binding) : nullptr;
-        if (unreused == ImageTableUnreused::Count && reused == nullptr) unreused = ImageTableUnreused::NotRemembered;
+        if (unreused == ImageTableUnreused::Count && reused == nullptr) unreused = WhyNotRemembered(context.device, binding);
         if (reused != nullptr && AnyPendingCpuWrites(context)) {
             for (const auto& entry : reused->elements) {
                 if (!entry.rejected) CompletePendingCpuWrites(context, entry.resource.baseAddress, static_cast<std::size_t>(entry.guestBytes));
@@ -7621,7 +7769,7 @@ std::uint64_t SampledTexturesImported() {
 ImageTableReuseCounts ImageTableReuses() {
     const auto& counters = TextureCounts();
     const auto largestMapping = counters.largestMappingRefusal.load(std::memory_order_relaxed);
-    ImageTableReuseCounts counts{counters.tablesReused.load(std::memory_order_relaxed) + counters.tablesReplayed.load(std::memory_order_relaxed), counters.tablesResolved.load(std::memory_order_relaxed), counters.tablesReplayed.load(std::memory_order_relaxed), counters.tableWritesKept.load(std::memory_order_relaxed), counters.tableWritesMade.load(std::memory_order_relaxed), counters.variantSurfaces.load(std::memory_order_relaxed), counters.variantSubstituted.load(std::memory_order_relaxed), counters.variantRejected.load(std::memory_order_relaxed), counters.arrayViewsShared.load(std::memory_order_relaxed), counters.tableEntryMemoHits.load(std::memory_order_relaxed), counters.tablesRemembered.load(std::memory_order_relaxed), counters.viewedKept.load(std::memory_order_relaxed), counters.viewedLookedUp.load(std::memory_order_relaxed), counters.tablesPartial.load(std::memory_order_relaxed), counters.partialEntries.load(std::memory_order_relaxed), counters.mappingWaited.load(std::memory_order_relaxed), largestMapping >> 32u, largestMapping & 0xffffffffu};
+    ImageTableReuseCounts counts{counters.tablesReused.load(std::memory_order_relaxed) + counters.tablesReplayed.load(std::memory_order_relaxed), counters.tablesResolved.load(std::memory_order_relaxed), counters.tablesReplayed.load(std::memory_order_relaxed), counters.tableWritesKept.load(std::memory_order_relaxed), counters.tableWritesMade.load(std::memory_order_relaxed), counters.variantSurfaces.load(std::memory_order_relaxed), counters.variantSubstituted.load(std::memory_order_relaxed), counters.variantRejected.load(std::memory_order_relaxed), counters.arrayViewsShared.load(std::memory_order_relaxed), counters.tableEntryMemoHits.load(std::memory_order_relaxed), counters.tablesRemembered.load(std::memory_order_relaxed), counters.viewedKept.load(std::memory_order_relaxed), counters.viewedLookedUp.load(std::memory_order_relaxed), counters.tablesPartial.load(std::memory_order_relaxed), counters.partialEntries.load(std::memory_order_relaxed), counters.mappingWaited.load(std::memory_order_relaxed), largestMapping >> 32u, largestMapping & 0xffffffffu, counters.proofSpans.load(std::memory_order_relaxed), counters.proofEntries.load(std::memory_order_relaxed)};
     for (std::size_t reason = 0; reason < counts.unremembered.size(); ++reason) counts.unremembered[reason] = counters.tablesUnremembered[reason].load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < counts.unreused.size(); ++reason) counts.unreused[reason] = counters.tablesUnreused[reason].load(std::memory_order_relaxed);
     return counts;

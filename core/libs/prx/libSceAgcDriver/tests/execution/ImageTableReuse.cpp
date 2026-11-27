@@ -60,11 +60,15 @@ constexpr std::uint32_t KeptEntry = 12;
 constexpr float RetakenClearDepth = 0.0625f;
 constexpr float LoadedDepth = 0.75f;
 constexpr std::size_t ChangeLogFlood = 20000;
+constexpr std::uint32_t LargeRecords = 4096;
+constexpr std::uint32_t LargeViewedRecords = 1536;
+constexpr std::size_t RememberedTables = 16;
 
 bool chained = false;
 
 alignas(256) std::array<std::uint32_t, Records> Keys = [] { std::array<std::uint32_t, Records> keys{}; for (std::uint32_t key = 0; key < Records; ++key) keys[key] = key; return keys; }();
 alignas(256) std::array<std::uint32_t, Lanes * 4> Output{};
+alignas(256) std::array<std::uint32_t, LargeRecords> LargeKeys{};
 alignas(256) std::array<std::uint32_t, 32> Srt{};
 
 alignas(256) constexpr std::array<std::uint32_t, 28> TableCode{
@@ -100,20 +104,20 @@ std::array<std::uint32_t, 4> Buffer(const void* base, std::uint32_t bytes) {
 
 class GuestBlock {
 public:
-    explicit GuestBlock(std::size_t registered = BlockBytes) : registered(registered) {
+    explicit GuestBlock(std::size_t registered = BlockBytes, std::size_t bytes = BlockBytes, std::size_t texturesAt = TexturesOffset) : registered(registered), bytes(bytes), texturesAt(texturesAt) {
 #ifdef _WIN32
-        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
-        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
+        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
+        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
 #else
         constexpr std::uintptr_t alignment = 65536;
-        void* mapped = mmap(nullptr, BlockBytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* mapped = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
             const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
             const auto aligned = (begin + alignment - 1) & ~(alignment - 1);
             if (aligned != begin) munmap(mapped, aligned - begin);
-            if (aligned + BlockBytes != begin + BlockBytes + alignment) munmap(reinterpret_cast<void*>(aligned + BlockBytes), begin + alignment - aligned);
+            if (aligned + bytes != begin + bytes + alignment) munmap(reinterpret_cast<void*>(aligned + bytes), begin + alignment - aligned);
             block = reinterpret_cast<std::uint8_t*>(aligned);
-            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
         }
 #endif
         Require(block != nullptr, "image table reuse: cannot allocate the guest block");
@@ -123,16 +127,16 @@ public:
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);
 #ifdef _WIN32
-        GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
-        GuestArena::GuestArenaRelease_nid_postfix(block, BlockBytes);
+        GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
 #else
-        munmap(block, BlockBytes);
-        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, BlockBytes);
+        munmap(block, bytes);
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, bytes);
 #endif
     }
 
     std::uint32_t* Table() const { return reinterpret_cast<std::uint32_t*>(block); }
-    float* Texels(std::uint32_t texture) const { return reinterpret_cast<float*>(block + TexturesOffset + static_cast<std::size_t>(texture) * TextureBytes); }
+    float* Texels(std::uint32_t texture) const { return reinterpret_cast<float*>(block + texturesAt + static_cast<std::size_t>(texture) * TextureBytes); }
 
     void Remap() const {
         GuestAllocations::Mutation mutation;
@@ -142,6 +146,8 @@ public:
 
 private:
     std::size_t registered = 0;
+    std::size_t bytes = 0;
+    std::size_t texturesAt = 0;
     std::uint8_t* block = nullptr;
 };
 
@@ -157,16 +163,16 @@ void Fill(const GuestBlock& block, std::uint32_t texture, float bias) {
     for (std::uint32_t texel = 0; texel < Width * Height; ++texel) block.Texels(texture)[texel] = bias + static_cast<float>(texture) * 100.0f + static_cast<float>(texel);
 }
 
-ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const GuestBlock& block, const std::uint32_t* srt = Srt.data(), const std::uint32_t* keys = Keys.data()) {
+ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const GuestBlock& block, const std::uint32_t* srt = Srt.data(), const std::uint32_t* keys = Keys.data(), std::uint32_t records = Records, std::size_t keyCount = Keys.size()) {
     const auto srtAddress = AddressOf(srt);
     const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
     const std::span<const std::uint32_t> code(TableCode);
-    const std::span<const std::uint32_t> table(block.Table(), Records * Stride / 4u);
+    const std::span<const std::uint32_t> table(block.Table(), records * Stride / 4u);
     const std::array<ShaderRecompiler::MemoryRegion, 4> memory{{
         {AddressOf(code.data()), std::as_bytes(code)},
         {srtAddress, std::as_bytes(std::span(srt, Srt.size()))},
         {AddressOf(table.data()), std::as_bytes(table)},
-        {AddressOf(keys), std::as_bytes(std::span(keys, Keys.size()))},
+        {AddressOf(keys), std::as_bytes(std::span(keys, keyCount))},
     }};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Lanes, 1, 1}, 0u, {true, false, false}, false, 1};
     const ShaderRecompiler::RecompileRequest request{
@@ -177,7 +183,7 @@ ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const
     };
     auto result = ShaderRecompiler::Recompile(request);
     const auto binding = std::find_if(result.bindings.begin(), result.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& candidate) { return candidate.role == ShaderRecompiler::DescriptorRole::ImageTable; });
-    Require(binding != result.bindings.end() && binding->guestDescriptor.size() == static_cast<std::size_t>(Records) * 8u, "image table reuse: the shader does not bind the whole table");
+    Require(binding != result.bindings.end() && binding->guestDescriptor.size() == static_cast<std::size_t>(records) * 8u, "image table reuse: the shader does not bind the whole table (" + std::to_string(binding != result.bindings.end() ? binding->guestDescriptor.size() / 8u : 0u) + " records)");
     return result;
 }
 
@@ -204,8 +210,8 @@ void Store(AgcDriver::VulkanDevice& device, const GuestBlock& block, std::uint32
     device.WaitIdle();
 }
 
-std::vector<std::uint32_t> Dispatch(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResult& result, std::uint32_t record) {
-    Keys[0] = record;
+std::vector<std::uint32_t> Dispatch(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResult& result, std::uint32_t record, std::uint32_t* keys = Keys.data()) {
+    keys[0] = record;
     std::fill(Output.begin(), Output.end(), 0xdeadbeefu);
     device.Dispatch(result, 1, 1, 1, {}, AddressOf(TableCode.data()));
     device.WaitIdle();
@@ -214,9 +220,13 @@ std::vector<std::uint32_t> Dispatch(AgcDriver::VulkanDevice& device, const Shade
     return red;
 }
 
-std::uint64_t WrittenEntries(const GuestBlock& block, std::uint64_t generation) {
+bool EntryWritten(const GuestBlock& block, std::uint32_t texture, std::uint64_t generation) {
+    return !AgcDriver::GuestMemory::UnchangedSince(AddressOf(block.Texels(texture)), TextureBytes, generation);
+}
+
+std::uint64_t WrittenEntries(const GuestBlock& block, std::uint64_t generation, std::uint32_t records = Records) {
     std::uint64_t written = 0;
-    for (std::uint32_t texture = 0; texture < Records; ++texture) written += AgcDriver::GuestMemory::UnchangedSince(AddressOf(block.Texels(texture)), TextureBytes, generation) ? 0u : 1u;
+    for (std::uint32_t texture = 0; texture < records; ++texture) written += EntryWritten(block, texture, generation) ? 1u : 0u;
     return written;
 }
 
@@ -1093,6 +1103,175 @@ bool RunPartialResolve(AgcDriver::VulkanDevice& device, const GuestBlock& block,
     return true;
 }
 
+constexpr std::size_t LargeTexturesOffset(std::uint32_t records) {
+    return (static_cast<std::size_t>(records) * Stride + 65535u) & ~std::size_t{65535u};
+}
+
+constexpr std::size_t LargeBlockBytes(std::uint32_t records) {
+    return LargeTexturesOffset(records) + static_cast<std::size_t>(records) * TextureBytes;
+}
+
+bool RunLargeTable(AgcDriver::VulkanDevice& device, const GuestBlock& block, std::uint32_t records, bool viewed) {
+    using AgcDriver::Graphics::ShaderResources;
+    using Textures = std::vector<std::shared_ptr<AgcDriver::Graphics::Texture>>;
+    const std::string kind = viewed ? "image table reuse of a large storage-viewed table" : "image table reuse of a large table";
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::puts(("guest memory has no write watch: " + kind + " is not tested").c_str());
+        return false;
+    }
+    const auto& context = device.graphicsContext();
+    if (viewed && (context.hostImportAlignment == 0 || AgcDriver::Graphics::HostImportFor(context, AddressOf(block.Table()), LargeBlockBytes(records)) == nullptr)) {
+        Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, kind + ": storage-viewed entries require host imports");
+        std::puts(("host imports are unavailable: " + kind + " is not tested").c_str());
+        return false;
+    }
+    const auto changedAt = records / 2u + 1u;
+    const auto keptAt = records - records / 4u + 1u;
+    for (std::uint32_t texture = 0; texture < LargeRecords; ++texture) {
+        if (texture < records) {
+            Fill(block, texture, 0.25f);
+            SetRecord(block, texture, texture);
+        }
+        LargeKeys[texture] = texture % records;
+    }
+    const auto srt = Buffer(block.Table(), records * Stride);
+    const auto keys = Buffer(LargeKeys.data(), static_cast<std::uint32_t>(sizeof(LargeKeys)));
+    std::copy(srt.begin(), srt.end(), Srt.begin());
+    std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
+    SetOutput(Output.data());
+    const auto program = Compile(device, block, Srt.data(), LargeKeys.data(), records, LargeKeys.size());
+    const AgcDriver::Graphics::CompiledShader shader{ShaderStage::Compute, &program, 0};
+    struct Built {
+        Textures textures;
+        Step step;
+        std::uint64_t refusals = 0;
+        std::uint64_t spans = 0;
+        std::uint64_t entries = 0;
+        std::uint64_t viewedKept = 0;
+        std::uint64_t viewedLookedUp = 0;
+    };
+    const auto build = [&] {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Built built;
+        const auto before = AgcDriver::Graphics::ImageTableReuses();
+        const auto resources = std::make_shared<ShaderResources>(context, shader);
+        built.textures = resources->SampledTextures();
+        built.step = Since(before);
+        built.refusals = Refusals(before);
+        const auto after = AgcDriver::Graphics::ImageTableReuses();
+        built.spans = after.proofSpans - before.proofSpans;
+        built.entries = after.proofEntries - before.proofEntries;
+        built.viewedKept = after.viewedKept - before.viewedKept;
+        built.viewedLookedUp = after.viewedLookedUp - before.viewedLookedUp;
+        return built;
+    };
+    const auto onThread = [&] {
+        Built built;
+        std::exception_ptr failure;
+        std::thread worker([&] {
+            try {
+                AgcDriver::GuestMemory::BumpCollectEpoch();
+                built = build();
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        });
+        worker.join();
+        if (failure != nullptr) std::rethrow_exception(failure);
+        return built;
+    };
+    const auto describe = [](const Built& built) { return std::to_string(built.step.reused) + " reused, " + std::to_string(built.step.partial) + " partly resolved again with " + std::to_string(built.step.partialEntries) + " entries looked up again, " + std::to_string(built.step.resolved) + " resolved, " + std::to_string(built.refusals) + " refused; the proof collected or checked " + std::to_string(built.spans) + " merged ranges whole and " + std::to_string(built.entries) + " entries one by one"; };
+    const auto settle = [&](const std::string& what) {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        for (std::uint64_t attempt = 0; attempt <= CpuWriteResolutions + 1u; ++attempt) {
+            auto built = build();
+            if (built.step.reused == 1u) return built;
+        }
+        Require(false, kind + ": " + what + ": the table was not reused after it was resolved");
+        return Built{};
+    };
+    const auto whole = [&](const Built& built, const Textures& textures, const std::string& what) {
+        Require(built.step.reused == 1u && built.step.partial == 0u && built.step.resolved == 0u && built.refusals == 0u, kind + ": " + what + ": " + describe(built) + "; expected one table reused whole");
+        Require(built.entries == 0u && built.spans == 1u, kind + ": " + what + ": " + describe(built) + "; expected the one range the entries' adjacent texels merge into and no entry on its own, whatever the number of entries");
+        Require(built.textures == textures, kind + ": " + what + ": the reuse binds other textures than the table it reused");
+        if (viewed) Require(built.viewedKept == records && built.viewedLookedUp == 0u, kind + ": " + what + ": " + std::to_string(built.viewedKept) + " storage-viewed entries kept and " + std::to_string(built.viewedLookedUp) + " looked up again, expected every entry kept");
+    };
+    const auto sampled = [&](const std::string& what) {
+        Require(Dispatch(device, program, changedAt, LargeKeys.data()) == Row(block.Texels(changedAt)), kind + ": " + what + ": the entry under the CPU write sampled the wrong texels");
+        Require(Dispatch(device, program, keptAt, LargeKeys.data()) == Row(block.Texels(keptAt)), kind + ": " + what + ": an entry away from the CPU write sampled the wrong texels");
+    };
+
+    const auto first = settle("a table of " + std::to_string(records) + " entries");
+    Require(first.textures.size() == records, kind + ": the build does not hold one texture per entry");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    whole(build(), first.textures, "a reuse in a new collect epoch");
+    whole(build(), first.textures, "a reuse in the same collect epoch");
+    whole(onThread(), first.textures, "a reuse on another thread in its own collect epoch");
+    sampled("before any change");
+
+    const auto unwritten = AgcDriver::GuestMemory::TrackerGeneration();
+    Fill(block, changedAt, 0.875f);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto written = build();
+    const auto writtenEntries = WrittenEntries(block, unwritten, records);
+    Require(writtenEntries != 0u && writtenEntries * 2u <= records && EntryWritten(block, changedAt, unwritten) && !EntryWritten(block, keptAt, unwritten), kind + ": a CPU write over one entry stamped " + std::to_string(writtenEntries) + " of the table's entries");
+    Require(written.refusals == 0u && written.step.resolved == 0u && (viewed || written.entries != 0u), kind + ": a CPU write under one entry: " + describe(written) + "; expected the changed range proved entry by entry and the table kept");
+    if (viewed) Require(written.step.reused == 1u && written.step.partial == 0u && written.viewedLookedUp == writtenEntries && written.viewedKept == records - writtenEntries, kind + ": a CPU write under one entry: " + describe(written) + ", " + std::to_string(written.viewedKept) + " storage-viewed entries kept and " + std::to_string(written.viewedLookedUp) + " looked up again; expected the " + std::to_string(writtenEntries) + " written entries looked up again");
+    else Require(written.step.reused == 0u && written.step.partial == 1u && written.step.partialEntries == writtenEntries, kind + ": a CPU write under one entry: " + describe(written) + "; expected the " + std::to_string(writtenEntries) + " written entries looked up again");
+    Require(written.textures.size() == records && (viewed || written.textures[changedAt] != first.textures[changedAt]), kind + ": the entry under the CPU write kept its texture");
+    for (std::uint32_t entry = 0; entry < records; ++entry) {
+        if (!EntryWritten(block, entry, unwritten)) Require(written.textures[entry] == first.textures[entry], kind + ": entry " + std::to_string(entry) + " away from the CPU write was bound to another texture");
+    }
+    sampled("after a CPU write under one entry");
+
+    const auto rewritten = settle("the table after a CPU write under one entry");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    whole(build(), rewritten.textures, "a reuse in a new collect epoch after the entry under a CPU write was looked up again");
+    return true;
+}
+
+bool RunRememberedReasons(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
+    using AgcDriver::Graphics::ImageTableUnreused;
+    using AgcDriver::Graphics::ShaderResources;
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::puts("guest memory has no write watch: why an image table was not remembered is not tested");
+        return false;
+    }
+    const auto& context = device.graphicsContext();
+    const auto program = CompileTable(device, block);
+    const auto build = [&](const ShaderRecompiler::RecompileResult& compiled) {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const AgcDriver::Graphics::CompiledShader shader{ShaderStage::Compute, &compiled, 0};
+        const auto before = AgcDriver::Graphics::ImageTableReuses();
+        static_cast<void>(std::make_shared<ShaderResources>(context, shader));
+        return before;
+    };
+    const auto resolved = [&](const AgcDriver::Graphics::ImageTableReuseCounts& before, ImageTableUnreused why, const std::string& what) {
+        Expect(before, 0, 1, what);
+        ExpectUnreused(before, why, what);
+    };
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    resolved(build(program), ImageTableUnreused::NotRemembered, "a table whose records were never remembered");
+    std::vector<ShaderRecompiler::RecompileResult> others;
+    others.reserve(RememberedTables);
+    for (std::uint32_t table = 0; table < RememberedTables; ++table) {
+        Fill(block, Records + table, 0.5f);
+        SetRecord(block, KeptEntry, Records + table);
+        others.push_back(Compile(device, block));
+        resolved(build(others.back()), ImageTableUnreused::NotRemembered, "table " + std::to_string(table) + " of the " + std::to_string(RememberedTables) + " tables that differ in one record");
+    }
+    SetRecord(block, KeptEntry, KeptEntry);
+    resolved(build(program), ImageTableUnreused::NotRememberedEvicted, "a table looked up again after " + std::to_string(RememberedTables) + " other tables were remembered");
+    auto reshaped = program;
+    const auto table = std::find_if(reshaped.bindings.begin(), reshaped.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTable; });
+    Require(table != reshaped.bindings.end() && table->imageShapes.size() == Records, "image table reuse: the table binding has no image shape per entry");
+    table->imageShapes[KeptEntry] = ShaderRecompiler::DescriptorImageShape::Image3D;
+    resolved(build(reshaped), ImageTableUnreused::NotRememberedShapes, "a remembered table's records bound with another image shape");
+    const auto again = build(program);
+    Expect(again, 1, 0, "the remembered table's records bound with their own image shapes again");
+    return true;
+}
+
 void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const GuestBlock& stores) {
     for (std::uint32_t texture = 0; texture < Records; ++texture) {
         Fill(block, texture, 0.25f);
@@ -1238,6 +1417,24 @@ int main(int argc, char** argv) {
             if (!device) return VulkanTestSkipped;
             if (!RunPartialResolve(*device, block, lone, importable)) return VulkanTestSkipped;
             std::puts("image table partial resolve tests passed");
+            return 0;
+        }
+        if (argc > 1 && (std::string(argv[1]) == "large" || std::string(argv[1]) == "large-viewed")) {
+            const bool viewed = std::string(argv[1]) == "large-viewed";
+            const auto records = viewed ? LargeViewedRecords : LargeRecords;
+            GuestBlock block(viewed ? LargeBlockBytes(records) : LargeBlockBytes(records) - 256u, LargeBlockBytes(records), LargeTexturesOffset(records));
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            if (!RunLargeTable(*device, block, records, viewed)) return VulkanTestSkipped;
+            std::puts(viewed ? "image table reuse tests of a large storage-viewed table passed" : "image table reuse tests of a large table passed");
+            return 0;
+        }
+        if (argc > 1 && std::string(argv[1]) == "remembered") {
+            GuestBlock block(UnimportableBytes);
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            if (!RunRememberedReasons(*device, block)) return VulkanTestSkipped;
+            std::puts("image table remembered-table tests passed");
             return 0;
         }
         if (argc > 1 && std::string(argv[1]) == "records") {
