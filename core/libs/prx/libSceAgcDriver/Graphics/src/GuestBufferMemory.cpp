@@ -7378,6 +7378,19 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     }
     bool importsRefreshed = false;
     if (context.hostImportAlignment != 0) {
+        if (const auto hook = GuestMemory::CurrentFlushHook()) {
+            for (const auto& region : regions) {
+                if (!region.pending || region.mirror != nullptr || region.direct != nullptr || region.sparse || sparseHeapCandidate(region)) continue;
+                const auto run = crossedRun(importRanges(), region.begin, region.end);
+                if (run.ranges.size() < 2) continue;
+                {
+                    const UntrappedImport probe(run.base, run.bytes);
+                    if (probe.Held()) continue;
+                }
+                const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::BufferUpload);
+                hook(run.base, static_cast<std::size_t>(run.bytes));
+            }
+        }
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
         if (importsStale(context, state)) refreshImports(context, state, importRanges());

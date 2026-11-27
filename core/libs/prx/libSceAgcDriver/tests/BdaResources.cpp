@@ -293,6 +293,70 @@ void trappedImportTests(const Context& context) {
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, 2 * half);
     ::munmap(mapped, 3 * half);
 }
+
+std::uintptr_t flushReleasesPage = 0;
+std::size_t flushReleasesBytes = 0;
+std::size_t flushReleases = 0;
+
+void trappedJoinFlushTests(const Context& context) {
+    if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() || !GuestWriteWatch::GuestWriteWatchSetReadTrapResolver_nid_postfix(+[](std::uintptr_t, std::uintptr_t) {})) {
+        std::cout << "trapped join flush tests skipped, the device lacks the userfaultfd write watch read traps need\n";
+        return;
+    }
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t large = 3 * piece;
+    const auto page = static_cast<std::size_t>(::getpagesize());
+    void* mapped = ::mmap(nullptr, 2 * large + 2 * piece, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(mapped != MAP_FAILED, "cannot map the trapped join range");
+    auto* block = reinterpret_cast<std::uint8_t*>((reinterpret_cast<std::uintptr_t>(mapped) + 2 * piece - 1) & ~static_cast<std::uintptr_t>(2 * piece - 1));
+    std::memset(block, 0x46, 2 * large);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    const auto second = first + large;
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, 2 * large);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    ClearHostImports(importing.device);
+    SetHostImportWindow(2 * piece);
+    SetHostImportBudget(8 * large);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, large, true, false, true);
+        mutation.Add(block + large, large, true, false, true);
+    }
+    Require(HostImportFor(importing, first, 16) != nullptr && HostImportFor(importing, second, 16) != nullptr, "the trapped join fixture did not import its two ranges apart");
+    const auto trapped = second + large - page;
+    Require(GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(trapped, page), "a page of the second range was not trapped");
+    const auto previous = AgcDriver::GuestMemory::CurrentFlushHook();
+    flushReleasesPage = trapped;
+    flushReleasesBytes = page;
+    flushReleases = 0;
+    AgcDriver::GuestMemory::SetFlushHook(+[](std::uint64_t address, std::size_t bytes) {
+        if (flushReleasesPage == 0 || flushReleasesPage < address || flushReleasesPage >= address + bytes) return;
+        GuestWriteWatch::GuestWriteWatchReleaseReads_nid_postfix(flushReleasesPage, flushReleasesBytes);
+        flushReleasesPage = 0;
+        ++flushReleases;
+    });
+    {
+        GuestBufferMemory memory(importing);
+        memory.AddReadable(second - 16, 32);
+        memory.Upload(false);
+        Require(flushReleases == 1, "a join over a run with a read-trapped page did not flush the run's pending writes first");
+        Require(ExistingHostImportFor(importing, second - 16, 32) != nullptr, "a join was refused although flushing the run's pending writes released its read trap");
+        memory.WriteBack();
+    }
+    AgcDriver::GuestMemory::SetFlushHook(previous);
+    if (flushReleasesPage != 0) GuestWriteWatch::GuestWriteWatchReleaseReads_nid_postfix(flushReleasesPage, flushReleasesBytes);
+    ClearHostImports(importing.device);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        mutation.Remove(block + large);
+    }
+    SetHostImportBudget(0);
+    SetHostImportWindow(0);
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, 2 * large);
+    ::munmap(mapped, 2 * large + 2 * piece);
+}
 #endif
 
 constexpr auto FixedImageConstants = [] {
@@ -6016,6 +6080,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     readTrappableImportTests(context);
 #if defined(__linux__)
     trappedImportTests(context);
+    trappedJoinFlushTests(context);
 #endif
     fixedReadOnlyRangeMirrorTests(context, access);
     addressTableKeyTests();
