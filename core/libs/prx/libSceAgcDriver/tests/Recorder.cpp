@@ -18244,23 +18244,25 @@ int pipelineCacheFileTests(const Device& device) {
         Require(overlapping.Synchronization().ExcludesPipelineUse() == PipelineCacheSynchronization::SnapshotsExcludePipelineUse(properties), "the pipeline cache did not take its snapshot exclusion from the device's vendor");
         if (!overlapping.Synchronization().ExcludesPipelineUse()) {
             std::atomic<bool> stop{false};
-            std::promise<void> started;
-            std::thread creations([&] {
-                bool first = true;
+            std::atomic<std::uint64_t> acquisitions{0};
+            const auto creations = [&] {
                 while (!stop.load(std::memory_order_acquire)) {
                     auto use = overlapping.Synchronization().LockForPipelineUse();
+                    const auto mine = acquisitions.fetch_add(1, std::memory_order_acq_rel) + 1;
                     build(overlapping.Handle(), 1);
-                    if (first) started.set_value();
-                    first = false;
+                    while (acquisitions.load(std::memory_order_acquire) == mine && !stop.load(std::memory_order_acquire)) std::this_thread::yield();
                 }
-            });
-            started.get_future().wait();
+            };
+            std::thread first(creations);
+            std::thread second(creations);
+            while (acquisitions.load(std::memory_order_acquire) < 4) std::this_thread::yield();
             auto saving = std::async(std::launch::async, [&] { overlapping.SaveNow(); });
             const bool saveReturned = saving.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
             stop.store(true, std::memory_order_release);
-            creations.join();
+            first.join();
+            second.join();
             saving.wait();
-            Require(saveReturned, "a waiting pipeline cache save did not finish while pipeline creations ran back to back on a driver that synchronizes the cache itself");
+            Require(saveReturned, "a waiting pipeline cache save did not finish while overlapping pipeline creations always held the cache, on a driver that synchronizes the cache itself");
         }
     }
     std::cout << "Pipeline cache file merge tests passed\n";
