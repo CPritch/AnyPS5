@@ -16,17 +16,20 @@
 #endif
 #include <windows.h>
 #else
+#include <dlfcn.h>
 #include <sys/mman.h>
 #endif
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -56,6 +59,7 @@ constexpr std::uint32_t LoneEntry = 30;
 constexpr std::uint32_t KeptEntry = 12;
 constexpr float RetakenClearDepth = 0.0625f;
 constexpr float LoadedDepth = 0.75f;
+constexpr std::size_t ChangeLogFlood = 20000;
 
 bool chained = false;
 
@@ -279,6 +283,30 @@ void ExpectUnreused(const AgcDriver::Graphics::ImageTableReuseCounts& before, Ag
 void ExpectNoRefusal(const AgcDriver::Graphics::ImageTableReuseCounts& before, const std::string& what) {
     const auto total = Refusals(before);
     Require(total == 0u, "image table reuse: " + what + ": the table was refused " + std::to_string(total) + " times");
+}
+
+void AwaitWaitingChange(std::uint64_t since) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::uint64_t current = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(since, spans, current) != GuestAllocations::ChangesAnswer::Waiting) {
+        Require(std::chrono::steady_clock::now() < deadline, "image table reuse: a guest mapping change never waited for the lease held over it");
+        spans.clear();
+        std::this_thread::yield();
+    }
+}
+
+const void* HostImageBase() {
+#ifdef _WIN32
+    const auto* inside = reinterpret_cast<const void*>(&GetTickCount);
+    HMODULE module = nullptr;
+    Require(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(inside), &module) != 0 && module != nullptr, "image table reuse: cannot locate a host image");
+    return module;
+#else
+    Dl_info info{};
+    Require(dladdr(reinterpret_cast<const void*>(&std::malloc), &info) != 0 && info.dli_fbase != nullptr, "image table reuse: cannot locate a host image");
+    return info.dli_fbase;
+#endif
 }
 
 std::vector<std::uint32_t> DispatchOnThread(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResult& result, std::uint32_t record) {
@@ -808,7 +836,9 @@ bool RunAcrossThreads(AgcDriver::VulkanDevice& device, const GuestBlock& block) 
     before = AgcDriver::Graphics::ImageTableReuses();
     Require(Dispatch(device, result, 19) == Row(block.Texels(19)), "image table reuse across threads: the table after its entries' mapping changed sampled the wrong entry");
     Expect(before, 0, 1, "the guest mapping under the entries changed");
-    ExpectUnreused(before, ImageTableUnreused::Mapping, "the guest mapping under the entries changed");
+    ExpectUnreused(before, ImageTableUnreused::MappingOverHalf, "the guest mapping under the entries changed");
+    const auto largest = AgcDriver::Graphics::ImageTableReuses();
+    Require(largest.largestMappingAffected == Records && largest.largestMappingEntries == Records, "image table reuse across threads: the largest refusal under a mapping change reports " + std::to_string(largest.largestMappingAffected) + " of " + std::to_string(largest.largestMappingEntries) + " entries, expected every entry of the table");
     Require(DispatchOnThread(device, result, 21) == Row(block.Texels(21)), "image table reuse across threads: the table remembered after a mapping change sampled the wrong entry on another thread");
     Expect(before, 1, 1, "the table remembered again after its mapping changed, reused on another thread");
     return true;
@@ -945,6 +975,102 @@ bool RunPartialResolve(AgcDriver::VulkanDevice& device, const GuestBlock& block,
     Require(moved.step.resolved == 1u && moved.step.partial == 0u && moved.step.reused == 0u, "image table partial resolve: a table whose record was pointed at another texture was not resolved whole (" + describe(moved.step) + ")");
     ExpectUnreused(moved.before, ImageTableUnreused::NotRemembered, "a table whose record was pointed at another texture");
     Require(Dispatch(device, movedProgram, LoneEntry + 1u) == Row(block.Texels(Moved)), "image table partial resolve: a record pointed at another texture sampled the old one");
+
+    static_cast<void>(settle(shader, "a table before the block of most entries was remapped"));
+    block.Remap();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto remappedWide = build(shader);
+    Require(remappedWide.step.resolved == 1u && remappedWide.step.partial == 0u && remappedWide.step.reused == 0u, "image table partial resolve: a guest mapping change under more than half the entries did not resolve the whole table (" + describe(remappedWide.step) + ")");
+    ExpectUnreused(remappedWide.before, ImageTableUnreused::MappingOverHalf, "a guest mapping change under more than half the entries");
+    const auto largest = AgcDriver::Graphics::ImageTableReuses();
+    Require(largest.largestMappingAffected == Records - 1u && largest.largestMappingEntries == Records, "image table partial resolve: the largest refusal under a mapping change reports " + std::to_string(largest.largestMappingAffected) + " of " + std::to_string(largest.largestMappingEntries) + " entries, expected " + std::to_string(Records - 1u) + " of " + std::to_string(Records));
+    Require(remappedWide.textures == resolveFully(shader, "a guest mapping change under more than half the entries"), "image table partial resolve: the whole resolve after a guest mapping change under more than half the entries binds other textures than another whole resolve");
+    sampled("a guest mapping change under more than half the entries", lone.Texels(0));
+
+    const auto beforeFlood = settle(shader, "a table before the guest mapping change log overflowed");
+    {
+        const GuestBlock unrelated(UnimportableBytes);
+        for (std::size_t change = 0; change < ChangeLogFlood; ++change) GuestAllocations::GuestAllocationsInvalidate_nid_postfix(AddressOf(unrelated.Texels(0)), 16);
+    }
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto flooded = build(shader);
+    Require(flooded.step.resolved == 1u && flooded.step.partial == 0u && flooded.step.reused == 0u, "image table partial resolve: a table proved before the guest mapping change log overflowed was not resolved whole (" + describe(flooded.step) + ")");
+    ExpectUnreused(flooded.before, ImageTableUnreused::MappingDropped, "a table proved before the guest mapping change log overflowed");
+    Require(flooded.textures == beforeFlood.textures && flooded.textures == resolveFully(shader, "a table proved before the guest mapping change log overflowed"), "image table partial resolve: the whole resolve after the guest mapping change log overflowed binds other textures than the unchanged table");
+    const auto afterFlood = build(shader);
+    Require(afterFlood.step.reused == 1u && afterFlood.refusals == 0u && afterFlood.textures == flooded.textures, "image table partial resolve: the table resolved after the guest mapping change log overflowed was not reused (" + describe(afterFlood.step) + ")");
+
+    const auto* image = HostImageBase();
+    const auto beforeImage = settle(shader, "a table before a host image was registered");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.RegisterImage(image);
+    }
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto registered = build(shader);
+    Require(registered.step.resolved == 1u && registered.step.partial == 0u && registered.step.reused == 0u, "image table partial resolve: a table proved before an image registration the change log does not record was not resolved whole (" + describe(registered.step) + ")");
+    ExpectUnreused(registered.before, ImageTableUnreused::MappingUntracked, "a table proved before an image registration the change log does not record");
+    Require(registered.textures == beforeImage.textures, "image table partial resolve: the whole resolve after an image registration away from every entry binds other textures");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.RegisterImage(image);
+    }
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto repeated = build(shader);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.UnregisterImage(image);
+    }
+    Require(repeated.step.reused == 1u && repeated.step.partial == 0u && repeated.step.resolved == 0u && repeated.refusals == 0u && repeated.textures == registered.textures, "image table partial resolve: registering a registered image again refused the table (" + describe(repeated.step) + ")");
+
+    const auto beforeWait = settle(shader, "a table before a guest mapping change elsewhere waited for a lease");
+    {
+        std::optional<GuestBlock> retired(std::in_place, UnimportableBytes);
+        auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        const auto since = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        std::thread remover([&] { retired.reset(); });
+        Built waited;
+        std::uint64_t proofs = 0;
+        std::exception_ptr failure;
+        try {
+            AwaitWaitingChange(since);
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            waited = build(shader);
+            proofs = AgcDriver::Graphics::ImageTableReuses().mappingWaited - waited.before.mappingWaited;
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        lease.clear();
+        remover.join();
+        if (failure != nullptr) std::rethrow_exception(failure);
+        Require(waited.step.reused == 1u && waited.step.partial == 0u && waited.step.resolved == 0u && waited.refusals == 0u && proofs == 1u && waited.textures == beforeWait.textures, "image table partial resolve: a guest mapping change away from every entry, waiting for a lease, refused the table (" + describe(waited.step) + ", " + std::to_string(proofs) + " proofs made while it waited)");
+    }
+    const auto afterWait = build(shader);
+    Require(afterWait.step.reused == 1u && afterWait.refusals == 0u && afterWait.textures == beforeWait.textures, "image table partial resolve: the table was not reused after a guest mapping change elsewhere finished waiting for its lease (" + describe(afterWait.step) + ")");
+    {
+        {
+            const GuestBlock unrelated(UnimportableBytes);
+        }
+        auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        const auto since = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        std::thread remapper([&] { lone.Remap(); });
+        Built under;
+        std::exception_ptr failure;
+        try {
+            AwaitWaitingChange(since);
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            under = build(shader);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        lease.clear();
+        remapper.join();
+        if (failure != nullptr) std::rethrow_exception(failure);
+        Require(under.step.reused == 0u && under.step.partial == 1u && under.step.partialEntries == 1u && under.step.resolved == 0u && under.refusals == 0u, "image table partial resolve: a guest mapping change under one entry, waiting for a lease, did not look that entry up again alone (" + describe(under.step) + ")");
+    }
+    const auto unwaited = settle(shader, "a table after a guest mapping change under one entry finished waiting for its lease");
+    keptExcept(beforeWait.textures, unwaited.textures, LoneEntry, "a guest mapping change under one entry that waited for a lease");
+    sampled("a guest mapping change under one entry that waited for a lease", lone.Texels(0));
 
     if (context.hostImportAlignment == 0 || AgcDriver::Graphics::HostImportFor(context, AddressOf(importable.Table()), BlockBytes) == nullptr) {
         Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "image table partial resolve: a storage-viewed entry requires host imports");

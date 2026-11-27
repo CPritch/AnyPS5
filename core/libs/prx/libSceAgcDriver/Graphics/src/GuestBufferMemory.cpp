@@ -3106,7 +3106,7 @@ bool refreshedFromLoggedChanges(const Context& context, HostImports& state) {
     auto& spans = state.loggedChanges;
     spans.clear();
     std::uint64_t current = 0;
-    if (!GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(state.refreshedGeneration, spans, current)) return false;
+    if (GuestAllocations::GuestAllocationsChangesSince_nid_no_patch(state.refreshedGeneration, spans, current) != GuestAllocations::ChangesAnswer::Answered) return false;
     std::sort(spans.begin(), spans.end());
     std::size_t merged = 0;
     for (const auto& span : spans) {

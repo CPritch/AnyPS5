@@ -99,7 +99,6 @@ bool isRetiring(const Range& range) {
 }
 
 std::atomic<std::uint64_t> generation{1};
-std::atomic<std::size_t> retiringRanges{0};
 
 struct ChangeEntry {
     std::uint64_t generation;
@@ -109,10 +108,14 @@ struct ChangeEntry {
 
 constexpr std::size_t ChangeLogEntries = 16384;
 
+struct MutationState;
+
 struct ChangeLog {
     std::mutex mutex;
     std::deque<ChangeEntry> entries;
-    std::uint64_t incompleteThrough = 1;
+    std::uint64_t untrackedThrough = 1;
+    std::uint64_t droppedThrough = 1;
+    MutationState* waiting = nullptr;
 };
 
 ChangeLog& changeLog() {
@@ -125,7 +128,7 @@ std::uint64_t logChanges(std::span<const std::pair<std::uint64_t, std::uint64_t>
     std::lock_guard lock(log.mutex);
     const auto ended = generation.fetch_add(1, std::memory_order_release) + 1;
     if (!complete) {
-        log.incompleteThrough = ended;
+        log.untrackedThrough = ended;
         return ended;
     }
     try {
@@ -133,10 +136,10 @@ std::uint64_t logChanges(std::span<const std::pair<std::uint64_t, std::uint64_t>
             if (begin < end) log.entries.push_back({ended, begin, end});
         }
     } catch (...) {
-        log.incompleteThrough = ended;
+        log.untrackedThrough = ended;
     }
     while (log.entries.size() > ChangeLogEntries) {
-        log.incompleteThrough = std::max(log.incompleteThrough, log.entries.front().generation);
+        log.droppedThrough = std::max(log.droppedThrough, log.entries.front().generation);
         log.entries.pop_front();
     }
     return ended;
@@ -170,7 +173,24 @@ struct MutationState {
     std::vector<std::pair<std::uintptr_t, std::size_t>> unpinned;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> replaced;
     bool untracked = false;
+    MutationState* nextWaiting = nullptr;
 };
+
+void listWaiting(MutationState& state) noexcept {
+    auto& log = changeLog();
+    std::lock_guard lock(log.mutex);
+    state.nextWaiting = log.waiting;
+    log.waiting = &state;
+}
+
+void unlistWaiting(MutationState& state) noexcept {
+    auto& log = changeLog();
+    std::lock_guard lock(log.mutex);
+    auto** link = &log.waiting;
+    while (*link != nullptr && *link != &state) link = &(*link)->nextWaiting;
+    if (*link != nullptr) *link = state.nextWaiting;
+    state.nextWaiting = nullptr;
+}
 
 void recordChange(void* mutation, const void* pointer, std::size_t bytes) {
     if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
@@ -293,14 +313,23 @@ void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t 
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
 }
 
-bool GuestAllocationsChangesSince_nid_no_patch(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, std::uint64_t& current) {
+ChangesAnswer GuestAllocationsChangesSince_nid_no_patch(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, std::uint64_t& current) {
     auto& log = changeLog();
     std::lock_guard lock(log.mutex);
     current = generation.load(std::memory_order_acquire);
-    if (since < log.incompleteThrough || since > current || retiringRanges.load(std::memory_order_acquire) != 0) return false;
+    if (since > current) return ChangesAnswer::Ahead;
+    if (since < log.untrackedThrough) return ChangesAnswer::Untracked;
+    if (since < log.droppedThrough) return ChangesAnswer::Dropped;
     const auto first = std::upper_bound(log.entries.begin(), log.entries.end(), since, [](std::uint64_t value, const ChangeEntry& entry) { return value < entry.generation; });
     for (auto it = first; it != log.entries.end(); ++it) spans.emplace_back(it->begin, it->end);
-    return true;
+    if (log.waiting == nullptr) return ChangesAnswer::Answered;
+    for (const auto* state = log.waiting; state != nullptr; state = state->nextWaiting) {
+        for (const auto& [address, bytes] : state->changed) {
+            if (bytes <= std::numeric_limits<std::uint64_t>::max() - address) spans.emplace_back(address, address + bytes);
+        }
+        spans.insert(spans.end(), state->replaced.begin(), state->replaced.end());
+    }
+    return ChangesAnswer::Waiting;
 }
 
 void GuestAllocationsSetGpuMapObserver_nid_postfix(void (*callback)(const Mapped& ranges, std::uint64_t generation)) {
@@ -354,18 +383,18 @@ void registerImage(const void* image) {
 }
 
 void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation) {
-    markUntracked(mutation);
     auto& state = registry();
     if (state.mainImageRegistered) return;
     const auto image = GetModuleHandleW(nullptr);
     require(image != nullptr, "cannot locate the main guest image");
+    if (!state.registeredImages.contains(reinterpret_cast<std::uintptr_t>(image))) markUntracked(mutation);
     registerImage(image);
     state.mainImageRegistered = true;
 }
 
 void GuestAllocationsRegisterImage_nid_postfix(void* mutation, const void* image) {
-    markUntracked(mutation);
     require(image != nullptr, "cannot register a guest image without a base");
+    if (!registry().registeredImages.contains(reinterpret_cast<std::uintptr_t>(image))) markUntracked(mutation);
     registerImage(image);
 }
 
@@ -459,9 +488,9 @@ std::uintptr_t registerImagePages(const ImagePages& collected) {
 }
 
 void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation) {
-    markUntracked(mutation);
     auto& state = registry();
     if (state.mainImageRegistered) return;
+    markUntracked(mutation);
     ImagePages collected{.main = true, .pageSize = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE))};
 #ifdef __APPLE__
     collectMachImagePages(collected);
@@ -474,11 +503,11 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation) {
 }
 
 void GuestAllocationsRegisterImage_nid_postfix(void* mutation, const void* image) {
-    markUntracked(mutation);
     require(image != nullptr, "cannot register a guest image without a base");
     auto& state = registry();
     const auto base = reinterpret_cast<std::uintptr_t>(image);
     if (state.registeredImages.contains(base)) return;
+    markUntracked(mutation);
     ImagePages collected{.base = base, .pageSize = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE))};
 #ifdef __APPLE__
     collectMachImagePages(collected);
@@ -547,9 +576,9 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     const auto unmark = [&] {
         if (!marked) return;
         if (!state->lock.owns_lock()) state->lock.lock();
+        unlistWaiting(*state);
         auto& retiring = registry().retiring;
         retiring.erase(std::find(retiring.begin(), retiring.end(), std::pair<std::uintptr_t, std::uintptr_t>{address, end}));
-        retiringRanges.fetch_sub(1, std::memory_order_release);
         registry().readableLease.reset();
         registry().registeredLease.reset();
         registry().allLease.reset();
@@ -580,8 +609,9 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
             return;
         }
         if (!marked && state != nullptr && state->lock.owns_lock()) {
+            recordReplaced(state, address, end);
             registry().retiring.emplace_back(address, end);
-            retiringRanges.fetch_add(1, std::memory_order_release);
+            listWaiting(*state);
             marked = true;
         }
         if (std::chrono::steady_clock::now() >= deadline) PinnedFailure(address, bytes, ("waited " + std::to_string(pinWait().count()) + " ms for the lease (APS5_PIN_WAIT_MS)").c_str());
