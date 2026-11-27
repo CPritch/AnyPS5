@@ -334,6 +334,7 @@ ShaderRecompiler::RecompileRequest Driver::drawStageRequest(const DrawStageConte
         {0, 0, pushOffset, pushBytes},
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, context.linked, Graphics::StageMeshConfiguration(context.graphics.stages, program.binary.stage), context.graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}, program.binary.stage == Stage::Mesh ? context.meshBarycentrics : std::nullopt, context.emulateBarycentrics && program.binary.stage == Stage::Fragment}
     };
+    if (request.target.deviceImageTables) request.target.deviceImageTables = context.localDevice->DeviceImagesServe(program.binary.codeAddress);
     return request;
 }
 

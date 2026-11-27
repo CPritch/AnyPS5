@@ -413,6 +413,7 @@ private:
         append(key, value.meshInlineFunctions);
         append(key, value.spannedShuffleThroughMemory);
         append(key, value.bindlessImages);
+        append(key, value.deviceImageTables);
     }
 };
 

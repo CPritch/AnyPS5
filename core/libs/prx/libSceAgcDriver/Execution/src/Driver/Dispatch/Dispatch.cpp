@@ -483,6 +483,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
         {0, 0, 0, threadGroup != std::array<std::uint32_t, 3>{} ? 0u : 128u}
     };
+    if (request.target.deviceImageTables) request.target.deviceImageTables = localDevice->DeviceImagesServe(address);
     if (const auto rsrc1 = queue.shader.find(0x212); !fromAhead && rsrc1 != queue.shader.end()) {
         const auto vectorGranule = request.context.waveSize == 32u ? 8u : 4u;
         if (const auto split = SplitTableCallPartsFor(request, ((rsrc1->second & 0x3fu) + 1u) * vectorGranule)) {
@@ -841,6 +842,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
+    if (!ExpectDeviceImages(*localDevice, userData, address, compiled, true)) {
+        dispatch(queue, packet, submission, indirectArguments);
+        return;
+    }
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     snapshots.reserve(captured.size());
     for (const auto& region : captured) snapshots.push_back({region.guestAddress, region.bytes});

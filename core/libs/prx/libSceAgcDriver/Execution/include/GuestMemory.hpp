@@ -184,6 +184,7 @@ void SetCollectPrefetch(bool enabled);
 std::uint64_t CollectPrefetchWalks();
 std::uint64_t ThreadCollectEpoch();
 std::uint64_t UnwatchSerial();
+std::uint64_t OwnWriteSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 struct GpuUseObservation {
     std::uint64_t address = 0;

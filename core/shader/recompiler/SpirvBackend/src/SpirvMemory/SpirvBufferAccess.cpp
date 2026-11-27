@@ -158,6 +158,10 @@ std::uint32_t readOnlyWordPointer(SpirvEmitterState& state, std::uint32_t base, 
 
 }
 
+std::uint32_t EmitAddressWordPointer(SpirvEmitterState& state, std::uint32_t base, std::uint32_t index) {
+    return wordPointer(state, base, index);
+}
+
 std::uint32_t EmitRootAddressWordPointer(SpirvEmitterState& state, RuntimeAbi::RootItem item, std::uint32_t index) {
     return wordPointer(state, EmitRootAddress(state, item), index);
 }

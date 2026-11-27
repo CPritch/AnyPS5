@@ -444,8 +444,10 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     deadCodeEliminator.Eliminate(program);
     dumpIr("srt");
 
+    const bool heapStage = request.shader.stage == ShaderStage::Fragment || request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Compute;
+    const bool gpuModeStage = request.target.gpuResolvedImages && request.target.descriptorMemory && heapStage;
     constexpr ResourceTracker resourceTracker;
-    resourceTracker.Track(program, BindlessLowering(request));
+    resourceTracker.Track(program, BindlessLowering(request), request.target.deviceImageTables && gpuModeStage && supports(spv::CapabilityInt64) && supports(spv::CapabilityPhysicalStorageBufferAddresses));
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     if (inputInfo.compute != nullptr) ProveImageOverwrites(program, {inputInfo.compute->threadsNum[0], inputInfo.compute->threadsNum[1], inputInfo.compute->threadsNum[2]});
@@ -1132,6 +1134,8 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     }
     result.gpuResolvedImages = targetOptions.gpuResolvedImages;
     result.samplerSlotDword = result.gpuResolvedImages ? bindings.layout.SamplerSlotDword() : 0u;
+    result.deviceImageTables = std::ranges::any_of(program.Info().images, [](const ImageResource& image) { return image.deviceTable; });
+    if (result.deviceImageTables && !(result.gpuResolvedImages && bindings.layout.UsesDataAddress())) throw std::logic_error("a device image table column was planned for a stage that is not a GPU-mode stage reading its table map by address");
     result.bufferAddressDword = bindings.layout.bufferAddressDwords != 0u ? bindings.layout.BufferAddressDword() : 0u;
     result.bufferAddressCount = bindings.layout.bufferAddressDwords / RuntimeAbi::BufferAddressWords;
     result.pushedBufferCount = result.bufferAddressCount;
@@ -1762,6 +1766,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .pushItems = artifact.pushItems,
         .dataAddressPush = artifact.dataAddressPush,
         .bdaStores = artifact.bdaStores,
+        .deviceImageTables = artifact.deviceImageTables,
         .bdaAbiVersion = artifact.bdaAbiVersion,
         .windowLaneGuards = artifact.windowLaneGuards,
         .descriptorFaults = artifact.descriptorFaults,
@@ -1923,6 +1928,19 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     }
     const auto resolved = ResourceMaterializer::ResolveImageTablesShared(variant.info.info, snapshot, artifact.variantId);
     const auto& tables = *resolved;
+    if (artifact.deviceImageTables) {
+        const auto& info = variant.info.info;
+        ResourceMaterializer::RegisterDeviceImageInterfaces(info);
+        result.deviceImageInterfaces.assign(info.images.size(), 0u);
+        for (std::size_t image = 0; image < info.images.size(); ++image) {
+            if (info.images[image].deviceTable) result.deviceImageInterfaces[image] = ResourceMaterializer::DeviceImageInterfaceId(info.images[image], info.runtimeImageModes.at(image));
+        }
+        result.deviceSamplerClasses.assign(info.samplers.size(), 0u);
+        for (const auto& constant : plan->bindings.specialization) {
+            const auto sampler = constant.id - PipelineSpecialization::DeviceSamplerClassBase;
+            if (constant.id >= PipelineSpecialization::DeviceSamplerClassBase && sampler < info.samplers.size()) result.deviceSamplerClasses[sampler] = constant.value;
+        }
+    }
     if (usedPlan != nullptr) *usedPlan = {entry != nullptr ? std::shared_ptr<const void>(entry) : std::shared_ptr<const void>(plan), bindingPlan};
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
@@ -2674,6 +2692,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         counters.misses.fetch_add(1, std::memory_order_relaxed);
     }
     result->cacheHit = cacheHit;
+    if (result->deviceImageTables) result->deviceImagePlan = source.plan;
     std::shared_ptr<const RecompileResult> shared = std::move(result);
     if (donor != nullptr) {
         reportResultMemo();
@@ -2736,9 +2755,15 @@ std::shared_ptr<const RecompileResult> RecompileImpl(const RecompileRequest& req
     if (!request.useCache || capture.source == nullptr) {
         auto program = PrepareResourceProgram(request);
         const auto variant = CountedCompile([&] { return compileVariant(request, std::move(program)); });
-        return Sealed(std::make_shared<const RecompileResult>(materializeResult(variant, request, capture.snapshot)));
+        auto built = materializeResult(variant, request, capture.snapshot);
+        if (built.deviceImageTables) built.deviceImagePlan = capture.plan;
+        return Sealed(std::make_shared<const RecompileResult>(std::move(built)));
     }
-    if (!ResultMemo()) return Sealed(std::make_shared<const RecompileResult>(materializeVariant(*capture.source, request, capture.snapshot)));
+    if (!ResultMemo()) {
+        auto built = materializeVariant(*capture.source, request, capture.snapshot);
+        if (built.deviceImageTables) built.deviceImagePlan = capture.plan;
+        return Sealed(std::make_shared<const RecompileResult>(std::move(built)));
+    }
     return Sealed(materializeMemoized(*capture.source, request, capture.snapshot, memoHit));
 }
 
@@ -3115,6 +3140,7 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeHeap
     UsedBindingPlan usedPlan;
     auto built = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, &usedPlan, nullptr, &substitutes));
     built->cacheHit = true;
+    if (built->deviceImageTables) built->deviceImagePlan = capture.plan;
     for (const auto reg : layout.userDataRegisters) built->heapUserWords.push_back(reg - userDataBase);
     built->heapTemplateId = NextTemplateId();
     auto created = std::make_shared<HeapTemplate>(HeapTemplate{std::move(built), std::move(usedPlan), perDrawBindings ? merged.buffers : std::vector<DescriptorValue>{}, perDrawBindings ? merged.images : std::vector<DescriptorValue>{}, perDrawBindings ? merged.samplers : std::vector<DescriptorValue>{}});
@@ -3144,6 +3170,7 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(con
     if (request.useCache && ResultMemo()) return Sealed(materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr));
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
     result->cacheHit = true;
+    if (result->deviceImageTables) result->deviceImagePlan = capture.plan;
     return Sealed(std::move(result));
 }
 
@@ -3229,6 +3256,7 @@ std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest&
     if (request.useCache && ResultMemo()) return Sealed(materializePreparedMemoized(*handle.source, handle.artifact, request, capture.snapshot, true, nullptr));
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle.artifact, request, capture.snapshot));
     result->cacheHit = true;
+    if (result->deviceImageTables) result->deviceImagePlan = capture.plan;
     return Sealed(std::move(result));
 }
 

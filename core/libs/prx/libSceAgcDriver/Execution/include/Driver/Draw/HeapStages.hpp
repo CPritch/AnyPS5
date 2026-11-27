@@ -12,6 +12,10 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver {
+class VulkanDevice;
+}
+
 namespace AgcDriver::DriverDetail {
 
 struct DispatchVariant;
@@ -24,6 +28,7 @@ bool HeapExcludedFor(const ShaderRecompiler::PreparedShaderInvocation& invocatio
 bool HeapClassesExcluded();
 void RequireHeapStageMappable(const ShaderRecompiler::RecompileResult& result, bool workgroupAddress = false);
 bool HeapStageFits(const ShaderRecompiler::RecompileResult& result, bool workgroupAddress = false);
+bool ExpectDeviceImages(const VulkanDevice& device, std::span<const std::uint32_t> userData, std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& result, bool dispatch);
 
 bool SampleHeapStageVerify();
 

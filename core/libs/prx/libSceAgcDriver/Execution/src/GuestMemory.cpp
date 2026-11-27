@@ -330,6 +330,7 @@ std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> prefetchRanges{0};
 std::atomic<std::uint64_t> prefetchWalks{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
+std::atomic<std::uint64_t> ownWriteSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
 // tracker mutex acquisitions that had to wait (APS5_PROFILE_DRAW; see lockTracker).
 std::atomic<std::uint64_t> collectDirty{0};
@@ -2646,6 +2647,10 @@ std::uint64_t UnwatchSerial() {
     return unwatchSerial.load(std::memory_order_acquire);
 }
 
+std::uint64_t OwnWriteSerial() {
+    return ownWriteSerial.load(std::memory_order_acquire);
+}
+
 void AdoptLatestCollectEpoch() {
     const auto latest = lastBumpedEpoch.load(std::memory_order_acquire);
     if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);
@@ -3241,6 +3246,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, bool imaged, co
     const BreakWhenStored breakStored;
     const auto stampStored = [complete](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
+        ownWriteSerial.fetch_add(1, std::memory_order_release);
         ++tracker.generation;
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) {
             tracker.noteUnstampedStore(stored.first, stored.second);
@@ -3312,6 +3318,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
     if (order != nullptr) *order = 0;
     tracker.initialize();
     if (bytes == 0) return 0;
+    ownWriteSerial.fetch_add(1, std::memory_order_release);
     ++tracker.generation;
     if (!tracker.watched || !tracker.covers(address, bytes)) {
         tracker.noteUnstampedStore(address, address + bytes);

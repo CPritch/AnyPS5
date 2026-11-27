@@ -23,6 +23,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FloatFlushProbe.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeviceImageTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -328,6 +329,11 @@ void check(VkResult result, const char* operation) {
 
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("Vulkan presentation: ") + reason);
+}
+
+void reportDeviceImagePathRefusal(const std::string& reason) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) std::fprintf(stderr, "[device-images] APS5_GPU_PATH stays off on this device: %s\n", reason.c_str());
 }
 
 void checkHostRequirements(const HostGpuQuery& query, bool printReport) {
@@ -829,6 +835,7 @@ struct VulkanDevice::State {
     bool contextReady = false;
     std::unique_ptr<Graphics::TextureDetiler> detiler;
     bool descriptorHeap = false;
+    bool deviceImagePath = false;
     VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT};
     std::uint32_t heapDataUniformDwords = 0;
     bool uniformConstantBuffers = false;
@@ -1372,6 +1379,7 @@ struct VulkanDevice::State {
             Graphics::ClearRetainedSpaces(device);
             Graphics::ClearCachedTextures(device);
             Graphics::ClearSnapshotCopies(device);
+            Graphics::DeviceImageTable::Release(device);
             Graphics::BindlessHeap::Release(device);
             Graphics::ClearUploadCopies(device);
             Graphics::ClearImageMirrors(device);
@@ -2973,6 +2981,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         throw std::runtime_error("AGC graphics: the GPU heap needs timeline semaphores to evict slots; APS5_NO_TIMELINE cannot be used with APS5_GPU_HEAP");
     Graphics::SetDescriptorHeapDevice(heapDevice);
     Graphics::BufferPool::SetForceAddresses(Graphics::DescriptorHeapEnabled());
+    if (Graphics::GpuPathEnabled()) {
+        const auto refusal = Graphics::DeviceImagePathRefusal({Graphics::GpuHeapEnabled(), Graphics::DescriptorHeapEnabled()});
+        state->deviceImagePath = !refusal.has_value();
+        if (refusal.has_value()) reportDeviceImagePathRefusal(*refusal);
+    }
     state->bufferPool = std::make_shared<Graphics::BufferPool>(graphicsContext());
     state->emptyBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), Graphics::EmptyBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::ranges::fill(state->emptyBuffer->Bytes(), std::byte{0});
@@ -3019,6 +3032,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->context.textureService = state->textureService.get();
         const auto budget = liveBudget ? Graphics::SampledTextureCacheBudget(state->context) / 2u : options.budgetBytes;
         std::fprintf(stderr, "[bindless] texture service: %s, budget %llu MiB%s, idle after %llu submits, commit chunk %u\n", options.lazy ? "lazy (entries resolved from misses only)" : "exact (tables primed before use)", static_cast<unsigned long long>(budget >> 20u), liveBudget ? " (half the sampled texture budget, read at each present)" : " (APS5_BINDLESS_BUDGET_MIB)", static_cast<unsigned long long>(options.idleSubmits), options.commitChunk);
+    }
+    if (state->deviceImagePath) {
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (!GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
+        Graphics::DeviceImageTable::Create(state->context, ShaderRecompiler::ResourceMaterializer::FindDeviceImageInterface);
     }
     if (window != nullptr) {
         require(window->getDrawableSize != nullptr, "missing window drawable size query");
@@ -5047,6 +5065,33 @@ bool VulkanDevice::PresentsOnOwnQueue() const {
     return state->presentQueue != VK_NULL_HANDLE;
 }
 
+bool VulkanDevice::DeviceImagePath() const {
+    return state->deviceImagePath;
+}
+
+bool VulkanDevice::DeviceImagesServe(std::uint64_t codeAddress) const {
+    if (!state->deviceImagePath) return false;
+    const auto* table = Graphics::DeviceImageTable::Existing(state->context);
+    return table != nullptr && table->ServesProgram(codeAddress);
+}
+
+void VulkanDevice::NoteDeviceImageProgram(const ShaderRecompiler::RecompileResult& result, std::uint64_t codeAddress) const {
+    if (!result.deviceImageTables) return;
+    if (auto* table = Graphics::DeviceImageTable::Existing(state->context)) table->NoteProgram(result.Identity(), codeAddress);
+}
+
+std::optional<std::string> VulkanDevice::ExpectDeviceImages(std::span<const ShaderRecompiler::DeviceImageTableAbi::Expectation> images) const {
+    auto* table = Graphics::DeviceImageTable::Existing(state->context);
+    require(table != nullptr && state->recorder != nullptr, "expected device images need the device's table and its recorder");
+    return table->Expect(graphicsContext(), *state->recorder, images);
+}
+
+void VulkanDevice::FallBackDeviceImages(const ShaderRecompiler::RecompileResult& result, std::uint64_t codeAddress, const std::string& reason) const {
+    auto* table = Graphics::DeviceImageTable::Existing(state->context);
+    require(table != nullptr, "a device image fallback needs the device's table");
+    table->FallBackProgram(result.Identity(), codeAddress, reason);
+}
+
 ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize) const {
     auto target = Target();
     target.float32FlushToZero = state->float32FlushToZero;
@@ -5180,6 +5225,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     target.hostInterpolationFirst = state->hostInterpolationFirst;
     target.float32DenormPreserve = state->float32DenormPreserve;
     target.descriptorMemory = Graphics::DescriptorHeapEnabled();
+    target.deviceImageTables = state->deviceImagePath;
     target.heapDataUniformDwords = target.descriptorMemory ? state->heapDataUniformDwords : 0u;
     target.uniformConstantBuffers = target.descriptorMemory && state->uniformConstantBuffers;
     target.float16WidenNans = state->float16WidenNans;

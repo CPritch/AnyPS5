@@ -71,6 +71,7 @@ inline constexpr std::uint32_t BufferRootPosition = 58304u;
 inline constexpr std::uint32_t BufferRootCount = 16u;
 inline constexpr std::uint32_t BufferOverflowPosition = BufferRootPosition + BufferRootCount;
 inline constexpr std::uint32_t GatherImageShapeBase = 58432u;
+inline constexpr std::uint32_t DeviceSamplerClassBase = 58368u;
 
 inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {
     return DescriptorIndexBase + binding * DescriptorIndexStride + element;

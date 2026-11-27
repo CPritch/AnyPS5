@@ -566,6 +566,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcSampleOrderShaderHeaders}
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindlessHeap.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeviceImageKeys.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeviceImageTable.cpp
         ${agcTextureDetileShaderHeader}
         ${agcReadbackHeaders}
         ${agcMultisampleUploadHeader}

@@ -97,6 +97,7 @@ struct SpirvTableAccess {
     bool uniform = false;
     bool bindless = false;
     bool heap = false;
+    bool device = false;
 };
 
 struct SpirvBindlessProbe {
@@ -322,6 +323,7 @@ struct SpirvEmitterState {
     std::map<std::vector<std::uint32_t>, std::vector<std::pair<const IrBlock*, SpirvBindlessProbe>>> bindlessHoisted;
     std::map<std::vector<std::uint32_t>, SpirvBindlessProbe> bindlessBlockProbes;
     const IrBlock* bindlessProbeBlock = nullptr;
+    std::uint32_t deviceImageLookupFunction = 0;
     std::uint32_t mainFunc = 0;
     std::uint32_t meshGuestFunc = 0;
     std::uint32_t pixelGuestFunc = 0;

@@ -129,6 +129,7 @@ struct ImageResource {
     bool nestedTable = false;
     bool targetMerge = false;
     ImageOverwrite overwrite;
+    bool deviceTable = false;
 
     bool operator==(const ImageResource& other) const = default;
 };
@@ -178,6 +179,17 @@ inline bool SamplesBaseLevelIfUnnormalized(const SamplerResource& sampler) {
 inline bool MirrorsIfUnnormalized(const SamplerResource& sampler) {
     return sampler.table == NoTable && !sampler.depthCompare && sampler.uses != 0u && ((sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseOffset | SamplerUseNonZeroLod)) == 0u || SamplesBaseLevelIfUnnormalized(sampler));
 }
+
+inline constexpr std::uint32_t NoSampler = std::numeric_limits<std::uint32_t>::max();
+
+struct DeviceImageUse {
+    std::uint32_t image = 0;
+    std::uint32_t sampler = NoSampler;
+    std::uint32_t descriptor = 0;
+    std::uint32_t firstUsePc = 0;
+
+    bool operator==(const DeviceImageUse& other) const = default;
+};
 
 inline bool AppliesLodBiasInShader(const SamplerResource& sampler) {
     return sampler.table == NoTable && (sampler.uses & (SamplerUseExplicitLod | SamplerUseImplicitLod | SamplerUseGradient)) != 0u;

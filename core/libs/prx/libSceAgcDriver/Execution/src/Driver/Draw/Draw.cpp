@@ -1152,6 +1152,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         require(!MixesHeapAndGuestStages(stages, programResults), "a draw mixes GPU heap and per-draw stages");
         if (!heapDraw) Graphics::NoteHeapExcluded(Graphics::HeapExcluded::Draw);
     }
+    for (std::size_t i = 0; i < programs.size(); ++i) {
+        if (programResults[i] != nullptr) static_cast<void>(ExpectDeviceImages(*localDevice, programs[i].userData, programs[i].binary.codeAddress, *programResults[i], false));
+    }
 
     if (stageDataVerified != 0) {
         std::lock_guard cacheLock(drawCacheMutex);
