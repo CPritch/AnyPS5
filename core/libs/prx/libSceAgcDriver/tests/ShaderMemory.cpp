@@ -6715,6 +6715,53 @@ void verifyDeviceImageTables() {
     }
 }
 
+void verifyDeviceImageTableMesh() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Entries = 64;
+    static TableTexture textures[2];
+    alignas(4096) static std::array<std::array<std::uint32_t, 8>, Entries> heap{};
+    alignas(4096) static std::array<std::uint32_t, 16> srt{};
+    static std::array<std::uint32_t, 4> output{};
+    for (std::uint32_t entry = 0; entry < Entries; ++entry) heap[entry] = TableT(textures[entry % 2u].bytes.data(), TableFormat8888UNorm, TableType2D);
+    const auto heapV = TableV(heap.data(), 32u, Entries);
+    const auto outputV = TableV(output.data(), 0u, 16u);
+    std::copy(heapV.begin(), heapV.end(), srt.begin());
+    srt[4] = 6u;
+    srt[5] = 0u;
+    srt[6] = 0u;
+    srt[7] = 1u << 30u;
+    std::copy(outputV.begin(), outputV.end(), srt.begin() + 12);
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 8> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 7u, 0u, 0u, 0u, 0u, 0u};
+    for (const bool deviceTables : {true, false}) {
+        auto request = DeviceTableRequest(DeviceTableComputeCode, userData, false, deviceTables, true);
+        request.shader.stage = ShaderStage::Mesh;
+        request.shader.codeAddress += deviceTables ? 0x40u : 0x80u;
+        request.context.compute.reset();
+        request.context.vertex = ShaderVertexStageInfo{};
+        request.context.vertex->paClVsOutCntl = (1u << 18u) | (1u << 21u);
+        request.graphics = GraphicsCompileContext{0u, {}, MeshConfiguration{4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u}, std::nullopt, {}};
+        static constexpr std::array<std::uint32_t, 5> meshCapabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityMeshShadingEXT};
+        static constexpr std::array<std::string_view, 3> meshExtensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage", "SPV_EXT_mesh_shader"};
+        request.target.supportedCapabilities = meshCapabilities;
+        request.target.supportedExtensions = meshExtensions;
+        request.target.spirvVersion = 0x00010400u;
+        request.target.maxWorkgroupSize = {1024u, 1024u, 64u};
+        request.target.maxWorkgroupInvocations = 1024u;
+        request.target.maxWorkgroupSharedMemoryBytes = 32768u;
+        const auto plan = GetResourcePlan(request);
+        require(plan->info.images.size() == 1u && plan->info.images[0].table != NoTable, "device image tables: the mesh stage's sampled image is not a table column");
+        require(plan->info.images[0].deviceTable == deviceTables, deviceTables ? "device image tables: a GPU-mode mesh stage's V# table column is not read through the device image table" : "device image tables: a mesh stage's table column left the CPU map with the option off");
+        const auto compiled = CompileTable(request);
+        const auto& result = *compiled.result;
+        require(result.deviceImageTables == deviceTables && result.gpuResolvedImages && result.dataAddressPush, "device image tables: the mesh stage's result does not match the device image table option");
+        require(ScanDeviceTableSpirv(result.spirv.Words()).lookup == deviceTables, "device image tables: the mesh module's device image lookup does not match the option");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+        static_cast<void>(ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion));
+#endif
+    }
+}
+
 const std::vector<std::uint32_t> DeviceTableBranchComputeCode{0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000030u, 0xbe900302u, 0x8f108510u, 0xbf068003u, 0xbf850007u, 0xf4080100u, 0xfa000000u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xbf82000bu, 0xf4080100u, 0xfa000000u, 0xbe8c03ffu, 0x00008000u, 0xbe8d0380u, 0xbe8e0380u, 0xbe8f0380u, 0xf42c0502u, 0x20000020u, 0xf09c0f08u, 0x00650000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
 const std::vector<std::uint32_t> DeviceTableBranchPixelCode{0xf4080200u, 0xfa000010u, 0x7e020300u, 0xbe900302u, 0x8f108510u, 0xbf068003u, 0xbf850007u, 0xf4080100u, 0xfa000000u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xbf82000bu, 0xf4080100u, 0xfa000000u, 0xbe8c03ffu, 0x00008000u, 0xbe8d0380u, 0xbe8e0380u, 0xbe8f0380u, 0xf42c0502u, 0x20000020u, 0xf09c0f08u, 0x00650000u, 0xf800180fu, 0x03020100u, 0xbf810000u};
 
@@ -14449,6 +14496,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--device-image-tables") {
             verifyDeviceImageTables();
             std::cout << "GPU-mode stages read V# table columns through the device image table, whose addresses they take from the map trailer\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--device-image-table-mesh") {
+            verifyDeviceImageTableMesh();
+            std::puts("a GPU-mode mesh stage reads its table column through the device image table");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--device-image-table-branches") {

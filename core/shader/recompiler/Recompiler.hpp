@@ -39,6 +39,10 @@ enum class ShaderStage {
     Mesh
 };
 
+[[nodiscard]] constexpr bool GpuModeImageStage(ShaderStage stage) {
+    return stage == ShaderStage::Fragment || stage == ShaderStage::Vertex || stage == ShaderStage::Compute || stage == ShaderStage::Mesh;
+}
+
 struct MemoryRegion {
     std::uint64_t guestAddress;
     std::span<const std::byte> bytes;

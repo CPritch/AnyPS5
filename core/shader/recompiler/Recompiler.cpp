@@ -444,8 +444,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     deadCodeEliminator.Eliminate(program);
     dumpIr("srt");
 
-    const bool heapStage = request.shader.stage == ShaderStage::Fragment || request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Compute;
-    const bool gpuModeStage = request.target.gpuResolvedImages && request.target.descriptorMemory && heapStage;
+    const bool gpuModeStage = request.target.gpuResolvedImages && request.target.descriptorMemory && GpuModeImageStage(request.shader.stage);
     constexpr ResourceTracker resourceTracker;
     resourceTracker.Track(program, BindlessLowering(request), request.target.deviceImageTables && gpuModeStage && supports(spv::CapabilityInt64) && supports(spv::CapabilityPhysicalStorageBufferAddresses));
     deadCodeEliminator.Eliminate(program);

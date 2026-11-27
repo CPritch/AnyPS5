@@ -257,14 +257,11 @@ bool CpuImageTablesTraced() {
 }
 
 CpuImageTableGate CpuImageTableGateOf(const ShaderRecompiler::RecompileRequest& request) {
-    using Stage = ShaderRecompiler::ShaderStage;
-    const auto stage = request.shader.stage;
-    const bool heapStage = stage == Stage::Fragment || stage == Stage::Vertex || stage == Stage::Compute;
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != request.target.supportedCapabilities.end(); };
     CpuImageTableGate gate;
     gate.known = true;
     gate.requested = request.target.deviceImageTables;
-    gate.gpuModeStage = request.target.gpuResolvedImages && request.target.descriptorMemory && heapStage;
+    gate.gpuModeStage = request.target.gpuResolvedImages && request.target.descriptorMemory && ShaderRecompiler::GpuModeImageStage(request.shader.stage);
     gate.int64 = supports(spv::CapabilityInt64);
     gate.bufferAddresses = supports(spv::CapabilityPhysicalStorageBufferAddresses);
     return gate;
