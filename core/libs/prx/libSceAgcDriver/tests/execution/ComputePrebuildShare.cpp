@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -11,6 +13,10 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 
 namespace {
 
@@ -44,6 +50,33 @@ struct OpenOnExit {
         AgcDriver::DriverDetail::AwaitLibraryPrebuilds();
     }
 };
+
+void CheckPrebuildsRunOnThreadsOfTheirOwnName() {
+#ifndef _WIN32
+    struct Seen {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::vector<std::string> names;
+    };
+    const auto seen = std::make_shared<Seen>();
+    const auto note = [seen] {
+        std::array<char, 64> name{};
+        const bool named = pthread_getname_np(pthread_self(), name.data(), name.size()) == 0;
+        std::lock_guard lock(seen->mutex);
+        seen->names.emplace_back(named ? name.data() : "");
+        seen->changed.notify_all();
+    };
+    std::thread submitter([note] {
+        AgcDriver::DriverDetail::NameDriverThread("qworker 0x0");
+        AgcDriver::DriverDetail::SubmitComputePrebuild(note);
+        AgcDriver::DriverDetail::SubmitLibraryPrebuild(note);
+    });
+    submitter.join();
+    std::unique_lock lock(seen->mutex);
+    Require(seen->changed.wait_for(lock, std::chrono::seconds(10), [&] { return seen->names.size() == 2u; }), "the compute and library prebuilds did not both run");
+    for (const auto& name : seen->names) Require(name == "shader prepare", "a prebuild ran on a thread named \"" + name + "\" instead of \"shader prepare\", so a build trace or a stack sample names the queue worker that started the pool");
+#endif
+}
 
 void CheckLibraryPrebuildRunsBesideBlockedComputePrebuilds() {
     const unsigned threads = PrebuildThreads();
@@ -85,6 +118,7 @@ void CheckLibraryPrebuildRunsBesideBlockedComputePrebuilds() {
 int main() {
     try {
         AgcDriver::DriverDetail::Driver::Get();
+        CheckPrebuildsRunOnThreadsOfTheirOwnName();
         CheckLibraryPrebuildRunsBesideBlockedComputePrebuilds();
         AgcDriver::DriverDetail::CloseRegistrationPreparation();
         std::puts("compute prebuild share tests passed");
