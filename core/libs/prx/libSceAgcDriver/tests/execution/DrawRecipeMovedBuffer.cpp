@@ -106,8 +106,13 @@ constexpr std::uint8_t SecondAlphaByte = 153u;
 constexpr float FilledAlpha = 0.8f;
 constexpr std::uint8_t FilledAlphaByte = 204u;
 constexpr std::size_t FillSource = 512;
-alignas(4096) std::array<float, 1024> BufferMemory{};
-alignas(4096) std::array<float, 1024> OtherMemory{};
+struct alignas(8192) GuestBuffers {
+    std::array<float, 1024> other{};
+    std::array<float, 1024> buffer{};
+};
+GuestBuffers Buffers{};
+std::array<float, 1024>& BufferMemory = Buffers.buffer;
+std::array<float, 1024>& OtherMemory = Buffers.other;
 constexpr std::size_t OtherSlices = 1024;
 
 float* SliceAt(std::size_t slice) {
