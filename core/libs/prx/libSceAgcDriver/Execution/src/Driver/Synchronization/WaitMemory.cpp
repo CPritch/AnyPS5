@@ -28,6 +28,8 @@ void PollSleep() {
 #endif
 }
 
+constexpr auto LongWaitReport = std::chrono::seconds(5);
+
 bool OwnStoreRejects(std::span<const std::uint32_t> packet, std::uint64_t awaited, std::size_t bytes, std::uint32_t queue) {
     const auto own = Graphics::Recorder::UnlandedOwnLabel(awaited, bytes, queue);
     if (own.mask == 0) return false;
@@ -109,6 +111,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Wait);
 
     auto start = std::chrono::steady_clock::now();
+    const auto waitBegan = start;
     auto lastDone = packetsDone.load();
 
     GuestMemory::TagGpuLockThread(queue);
@@ -410,7 +413,9 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         stall.Check(((packet[0] >> 8u) & 0xffu) == 0x93u ? "WAIT_REG_MEM_64 at" : "WAIT_REG_MEM at", awaited);
 
-        if (!warned && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(waitTimeoutMs())) {
+        const auto stalledFor = std::chrono::steady_clock::now() - start;
+        const auto waitedFor = std::chrono::steady_clock::now() - waitBegan;
+        if (!warned && (stalledFor > std::chrono::milliseconds(waitTimeoutMs()) || waitedFor > LongWaitReport)) {
             warned = true;
             ++outcomes.timedOut;
             {
@@ -425,8 +430,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             const std::uint64_t reference = wide ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet[4];
             const std::uint64_t mask = wide ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet[5];
             const std::uint64_t current = Pm4::LoadLabel(awaited, awaitedBytes);
-            std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM%s%s at 0x%llx timed out after %dms (function %u ref 0x%llx mask 0x%llx value 0x%llx)\n", queue, wide ? "_64" : "", requireMemory ? " (landing)" : "",
+            if (stalledFor > std::chrono::milliseconds(waitTimeoutMs())) std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM%s%s at 0x%llx timed out after %dms (function %u ref 0x%llx mask 0x%llx value 0x%llx)\n", queue, wide ? "_64" : "", requireMemory ? " (landing)" : "",
                          static_cast<unsigned long long>(awaited), waitTimeoutMs(), packet[1] & 7u, static_cast<unsigned long long>(reference), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(current));
+            else std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM%s%s at 0x%llx has waited %.1f s while other GPU work progressed (function %u ref 0x%llx mask 0x%llx value 0x%llx)\n", queue, wide ? "_64" : "", requireMemory ? " (landing)" : "",
+                         static_cast<unsigned long long>(awaited), std::chrono::duration<double>(waitedFor).count(), packet[1] & 7u, static_cast<unsigned long long>(reference), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(current));
             const auto address = awaited;
             {
                 std::lock_guard historyLock(writeHistoryMutex());
