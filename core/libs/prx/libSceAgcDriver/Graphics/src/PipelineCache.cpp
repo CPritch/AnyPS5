@@ -273,7 +273,8 @@ bool PipelineCache::save(bool final, bool waitForPipelines) try {
         auto synchronizationLock = source == cache ? snapshot() : PipelineCacheSynchronization::SnapshotLock{};
         if (source == cache && !synchronizationLock.owns_lock()) return false;
         VkResult result = VK_INCOMPLETE;
-        for (unsigned attempt = 0; attempt < SnapshotAttempts && result == VK_INCOMPLETE; ++attempt) {
+        const unsigned attempts = final ? FinalSnapshotAttempts : SnapshotAttempts;
+        for (unsigned attempt = 0; attempt < attempts && result == VK_INCOMPLETE; ++attempt) {
             if (getData(context.device, source, &size, nullptr) != VK_SUCCESS || size == 0) return true;
             if (merged != VK_NULL_HANDLE && size == disk.header.dataBytes) {
                 settle(disk.header);
@@ -283,7 +284,10 @@ bool PipelineCache::save(bool final, bool waitForPipelines) try {
             result = getData(context.device, source, &size, file.data() + sizeof(FileHeader));
             if (result != VK_SUCCESS && result != VK_INCOMPLETE) return true;
         }
-        if (result != VK_SUCCESS) return false;
+        if (result != VK_SUCCESS) {
+            std::fprintf(stderr, "[pipeline-cache] not saving %s: pipelines kept growing the cache through %u snapshots%s\n", path.string().c_str(), attempts, final ? " (teardown)" : "");
+            return false;
+        }
         file.resize(sizeof(FileHeader) + size);
     }
     destroyMerged.Reset();

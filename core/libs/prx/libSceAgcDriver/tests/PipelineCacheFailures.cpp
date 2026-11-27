@@ -201,7 +201,16 @@ int main(int argc, char** argv) {
         }
         cache->SaveNow();
         Check(Read(file).size() == 24 + live, "an incomplete snapshot prevented a later complete save");
+        std::filesystem::remove(file);
+        constexpr unsigned teardownGrowth = PipelineCache::SnapshotAttempts + 3u;
+        static_assert(teardownGrowth < PipelineCache::FinalSnapshotAttempts);
+        {
+            std::lock_guard lock(mutex);
+            live = caches.at(cache->Handle()).size() + std::size_t{teardownGrowth} * 4096u;
+        }
+        growDuringSnapshot = teardownGrowth;
         cache.reset();
+        Check(growDuringSnapshot == 0 && std::filesystem::exists(file) && Read(file).size() == 24 + live, "the teardown save gave up on a cache that pipelines grew for more snapshots than a periodic save retries");
         Check(caches.empty(), "incomplete snapshot test leaked Vulkan objects");
         std::puts("incomplete: retried a snapshot the cache outgrew and wrote no truncated file");
         return 0;
