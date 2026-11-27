@@ -180,6 +180,8 @@ void BreakProofs();
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
+void SetCollectPrefetch(bool enabled);
+std::uint64_t CollectPrefetchWalks();
 std::uint64_t ThreadCollectEpoch();
 std::uint64_t UnwatchSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
@@ -252,8 +254,15 @@ private:
     void block();
     bool tryEnter();
     void acquired();
+    bool open(const void* token);
+    void choosePriority();
+    void leave(const void* token);
     Mutex mutex;
     std::atomic<std::uint32_t> waiters{0};
+    std::atomic<std::uint32_t> released{0};
+    std::atomic<const void*> priority{nullptr};
+    Mutex queueMutex;
+    std::vector<std::pair<const void*, std::uint64_t>> queue;
     // The holder's thread token and recursion depth, written by the holder only; another thread
     // reads the owner just to see that it is not itself.
     std::atomic<const void*> owner{nullptr};

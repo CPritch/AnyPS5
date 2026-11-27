@@ -719,6 +719,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         try {
+            const BackgroundWaitScope backgroundWait;
             auto invocation = InvocationFor(snapshot, codeOffset, request, AsyncDrawCompile(), &linking);
             timing.Mark("prepared_invocation");
 
@@ -741,6 +742,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             compiledResult = MaterializeInBackground(invocation, capture, request.context.memory, address);
             if (compiledResult->gpuResolvedImages) RequireHeapStageMappable(*compiledResult, compiledResult->workgroupMemoryDwords != 0);
             timing.Mark("materialize");
+            if (AsyncDrawCompile()) NoteDispatchRecorded(address);
             if (profile && compiledResult->cacheHit) cacheHits.fetch_add(1, std::memory_order_relaxed);
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             static std::atomic<double> totalMs{0};
@@ -751,6 +753,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (const auto limit = MaxComputeSpirvWords(); limit != 0 && compiledResult->spirv.size() > limit)
                 throw std::runtime_error(std::to_string(compiledResult->spirv.size()) + " SPIR-V words, above APS5_MAX_COMPUTE_SPIRV_WORDS (" + std::to_string(limit) + ")");
         } catch (const DrawCompilePending&) {
+            NoteDispatchDropped(address);
             return;
         } catch (const std::exception& error) {
             std::string dump;

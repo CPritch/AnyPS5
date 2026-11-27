@@ -152,6 +152,39 @@ void GpuMutexRecursion() {
     Check(counter == 80000, "every nested increment under the GPU mutex counted");
 }
 
+void GpuMutexHandoff() {
+    auto& mutex = AgcDriver::GuestMemory::GpuMutex();
+    int handed = 0;
+    for (int round = 0; round < 20; ++round) {
+        std::atomic<int> order{0};
+        int oldest = 0;
+        int newcomer = 0;
+        std::atomic<bool> arriving{false};
+        mutex.lock();
+        std::thread first([&] {
+            mutex.lock();
+            oldest = ++order;
+            mutex.unlock();
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        std::thread second([&] {
+            arriving.store(true);
+            mutex.lock();
+            newcomer = ++order;
+            mutex.unlock();
+        });
+        while (!arriving.load()) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        mutex.unlock();
+        first.join();
+        second.join();
+        if (oldest == 1 && newcomer == 2) ++handed;
+    }
+    Check(handed == 20, "a thread that waited past the handoff time takes the GPU mutex before a thread that arrived later");
+    Check(!mutex.HeldByThisThread() && mutex.try_lock(), "the GPU mutex is free after the handoffs");
+    mutex.unlock();
+}
+
 template<typename TTag>
 void SlotIsolation(const char* what) {
     using Slot = HostThreadSlot<std::uint64_t, TTag>;
@@ -212,6 +245,7 @@ int main() {
     MutexWakesSleeper();
     DeviceGate();
     GpuMutexRecursion();
+    GpuMutexHandoff();
     ThreadSlots();
     if (failures != 0) {
         std::fprintf(stderr, "%d lock check(s) failed\n", failures);
