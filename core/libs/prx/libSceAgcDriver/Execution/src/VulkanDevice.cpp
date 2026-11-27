@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/SplitSelect_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "HeapCacheSwitch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
@@ -6965,7 +6966,8 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
         check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects->layout), "vkCreatePipelineLayout");
     }
     require(!gpuMode || (!split && !shader.bindlessHeap), "a GPU-mode compute stage cannot split its state or read the bindless image heap");
-    const VkPipelineCreateFlags pipelineFlags = computePipelineFlags();
+    const bool unoptimized = DriverDetail::CompilesUnoptimized(shader.spirv.size(), DriverDetail::UnoptimizedComputePipelineWords());
+    const VkPipelineCreateFlags pipelineFlags = computePipelineFlags() | (unoptimized ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0);
     const Graphics::CompiledShader placed{ShaderRecompiler::ShaderStage::Compute, &shader, 0u};
     objects->pushPlacements = Graphics::PushDataPlacements(std::span(&placed, 1));
     Graphics::PipelineSpecialization specialization(shader, context.atomicLockTable);
@@ -7014,7 +7016,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     if (objects->descriptorHeap) objects->heapMappings = std::move(heapMappings);
     if (trace.Active()) {
         const std::array identity{Graphics::DescribedPipelineIdentity(shader)};
-        trace.Report({state->probingFloatControls ? "compute-probe" : "compute", programAddress, identity[0], shader.spirv.size(), shader.specialization.size(), Graphics::PipelineSpecializationHash(specialization.Info()), state->probingFloatControls || identity[0].Empty() ? Graphics::PipelineBuildJournal::Unrecorded : Graphics::PipelineBuildJournalOf(identity)});
+        trace.Report({state->probingFloatControls ? "compute-probe" : unoptimized ? "compute-unoptimized" : "compute", programAddress, identity[0], shader.spirv.size(), shader.specialization.size(), Graphics::PipelineSpecializationHash(specialization.Info()), state->probingFloatControls || identity[0].Empty() ? Graphics::PipelineBuildJournal::Unrecorded : Graphics::PipelineBuildJournalOf(identity)});
     }
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
@@ -7043,10 +7045,11 @@ VkPipeline VulkanDevice::specializedComputePipeline(const Graphics::Context& con
     VkShaderModule module = Graphics::CreateShaderModule(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule"), state->device, state->graphicsPipelineLibrary, shader.spirv.data(), shader.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule");
     VkPipeline pipeline = VK_NULL_HANDLE;
     Graphics::PipelineBuildTrace trace(context.pipelineCreationFeedback);
+    const VkPipelineCreateFlags splitFlags = computePipelineFlags() | (DriverDetail::CompilesUnoptimized(shader.spirv.size(), DriverDetail::UnoptimizedComputePipelineWords()) ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0);
     try {
         const auto createPipelines = state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
-        if (objects.descriptorHeap) CreateComputeHeapPipeline(state->device, createPipelines, context.pipelineCache, module, computePipelineFlags(), computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), objects.heapMappings, &pipeline, context.pipelineCacheSynchronization, &trace);
-        else CreateComputePipeline(state->device, createPipelines, context.pipelineCache, module, objects.layout, computePipelineFlags(), computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), &pipeline, context.pipelineCacheSynchronization, &trace);
+        if (objects.descriptorHeap) CreateComputeHeapPipeline(state->device, createPipelines, context.pipelineCache, module, splitFlags, computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), objects.heapMappings, &pipeline, context.pipelineCacheSynchronization, &trace);
+        else CreateComputePipeline(state->device, createPipelines, context.pipelineCache, module, objects.layout, splitFlags, computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), &pipeline, context.pipelineCacheSynchronization, &trace);
     } catch (...) {
         objects.destroyModule(objects.device, module, nullptr);
         throw;

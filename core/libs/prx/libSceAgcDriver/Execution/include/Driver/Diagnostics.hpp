@@ -31,6 +31,8 @@ public:
 bool SkipRefusedDraws();
 bool AsyncDrawCompile();
 std::size_t AsyncComputePipelineWords();
+std::size_t UnoptimizedComputePipelineWords();
+constexpr bool CompilesUnoptimized(std::size_t words, std::size_t threshold) { return threshold != 0 && words >= threshold; }
 std::chrono::milliseconds AsyncDispatchWait();
 
 class BackgroundWaitScope {

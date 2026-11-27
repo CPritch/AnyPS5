@@ -75,6 +75,8 @@ void CheckFailedBuildAhead() {
     Require(device->ComputePipelineAhead(abandoned) == Ahead::Unavailable, "an abandoned build ahead left its compute pipeline queued");
 }
 
+static_assert(!AgcDriver::DriverDetail::CompilesUnoptimized(1u << 20u, 0u) && !AgcDriver::DriverDetail::CompilesUnoptimized(99u, 100u) && AgcDriver::DriverDetail::CompilesUnoptimized(100u, 100u) && AgcDriver::DriverDetail::CompilesUnoptimized(1u << 20u, 100u), "APS5_UNOPTIMIZED_COMPUTE_WORDS selects every compute module of at least its word count, and none when it is 0");
+
 int main() {
     try {
         CheckFailedBuildAhead();

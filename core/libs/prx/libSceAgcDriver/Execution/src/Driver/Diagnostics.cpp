@@ -115,6 +115,14 @@ std::size_t AsyncComputePipelineWords() {
     return words;
 }
 
+std::size_t UnoptimizedComputePipelineWords() {
+    static const std::size_t words = [] {
+        const char* text = std::getenv("APS5_UNOPTIMIZED_COMPUTE_WORDS");
+        return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{0};
+    }();
+    return words;
+}
+
 std::chrono::milliseconds AsyncDispatchWait() {
     static const std::chrono::milliseconds wait = [] {
         const char* text = std::getenv("APS5_ASYNC_DISPATCH_WAIT_MS");
