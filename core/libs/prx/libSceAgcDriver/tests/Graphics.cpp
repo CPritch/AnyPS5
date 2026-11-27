@@ -5,6 +5,7 @@
 #include "CommandStateLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -47,8 +48,10 @@
 #else
 #include <sys/mman.h>
 #endif
-#ifdef __APPLE__
+#ifndef _WIN32
 #include <pthread.h>
+#endif
+#ifdef __APPLE__
 #include <sys/qos.h>
 #endif
 #include <algorithm>
@@ -6304,6 +6307,7 @@ struct MockVulkan {
     std::vector<bool> fragmentLibraryMultisample;
     std::vector<bool> preRasterizationBiasEnableDynamic;
     std::uint32_t pipelineCreateCount = 0;
+    std::vector<std::string> graphicsPipelineThreads;
     std::vector<std::array<std::uint32_t, 3>> pipelineSpecializations;
     VkPipeline boundPipeline = VK_NULL_HANDLE;
     std::vector<std::byte> lastPushConstants;
@@ -6549,6 +6553,10 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreatePipelineLayout(VkDevice, const VkPipeli
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipelines) {
     {
         std::unique_lock lock(pipelineCreateMutex);
+#ifndef _WIN32
+        std::array<char, 64> threadName{};
+        mock.graphicsPipelineThreads.emplace_back(pthread_getname_np(pthread_self(), threadName.data(), threadName.size()) == 0 ? threadName.data() : "");
+#endif
         if (blockLibraryCreate) {
             libraryCreateEntered = true;
             pipelineCreateCondition.notify_all();
@@ -14468,6 +14476,7 @@ void pipelineDeferredBuildTests() {
     const auto mainLayout = makeHandle<VkDescriptorSetLayout>();
     const auto fragmentLayout = makeHandle<VkDescriptorSetLayout>();
     Require(DefersPipelineBuild(shaders), "APS5_ASYNC_PIPELINE_WORDS=1 did not defer a pipeline with SPIR-V");
+    AgcDriver::DriverDetail::NameDriverThread("draw-commit");
     const auto created = mock.pipelineCreateCount;
     std::uint64_t hash = 1;
     {
@@ -14487,6 +14496,13 @@ void pipelineDeferredBuildTests() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     Require(mock.pipelineCreateCount > created, "the deferred build created no pipeline");
+#ifndef _WIN32
+    {
+        std::lock_guard lock(pipelineCreateMutex);
+        Require(!mock.graphicsPipelineThreads.empty(), "the deferred build recorded no graphics pipeline creation");
+        for (const auto& name : mock.graphicsPipelineThreads) Require(name == "deferred build", "a deferred pipeline build ran on a thread named \"" + name + "\" instead of \"deferred build\", so a build trace or a stack sample names the thread that started the pool");
+    }
+#endif
     const auto built = mock.pipelineCreateCount;
     Require(CachedPipeline(context, State{}, VertexInputLayout{}, resources, shaders) == resident && mock.pipelineCreateCount == built, "the deferred build stored a pipeline under another key than the draw's");
     VertexInputLayout other;

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
@@ -2003,6 +2004,7 @@ std::size_t deferredPipelineWords() {
 }
 
 void runDeferredBuilds() {
+    AgcDriver::DriverDetail::NameDriverThread("deferred build");
     auto& builds = deferredBuilds();
     for (;;) {
         std::unique_ptr<DeferredPipelineBuild> job;
