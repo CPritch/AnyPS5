@@ -135,7 +135,7 @@ VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& a
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !skipDevice) noteDeviceRefusal(allocation.memoryTypeIndex, allocation.allocationSize);
     if (exhausted(result) && !skipDevice) {
         if (reuse && reuse(allocation.memoryTypeIndex)) return VK_NULL_HANDLE;
-        reclaimed = trim();
+        reclaimed = trim(!deviceLocalType(allocation.memoryTypeIndex));
         if (reuse && reuse(allocation.memoryTypeIndex)) return VK_NULL_HANDLE;
         if (reclaimed != 0) {
             memory = VK_NULL_HANDLE;
@@ -147,7 +147,7 @@ VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& a
         if (cacheReclaim != nullptr && (cacheReclaimFutile == nullptr || !cacheReclaimFutile())) released = cacheReclaim(ReclaimTarget(allocation.allocationSize), newImage);
         if (reuse && reuse(allocation.memoryTypeIndex)) return VK_NULL_HANDLE;
         if (released != 0) {
-            reclaimed += trim();
+            reclaimed += trim(!deviceLocalType(allocation.memoryTypeIndex));
             memory = VK_NULL_HANDLE;
             result = allocateMemory(device, &allocation, nullptr, &memory);
             ++attempts;
@@ -160,6 +160,14 @@ VkDeviceMemory BufferPool::allocateMemoryWithReuse(const VkMemoryAllocateInfo& a
         memory = VK_NULL_HANDLE;
         result = allocateMemory(device, &host, nullptr, &memory);
         ++attempts;
+        if (exhausted(result) && deviceLocalType(allocation.memoryTypeIndex)) {
+            if (const auto hostReclaimed = trim(true); hostReclaimed != 0) {
+                reclaimed += hostReclaimed;
+                memory = VK_NULL_HANDLE;
+                result = allocateMemory(device, &host, nullptr, &memory);
+                ++attempts;
+            }
+        }
         if (result == VK_SUCCESS) {
             if (allocatedType != nullptr) *allocatedType = *hostType;
             if (!skipDevice && allocation.memoryTypeIndex < deviceRefusedAt.size()) deviceRefusedAt[allocation.memoryTypeIndex].store(PoolSteadyNanoseconds(), std::memory_order_release);
@@ -717,7 +725,11 @@ std::size_t BufferPool::MaxSlots() {
     return slots;
 }
 
-VkDeviceSize BufferPool::trim() {
+bool BufferPool::deviceLocalType(std::uint32_t memoryType) const noexcept {
+    return memoryType < memoryProperties.memoryTypeCount && (memoryProperties.memoryHeaps[memoryProperties.memoryTypes[memoryType].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+}
+
+VkDeviceSize BufferPool::trim(bool hostTiers) {
     Tier retiredSmall;
     Tier retiredLarge;
     Tier retiredDevice;
@@ -726,6 +738,7 @@ VkDeviceSize BufferPool::trim() {
     {
         std::lock_guard lock(mutex);
         for (const auto& [tier, retired] : {std::pair{&smallTier, &retiredSmall}, std::pair{&largeTier, &retiredLarge}, std::pair{&deviceTier, &retiredDevice}, std::pair{&smallDeviceTier, &retiredSmallDevice}, std::pair{&hostImageTier, &retiredHostImage}}) {
+            if (!hostTiers && (tier == &smallTier || tier == &largeTier || tier == &hostImageTier)) continue;
             tier->free.swap(retired->free);
             tier->evictions += tier->slots;
             tier->retainedBytes = 0;
@@ -735,7 +748,7 @@ VkDeviceSize BufferPool::trim() {
         imageBytes = 0;
         imageSlots = 0;
         imageOrder.clear();
-        hostImageOrder.clear();
+        if (hostTiers) hostImageOrder.clear();
     }
     VkDeviceSize bytes = 0;
     for (const auto* tier : {&retiredSmall, &retiredLarge, &retiredDevice, &retiredSmallDevice, &retiredHostImage}) {
@@ -747,7 +760,7 @@ VkDeviceSize BufferPool::trim() {
         std::unique_ptr<SlabBlock> released;
         {
             std::lock_guard lock(slabMutex);
-            const auto found = std::find_if(slabBlocks.begin(), slabBlocks.end(), [](const auto& entry) { return entry.second->used == 0; });
+            const auto found = std::find_if(slabBlocks.begin(), slabBlocks.end(), [&](const auto& entry) { return entry.second->used == 0 && (hostTiers || deviceLocalType(static_cast<std::uint32_t>(entry.second->slab >> 40u))); });
             if (found == slabBlocks.end()) break;
             auto& slab = slabs.at(found->second->slab);
             slab.available.erase(std::find(slab.available.begin(), slab.available.end(), found->second.get()));
@@ -759,7 +772,7 @@ VkDeviceSize BufferPool::trim() {
         freeBlock(*released);
         bytes += SlabBlockBytes(released->slotBytes);
     }
-    return bytes + trimImageBlocks();
+    return bytes + trimImageBlocks(hostTiers);
 }
 
 void BufferPool::Put(const BufferAllocation& allocation) noexcept {
@@ -1081,13 +1094,13 @@ void BufferPool::releaseImageAllocation(const ImageAllocation& allocation) noexc
     MemoryAccounting::Free(freeMemory, device, released->memory);
 }
 
-VkDeviceSize BufferPool::trimImageBlocks() {
+VkDeviceSize BufferPool::trimImageBlocks(bool hostBlocks) {
     VkDeviceSize bytes = 0;
     for (;;) {
         std::unique_ptr<ImageBlock> released;
         {
             std::lock_guard lock(imageMutex);
-            const auto found = std::find_if(imageBlocks.begin(), imageBlocks.end(), [](const auto& entry) { return entry.second->allocations == 0; });
+            const auto found = std::find_if(imageBlocks.begin(), imageBlocks.end(), [&](const auto& entry) { return entry.second->allocations == 0 && (hostBlocks || deviceLocalType(entry.second->memoryType)); });
             if (found == imageBlocks.end()) break;
             auto& block = *found->second;
             unlinkImageBlock(block);

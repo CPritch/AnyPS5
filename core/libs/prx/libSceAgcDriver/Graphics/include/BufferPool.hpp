@@ -119,7 +119,7 @@ private:
     void linkImageBlock(ImageBlock& block) noexcept;
     void unlinkImageBlock(ImageBlock& block) noexcept;
     void releaseImageAllocation(const ImageAllocation& allocation) noexcept;
-    VkDeviceSize trimImageBlocks();
+    VkDeviceSize trimImageBlocks(bool hostBlocks = true);
     struct SlabBlock {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         std::byte* mapping = nullptr;
@@ -171,7 +171,8 @@ private:
     static bool DeviceTiered(VkMemoryPropertyFlags properties);
     static std::size_t NextCapacity(std::size_t capacity);
     VkDeviceSize destroy(const BufferAllocation& allocation, bool retained = false) noexcept;
-    VkDeviceSize trim();
+    VkDeviceSize trim(bool hostTiers = true);
+    bool deviceLocalType(std::uint32_t memoryType) const noexcept;
     // Moves the tier's least recently used slot (the oldest front of its lists) to `evicted`; the
     // caller destroys those after releasing the mutex, so builds taking buffers on other threads
     // do not wait behind the Vulkan destroy calls. Nothing changes when the vector cannot grow.

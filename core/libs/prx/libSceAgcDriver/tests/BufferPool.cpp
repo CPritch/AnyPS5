@@ -412,6 +412,28 @@ void RefusalTeachesHeapCeiling() {
     Expect(mock.liveBytes == 0, "the heap ceiling test leaked memory");
 }
 
+void HostStagingSurvivesDeviceRefusal() {
+    mock = MockDevice{};
+    auto context = budgetContext();
+    reportedBudget = 1620 * MiB;
+    reportedUsage = 200 * MiB;
+    VkDeviceMemory retained = VK_NULL_HANDLE;
+    {
+        Buffer staging(context, 2 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        retained = MemoryOf(staging.Handle());
+    }
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = 4 * MiB;
+    allocation.memoryTypeIndex = 0;
+    mock.results = {VK_ERROR_OUT_OF_DEVICE_MEMORY};
+    std::uint32_t type = 99;
+    const auto memory = context.bufferPool->AllocateMemory(allocation, "test device refusal", 1u, &type);
+    Expect(type == 1, "a device refusal with a host fallback was not placed in the host memory type");
+    mockFreeMemory(VK_NULL_HANDLE, memory, nullptr);
+    Buffer staging(context, 2 * MiB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    Expect(MemoryOf(staging.Handle()) == retained, "a device-local refusal freed a retained host staging buffer that could not have made room in device memory");
+}
+
 void HostSlotBeforeCacheRelease() {
     mock = MockDevice{};
     auto context = budgetContext();
@@ -1975,6 +1997,7 @@ int main(int argc, char** argv) {
         RefusedDeviceSkippedWhileFutile();
         RefusalTeachesHeapCeiling();
         HostTierBudgetsFollowHostHeap();
+        HostStagingSurvivesDeviceRefusal();
         HostSlotBeforeCacheRelease();
         RefusedDevicePlacement();
         IdleReclaimSkipsHostPlaced();
