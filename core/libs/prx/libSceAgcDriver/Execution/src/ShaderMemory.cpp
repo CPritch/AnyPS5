@@ -729,6 +729,11 @@ bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t b
     return policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
 }
 
+bool ShaderMemory::settle(void* context, std::uint64_t address, std::uint64_t bytes) {
+    GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
+    return !pending(context, address, bytes);
+}
+
 ShaderRecompiler::SrtWriteStamp ShaderMemory::stampWrites(void* context, std::uint64_t address, std::uint64_t bytes) {
     const auto& self = *static_cast<const ShaderMemory*>(context);
     if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes || self.overlapsInitial(address, address + bytes)) return {};
@@ -953,6 +958,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.readSpecializationMemory = &read;
     runtime.accessible = &accessible;
     runtime.pendingWrite = &pending;
+    runtime.settleWrites = &settle;
     runtime.readWords = &readWords;
     runtime.stampWrites = &stampWrites;
     runtime.unchangedSince = &unchangedSince;

@@ -5334,6 +5334,109 @@ void verifyImageTableBulkKeyScan() {
     require(snapshot.keys == 4u && snapshot.codes[0] == snapshot.codes[3] && snapshot.codes[0] != snapshot.codes[1] && snapshot.codes[2] == outside, "image table bulk key scan: the narrowed codes are wrong");
 }
 
+using PendingKeys = std::array<std::array<std::uint32_t, 4>, 3>;
+
+struct alignas(4096) PendingKeyPage {
+    PendingKeys materials{};
+};
+
+PendingKeys* pendingKeys = nullptr;
+PendingKeys pendingKeyLanded{};
+bool pendingKeysWritten = false;
+bool pendingKeysLand = false;
+std::uint32_t pendingKeyFlushes = 0;
+std::uint32_t pendingKeyLandings = 0;
+
+bool PendingKeyRange(std::uint64_t address, std::size_t bytes) {
+    const auto begin = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pendingKeys->data()));
+    return address < begin + sizeof(PendingKeys) && begin < address + bytes;
+}
+
+AgcDriver::ShaderMemory::PendingWrite PendingKeyWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte>) {
+    return pendingKeysWritten && PendingKeyRange(address, bytes) ? AgcDriver::ShaderMemory::PendingWrite::Sync : AgcDriver::ShaderMemory::PendingWrite::None;
+}
+
+void LandPendingKeys(std::uint64_t address, std::size_t bytes) {
+    if (!PendingKeyRange(address, bytes)) return;
+    ++pendingKeyFlushes;
+    if (!pendingKeysWritten || !pendingKeysLand) return;
+    *pendingKeys = pendingKeyLanded;
+    pendingKeysWritten = false;
+    ++pendingKeyLandings;
+}
+
+void verifyImageTablePendingKeySettle() {
+    using namespace ShaderRecompiler;
+    namespace Abi = ImageTableAbi;
+    constexpr std::uint32_t Records = 4096u;
+    static TableTexture textures[2];
+    alignas(4096) static TableGuest guest;
+    alignas(4096) static std::array<std::array<std::uint32_t, 8>, Records> heap{};
+    static PendingKeyPage keyPage;
+    for (std::uint32_t record = 0; record < Records; record++) heap[record] = TableT(textures[record % 2u].bytes.data(), record % 2u == 0u ? TableFormat8888UNorm : TableFormat32UInt, TableType2D);
+    const PendingKeys stale{{{0u, 2u, 0u, 0u}, {0u, 3u, 0u, 0u}, {0u, 4u, 0u, 0u}}};
+    const auto userData = TableUserData(guest);
+    const auto request = TableRequest(TableMaterialCode, userData);
+    const auto outside = Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::OutsideDomain));
+    struct FlushReset {
+        ~FlushReset() {
+            AgcDriver::GuestMemory::SetFlushHook(nullptr);
+            pendingKeys = nullptr;
+        }
+    } flushReset;
+    AgcDriver::GuestMemory::SetFlushHook(&LandPendingKeys);
+    struct Captured {
+        ImageTableColumnSnapshot column;
+        std::vector<MemoryRegion> regions;
+    };
+    const auto capture = [&](PendingKeys& keys, std::uint32_t records, bool land) {
+        FillTableSrt(guest, heap.data(), 32u, records);
+        const auto keysV = TableV(keys.data(), 16u, 3u);
+        std::copy(keysV.begin(), keysV.end(), guest.srt.begin() + 8);
+        pendingKeys = &keys;
+        keys = stale;
+        pendingKeyLanded = {{{0u, 5u, 0u, 0u}, {0u, 7u, 0u, 0u}, {0u, records - 1u, 0u, 0u}}};
+        pendingKeysWritten = true;
+        pendingKeysLand = land;
+        pendingKeyFlushes = 0u;
+        pendingKeyLandings = 0u;
+        AgcDriver::ShaderMemory memory({}, &PendingKeyWrite);
+        Captured out;
+        out.column = memory.Capture(request)->snapshot.tables.tables.at(0);
+        out.regions = memory.Regions();
+        return out;
+    };
+    const auto whole = [&](const Captured& captured, std::uint32_t records) {
+        const auto& column = captured.column;
+        return column.keys == records && column.codes.size() == records && std::none_of(column.codes.begin(), column.codes.end(), [](std::uint32_t code) { return (code & Abi::PoisonFlag) != 0u; }) && !TableCovered(captured.regions, &(*pendingKeys)[0][1], sizeof(std::uint32_t));
+    };
+    const auto narrowed = [&](const Captured& captured, const PendingKeys& keys) {
+        const auto& column = captured.column;
+        if (column.keys != Records || column.codes.size() != Records || column.outside) return false;
+        for (std::uint32_t record = 0; record < Records; record++) {
+            const bool keyed = record == 0u || record == 5u || record == 7u || record == Records - 1u;
+            if (keyed ? (column.codes[record] & Abi::PoisonFlag) != 0u || column.words.at(column.codes[record]).dwords != heap[record] : column.codes[record] != outside) return false;
+        }
+        return std::all_of(keys.begin(), keys.end(), [&](const auto& material) { return TableCovered(captured.regions, &material[1], sizeof(std::uint32_t)); });
+    };
+
+    const auto small = capture(keyPage.materials, Records - 1u, true);
+    require(pendingKeyFlushes == 0u && pendingKeyLandings == 0u && pendingKeysWritten, "image table pending keys: a column below the settle threshold waited for the GPU write on its keys");
+    require(whole(small, Records - 1u), "image table pending keys: a column below the settle threshold was narrowed by keys a GPU write had pending");
+
+    const auto settled = capture(keyPage.materials, Records, true);
+    require(pendingKeyLandings == 1u && !pendingKeysWritten, "image table pending keys: a column at the settle threshold did not settle the GPU write on its keys once");
+    require(narrowed(settled, keyPage.materials), "image table pending keys: a settled column did not select exactly the records its settled keys name");
+
+    const auto shared = capture(guest.materials, Records, true);
+    require(pendingKeyLandings == 1u && !pendingKeysWritten, "image table pending keys: keys on a page read word by word did not settle once");
+    require(narrowed(shared, guest.materials), "image table pending keys: keys settled on a page read word by word did not select exactly the records they name");
+
+    const auto unsettled = capture(keyPage.materials, Records, false);
+    require(pendingKeyFlushes == 1u && pendingKeyLandings == 0u && pendingKeysWritten, "image table pending keys: a column at the settle threshold did not try to settle its keys once");
+    require(whole(unsettled, Records), "image table pending keys: a column was narrowed by keys whose GPU write stayed pending");
+}
+
 void verifyImageTables() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -13781,6 +13884,7 @@ int main(int argc, char** argv) {
             verifyImageTableBulkReads();
             verifyImageTableScratchReuse();
             verifyImageTableBulkKeyScan();
+            verifyImageTablePendingKeySettle();
             verifyImageTableSrtKey();
             verifyImageTableMaskedOffset();
             verifyImageTableFirstLaneScale();

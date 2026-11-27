@@ -856,6 +856,7 @@ public:
 private:
     static constexpr std::uint64_t PageBytes = 4096u;
     static constexpr std::uint32_t NoRecord = std::numeric_limits<std::uint32_t>::max();
+    static constexpr std::uint32_t SettledKeyRecords = 4096u;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> pointerSlots;
     mutable std::uint32_t indirectDwords = 0;
     mutable std::uint32_t indirectDword = 0;
@@ -951,7 +952,7 @@ private:
                 skip(NarrowSkip::KeyScan);
                 return;
             }
-            if (positions != 0u && runtime.pendingWrite != nullptr && runtime.pendingWrite(runtime.userContext, base + first, size - first)) {
+            if (positions != 0u && runtime.pendingWrite != nullptr && runtime.pendingWrite(runtime.userContext, base + first, size - first) && (records.keys < SettledKeyRecords || runtime.settleWrites == nullptr || !runtime.settleWrites(runtime.userContext, base + first, size - first))) {
                 skip(NarrowSkip::Pending);
                 return;
             }

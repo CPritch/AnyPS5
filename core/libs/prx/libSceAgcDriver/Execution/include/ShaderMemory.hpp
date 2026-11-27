@@ -148,6 +148,7 @@ private:
     static bool readWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count);
     static bool accessible(void* context, std::uint64_t address, std::uint64_t bytes);
     static bool pending(void* context, std::uint64_t address, std::uint64_t bytes);
+    static bool settle(void* context, std::uint64_t address, std::uint64_t bytes);
     static ShaderRecompiler::SrtWriteStamp stampWrites(void* context, std::uint64_t address, std::uint64_t bytes);
     static bool unchangedSince(void* context, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp);
     static bool supplyWords(void* context, const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>& words);

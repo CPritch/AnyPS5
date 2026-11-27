@@ -108,6 +108,7 @@ struct SrtRuntime {
     SrtReadTrace* readTrace = nullptr;
     SrtMemoryProbe accessible = nullptr;
     SrtMemoryProbe pendingWrite = nullptr;
+    SrtMemoryProbe settleWrites = nullptr;
     SrtMemoryBulkReader readWords = nullptr;
     SrtMemoryStamper stampWrites = nullptr;
     SrtMemoryUnchanged unchangedSince = nullptr;
