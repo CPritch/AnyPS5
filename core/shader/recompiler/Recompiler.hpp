@@ -416,6 +416,7 @@ struct SpirvTarget {
     bool spannedShuffleThroughMemory = false;
     bool bindlessImages = false;
     bool deviceImageTables = false;
+    bool twoLaneSpanReadInline = false;
 };
 
 struct BindingLayout {

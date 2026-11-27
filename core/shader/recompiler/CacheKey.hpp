@@ -414,6 +414,7 @@ private:
         append(key, value.spannedShuffleThroughMemory);
         append(key, value.bindlessImages);
         append(key, value.deviceImageTables);
+        append(key, value.twoLaneSpanReadInline);
     }
 };
 

@@ -1102,6 +1102,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.meshInlineFunctions = request.target.meshInlineFunctions;
     targetOptions.spannedShuffleThroughMemory = request.target.spannedShuffleThroughMemory;
     targetOptions.bindlessImages = BindlessLowering(request);
+    targetOptions.twoLaneSpanReadInline = request.target.twoLaneSpanReadInline;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;

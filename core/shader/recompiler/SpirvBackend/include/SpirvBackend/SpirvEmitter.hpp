@@ -56,6 +56,7 @@ struct SpirvTargetOptions {
     bool meshInlineFunctions = false;
     bool spannedShuffleThroughMemory = false;
     bool bindlessImages = false;
+    bool twoLaneSpanReadInline = false;
 };
 
 struct SpirvEmitInfo {
