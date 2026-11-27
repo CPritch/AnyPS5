@@ -323,7 +323,12 @@ ChangesAnswer GuestAllocationsChangesSince_nid_no_patch(std::uint64_t since, std
     const auto first = std::upper_bound(log.entries.begin(), log.entries.end(), since, [](std::uint64_t value, const ChangeEntry& entry) { return value < entry.generation; });
     for (auto it = first; it != log.entries.end(); ++it) spans.emplace_back(it->begin, it->end);
     if (log.waiting == nullptr) return ChangesAnswer::Answered;
+    const auto answered = spans.size();
     for (const auto* state = log.waiting; state != nullptr; state = state->nextWaiting) {
+        if (state->untracked) {
+            spans.resize(answered);
+            return ChangesAnswer::Untracked;
+        }
         for (const auto& [address, bytes] : state->changed) {
             if (bytes <= std::numeric_limits<std::uint64_t>::max() - address) spans.emplace_back(address, address + bytes);
         }
