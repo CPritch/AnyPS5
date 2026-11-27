@@ -26,6 +26,7 @@ std::shared_ptr<void> HoldHeapMirror(std::uint64_t address);
 class ResidentBuffer : public std::enable_shared_from_this<ResidentBuffer> {
 public:
     static constexpr std::uint64_t BlockBytes = 65536;
+    static constexpr std::uint64_t WriteBackChunkBytes = std::uint64_t{32} << 20u;
 
     static std::shared_ptr<ResidentBuffer> Create(const Context& context, std::uint64_t base, std::uint64_t bytes, const GuestRuns& backed);
     ~ResidentBuffer();

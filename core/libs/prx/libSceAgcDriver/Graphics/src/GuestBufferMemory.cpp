@@ -9129,6 +9129,8 @@ void GuestBufferMemory::WriteBack() {
             if (mirror.heap && begin >= served) continue;
             const auto length = static_cast<std::size_t>((mirror.heap ? served : end) - begin);
             if (mirror.heap) {
+                static const bool traceBig = std::getenv("APS5_TRACE_BIGBUF") != nullptr;
+                const auto heapStarted = std::chrono::steady_clock::now();
                 auto& tally = AddressStoreTallies();
                 if (storeRuns) tally.spanBytes.fetch_add(length, std::memory_order_relaxed);
                 const auto store = [&](std::uint64_t first, std::span<const std::byte> current, std::span<const std::byte> original) {
@@ -9145,19 +9147,27 @@ void GuestBufferMemory::WriteBack() {
                 };
                 if (mirror.resident != nullptr) {
                     auto& resident = *mirror.resident;
+                    std::vector<std::byte> originalChunk;
                     const auto exact = [&](std::uint64_t first, std::span<const std::byte> current) {
-                        std::vector<std::byte> original(current.size());
+                        if (originalChunk.size() < current.size()) originalChunk.resize(current.size());
+                        const auto original = std::span(originalChunk).first(current.size());
                         resident.Read(first, original);
                         store(first, current, original);
                         resident.Store(first, current);
                         if (storeRuns) tally.comparedBytes.fetch_add(current.size(), std::memory_order_relaxed);
                     };
+                    std::vector<std::byte> currentChunk;
                     for (const auto& [first, last] : addressStores ? clipPieces(declared, begin, served) : Pieces{{begin, served}}) {
                         const auto readback = std::find_if(heapReadbacks.begin(), heapReadbacks.end(), [&](const auto& entry) { return entry.first <= first && last - entry.first <= entry.second->Bytes().size(); });
-                        std::vector<std::byte> current(static_cast<std::size_t>(last - first));
-                        if (readback != heapReadbacks.end()) std::memcpy(current.data(), readback->second->Bytes().data() + (first - readback->first), current.size());
-                        else resident.ReadDevice(first, current);
-                        exact(first, current);
+                        for (auto at = first; at < last;) {
+                            const auto bytes = static_cast<std::size_t>(std::min<std::uint64_t>(last - at, ResidentBuffer::WriteBackChunkBytes));
+                            if (currentChunk.size() < bytes) currentChunk.resize(bytes);
+                            const auto current = std::span(currentChunk).first(bytes);
+                            if (readback != heapReadbacks.end()) std::memcpy(current.data(), readback->second->Bytes().data() + (at - readback->first), bytes);
+                            else resident.ReadDevice(at, current);
+                            exact(at, current);
+                            at += bytes;
+                        }
                     }
                     const auto pages = storeRuns && storedPages.has_value() ? clipPieces(*storedPages, begin, served) : Pieces{};
                     constexpr std::uint64_t page = ShaderRecompiler::BdaAbi::StorePageBytes;
@@ -9210,6 +9220,7 @@ void GuestBufferMemory::WriteBack() {
                     }
                 }
                 if (runs != nullptr) Recorder::NoteWrittenBack(outside(stored, declared));
+                if (traceBig && length >= (std::size_t{1} << 20u)) std::fprintf(stderr, "[bigbuf] heap mirror writeback 0x%llx+0x%llx resident=%d address-stores=%d in %.1f ms\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(length), mirror.resident != nullptr ? 1 : 0, addressStores ? 1 : 0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - heapStarted).count());
                 continue;
             }
             const auto current = mirror.buffer->Bytes().subspan(offset, length);

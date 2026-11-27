@@ -328,6 +328,36 @@ void StagingChunkTests(AgcDriver::VulkanDevice& device) {
     }
 }
 
+void WriteBackChunkTests(AgcDriver::VulkanDevice& device) {
+    constexpr std::uint64_t LargeBytes = 48u << 20u;
+    constexpr std::uint64_t Declared = 40u << 20u;
+    constexpr std::uint64_t Chunk = AgcDriver::Graphics::ResidentBuffer::WriteBackChunkBytes;
+    static_assert(Declared > Chunk && StoreBlock + Declared <= LargeBytes);
+    constexpr std::uint64_t Stored = Threads * sizeof(std::uint32_t);
+    const auto pattern = [](std::uint64_t offset) { return static_cast<std::uint32_t>(offset >> 12u) * 2654435761u + 7u; };
+    GuestHeap read(false);
+    GuestHeap written(true, 1, LargeBytes);
+    const OutputBlock output;
+    for (std::uint64_t offset = StoreBlock + Stored; offset < StoreBlock + Declared; offset += 4096u) written.Store(offset, pattern(offset));
+    const ImportBudget budget(AgcDriver::Graphics::HostImportLiveBytes() + Block);
+    std::fill(output.Data(), output.Data() + Threads, 0xdeadbeefu);
+    std::vector<std::uint32_t> userData(12, 0u);
+    userData[0] = static_cast<std::uint32_t>(read.Address());
+    userData[1] = static_cast<std::uint32_t>(read.Address() >> 32u);
+    const auto out = BufferDescriptor(reinterpret_cast<std::uintptr_t>(output.Data()), static_cast<std::uint32_t>(Stored));
+    const auto store = BufferDescriptor(written.Address() + StoreBlock, static_cast<std::uint32_t>(Declared));
+    std::copy(out.begin(), out.end(), userData.begin() + 4);
+    std::copy(store.begin(), store.end(), userData.begin() + 8);
+    const auto before = AgcDriver::Graphics::MirrorCounters();
+    Run(device, Code, userData);
+    const auto made = AgcDriver::Graphics::MirrorCounters();
+    Require(made.heapBytes - before.heapBytes > Chunk + HeapBytes, "resident heap mirror: a " + std::to_string(Declared >> 20u) + " MiB written range was not mirrored past one write-back chunk (" + std::to_string((made.heapBytes - before.heapBytes) >> 10u) + " KiB held)");
+    CheckStores(written, "a write-back split into chunks");
+    for (std::uint64_t offset = StoreBlock + Stored; offset < StoreBlock + Declared; offset += 4096u) {
+        Require(written.Load(offset) == pattern(offset), "resident heap mirror: a write-back split into " + std::to_string(Chunk >> 20u) + " MiB chunks changed the untouched guest word at offset " + Hex(offset) + " to " + Hex(written.Load(offset)) + ", expected " + Hex(pattern(offset)));
+    }
+}
+
 void StorageImageZeroStoreTests(AgcDriver::VulkanDevice& device) {
     GuestHeap heap(true);
     GuestHeap written(true);
@@ -862,6 +892,7 @@ int main() {
         if (sparse) {
             ResidentTests(*device);
             StagingChunkTests(*device);
+            WriteBackChunkTests(*device);
             ReusedAddressTests(*device);
             JoinedImportTests(*device);
         } else {
