@@ -2993,7 +2993,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     std::ranges::fill(state->oversizedBuffer->Bytes(), std::byte{0});
     if (state->descriptorHeap && Graphics::DescriptorHeapEnabled()) APS5_LOG_OUT("Vulkan descriptor heap: %s", "GPU-mode draws and dispatches bind from VK_EXT_descriptor_heap");
     if (!compileOnly && Pm4::GdsImportable() && Graphics::HostImportFor(graphicsContext(), Pm4::GdsAddress(), Pm4::GdsBytes, Graphics::ImportRequester::Map) == nullptr) Pm4::RejectGdsImport();
-    if (!state->imageInt64Atomics || !state->bufferInt64Atomics) {
+    if (!state->imageInt64Atomics || !state->bufferInt64Atomics || state->storageImageWithoutFormat) {
         state->atomicLockTable = std::make_unique<Graphics::Buffer>(graphicsContext(), ShaderRecompiler::RuntimeAbi::AtomicLockCount * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
         const auto words = state->atomicLockTable->Bytes();
         std::memset(words.data(), 0, words.size());

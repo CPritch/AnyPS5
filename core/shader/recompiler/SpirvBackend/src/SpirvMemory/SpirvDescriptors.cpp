@@ -161,7 +161,7 @@ std::uint32_t ImageType(SpirvEmitterState& state, const ImageResource& image) {
             if (image.numericClass != IrTextureNumericClass::Uint) {
                 FailEmit("atomic storage image must be uint");
             }
-            if (!lockedAtomic64) format = image.atomic64 ? spv::ImageFormatR64ui : spv::ImageFormatR32ui;
+            if (!lockedAtomic64 && NarrowImageAtomicBits(image) == 0u) format = image.atomic64 ? spv::ImageFormatR64ui : spv::ImageFormatR32ui;
         }
     } else {
         FailEmit("invalid image resource class");

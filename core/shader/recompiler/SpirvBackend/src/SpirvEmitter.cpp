@@ -324,7 +324,8 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.requirements.bufferAtomicLocks = state.requirements.bufferInt64Atomics && !state.requirements.addressInt64Atomics && !int64Atomics;
     state.requirements.bufferU64View = (state.requirements.bufferInt64Atomics && !state.requirements.bufferAtomicLocks) || (state.requirements.coherentBufferPairs && int64Atomics);
     state.requirements.imageAtomicLocks = state.requirements.imageInt64Atomics && std::ranges::find(state.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityInt64ImageEXT)) == state.supportedCapabilities.end();
-    if (state.requirements.imageAtomicLocks || state.requirements.bufferAtomicLocks) state.requirements.subgroupBallot = true;
+    state.requirements.narrowImageAtomicLocks = std::ranges::any_of(program.Info().images, [](const ImageResource& image) { return image.narrowAtomicCompatible; });
+    if (state.requirements.imageAtomicLocks || state.requirements.bufferAtomicLocks || state.requirements.narrowImageAtomicLocks) state.requirements.subgroupBallot = true;
     state.bindlessImages = target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end(); };
     state.bindlessWaveUniform = state.bindlessImages && program.Resources().stage == IrShaderStage::Compute && !HostSubgroupSingleLane(state) && supports(spv::CapabilityGroupNonUniformBallot);
