@@ -853,7 +853,7 @@ void BufferPool::markImageRange(ImageBlock& block, std::uint32_t first, std::uin
 }
 
 void BufferPool::linkImageBlock(ImageBlock& block) noexcept {
-    auto& first = imageAvailable[block.memoryType];
+    auto& first = imageAvailable[availableIndex(block.memoryType, block.unitBytes)];
     block.previous = nullptr;
     block.next = first;
     if (first != nullptr) first->previous = &block;
@@ -862,17 +862,19 @@ void BufferPool::linkImageBlock(ImageBlock& block) noexcept {
 
 void BufferPool::unlinkImageBlock(ImageBlock& block) noexcept {
     if (block.previous != nullptr) block.previous->next = block.next;
-    else imageAvailable[block.memoryType] = block.next;
+    else imageAvailable[availableIndex(block.memoryType, block.unitBytes)] = block.next;
     if (block.next != nullptr) block.next->previous = block.previous;
     block.previous = nullptr;
     block.next = nullptr;
 }
 
 ImageAllocation BufferPool::takeImageRange(const std::shared_ptr<BufferPool>& pool, std::uint32_t memoryType, VkDeviceSize bytes, VkDeviceSize alignment) {
-    const auto units = static_cast<std::uint32_t>((bytes + imageUnitBytes - 1u) / imageUnitBytes);
-    const auto aligned = static_cast<std::uint32_t>(std::max(alignment, imageUnitBytes) / imageUnitBytes);
+    const auto unit = ImageUnitFor(bytes);
+    const auto units = static_cast<std::uint32_t>((bytes + unit - 1u) / unit);
+    const auto aligned = static_cast<std::uint32_t>(std::max(alignment, unit) / unit);
+    if (units > imageBlockUnits || aligned > imageBlockUnits) return {};
     std::lock_guard lock(imageMutex);
-    for (auto* block = imageAvailable[memoryType]; block != nullptr; block = block->next) {
+    for (auto* block = imageAvailable[availableIndex(memoryType, unit)]; block != nullptr; block = block->next) {
         if (units >= block->unfitUnits && aligned >= block->unfitAlignment) continue;
         const auto first = imageRange(*block, units, aligned);
         if (!first) {
@@ -884,18 +886,18 @@ ImageAllocation BufferPool::takeImageRange(const std::shared_ptr<BufferPool>& po
         }
         if (block->retained) {
             block->retained = false;
-            retainedImageSlabBytes.fetch_sub(imageBlockBytes, std::memory_order_relaxed);
+            retainedImageSlabBytes.fetch_sub(block->Bytes(), std::memory_order_relaxed);
         }
         markImageRange(*block, *first, units, true);
         block->freeUnits -= units;
         ++block->allocations;
         block->hint = *first + units;
-        MemoryAccounting::RetainPart(device, block->memory, static_cast<VkDeviceSize>(units) * imageUnitBytes, false);
+        MemoryAccounting::RetainPart(device, block->memory, static_cast<VkDeviceSize>(units) * unit, false);
         if (block->freeUnits == 0) unlinkImageBlock(*block);
         ImageAllocation allocation;
         allocation.owner = pool;
         allocation.memory = block->memory;
-        allocation.offset = static_cast<VkDeviceSize>(*first) * imageUnitBytes;
+        allocation.offset = static_cast<VkDeviceSize>(*first) * unit;
         allocation.bytes = bytes;
         allocation.memoryType = memoryType;
         allocation.slab = true;
@@ -923,7 +925,8 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
     const bool required = dedicated.requiresDedicatedAllocation != VK_FALSE;
     const bool preferred = !required && dedicated.prefersDedicatedAllocation != VK_FALSE;
     static const bool disabled = std::getenv("APS5_IMAGE_SLABS") == nullptr || std::getenv("APS5_NO_IMAGE_SLABS") != nullptr;
-    const bool slabShape = !disabled && !required && imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && imageInfo.pNext == nullptr && needed.size <= (VkDeviceSize{1} << 20u) && needed.alignment < imageBlockBytes;
+    const bool slabShape = !disabled && !required && imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && imageInfo.pNext == nullptr && needed.size <= imageSlabLimit && needed.alignment < imageBlockBytes;
+    const bool largeShape = !disabled && !required && imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && imageInfo.pNext == nullptr && needed.size > imageSlabLimit && needed.size <= largeImageLimit && needed.alignment < largeImageUnitBytes * imageBlockUnits;
     const bool eligible = slabShape && !preferred;
     const auto preferredType = context.MemoryType(needed.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (eligible) {
@@ -936,7 +939,8 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
     const auto memoryType = budgeted ? context.DeviceMemoryType(needed.memoryTypeBits, needed.size, operation) : preferredType;
     const bool hostPlaced = memoryType < memoryProperties.memoryTypeCount && (memoryProperties.memoryHeaps[memoryProperties.memoryTypes[memoryType].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0;
     const bool separate = required || (preferred && !hostPlaced);
-    const bool placedEligible = eligible || (slabShape && preferred && hostPlaced);
+    const bool placedEligible = eligible || ((slabShape || largeShape) && hostPlaced);
+    const auto blockBytes = ImageUnitFor(needed.size) * imageBlockUnits;
     const auto newBlock = [&](std::uint32_t type) {
         const auto dispose = [this](ImageBlock* block) noexcept {
             if (block->memory != VK_NULL_HANDLE) MemoryAccounting::Free(freeMemory, device, block->memory);
@@ -944,8 +948,9 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
         };
         std::unique_ptr<ImageBlock, decltype(dispose)> block(new ImageBlock, dispose);
         block->memoryType = type;
+        block->unitBytes = ImageUnitFor(needed.size);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocation.allocationSize = imageBlockBytes;
+        allocation.allocationSize = blockBytes;
         allocation.memoryTypeIndex = type;
         ImageAllocation reused;
         const auto reuse = [&](std::uint32_t candidate) {
@@ -960,12 +965,12 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
         }
         if (reused) return reused;
         if (auto existing = takeImageRange(pool, block->memoryType, needed.size, needed.alignment)) return existing;
-        const auto units = static_cast<std::uint32_t>((needed.size + imageUnitBytes - 1u) / imageUnitBytes);
+        const auto units = static_cast<std::uint32_t>((needed.size + block->unitBytes - 1u) / block->unitBytes);
         markImageRange(*block, 0, units, true);
         block->freeUnits -= units;
         block->allocations = 1;
         block->hint = units;
-        MemoryAccounting::Retain(device, block->memory, imageBlockBytes - static_cast<VkDeviceSize>(units) * imageUnitBytes);
+        MemoryAccounting::Retain(device, block->memory, blockBytes - static_cast<VkDeviceSize>(units) * block->unitBytes);
         ImageAllocation result;
         {
             std::lock_guard lock(imageMutex);
@@ -994,7 +999,7 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
         allocation.allocationSize = needed.size;
         allocation.memoryTypeIndex = memoryType;
         const auto fallback = context.RefusedDeviceMemoryFallback(needed.memoryTypeBits, memoryType);
-        if (slabShape && fallback.has_value()) {
+        if ((slabShape || largeShape) && fallback.has_value()) {
             const bool tryDevice = !deviceRefusedWhileFutile(memoryType);
             if (tryDevice) {
                 try {
@@ -1023,7 +1028,7 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
         const auto heap = memoryProperties.memoryTypes[memoryType].heapIndex;
         const auto budget = reported.heapBudget[heap];
         const auto usage = reported.heapUsage[heap];
-        if (budget != 0 && (usage >= budget || imageBlockBytes > budget - usage)) return standalone();
+        if (budget != 0 && (usage >= budget || blockBytes > budget - usage)) return standalone();
     }
     if (auto created = newBlock(memoryType)) return created;
     return standalone();
@@ -1046,17 +1051,17 @@ void BufferPool::releaseImageAllocation(const ImageAllocation& allocation) noexc
         if (found == imageBlocks.end()) std::terminate();
         auto& block = *found->second;
         if (block.freeUnits == 0) linkImageBlock(block);
-        const auto first = static_cast<std::uint32_t>(allocation.offset / imageUnitBytes);
-        const auto units = static_cast<std::uint32_t>((allocation.bytes + imageUnitBytes - 1u) / imageUnitBytes);
+        const auto first = static_cast<std::uint32_t>(allocation.offset / block.unitBytes);
+        const auto units = static_cast<std::uint32_t>((allocation.bytes + block.unitBytes - 1u) / block.unitBytes);
         markImageRange(block, first, units, false);
         block.freeUnits += units;
         block.hint = std::min(block.hint, first);
-        MemoryAccounting::RetainPart(device, block.memory, static_cast<VkDeviceSize>(units) * imageUnitBytes, true);
+        MemoryAccounting::RetainPart(device, block.memory, static_cast<VkDeviceSize>(units) * block.unitBytes, true);
         if (--block.allocations != 0) return;
-        imageMemoryReleasedBytes += imageBlockBytes;
-        if (retainedImageSlabBytes.load(std::memory_order_relaxed) == 0 && imageBudget >= imageBlockBytes && imageBytes <= imageBudget - imageBlockBytes && !heapOverBudget(block.memoryType)) {
+        imageMemoryReleasedBytes += block.Bytes();
+        if (retainedImageSlabBytes.load(std::memory_order_relaxed) == 0 && imageBudget >= block.Bytes() && imageBytes <= imageBudget - block.Bytes() && !heapOverBudget(block.memoryType)) {
             block.retained = true;
-            retainedImageSlabBytes.store(imageBlockBytes, std::memory_order_relaxed);
+            retainedImageSlabBytes.store(block.Bytes(), std::memory_order_relaxed);
             return;
         }
         unlinkImageBlock(block);
@@ -1076,12 +1081,12 @@ VkDeviceSize BufferPool::trimImageBlocks() {
             if (found == imageBlocks.end()) break;
             auto& block = *found->second;
             unlinkImageBlock(block);
-            if (block.retained) retainedImageSlabBytes.fetch_sub(imageBlockBytes, std::memory_order_relaxed);
+            if (block.retained) retainedImageSlabBytes.fetch_sub(block.Bytes(), std::memory_order_relaxed);
             released = std::move(found->second);
             imageBlocks.erase(found);
         }
         MemoryAccounting::Free(freeMemory, device, released->memory);
-        bytes += imageBlockBytes;
+        bytes += released->Bytes();
     }
     return bytes;
 }

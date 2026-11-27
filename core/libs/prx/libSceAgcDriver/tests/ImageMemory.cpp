@@ -687,6 +687,37 @@ void RefusedDeviceImagesShareHostBlock() {
     Clean();
 }
 
+void RefusedDeviceLargeImagesShareHostBlock() {
+    ResetMock();
+    {
+        auto context = NewContext();
+        mock.refusedDevice = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        const auto first = NewImage(2 * MiB, 4096, 3u);
+        const auto second = NewImage(3 * MiB, 4096, 3u);
+        const auto small = NewImage(64 * KiB, 256, 3u);
+        auto firstAllocation = Take(context, first);
+        Bind(first, firstAllocation);
+        auto secondAllocation = Take(context, second);
+        Bind(second, secondAllocation);
+        auto smallAllocation = Take(context, small);
+        Bind(small, smallAllocation);
+        const auto& memory = mock.memories[Index(MemoryOf(firstAllocation))];
+        Expect(memory.type == 1 && memory.bytes == 64 * MiB && memory.dedicated == VK_NULL_HANDLE, "a large image the device refused was not placed in a large host image block");
+        Expect(MemoryOf(secondAllocation) == MemoryOf(firstAllocation), "two large images the device refused did not share one host image block");
+        Expect(MemoryOf(smallAllocation) != MemoryOf(firstAllocation) && mock.memories[Index(MemoryOf(smallAllocation))].bytes == 4 * MiB, "a small image shared a large host image block");
+        const auto offset = firstAllocation.Offset();
+        Drop(first, firstAllocation);
+        const auto third = NewImage(2 * MiB, 4096, 3u);
+        auto thirdAllocation = Take(context, third);
+        Bind(third, thirdAllocation);
+        Expect(MemoryOf(thirdAllocation) == MemoryOf(secondAllocation) && thirdAllocation.Offset() == offset, "a released range of a large host image block was not reused");
+        Drop(third, thirdAllocation);
+        Drop(small, smallAllocation);
+        Drop(second, secondAllocation);
+    }
+    Clean();
+}
+
 void SmallBudgetHeadroom() {
     ResetMock();
     {
@@ -1258,6 +1289,7 @@ int main(int argc, char** argv) {
         SmallBudgetHeadroom();
         PreferredDedicatedInHostMemory();
         RefusedDeviceImagesShareHostBlock();
+        RefusedDeviceLargeImagesShareHostBlock();
         ReleasedMemoryAccounting();
         ReleasedMemoryIsThreadLocal();
         std::puts("image allocation: ownership and host allocation failures");

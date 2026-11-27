@@ -93,9 +93,15 @@ private:
     static constexpr VkDeviceSize imageUnitBytes = 256;
     static constexpr VkDeviceSize imageBlockBytes = VkDeviceSize{4} << 20u;
     static constexpr std::uint32_t imageBlockUnits = static_cast<std::uint32_t>(imageBlockBytes / imageUnitBytes);
+    static constexpr VkDeviceSize imageSlabLimit = VkDeviceSize{1} << 20u;
+    static constexpr VkDeviceSize largeImageUnitBytes = 4096;
+    static constexpr VkDeviceSize largeImageLimit = VkDeviceSize{16} << 20u;
+    static constexpr VkDeviceSize ImageUnitFor(VkDeviceSize bytes) noexcept { return bytes > imageSlabLimit ? largeImageUnitBytes : imageUnitBytes; }
     struct ImageBlock {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         std::uint32_t memoryType = 0;
+        VkDeviceSize unitBytes = imageUnitBytes;
+        VkDeviceSize Bytes() const noexcept { return unitBytes * imageBlockUnits; }
         std::array<std::uint64_t, imageBlockUnits / 64> occupied{};
         std::uint32_t freeUnits = imageBlockUnits;
         std::uint32_t allocations = 0;
@@ -222,7 +228,8 @@ private:
     std::unordered_map<VkDeviceMemory, std::unique_ptr<SlabBlock>> slabBlocks;
     AgcDriver::Mutex imageMutex;
     std::unordered_map<VkDeviceMemory, std::unique_ptr<ImageBlock>> imageBlocks;
-    std::array<ImageBlock*, VK_MAX_MEMORY_TYPES> imageAvailable{};
+    std::array<ImageBlock*, VK_MAX_MEMORY_TYPES * 2> imageAvailable{};
+    static std::size_t availableIndex(std::uint32_t memoryType, VkDeviceSize unitBytes) noexcept { return static_cast<std::size_t>(memoryType) * 2u + (unitBytes == imageUnitBytes ? 0u : 1u); }
     std::atomic<VkDeviceSize> retainedImageSlabBytes{0};
     static constexpr VkDeviceSize budget = 512ull * 1024 * 1024;
     // The small tier's own budget (slots of at most half a MiB each): pinned host memory the large
