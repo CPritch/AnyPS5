@@ -344,6 +344,15 @@ void trappedJoinFlushTests(const Context& context) {
         Require(ExistingHostImportFor(importing, second - 16, 32) != nullptr, "a join was refused although flushing the run's pending writes released its read trap");
         memory.WriteBack();
     }
+    Require(GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(trapped, page), "the page of the joined run was not trapped again");
+    flushReleasesPage = trapped;
+    {
+        GuestBufferMemory memory(importing);
+        memory.AddReadable(second - 16, 32);
+        memory.Upload(false);
+        Require(flushReleases == 1, "an upload flushed a run's pending writes again although a join already imports the region");
+        memory.WriteBack();
+    }
     AgcDriver::GuestMemory::SetFlushHook(previous);
     if (flushReleasesPage != 0) GuestWriteWatch::GuestWriteWatchReleaseReads_nid_postfix(flushReleasesPage, flushReleasesBytes);
     ClearHostImports(importing.device);

@@ -7378,20 +7378,28 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     }
     bool importsRefreshed = false;
     if (context.hostImportAlignment != 0) {
+        auto& state = Imports();
         if (const auto hook = GuestMemory::CurrentFlushHook()) {
-            for (const auto& region : regions) {
-                if (!region.pending || region.mirror != nullptr || region.direct != nullptr || region.sparse || sparseHeapCandidate(region)) continue;
-                const auto run = crossedRun(importRanges(), region.begin, region.end);
-                if (run.ranges.size() < 2) continue;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> trapped;
+            {
+                std::lock_guard lock(state.mutex);
+                for (const auto& region : regions) {
+                    if (!region.pending || region.mirror != nullptr || region.direct != nullptr || region.sparse || sparseHeapCandidate(region)) continue;
+                    if (findImport(state, region.begin, region.end) != nullptr) continue;
+                    const auto run = crossedRun(importRanges(), region.begin, region.end);
+                    if (run.ranges.size() < 2) continue;
+                    trapped.emplace_back(run.base, run.bytes);
+                }
+            }
+            for (const auto& [base, bytes] : trapped) {
                 {
-                    const UntrappedImport probe(run.base, run.bytes);
+                    const UntrappedImport probe(base, bytes);
                     if (probe.Held()) continue;
                 }
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::BufferUpload);
-                hook(run.base, static_cast<std::size_t>(run.bytes));
+                hook(base, static_cast<std::size_t>(bytes));
             }
         }
-        auto& state = Imports();
         std::lock_guard lock(state.mutex);
         if (importsStale(context, state)) refreshImports(context, state, importRanges());
         importsRefreshed = true;
