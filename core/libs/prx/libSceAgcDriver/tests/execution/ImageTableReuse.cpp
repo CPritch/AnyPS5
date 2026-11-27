@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <span>
 #include <string>
@@ -93,7 +94,7 @@ std::array<std::uint32_t, 4> Buffer(const void* base, std::uint32_t bytes) {
 
 class GuestBlock {
 public:
-    explicit GuestBlock(std::size_t registered = BlockBytes) {
+    explicit GuestBlock(std::size_t registered = BlockBytes) : registered(registered) {
 #ifdef _WIN32
         block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
         if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
@@ -127,7 +128,14 @@ public:
     std::uint32_t* Table() const { return reinterpret_cast<std::uint32_t*>(block); }
     float* Texels(std::uint32_t texture) const { return reinterpret_cast<float*>(block + TexturesOffset + static_cast<std::size_t>(texture) * TextureBytes); }
 
+    void Remap() const {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        mutation.Add(block, registered, true, true, true);
+    }
+
 private:
+    std::size_t registered = 0;
     std::uint8_t* block = nullptr;
 };
 
@@ -235,6 +243,34 @@ void ExpectWrites(const AgcDriver::Graphics::ImageTableReuseCounts& before, std:
 void Expect(const AgcDriver::Graphics::ImageTableReuseCounts& before, std::uint64_t reused, std::uint64_t resolved, const std::string& what) {
     const auto step = Since(before);
     Require(step.reused == reused && step.resolved == resolved, "image table reuse: " + what + ": " + std::to_string(step.reused) + " reused and " + std::to_string(step.resolved) + " resolved tables, expected " + std::to_string(reused) + " and " + std::to_string(resolved));
+}
+
+std::uint64_t Unreused(const AgcDriver::Graphics::ImageTableReuseCounts& before, AgcDriver::Graphics::ImageTableUnreused why) {
+    const auto index = static_cast<std::size_t>(why);
+    return AgcDriver::Graphics::ImageTableReuses().unreused[index] - before.unreused[index];
+}
+
+void ExpectUnreused(const AgcDriver::Graphics::ImageTableReuseCounts& before, AgcDriver::Graphics::ImageTableUnreused why, const std::string& what) {
+    const auto now = AgcDriver::Graphics::ImageTableReuses();
+    std::uint64_t total = 0;
+    for (std::size_t reason = 0; reason < now.unreused.size(); ++reason) total += now.unreused[reason] - before.unreused[reason];
+    Require(total == 1u && Unreused(before, why) == 1u, "image table reuse: " + what + ": the table was not refused once for the expected reason (" + std::to_string(Unreused(before, why)) + " of " + std::to_string(total) + " refusals)");
+}
+
+std::vector<std::uint32_t> DispatchOnThread(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResult& result, std::uint32_t record) {
+    std::vector<std::uint32_t> sampled;
+    std::exception_ptr failure;
+    std::thread worker([&] {
+        try {
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            sampled = Dispatch(device, result, record);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    worker.join();
+    if (failure != nullptr) std::rethrow_exception(failure);
+    return sampled;
 }
 
 void RunImageStore(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
@@ -464,8 +500,39 @@ void RunViewedStore(AgcDriver::VulkanDevice& device, const GuestBlock& block, co
     AgcDriver::GuestMemory::BumpCollectEpoch();
     const auto kept = AgcDriver::Graphics::ImageTableReuses();
     Require(Dispatch(device, viewedOnly, 40) == Row(block.Texels(40)), "image table reuse: a table of only storage-viewed entries sampled the wrong entry");
-    Require(Dispatch(device, viewedOnly, 41) == Row(block.Texels(41)), "image table reuse: a table of only storage-viewed entries resolved again sampled the wrong entry");
-    Expect(kept, 0, 2, "a table of only storage-viewed entries, which has nothing to reuse");
+    Require(Dispatch(device, viewedOnly, 41) == Row(block.Texels(41)), "image table reuse: a reused table of only storage-viewed entries sampled the wrong entry");
+    Expect(kept, 1, 1, "a table of only storage-viewed entries, whose views are proved current");
+    const auto views = AgcDriver::Graphics::ImageTableReuses();
+    Require(views.viewedKept - kept.viewedKept == Records && views.viewedLookedUp == kept.viewedLookedUp, "image table reuse: the reuse of a table of only storage-viewed entries looked up " + std::to_string(views.viewedLookedUp - kept.viewedLookedUp) + " entries again and kept " + std::to_string(views.viewedKept - kept.viewedKept) + ", expected none and " + std::to_string(Records));
+
+    const auto other = DispatchOnThread(device, viewedOnly, 42);
+    Require(other == Row(block.Texels(42)), "image table reuse: a table of storage-viewed entries reused on another thread sampled the wrong entry");
+    const auto across = AgcDriver::Graphics::ImageTableReuses();
+    Require(across.viewedKept - views.viewedKept == Records && across.viewedLookedUp == views.viewedLookedUp, "image table reuse: a table of storage-viewed entries reused on another thread did not keep its views");
+    Expect(views, 1, 0, "a table of only storage-viewed entries reused on another thread");
+
+    Store(device, block, 43);
+    const auto storedCounts = AgcDriver::Graphics::ImageTableReuses();
+    Require(Dispatch(device, viewedOnly, 43) == Row(stored.data()), "image table reuse: a storage-viewed entry an image store left pending kept its old texels");
+    Expect(storedCounts, 1, 0, "a table of storage-viewed entries after an image store over one");
+    AgcDriver::Graphics::StorageTexture::FlushPending(AddressOf(block.Texels(43)), TextureBytes, nullptr, "test");
+    device.WaitIdle();
+
+    Fill(block, 44, 0.875f);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto written = AgcDriver::Graphics::ImageTableReuses();
+    Require(Dispatch(device, viewedOnly, 44) == Row(block.Texels(44)), "image table reuse: a storage-viewed entry the CPU wrote kept the old texels of its storage image");
+    const auto refreshed = AgcDriver::Graphics::ImageTableReuses();
+    Require(refreshed.viewedLookedUp - written.viewedLookedUp != 0u, "image table reuse: a storage-viewed entry whose memory the CPU wrote since its storage image matched it was not looked up again");
+    Expect(written, 1, 0, "a table of storage-viewed entries after a CPU write under one");
+    Require(Dispatch(device, viewedOnly, 44) == Row(block.Texels(44)), "image table reuse: the table after its storage-viewed entry was looked up again sampled the wrong entry");
+
+    AgcDriver::Graphics::ReleaseTextureCaches(~std::uint64_t{0});
+    const auto released = AgcDriver::Graphics::ImageTableReuses();
+    Require(Dispatch(device, viewedOnly, 45) == Row(block.Texels(45)), "image table reuse: a table of storage-viewed entries after the texture caches were released sampled the wrong entry");
+    const auto remade = AgcDriver::Graphics::ImageTableReuses();
+    Require(remade.viewedKept == released.viewedKept && remade.viewedLookedUp - released.viewedLookedUp == Records, "image table reuse: a table of storage-viewed entries kept views the released texture caches no longer hold");
+    Expect(released, 1, 0, "a table of storage-viewed entries after the texture caches were released");
 }
 
 std::array<std::uint32_t, 8> EntryWords(const GuestBlock& block, std::uint32_t texture) {
@@ -663,6 +730,60 @@ bool RunRetiredDepthSurface(AgcDriver::VulkanDevice& device, const GuestBlock& b
     return true;
 }
 
+bool RunAcrossThreads(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
+    using AgcDriver::Graphics::ImageTableUnreused;
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::puts("guest memory has no write watch: image table reuse across threads is not tested");
+        return false;
+    }
+    const auto result = CompileTable(device, block);
+    Fill(block, Moved, 0.5f);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    auto before = AgcDriver::Graphics::ImageTableReuses();
+    Require(Dispatch(device, result, 5) == Row(block.Texels(5)), "image table reuse across threads: the first dispatch sampled the wrong entry");
+    Require(AgcDriver::Graphics::ImageTableReuses().remembered - before.remembered == 1u, "image table reuse across threads: the table resolved on the first thread was not remembered");
+    Require(DispatchOnThread(device, result, 9) == Row(block.Texels(9)), "image table reuse across threads: a second thread reusing the table sampled the wrong entry");
+    Expect(before, 1, 1, "a table resolved on one thread and dispatched on another, in that thread's own collect epoch");
+    Require(DispatchOnThread(device, result, 11) == Row(block.Texels(11)), "image table reuse across threads: a third thread reusing the table sampled the wrong entry");
+    Require(Dispatch(device, result, 13) == Row(block.Texels(13)), "image table reuse across threads: the first thread reusing the table after the others sampled the wrong entry");
+    Expect(before, 3, 1, "a table dispatched on three threads");
+
+    SetRecord(block, 9, Moved);
+    const auto moved = Compile(device, block);
+    before = AgcDriver::Graphics::ImageTableReuses();
+    Require(DispatchOnThread(device, moved, 9) == Row(block.Texels(Moved)), "image table reuse across threads: a record pointed at another texture sampled the old one on another thread");
+    Expect(before, 0, 1, "a table whose record's words changed, dispatched on another thread");
+    ExpectUnreused(before, ImageTableUnreused::NotRemembered, "a table whose record's words changed");
+    before = AgcDriver::Graphics::ImageTableReuses();
+    Require(DispatchOnThread(device, result, 9) == Row(block.Texels(9)), "image table reuse across threads: the table with the record's old words sampled the moved texture");
+    Require(DispatchOnThread(device, moved, 9) == Row(block.Texels(Moved)), "image table reuse across threads: the table with the record's new words sampled the wrong entry when reused");
+    Expect(before, 2, 0, "the tables with a record's old and new words, each reused on another thread");
+
+    Fill(block, 7, 0.875f);
+    before = AgcDriver::Graphics::ImageTableReuses();
+    Require(DispatchOnThread(device, result, 7) == Row(block.Texels(7)), "image table reuse across threads: an entry the CPU wrote kept its old texels on another thread");
+    Expect(before, 0, 1, "a CPU write under an entry, then a dispatch on another thread");
+    ExpectUnreused(before, ImageTableUnreused::Changed, "a CPU write under an entry");
+
+    before = AgcDriver::Graphics::ImageTableReuses();
+    Require(Dispatch(device, result, 15) == Row(block.Texels(15)), "image table reuse across threads: the table resolved after a CPU write sampled the wrong entry");
+    {
+        const GuestBlock unrelated(UnimportableBytes);
+        Fill(unrelated, 0, 0.0f);
+    }
+    Require(Dispatch(device, result, 17) == Row(block.Texels(17)), "image table reuse across threads: the table after an unrelated mapping change sampled the wrong entry");
+    Expect(before, 2, 0, "a guest mapping changed away from every entry");
+
+    block.Remap();
+    before = AgcDriver::Graphics::ImageTableReuses();
+    Require(Dispatch(device, result, 19) == Row(block.Texels(19)), "image table reuse across threads: the table after its entries' mapping changed sampled the wrong entry");
+    Expect(before, 0, 1, "the guest mapping under the entries changed");
+    ExpectUnreused(before, ImageTableUnreused::Mapping, "the guest mapping under the entries changed");
+    Require(DispatchOnThread(device, result, 21) == Row(block.Texels(21)), "image table reuse across threads: the table remembered after a mapping change sampled the wrong entry on another thread");
+    Expect(before, 1, 1, "the table remembered again after its mapping changed, reused on another thread");
+    return true;
+}
+
 void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const GuestBlock& stores) {
     for (std::uint32_t texture = 0; texture < Records; ++texture) {
         Fill(block, texture, 0.25f);
@@ -737,7 +858,7 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const Gu
     Require(Dispatch(device, result, 19) == Row(block.Texels(19)), "image table reuse: the original table sampled the moved record");
     Require(Dispatch(device, moved, 19) == Row(block.Texels(Moved)), "image table reuse: the moved table sampled the wrong entry when reused");
     Require(Dispatch(device, result, 21) == Row(block.Texels(21)), "image table reuse: the original table sampled the wrong entry when reused");
-    Expect(before, 2, 2, "two tables that differ in one record");
+    Expect(before, 3, 1, "two tables that differ in one record, the original one unchanged across the epoch");
     ExpectWrites(before, 0, 4, "two tables that differ in one record, alternating");
 
     SetOutput(block.Texels(13));
@@ -808,11 +929,13 @@ int main(int argc, char** argv) {
         GuestBlock pending(UnimportableBytes);
         GuestBlock viewed;
         GuestBlock plain;
+        GuestBlock threads(UnimportableBytes);
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         RunTests(*device, block, stores);
         RunPendingWriteBack(*device, pending);
         RunViewedStore(*device, viewed, plain);
+        RunAcrossThreads(*device, threads);
         std::puts("image table reuse tests passed");
         return 0;
     } catch (const std::exception& error) {
