@@ -145,8 +145,8 @@ expect_usage_error("a negative limit" "needs an unsigned 32-bit number" --heap-d
 expect_heap_profile("--no-gpu-heap with limit 0" "\\(override\\): no heap, gpuResolvedImages 0, descriptorMemory 0, data uniform dwords 0" --no-gpu-heap --heap-data-uniform-dwords 0 "${CAPTURE}/heap-4096.req")
 expect_heap_profile("--gpu-heap replaces a captured limit" "\\(override\\): heap, gpuResolvedImages 1, descriptorMemory 1, data uniform dwords 16384" --gpu-heap "${CAPTURE}/heap-4096.req")
 
-execute_process(COMMAND "${TOOL}" --robust2 --lds-lock-fences "${CAPTURE}/lds.req" RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE errors)
-if(NOT code STREQUAL "0" OR NOT output MATCHES "target flags forced on: robust2, lds-lock-fences\n" OR NOT output MATCHES "heap profile \\(captured\\)")
+execute_process(COMMAND "${TOOL}" --robust2 --lds-lock-fences --device-image-tables "${CAPTURE}/lds.req" RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE errors)
+if(NOT code STREQUAL "0" OR NOT output MATCHES "target flags forced on: robust2, lds-lock-fences, device-image-tables\n" OR NOT output MATCHES "heap profile \\(captured\\)")
     message(FATAL_ERROR "forced target flags were not reported next to the captured heap profile: ${code}\n${output}${errors}")
 endif()
 

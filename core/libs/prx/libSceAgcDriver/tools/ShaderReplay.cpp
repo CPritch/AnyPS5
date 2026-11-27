@@ -92,6 +92,7 @@ HeapProfileSelection SelectHeapProfile(ShaderRecompiler::SpirvTarget& target) {
     return selection;
 }
 bool g_f16HostNans = false;
+bool g_deviceImageTables = false;
 bool g_spannedShuffleThroughMemory = false;
 bool g_shaderInt16 = false;
 bool g_code = false;
@@ -176,6 +177,7 @@ bool Replay(const char* path) {
     force(g_deviceAtomicWorkgroupMemoryBarriers, target.deviceAtomicWorkgroupMemoryBarriers, "device-atomic-workgroup-memory-barriers");
     force(g_f16HostNans, target.float16HostNans, "f16-host-nans");
     force(g_spannedShuffleThroughMemory, target.spannedShuffleThroughMemory, "spanned-shuffle-memory");
+    force(g_deviceImageTables, target.deviceImageTables, "device-image-tables");
     if (g_shaderFma) {
         request.supportedCapabilities.push_back(spv::CapabilityFMAKHR);
         request.supportedExtensions.push_back("SPV_KHR_fma");
@@ -349,7 +351,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--device-atomic-workgroup-memory-barriers] [--shader-fma] [--shader-int16] [--f16-widen-nans] [--f16-narrow-nans] [--f16-host-nans] [--spanned-shuffle-memory] [--gpu-heap] [--no-gpu-heap] [--heap-data-uniform-dwords N] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n  a request replays with the heap profile it was captured with; --gpu-heap forces the heap profile (gpuResolvedImages, descriptorMemory, and 16384 data uniform dwords unless --heap-data-uniform-dwords is given, replacing a captured limit), --no-gpu-heap forces it off, --heap-data-uniform-dwords N forces the limit (0 selects ring-address reads); --gpu-heap with --no-gpu-heap, and --no-gpu-heap with a nonzero limit, exit 2\n  --maintenance8, --robust2, --wave-lds-memory-barriers, --device-scope-lds-memory-barriers, --lds-lock-fences, --device-atomic-workgroup-memory-barriers, --f16-host-nans and --spanned-shuffle-memory force their target flag on over the captured value and are listed on a 'target flags forced on' line\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--device-atomic-workgroup-memory-barriers] [--shader-fma] [--shader-int16] [--f16-widen-nans] [--f16-narrow-nans] [--f16-host-nans] [--spanned-shuffle-memory] [--device-image-tables] [--gpu-heap] [--no-gpu-heap] [--heap-data-uniform-dwords N] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n  a request replays with the heap profile it was captured with; --gpu-heap forces the heap profile (gpuResolvedImages, descriptorMemory, and 16384 data uniform dwords unless --heap-data-uniform-dwords is given, replacing a captured limit), --no-gpu-heap forces it off, --heap-data-uniform-dwords N forces the limit (0 selects ring-address reads); --gpu-heap with --no-gpu-heap, and --no-gpu-heap with a nonzero limit, exit 2\n  --maintenance8, --robust2, --wave-lds-memory-barriers, --device-scope-lds-memory-barriers, --lds-lock-fences, --device-atomic-workgroup-memory-barriers, --f16-host-nans, --spanned-shuffle-memory and --device-image-tables force their target flag on over the captured value and are listed on a 'target flags forced on' line\n");
         return 2;
     }
     if (HeapFlagsConflict(argc, argv)) return 2;
@@ -434,6 +436,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--spanned-shuffle-memory") {
             g_spannedShuffleThroughMemory = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--device-image-tables") {
+            g_deviceImageTables = true;
             continue;
         }
         if (std::string(argv[i]) == "--mem") {
