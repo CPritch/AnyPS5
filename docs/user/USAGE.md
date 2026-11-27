@@ -2,6 +2,8 @@
 
 [**Web converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
 
+The web converter also relinks ELF modules directly inside `Media/Modules/` and `Media/Plugins/`, with the same initialization behavior as the native relinker's `--module-dir` option.
+
 ### Browser folder output
 
 The online converter can save Linux output as an uncompressed folder in supported browsers. It does not overwrite an existing destination folder. If conversion fails or is cancelled, it aborts the active file and attempts to remove the newly created output folder. If the browser prevents cleanup, the error names the folder that may contain incomplete files.
@@ -44,7 +46,7 @@ Use a clean ELF executable. Put its bundled ELF modules in `sce_module/`, `sce_m
 - `--sce-module-path` accepts absolute paths and paths relative to the current working directory. Give the parent directory, not the `sce_module` directory itself.
 - Only files directly inside the module directories are processed.
 - SELF/fSELF containers are skipped with a warning. Unwrap them before relinking if they need to be included.
-  - `tools/unwrap_self.py <input.self> <output.elf>` does that for a decrypted container. It places the segments at the offsets of the SELF segment records and restores `p_offset % p_align == p_vaddr % p_align`. It refuses a container whose load segments all look encrypted.
+  - `tools/unwrap_self.py <input.self> <output.elf>` does that for a decrypted container. It places the segments at the offsets of the SELF segment records and restores `p_offset % p_align == p_vaddr % p_align`. It also refuses a container when every load segment looks encrypted or large, high-entropy segments account for most load bytes.
 - Backup copies are skipped with a message, both on the command line and in the online converter. An ELF module counts as a backup when its file name extends the name of another ELF module in the same directory and both have the same SONAME, or, when neither has a SONAME, both export the same module names. Example: a dumper's `libX.prx.esbak` or `libX.prxbak` beside an ELF `libX.prx`. A single backup beside a SELF container is still relinked.
 - `prx/` can exist together with either `sce_module/` or `sce_modules/`.
 - Having both `sce_module/` and `sce_modules/` is an error.
@@ -712,10 +714,10 @@ Which milestones a run records depends on the system:
 | System | `loaded`, `started` | `firstDraw`, `firstPresent` | `stage`, frames, frame rate |
 |---|---|---|---|
 | Linux | not recorded | recorded | recorded |
-| Windows | not recorded | recorded | recorded |
+| Windows | recorded with a recent relinker and a runtime that supports the report hook | recorded | recorded |
 | macOS | recorded | recorded | recorded |
 
-A milestone that is missing from the report is either one the run did not reach or one this system does not record: on Linux and Windows `loaded` and `started` are never recorded, so their absence says nothing, and `stage` and `framesPresented` say how far the run was seen to get. The Windows and macOS code has not been run.
+A missing milestone can mean the run ended earlier or that the system or conversion lacks support for it. Linux and older Windows conversions can reach `first-draw` or `presents` with no `loaded` or `started`. Use `stage` and `framesPresented` to see how far the run was observed to get.
 
 To share a run, attach `anyps5-report.json` to the title's discussion. The runtime filters user names, home folders, host names, addresses and account numbers out of the report and never writes save data. That is a filter, not a guarantee, so read the file before you share it.
 

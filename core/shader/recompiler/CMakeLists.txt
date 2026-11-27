@@ -294,6 +294,7 @@ function(add_shader_recompiler target runtimeTarget)
             RecompileCacheKey::ContextHash
             RecompileCacheKey::SealFeatureDigest
             RecompileResult
+            MetadataBytes
             PrepareShader
             GetPreparedCode
             PreparedShaderInvocation::TryCreate
