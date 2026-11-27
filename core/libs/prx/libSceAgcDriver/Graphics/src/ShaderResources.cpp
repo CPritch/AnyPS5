@@ -8582,7 +8582,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
-        if (override != moved.end() && override->words.empty()) result->movedReads.emplace_back(override->address, override->address + override->size);
+        if (heapStage && override != moved.end() && override->words.empty()) {
+            if (result == nullptr) result = std::make_shared<DrawBindings>();
+            result->movedReads.emplace_back(override->address, override->address + override->size);
+        }
         if (override != moved.end() && override->words.empty() && (readsInPlace || override->heapInPlace)) {
             if (!readsInPlace || override->view.address != 0) movedBehindGpuWrites.fetch_add(1, std::memory_order_relaxed);
             if (override->view.address != 0) {

@@ -17,7 +17,9 @@ namespace {
 
 std::uint32_t LoadFaultWord(SpirvEmitterState& state, std::uint32_t index) {
     const auto value = state.module.AllocateId();
-    state.module.AddFunction(spv::OpLoad, TypeU32(state), value, BdaWord(state, state.faultBufferVariable, ConstantU32(state, index)));
+    const auto pointer = BdaWord(state, state.faultBufferVariable, ConstantU32(state, index));
+    if (state.BdaAddressed()) state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, spv::MemoryAccessAlignedMask, 4u);
+    else state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
     return value;
 }
 

@@ -639,7 +639,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                 }
             }
             Require(descriptors.insert(key).second || tableAlias || (binding != shader.bindings.end() && (binding->role == ShaderRecompiler::DescriptorRole::ImageTable || binding->role == ShaderRecompiler::DescriptorRole::ImageStorageTable)), "duplicate SPIR-V resource binding");
-            Require(binding != shader.bindings.end(), "SPIR-V resource is absent from recompiler binding metadata");
+            Require(binding != shader.bindings.end(), "SPIR-V resource is absent from recompiler binding metadata (set " + std::to_string(key.first) + ", binding " + std::to_string(key.second) + ")");
             Require(binding->kind == ShaderRecompiler::DescriptorKind::Sampler || binding->kind == ShaderRecompiler::DescriptorKind::SampledImage || binding->kind == ShaderRecompiler::DescriptorKind::StorageImage, "SPIR-V descriptor type disagrees with recompiler binding metadata");
             if (binding->role == ShaderRecompiler::DescriptorRole::ImageTable || binding->role == ShaderRecompiler::DescriptorRole::ImageStorageTable || binding->role == ShaderRecompiler::DescriptorRole::SamplerTable) {
                 Require(type.size() == 3 && (type[0] & 0xffffu) == spv::OpTypeRuntimeArray, "image table must be declared as a runtime descriptor array");
@@ -693,7 +693,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             const bool array = binding != shader.bindings.end() && binding->role == ShaderRecompiler::DescriptorRole::GuestBuffers;
             const auto [view, first] = bufferViews.emplace(key, decoration.aliased);
             Require(descriptors.insert(key).second || (!first && view->second && decoration.aliased && array), "duplicate SPIR-V resource binding");
-            Require(binding != shader.bindings.end(), "SPIR-V resource is absent from recompiler binding metadata");
+            Require(binding != shader.bindings.end(), "SPIR-V resource is absent from recompiler binding metadata (set " + std::to_string(key.first) + ", binding " + std::to_string(key.second) + ")");
             declared.insert(&*binding);
             Require(binding->kind == ShaderRecompiler::DescriptorKind::StorageBuffer, "SPIR-V descriptor type disagrees with recompiler binding metadata");
             Require(!binding->readOnly, "read-only descriptor metadata is unsupported because the recompiler emits no NonWritable decoration");
