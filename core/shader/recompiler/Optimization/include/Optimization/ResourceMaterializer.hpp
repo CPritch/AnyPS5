@@ -94,7 +94,7 @@ public:
     void ApplyStaticInterface(IrProgram& program, bool nativeSampleOffsets = true) const;
     static void MarkNarrowImageAtomics(IrProgram& program, bool enabled);
     static std::vector<ImageResource> RuntimeImageModes(const ImageResource& image);
-    static RuntimeImageModeMatch TryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
+    static RuntimeImageModeMatch TryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes, bool describe = true);
     static std::uint32_t RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
     static void PrepareImageModes(ShaderInfo& info);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
