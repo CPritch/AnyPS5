@@ -1708,6 +1708,10 @@ public:
         enqueue({std::move(key), nullptr, nullptr, std::move(words)});
     }
 
+    void StoreSubstitutes(std::vector<std::byte> key, std::vector<std::uint32_t> words, std::uint64_t version) {
+        enqueue({std::move(key), nullptr, nullptr, std::move(words), version});
+    }
+
     bool LoadSubstitutes(std::span<const std::byte> key, std::size_t recordWords, std::vector<std::uint32_t>& words) {
         return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) {
             std::span<const std::byte> payload;
@@ -1774,6 +1778,10 @@ public:
         counters.specializedMisses = specializedMisses.load(std::memory_order_relaxed);
         counters.specializedWrites = specializedWrites.load(std::memory_order_relaxed);
         counters.specializedLoadFailures = specializedLoadFailures.load(std::memory_order_relaxed);
+        counters.substituteHits = substituteHits.load(std::memory_order_relaxed);
+        counters.substituteMisses = substituteMisses.load(std::memory_order_relaxed);
+        counters.substituteWrites = substituteWrites.load(std::memory_order_relaxed);
+        counters.substituteLoadFailures = substituteLoadFailures.load(std::memory_order_relaxed);
         counters.prebuiltHits = prebuiltHits.load(std::memory_order_relaxed);
         counters.prebuiltMisses = prebuiltMisses.load(std::memory_order_relaxed);
         counters.prebuiltRejected = prebuiltRejected.load(std::memory_order_relaxed);
@@ -1832,6 +1840,7 @@ private:
         std::shared_ptr<const CompiledVariant> variant;
         std::shared_ptr<const IrResourcePlan> plan;
         std::vector<std::uint32_t> words;
+        std::uint64_t substituteVersion = 0;
     };
 
     bool loadPrebuilt(std::span<const std::byte> key, CompiledVariant& variant) {
@@ -1963,14 +1972,27 @@ private:
     }
 
     void write(const Job& job) {
-        const auto file = job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : !job.words.empty() ? wrapEntry(job.key, std::as_bytes(std::span(job.words))) : EncodeEntry(job.key, *job.variant);
-        if (!file.empty() && WriteFileAtomically(directory / EntryName(job.key), file)) {
-            (job.plan != nullptr ? planWrites : !job.words.empty() ? specializedWrites : writes).fetch_add(1, std::memory_order_relaxed);
-            bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
-        } else {
-            const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
-            if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (directory / EntryName(job.key)).string().c_str());
+        if (job.substituteVersion != 0u) {
+            const auto name = EntryName(job.key);
+            std::lock_guard lock(substituteMutex);
+            auto& written = substituteVersions[name];
+            if (job.substituteVersion <= written) return;
+            if (writeFile(name, wrapEntry(job.key, std::as_bytes(std::span(job.words))), substituteWrites)) written = job.substituteVersion;
+            return;
         }
+        const auto file = job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : !job.words.empty() ? wrapEntry(job.key, std::as_bytes(std::span(job.words))) : EncodeEntry(job.key, *job.variant);
+        static_cast<void>(writeFile(EntryName(job.key), file, job.plan != nullptr ? planWrites : !job.words.empty() ? specializedWrites : writes));
+    }
+
+    bool writeFile(const std::string& name, const std::vector<std::byte>& file, std::atomic<std::uint64_t>& counter) {
+        if (!file.empty() && WriteFileAtomically(directory / name, file)) {
+            counter.fetch_add(1, std::memory_order_relaxed);
+            bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
+            return true;
+        }
+        const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
+        if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (directory / name).string().c_str());
+        return false;
     }
 
     static std::optional<std::chrono::system_clock::time_point> lastWriteTime(const std::filesystem::path& path) {
@@ -2055,14 +2077,15 @@ private:
         const auto totals = Totals();
         const auto loadNs = loadNanoseconds.load(std::memory_order_relaxed);
         const auto delta = [](std::uint64_t after, std::uint64_t before) { return static_cast<unsigned long long>(after - before); };
-        const auto baseChanged = totals.hits != reported.hits || totals.misses != reported.misses || totals.writes != reported.writes || totals.loadFailures != reported.loadFailures || totals.writeFailures != reported.writeFailures || totals.planHits != reported.planHits || totals.planMisses != reported.planMisses || totals.planWrites != reported.planWrites || totals.planLoadFailures != reported.planLoadFailures || totals.specializedHits != reported.specializedHits || totals.specializedMisses != reported.specializedMisses || totals.specializedWrites != reported.specializedWrites || totals.specializedLoadFailures != reported.specializedLoadFailures;
+        const auto baseChanged = totals.hits != reported.hits || totals.misses != reported.misses || totals.writes != reported.writes || totals.loadFailures != reported.loadFailures || totals.writeFailures != reported.writeFailures || totals.planHits != reported.planHits || totals.planMisses != reported.planMisses || totals.planWrites != reported.planWrites || totals.planLoadFailures != reported.planLoadFailures || totals.specializedHits != reported.specializedHits || totals.specializedMisses != reported.specializedMisses || totals.specializedWrites != reported.specializedWrites || totals.specializedLoadFailures != reported.specializedLoadFailures || totals.substituteHits != reported.substituteHits || totals.substituteMisses != reported.substituteMisses || totals.substituteWrites != reported.substituteWrites || totals.substituteLoadFailures != reported.substituteLoadFailures;
         const auto prebuiltChanged = totals.prebuiltHits != reported.prebuiltHits || totals.prebuiltMisses != reported.prebuiltMisses || totals.prebuiltRejected != reported.prebuiltRejected;
         if (!baseChanged && !prebuiltChanged) return;
-        if (baseChanged) std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; specialized modules: %llu hits, %llu misses, %llu writes, %llu load failures; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
+        if (baseChanged) std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; specialized modules: %llu hits, %llu misses, %llu writes, %llu load failures; substitute tables: %llu hits, %llu misses, %llu writes, %llu load failures; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
                      delta(totals.hits, reported.hits), delta(totals.misses, reported.misses), delta(totals.writes, reported.writes), static_cast<double>(totals.bytesWritten - reported.bytesWritten) / (1024.0 * 1024.0),
                      delta(totals.loadFailures, reported.loadFailures), delta(totals.writeFailures, reported.writeFailures),
                      delta(totals.planHits, reported.planHits), delta(totals.planMisses, reported.planMisses), delta(totals.planWrites, reported.planWrites), delta(totals.planLoadFailures, reported.planLoadFailures),
                      delta(totals.specializedHits, reported.specializedHits), delta(totals.specializedMisses, reported.specializedMisses), delta(totals.specializedWrites, reported.specializedWrites), delta(totals.specializedLoadFailures, reported.specializedLoadFailures),
+                     delta(totals.substituteHits, reported.substituteHits), delta(totals.substituteMisses, reported.substituteMisses), delta(totals.substituteWrites, reported.substituteWrites), delta(totals.substituteLoadFailures, reported.substituteLoadFailures),
                      static_cast<double>(totals.bytesRead - reported.bytesRead) / (1024.0 * 1024.0), static_cast<double>(loadNs - reportedLoadNs) / 1e6,
                      static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.misses), static_cast<unsigned long long>(totals.writes), static_cast<unsigned long long>(totals.planHits), static_cast<unsigned long long>(totals.planMisses));
         if (prebuiltChanged && (!packs.empty() || !looseDirectories.empty())) std::fprintf(stderr, "[shader-prebuilt] interval: %llu hits, %llu misses, %llu rejected; lookup %.3f ms, file read %.3f ms, decode %.3f ms; total load %.3f ms, max %.3f ms (lifetime hits %llu)\n",
@@ -2087,7 +2110,9 @@ private:
     std::atomic<std::uint64_t> hits{0}, misses{0}, writes{0}, loadFailures{0}, writeFailures{0}, bytesRead{0}, bytesWritten{0}, loadNanoseconds{0};
     std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0};
     std::atomic<std::uint64_t> specializedHits{0}, specializedMisses{0}, specializedWrites{0}, specializedLoadFailures{0};
-    std::atomic<std::uint64_t> substituteHits{0}, substituteMisses{0}, substituteLoadFailures{0};
+    std::atomic<std::uint64_t> substituteHits{0}, substituteMisses{0}, substituteWrites{0}, substituteLoadFailures{0};
+    std::mutex substituteMutex;
+    std::unordered_map<std::string, std::uint64_t> substituteVersions;
     std::atomic<std::uint64_t> prebuiltHits{0}, prebuiltMisses{0}, prebuiltRejected{0}, lookupNanoseconds{0}, readNanoseconds{0}, decodeNanoseconds{0}, maxLoadNanoseconds{0}, prebuiltBytesRead{0}, prebuiltLoadNanoseconds{0};
     std::atomic<std::int64_t> lastReport{0};
     std::mutex reportMutex;
@@ -2295,12 +2320,12 @@ bool LoadSubstitutes(std::span<const std::byte> key, std::size_t recordWords, st
     return instance.LoadSubstitutes(full, recordWords, words);
 }
 
-void StoreSubstitutes(std::vector<std::byte> key, std::vector<std::uint32_t> words) {
+void StoreSubstitutes(std::vector<std::byte> key, std::vector<std::uint32_t> words, std::uint64_t version) {
     auto& instance = store();
-    if (!instance.Enabled() || words.empty()) return;
+    if (!instance.Enabled() || words.empty() || version == 0u) return;
     const auto& switches = switchKey();
     key.insert(key.end(), switches.begin(), switches.end());
-    instance.StoreSpecialized(std::move(key), std::move(words));
+    instance.StoreSubstitutes(std::move(key), std::move(words), version);
 }
 
 bool LoadSpecialized(std::span<const std::byte> key, std::vector<std::uint32_t>& words) {

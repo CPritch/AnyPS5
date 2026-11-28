@@ -42,6 +42,10 @@ struct Counters {
     std::uint64_t specializedMisses = 0;
     std::uint64_t specializedWrites = 0;
     std::uint64_t specializedLoadFailures = 0;
+    std::uint64_t substituteHits = 0;
+    std::uint64_t substituteMisses = 0;
+    std::uint64_t substituteWrites = 0;
+    std::uint64_t substituteLoadFailures = 0;
     std::uint64_t prebuiltHits = 0;
     std::uint64_t prebuiltMisses = 0;
     std::uint64_t prebuiltRejected = 0;
@@ -85,7 +89,7 @@ void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan>
 [[nodiscard]] bool LoadSpecialized(std::span<const std::byte> key, std::vector<std::uint32_t>& words);
 void StoreSpecialized(std::vector<std::byte> key, std::vector<std::uint32_t> words);
 [[nodiscard]] bool LoadSubstitutes(std::span<const std::byte> key, std::size_t recordWords, std::vector<std::uint32_t>& words);
-void StoreSubstitutes(std::vector<std::byte> key, std::vector<std::uint32_t> words);
+void StoreSubstitutes(std::vector<std::byte> key, std::vector<std::uint32_t> words, std::uint64_t version);
 void Flush();
 void ReleaseMapped(const SharedSpirv& spirv) noexcept;
 void Shutdown();
