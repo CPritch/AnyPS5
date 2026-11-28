@@ -22,6 +22,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -64,6 +65,16 @@ void NotePipelineReady(std::uint64_t address) {
     skips.pending.fetch_sub(1, std::memory_order_relaxed);
     std::fprintf(stderr, "[dispatch] compute shader 0x%llx: its pipeline is ready after %llu skipped dispatches\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(found->second));
     skips.skipped.erase(found);
+}
+
+bool AwaitPipelineAhead(VulkanDevice& device, const ShaderRecompiler::RecompileResult& shader) {
+    auto& budget = ComputePipelineWaitBudget();
+    const auto start = std::chrono::steady_clock::now();
+    const auto grant = budget.Take(start);
+    if (grant.allowed <= std::chrono::steady_clock::duration{}) return false;
+    const bool settled = device.AwaitComputePipelineAhead(shader, start + grant.allowed);
+    budget.Finish(grant, std::chrono::steady_clock::now());
+    return settled;
 }
 
 void StartComputePipelineAhead(const std::shared_ptr<VulkanDevice>& device, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, std::uint64_t address) {
@@ -865,7 +876,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 throw;
             }
         }
-        if (ahead == VulkanDevice::PipelineAhead::Start || ahead == VulkanDevice::PipelineAhead::Building) {
+        if ((ahead == VulkanDevice::PipelineAhead::Start || ahead == VulkanDevice::PipelineAhead::Building) && !AwaitPipelineAhead(*localDevice, *compiledResult)) {
             NotePipelineSkip(address, compiledResult->spirv.size());
             return;
         }
