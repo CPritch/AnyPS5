@@ -7949,10 +7949,6 @@ int APS5_VABI WKPageCanDelete() {
 }
 
 
-int APS5_VABI WKUserContentExtensionStoreRemove() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI _ZN9Inspector21InspectorRuntimeAgent6enableERN3WTF6StringE() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -9018,16 +9014,6 @@ int APS5_VABI WKPageValidateCommand() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-
-int APS5_VABI WKRegistrableDomainCreate() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-
-
-
-
-
 int APS5_VABI WKViewAccessibilityFocusedObject() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -9237,58 +9223,6 @@ int APS5_VABI WKWebsiteDataStoreSetStatisticsMaxStatisticsEntries() {
 }
 
 int APS5_VABI WKWebsiteDataStoreSetStatisticsMergeStatistic() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsMinimumTimeBetweenDataRecordsRemoval() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsNotifyPagesWhenDataRecordsWereScanned() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsPrevalentResource() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsPruneEntriesDownTo() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsShouldClassifyResourcesBeforeDataRecordsRemoval() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsSubframeUnderTopFrameOrigin() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsSubresourceUnderTopFrameOrigin() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsSubresourceUniqueRedirectFrom() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsSubresourceUniqueRedirectTo() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsTimeToLiveUserInteraction() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsTopFrameUniqueRedirectFrom() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsTopFrameUniqueRedirectTo() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKWebsiteDataStoreSetStatisticsVeryPrevalentResource() {
     NotImplemented_nid_no_patch(__func__);
 }
 

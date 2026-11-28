@@ -138,7 +138,7 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
     const bool prebuildOnly = submission.queue == 0 && (!allQueues || pipelineDispatch());
     static const bool probing = std::getenv("APS5_PROBE_DISPATCH") != nullptr;
     if (prebuildOnly && (!prebuildGraphicsQueue || probing || from < PrebuiltUntil())) return;
-    if (!prebuildOnly && submission.queue == 0 && DrawPipeline::Depth() != 0 && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (submission.commands[from] >> 8u) & 0xffu);
+    if (!prebuildOnly && submission.queue == 0 && DrawPipeline::Depth() != 0 && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (submission.commands[from] >> 8u) & 0xffu, "group_ahead");
     auto& resolved = resolvedAhead();
     const auto localDevice = device.Load();
     if (resolved.contains(from) || localDevice == nullptr) return;
