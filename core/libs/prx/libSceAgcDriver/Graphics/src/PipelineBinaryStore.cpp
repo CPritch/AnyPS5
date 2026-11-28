@@ -442,6 +442,13 @@ PipelineBinaryStore::RestoreResult PipelineBinaryStore::restore(const VkComputeP
     return restoreFile(info, key, pipeline, path);
 }
 
+PipelineBinaryStore::RestoreResult PipelineBinaryStore::refused(std::span<const std::byte> key, const std::filesystem::path& path) const {
+    rememberThreshold(key, true);
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    return RestoreResult::CaptureFailed;
+}
+
 PipelineBinaryStore::RestoreResult PipelineBinaryStore::restoreFile(const VkComputePipelineCreateInfo& info, std::span<const std::byte> key, VkPipeline* pipeline, const std::filesystem::path& path) const try {
     const auto lookupStarted = std::chrono::steady_clock::now();
     std::error_code error;
@@ -488,8 +495,8 @@ PipelineBinaryStore::RestoreResult PipelineBinaryStore::restoreFile(const VkComp
     VkPipelineBinaryHandlesInfoKHR handles{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR, nullptr, static_cast<std::uint32_t>(count), binaries.handles.data()};
     const auto imported = PreservedCall(createBinaries, context.device, &binaryInfo, nullptr, &handles);
     if (imported != VK_SUCCESS || handles.pipelineBinaryCount != count || std::ranges::find(binaries.handles, VK_NULL_HANDLE) != binaries.handles.end()) {
-        std::fprintf(stderr, "[pipeline-binary] import rejected key=%016llx result=%d; rebuilding\n", static_cast<unsigned long long>(ShaderRecompiler::HashBytes(key)), static_cast<int>(imported));
-        return RestoreResult::Missing;
+        std::fprintf(stderr, "[pipeline-binary] import rejected key=%016llx result=%d; rebuilding through the driver cache\n", static_cast<unsigned long long>(ShaderRecompiler::HashBytes(key)), static_cast<int>(imported));
+        return refused(key, path);
     }
     const auto chain = pipelineChain(info.pNext);
     RebuiltChain restoredChain;
@@ -501,8 +508,8 @@ PipelineBinaryStore::RestoreResult PipelineBinaryStore::restoreFile(const VkComp
     if (result != VK_SUCCESS) {
         if (*pipeline != VK_NULL_HANDLE) destroyPipeline(context.device, *pipeline, nullptr);
         *pipeline = VK_NULL_HANDLE;
-        std::fprintf(stderr, "[pipeline-binary] restore rejected key=%016llx result=%d; rebuilding\n", static_cast<unsigned long long>(ShaderRecompiler::HashBytes(key)), static_cast<int>(result));
-        return RestoreResult::Missing;
+        std::fprintf(stderr, "[pipeline-binary] restore rejected key=%016llx result=%d; rebuilding through the driver cache\n", static_cast<unsigned long long>(ShaderRecompiler::HashBytes(key)), static_cast<int>(result));
+        return refused(key, path);
     }
     std::fprintf(stderr, "[pipeline-binary] loaded key=%016llx bytes=%zu create_ms=%.3f total_ms=%.3f\n", static_cast<unsigned long long>(ShaderRecompiler::HashBytes(key)), file.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lookupStarted).count());
     return RestoreResult::Restored;

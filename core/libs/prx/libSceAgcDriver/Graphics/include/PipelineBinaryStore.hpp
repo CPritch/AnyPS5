@@ -39,6 +39,7 @@ private:
     RestoreResult restoreFile(const VkComputePipelineCreateInfo& info, std::span<const std::byte> key, VkPipeline* pipeline, const std::filesystem::path& path) const;
     bool capture(VkPipeline pipeline, std::span<const std::byte> key) const;
     void rememberThreshold(std::span<const std::byte> key, bool captureFailed = false) const;
+    RestoreResult refused(std::span<const std::byte> key, const std::filesystem::path& path) const;
     std::filesystem::path filePath(std::span<const std::byte> key) const;
 
     Context context;
