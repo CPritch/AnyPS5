@@ -3,10 +3,15 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <cstdint>
+#include <exception>
+#include <functional>
+#include <memory>
 #include <span>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
+class TextureDetiler;
 VkDeviceAddress BufferDeviceAddress(const Context& context, VkBuffer buffer);
 
 class Buffer {
@@ -112,6 +117,10 @@ public:
     void SubmitAndWait();
     void Submit();
     void Wait();
+    using Validation = std::function<void()>;
+    void OnValidated(Validation validation);
+    void Keep(std::shared_ptr<void> object);
+    void ReleaseStandalone() noexcept;
 
 private:
     void release() noexcept;
@@ -120,6 +129,11 @@ private:
     VkFence fence = VK_NULL_HANDLE;
     bool pending = false;
     bool submitted = false;
+    std::vector<Validation> validations;
+    std::exception_ptr validationFailure;
+    bool validationChecked = false;
+    std::vector<std::shared_ptr<void>> kept;
+    TextureDetiler* detiler = nullptr;
 };
 
 struct CommandBatchStalls {

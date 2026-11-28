@@ -2,6 +2,8 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTUREDETILER_HPP
 
 #include <array>
+#include <atomic>
+#include <functional>
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -65,6 +67,9 @@ class HeapSlotOwner;
         std::uint32_t CmaskErrors();
         void DispatchMultisampleReadback(VkCommandBuffer commands, VkFormat format, VkBuffer destination, std::uint64_t offset, std::uint64_t bytes, VkImageView arrayView, std::uint32_t width, std::uint32_t height, std::uint32_t layers, std::uint32_t fragments, std::uint32_t firstElement, std::uint32_t elements, const HeapSlotOwner* owner = nullptr);
         void DispatchMultisampleImage(VkCommandBuffer commands, std::uint32_t elementBytes, VkBuffer source, std::uint64_t offset, std::uint64_t bytes, VkImageView arrayView, std::uint32_t width, std::uint32_t height, std::uint32_t layers, std::uint32_t fragments, std::uint32_t firstElement, std::uint32_t elements, const HeapSlotOwner* owner = nullptr);
+        void DispatchDepthConvert(VkCommandBuffer commands, VkBuffer source, std::uint64_t sourceOffset, VkBuffer destination, std::uint64_t destinationOffset, std::uint32_t width, std::uint32_t rows, std::uint32_t sourceRowPitchBytes, std::uint32_t destinationRowPitchBytes, VkFormat depthFormat, bool toDepth, const std::function<void(std::function<void()>)>& registerValidation);
+        void BeginStandaloneBatch();
+        void EndStandaloneBatch();
 
     private:
         struct Retired {};
@@ -79,6 +84,7 @@ class HeapSlotOwner;
         struct DescriptorRing {
             std::vector<VkDescriptorPool> pools;
             std::vector<std::uint64_t> serials;
+            std::vector<bool> standaloneUsers;
             std::size_t current = 0;
             std::uint32_t used = 0;
         };
@@ -123,6 +129,12 @@ class HeapSlotOwner;
         DescriptorRing readbackDescriptorSets;
         VkShaderModule multisampleUploadModule = VK_NULL_HANDLE;
         std::vector<std::pair<Recorder*, std::uint64_t>> recorders;
+        VkShaderModule depthConvertModule = VK_NULL_HANDLE;
+        VkPipeline depthConvertPipeline = VK_NULL_HANDLE;
+        VkDescriptorSetLayout depthConvertDescriptorLayout = VK_NULL_HANDLE;
+        VkPipelineLayout depthConvertPipelineLayout = VK_NULL_HANDLE;
+        DescriptorRing depthConvertDescriptorSets;
+        std::atomic<std::uint32_t> standaloneBatches{0};
     };
 
 }
