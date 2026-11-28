@@ -73,7 +73,7 @@ public:
     ComputePipelineReplayResult ReplayComputePipeline(const ComputePipelineCapture& capture, std::span<const std::byte> initialCache = {});
     // Builds the pipeline of a journaled compute result ahead of its first dispatch (the journal
     // replay's hook, on its threads): false when the device already holds a pipeline for the module.
-    bool ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, bool storePagesVariant = false);
+    bool ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants);
     bool HasComputePipeline(const ShaderRecompiler::RecompileResult& shader) const;
     void RecordComputePipelineAhead(const ShaderRecompiler::RecompileResult& shader) const;
     void PrebuildComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress = 0, bool awaited = false);
@@ -456,7 +456,7 @@ private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
     friend struct VulkanDeviceTestAccess;
     std::pair<VkBuffer, std::uint64_t> scratchPoolHeader(const ShaderRecompiler::RecompileResult& shader) const;
-    VkPipeline specializedComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, ComputePipelineObjects& objects, const std::array<std::uint32_t, 3>& base, bool storePages, bool record = true);
+    VkPipeline specializedComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, ComputePipelineObjects& objects, const std::array<std::uint32_t, 3>& base, bool storePages);
     void buildStorePagesVariant(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, ComputePipelineObjects& objects);
     ShaderRecompiler::SpirvTarget buildTarget() const;
     Graphics::Context buildContext() const;

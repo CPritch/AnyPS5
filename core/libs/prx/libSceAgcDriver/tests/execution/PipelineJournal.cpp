@@ -369,7 +369,7 @@ void StorePagesVariantTests() {
         run(*device, "first run: the prepared constant store dispatch");
         Require(device->ComputePipelinesCreated() == 2, "the first run's prepared store dispatch built " + std::to_string(device->ComputePipelinesCreated()) + " compute pipelines, expected its own and its store-page variant");
         AgcDriver::Graphics::FlushPipelineJournal();
-        Require(Snapshot().journal.recordedCompute == 2, "the first run did not record the compute pipeline and its store-page variant");
+        Require(Snapshot().journal.recordedCompute == 1, "the first run did not record the compute pipeline once");
     }
     {
         const auto device = OpenVulkanTestDevice();
@@ -377,7 +377,7 @@ void StorePagesVariantTests() {
         device->WaitForPipelineJournalReplay();
         const auto replayed = Snapshot();
         Require(replayed.journal.replayFailed == 0 && replayed.journal.replayRejected == 0, "the replay of the compute pipeline and its store-page variant failed");
-        Require(device->ComputePipelinesCreated() == 2, "the replay built " + std::to_string(device->ComputePipelinesCreated()) + " compute pipelines, expected the recorded pipeline and its store-page variant");
+        Require(device->ComputePipelinesCreated() == 2, "the replay built " + std::to_string(device->ComputePipelinesCreated()) + " compute pipelines, expected the recorded pipeline and the store-page variant its module needs");
         run(*device, "second run: the prepared constant store dispatch");
         Require(device->ComputePipelinesCreated() == 2, "the second run's prepared store dispatch built a compute pipeline or store-page variant the replay had built");
     }
@@ -453,14 +453,14 @@ void JournalTests() {
         const auto replayed = Snapshot();
         Require(replayed.journal.loadedRecipes == 2 && replayed.journal.loadedModules == 3 && replayed.journal.droppedRecords == 0, "the second run did not load the two recorded pipelines and their three modules");
         Require(replayed.journal.replayedGraphics == 1 && replayed.journal.replayedCompute == 1 && replayed.journal.replayRejected == 0 && replayed.journal.replayFailed == 0 && replayed.journal.replayPresent == 0, "the replay did not build one graphics and one compute pipeline");
-        Require(device->ComputePipelinesCreated() == 1, "the replay did not build the compute pipeline on the new device");
+        Require(device->ComputePipelinesCreated() == 2, "the replay did not build the compute pipeline and the store-page variant its module needs on the new device");
         std::memset(compute.data, Fill, compute.bytes);
         const auto words = AddressWords(compute);
         const auto result = CompileCompute(*device, computeCode, words, 32);
         device->Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(computeCode.data()));
         device->WaitIdle();
         ExpectConstantStore(compute, "second run: the constant store dispatch");
-        Require(device->ComputePipelinesCreated() == 1, "the second run's dispatch built a compute pipeline the replay had built");
+        Require(device->ComputePipelinesCreated() == 2, "the second run's dispatch built a compute pipeline the replay had built");
         std::memset(target.data, 0, target.bytes);
         Draw(*device, DecodeTarget(target), Program(red));
         ExpectTexel(*device, target, redTexel, "second run: the draw through the replayed pipeline");
@@ -483,7 +483,7 @@ void JournalTests() {
         const auto compute = bounded.journal.replayedCompute - before.journal.replayedCompute;
         const auto wantGraphics = std::string(graphicsLimit) == "0" ? 0u : 1u;
         const auto wantCompute = std::string(computeLimit) == "0" ? 0u : 1u;
-        Require(graphics == wantGraphics && compute == wantCompute && device->ComputePipelinesCreated() == wantCompute, "a replay bounded to " + std::string(graphicsLimit) + " graphics and " + (*computeLimit == '\0' ? std::string("the default") : std::string(computeLimit)) + " compute entries replayed " + std::to_string(graphics) + " graphics and " + std::to_string(compute) + " compute pipelines");
+        Require(graphics == wantGraphics && compute == wantCompute && device->ComputePipelinesCreated() == 2u * wantCompute, "a replay bounded to " + std::string(graphicsLimit) + " graphics and " + (*computeLimit == '\0' ? std::string("the default") : std::string(computeLimit)) + " compute entries replayed " + std::to_string(graphics) + " graphics and " + std::to_string(compute) + " compute pipelines");
     }
     SetEnvironment("APS5_PIPELINE_JOURNAL_ENTRIES", "");
     SetEnvironment("APS5_PIPELINE_JOURNAL_COMPUTE_ENTRIES", "");
@@ -745,7 +745,7 @@ void ReplayRacesDispatchTests() {
         const auto after = Snapshot();
         Require(after.journal.replayRejected == before.journal.replayRejected && after.journal.replayFailed == before.journal.replayFailed, "the raced replay rejected or failed a compute pipeline");
         const auto visited = (after.journal.replayedCompute - before.journal.replayedCompute) + (after.journal.replayPresent - before.journal.replayPresent);
-        Require(device->ComputePipelinesCreated() == visited, "a dispatch and the replay both built a compute pipeline: " + std::to_string(device->ComputePipelinesCreated()) + " built for " + std::to_string(visited) + " replayed");
+        Require(device->ComputePipelinesCreated() == 2u * visited, "a dispatch and the replay both built a compute pipeline or its store-page variant: " + std::to_string(device->ComputePipelinesCreated()) + " built for " + std::to_string(visited) + " replayed pipelines of modules with store pages");
     }
     AgcDriver::Graphics::FlushPipelineJournal();
     std::filesystem::remove(path, error);
@@ -1094,7 +1094,7 @@ int BuildTraceTests() {
     Require(held.replayed.replayed == held.opened.replayed, "a replay bounded to no compute entries traced a replayed build");
     Require(held.createdByDispatch == 1 && held.dispatched.journalHeld - held.replayed.journalHeld == 1 && held.dispatched.journalNew == held.replayed.journalNew, "a dispatch of a program the journal held but did not replay was not traced as held");
     const auto replayed = TracedDispatch(code, "the run that replays the compute pipeline");
-    Require(replayed.replayed.replayed - replayed.opened.replayed == 1 && replayed.replayed.journalNew == replayed.opened.journalNew && replayed.replayed.journalHeld == replayed.opened.journalHeld, "the replay of the recorded compute pipeline was not traced as one replayed build");
+    Require(replayed.replayed.replayed - replayed.opened.replayed == 2 && replayed.replayed.journalNew == replayed.opened.journalNew && replayed.replayed.journalHeld == replayed.opened.journalHeld, "the replay of the recorded compute pipeline and its module's store-page variant was not traced as two replayed builds");
     Require(replayed.createdByDispatch == 0 && replayed.dispatched.builds == replayed.replayed.builds, "the dispatch after the replay traced a build of its own");
     const auto answer = [](const AgcDriver::Graphics::PipelineBuildCounters& from, const AgcDriver::Graphics::PipelineBuildCounters& to) {
         return std::to_string(to.cacheHits - from.cacheHits) + " hit, " + std::to_string(to.cacheMisses - from.cacheMisses) + " miss, " + std::to_string(to.unreported - from.unreported) + " unreported, " + std::to_string(to.unasked - from.unasked) + " unasked";

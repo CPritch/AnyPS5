@@ -81,7 +81,7 @@ struct PipelineJournalCounters {
 [[nodiscard]] std::filesystem::path PipelineJournalPath();
 [[nodiscard]] PipelineJournalCounters PipelineJournalTotals();
 void RecordGraphicsPipeline(const GraphicsPipelineRecipe& recipe, std::span<const CompiledShader> shaders);
-void RecordComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, bool storePagesVariant = false);
+void RecordComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants);
 void FlushPipelineJournal();
 void ReportPipelineJournal();
 
@@ -96,7 +96,7 @@ public:
 };
 
 struct PipelineJournalHooks {
-    std::function<bool(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, bool storePagesVariant)> compute;
+    std::function<bool(const ShaderRecompiler::RecompileResult& shader, bool pushConstants)> compute;
 };
 
 // The journal belongs to the device that wrote it, named by the same properties as the driver's

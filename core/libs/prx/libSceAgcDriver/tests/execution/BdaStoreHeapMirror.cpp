@@ -597,7 +597,7 @@ void StorePagesAheadTest(AgcDriver::VulkanDevice& device, bool replayed) {
     const auto start = AgcDriver::VulkanDevice::ComputePipelineCounts();
     const char* how = replayed ? "replayed from the pipeline journal" : "built ahead on the prebuild pool";
     const std::array<AgcDriver::Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &result, 0}}};
-    if (replayed) Require(device.ReplayComputePipeline(result, AgcDriver::Graphics::PushConstantStages(shaders) != 0, true), std::string("BDA store heap mirror: the store pipeline was not ") + how);
+    if (replayed) Require(device.ReplayComputePipeline(result, AgcDriver::Graphics::PushConstantStages(shaders) != 0), std::string("BDA store heap mirror: the store pipeline was not ") + how);
     else device.PrebuildComputePipeline(result, address, true);
     const auto ahead = AgcDriver::VulkanDevice::ComputePipelineCounts();
     Require(ahead.created - start.created == 2, std::string("BDA store heap mirror: the store pipeline ") + how + " created " + std::to_string(ahead.created - start.created) + " compute pipeline(s), expected its own and its store-page variant");

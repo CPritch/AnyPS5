@@ -3260,7 +3260,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
 
 void VulkanDevice::startJournalReplay() {
     if (!state->journalReplayPending.exchange(false, std::memory_order_acq_rel)) return;
-    state->journalReplay = Graphics::StartPipelineJournalReplay(graphicsContext(), Graphics::PipelineJournalDeviceFingerprint(state->properties), {[this](const ShaderRecompiler::RecompileResult& shader, bool pushConstants, bool storePagesVariant) { return ReplayComputePipeline(shader, pushConstants, storePagesVariant); }});
+    state->journalReplay = Graphics::StartPipelineJournalReplay(graphicsContext(), Graphics::PipelineJournalDeviceFingerprint(state->properties), {[this](const ShaderRecompiler::RecompileResult& shader, bool pushConstants) { return ReplayComputePipeline(shader, pushConstants); }});
 }
 
 VulkanDevice::~VulkanDevice() = default;
@@ -3302,13 +3302,17 @@ std::uint64_t VulkanDevice::DescriptorHeapComputePipelines() const {
     return state->descriptorHeapComputePipelines.load(std::memory_order_relaxed);
 }
 
-bool VulkanDevice::ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, bool storePagesVariant) {
+bool VulkanDevice::ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants) {
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     const auto key = ComputePipelineKey::Of(shader, pushConstants);
     if (key.identity.Empty()) return false;
     const auto variant = [&](const std::shared_ptr<ComputePipelineObjects>& objects) {
-        if (!storePagesVariant || objects == nullptr || !objects->storePages) return false;
-        static_cast<void>(specializedComputePipeline(graphicsContext(), shader, *objects, {0u, 0u, 0u}, true, false));
+        if (objects == nullptr || !objects->storePages) return false;
+        {
+            std::lock_guard split(objects->splitMutex);
+            if (objects->splitPipelines.contains(std::array<std::uint32_t, 4>{0u, 0u, 0u, 1u})) return false;
+        }
+        static_cast<void>(specializedComputePipeline(graphicsContext(), shader, *objects, {0u, 0u, 0u}, true));
         return true;
     };
     {
@@ -3320,7 +3324,6 @@ bool VulkanDevice::ReplayComputePipeline(const ShaderRecompiler::RecompileResult
             else if (const auto building = state->computePipelinesBuilding.find(key); building != state->computePipelinesBuilding.end()) pending = building->second;
         }
         if (existing != nullptr || pending.valid()) {
-            if (!storePagesVariant) return false;
             if (existing == nullptr) existing = pending.get();
             return variant(existing);
         }
@@ -7241,7 +7244,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     return objects;
 }
 
-VkPipeline VulkanDevice::specializedComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, ComputePipelineObjects& objects, const std::array<std::uint32_t, 3>& base, bool storePages, bool record) {
+VkPipeline VulkanDevice::specializedComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, ComputePipelineObjects& objects, const std::array<std::uint32_t, 3>& base, bool storePages) {
     std::lock_guard lock(objects.splitMutex);
     const std::array<std::uint32_t, 4> key{base[0], base[1], base[2], storePages ? 1u : 0u};
     if (const auto found = objects.splitPipelines.find(key); found != objects.splitPipelines.end()) return found->second;
@@ -7256,10 +7259,6 @@ VkPipeline VulkanDevice::specializedComputePipeline(const Graphics::Context& con
     Graphics::PipelineBuildTrace trace(context.pipelineCreationFeedback);
     const VkPipelineCreateFlags splitFlags = computePipelineFlags() | (DriverDetail::CompilesUnoptimized(shader.spirv.size(), DriverDetail::UnoptimizedComputePipelineWords()) ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0);
     try {
-        if (record && storePages && base == std::array<std::uint32_t, 3>{} && Graphics::PipelineJournalEnabled() && !state->probingFloatControls) {
-            const std::array<Graphics::CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
-            Graphics::RecordComputePipeline(shader, Graphics::PushConstantStages(stages) != 0, true);
-        }
         if (Graphics::PipelineBuildStartLogging()) Graphics::LogComputePipelineBuildStart(shader);
         const auto createPipelines = state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
         const std::span<const std::uint32_t> spirv(shader.spirv.data(), shader.spirv.size());

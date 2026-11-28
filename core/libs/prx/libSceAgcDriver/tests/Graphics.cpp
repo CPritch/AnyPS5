@@ -15189,7 +15189,7 @@ void pipelineJournalTests(bool longPath = false, bool extended = false) {
         bool receivedPush = false;
         std::uint32_t computeCalls = 0;
         std::mutex computeMutex;
-        PipelineJournalHooks hooks{[&](const ShaderRecompiler::RecompileResult& shader, bool pushConstants, bool) {
+        PipelineJournalHooks hooks{[&](const ShaderRecompiler::RecompileResult& shader, bool pushConstants) {
             std::lock_guard lock(computeMutex);
             ++computeCalls;
             received = shader;
