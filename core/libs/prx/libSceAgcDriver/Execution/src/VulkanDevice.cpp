@@ -6462,6 +6462,7 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     } else {
         prepared->objects = awaitComputePipelineBuild(shader, pushStages);
     }
+    if (prepared->objects != nullptr && prepared->objects->storePages) static_cast<void>(specializedComputePipeline(context, shader, *prepared->objects, {0u, 0u, 0u}, true));
     return prepared;
 }
 
