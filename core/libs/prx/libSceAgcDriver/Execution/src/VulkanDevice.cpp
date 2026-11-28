@@ -6456,9 +6456,9 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     if (built.Layout() != VK_NULL_HANDLE) {
         const auto layouts = built.SetLayouts();
         prepared->objects = computePipeline(context, shader, layouts.main, layouts.mainKey, pushStages, programAddress);
-    } else if (context.descriptorCache != nullptr && !shader.gpuResolvedImages) {
+    } else if (context.descriptorCache != nullptr) {
         const auto described = Graphics::DescribeSetLayouts(context, shaders);
-        prepared->describedLayoutKey = described.mainKey;
+        if (!shader.gpuResolvedImages) prepared->describedLayoutKey = described.mainKey;
         prepared->objects = computePipeline(context, shader, described.layouts.main, described.mainKey, pushStages, programAddress);
     } else {
         prepared->objects = awaitComputePipelineBuild(shader, pushStages);

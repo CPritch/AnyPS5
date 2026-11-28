@@ -153,7 +153,8 @@ int main(int argc, char** argv) {
             if (!device) return VulkanTestSkipped;
         }
         const bool indirect = argc == 2 && std::string_view(argv[1]) == "indirect";
-        Require(argc == 1 || indirect, "unknown fixture mode");
+        const bool unprebuilt = argc == 2 && std::string_view(argv[1]) == "unprebuilt";
+        Require(argc == 1 || indirect || unprebuilt, "unknown fixture mode");
         Constants = NewBlock();
         Input = NewBlock();
         Output = NewBlock();
@@ -185,11 +186,13 @@ int main(int argc, char** argv) {
         Require(sceAgcDriverSubmitDcb(&packet) == 0, "the graphics queue submit failed");
         Require(WaitFor([] { return Slots[0].done != 0; }, std::chrono::seconds(60)), "the dispatch before the wait did not finish");
         Require(Slots[0].output[0] == 0x1234u, "the dispatch before the wait stored " + std::to_string(Slots[0].output[0]));
-        Require(WaitFor([] { return HeldBuilds.load(std::memory_order_acquire) != 0; }, std::chrono::seconds(20)), "the prebuild pool did not start building the pipeline of the dispatch behind the wait");
+        if (unprebuilt) Require(HeldBuilds.load(std::memory_order_acquire) == 0, "the pipeline of the dispatch behind the wait was built ahead with the queue 0 prebuild off");
+        else Require(WaitFor([] { return HeldBuilds.load(std::memory_order_acquire) != 0; }, std::chrono::seconds(20)), "the prebuild pool did not start building the pipeline of the dispatch behind the wait");
 
         const auto before = VulkanDevice::ComputePipelineCounts();
         Gate = 1;
-        Require(WaitFor([&] { return VulkanDevice::ComputePipelineCounts().awaited > before.awaited; }, std::chrono::seconds(20)), "the queue 0 dispatch did not wait for its compute pipeline's build on the prebuild pool");
+        if (unprebuilt) Require(WaitFor([] { return HeldBuilds.load(std::memory_order_acquire) != 0; }, std::chrono::seconds(20)), "the queue 0 dispatch did not build its compute pipeline");
+        else Require(WaitFor([&] { return VulkanDevice::ComputePipelineCounts().awaited > before.awaited; }, std::chrono::seconds(20)), "the queue 0 dispatch did not wait for its compute pipeline's build on the prebuild pool");
         std::atomic<bool> locked{false};
         locker = std::thread([&locked] {
             std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
@@ -199,7 +202,7 @@ int main(int argc, char** argv) {
         const bool waitedForRelease = AddressDone == 0;
         ReleaseBuild();
         locker.join();
-        Require(lockedWhileWaiting, "another thread could not take the GPU mutex within 5 s while a queue 0 dispatch waited for its compute pipeline's build on the prebuild pool");
+        Require(lockedWhileWaiting, unprebuilt ? "another thread could not take the GPU mutex within 5 s while a queue 0 dispatch built its compute pipeline" : "another thread could not take the GPU mutex within 5 s while a queue 0 dispatch waited for its compute pipeline's build on the prebuild pool");
         Require(waitedForRelease, "the dispatch behind the wait finished while its compute pipeline's build was held");
 
         Require(WaitFor([] { return AddressDone != 0; }, std::chrono::seconds(60)), "the dispatch behind the wait did not finish");
@@ -214,7 +217,7 @@ int main(int argc, char** argv) {
         Require(after.underGpuMutex == before.underGpuMutex, "a compute pipeline was created under the GPU mutex");
         Require(HeldBuilds.load(std::memory_order_acquire) == 1, "the pipeline of the dispatch behind the wait was built " + std::to_string(HeldBuilds.load()) + " times");
         VulkanDevice::SetComputePipelineBuildHookForTest(nullptr);
-        std::cout << "compute build wait outside GPU mutex test passed (" << (indirect ? "indirect" : "direct") << " dispatch, GPU-resolved images " << (AgcDriver::Graphics::DescriptorHeapEnabled() ? "on" : "off") << ")\n";
+        std::cout << "compute build wait outside GPU mutex test passed (" << (indirect ? "indirect" : unprebuilt ? "unprebuilt" : "direct") << " dispatch, GPU-resolved images " << (AgcDriver::Graphics::DescriptorHeapEnabled() ? "on" : "off") << ")\n";
         AgcDriverShutdown_nid_postfix();
         return 0;
     } catch (const std::exception& error) {
