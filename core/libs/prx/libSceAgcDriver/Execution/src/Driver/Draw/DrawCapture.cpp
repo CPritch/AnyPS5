@@ -130,6 +130,13 @@ using MaterializeWork = std::function<std::shared_ptr<const ShaderRecompiler::Re
 
 std::atomic<std::uint64_t> heapTemplatesInBackground{0};
 
+constexpr double TracedMaterializeMs = 250.0;
+
+bool TraceMaterialize() {
+    static const bool enabled = std::getenv("APS5_TRACE_MATERIALIZE") != nullptr;
+    return enabled;
+}
+
 bool cheapAt(std::uint64_t address, bool contended) {
     auto& pending = pendingMaterializes();
     std::lock_guard lock(pending.mutex);
@@ -141,6 +148,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> timedAt(std::uint64_t a
     const auto started = std::chrono::steady_clock::now();
     auto result = work();
     const auto ms = ElapsedMs(started);
+    if (TraceMaterialize() && ms >= TracedMaterializeMs) std::fprintf(stderr, "[materialize] program 0x%llx: %.0f ms on the dispatching thread\n", static_cast<unsigned long long>(address), ms);
     auto& pending = pendingMaterializes();
     std::lock_guard lock(pending.mutex);
     pending.lastMs[address] = ms;
@@ -169,7 +177,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> finishedInBackground(st
     }
     if (created != nullptr) *created = started;
     if (started) {
-        SubmitLibraryPrebuild([job, work = makeWork(), address] {
+        SubmitLibraryPrebuild([job, work = makeWork(), address, submitted = std::chrono::steady_clock::now()] {
             std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
             std::exception_ptr failure;
             const auto started = std::chrono::steady_clock::now();
@@ -180,6 +188,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> finishedInBackground(st
             }
             {
                 const auto ms = ElapsedMs(started);
+                if (TraceMaterialize() && ms >= TracedMaterializeMs) std::fprintf(stderr, "[materialize] program 0x%llx: %.0f ms queued, %.0f ms running%s\n", static_cast<unsigned long long>(address), std::chrono::duration<double, std::milli>(started - submitted).count(), ms, failure != nullptr ? ", failed" : "");
                 auto& registry = pendingMaterializes();
                 std::lock_guard lock(registry.mutex);
                 registry.lastMs[address] = ms;
