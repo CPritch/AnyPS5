@@ -966,6 +966,7 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
     const bool slabShape = !disabled && !required && imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && imageInfo.pNext == nullptr && needed.size <= imageSlabLimit && needed.alignment < imageBlockBytes;
     const bool largeShape = !disabled && !required && imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && imageInfo.pNext == nullptr && needed.size > imageSlabLimit && needed.size <= largeImageLimit && needed.alignment < largeImageUnitBytes * imageBlockUnits;
     const bool eligible = slabShape && !preferred;
+    noteImageAllocation(required, preferred, slabShape, largeShape, imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && imageInfo.pNext == nullptr, needed.size);
     const auto preferredType = context.MemoryType(needed.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (eligible) {
         if (auto existing = takeImageRange(pool, preferredType, needed.size, needed.alignment)) return existing;
@@ -1070,6 +1071,22 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
     }
     if (auto created = newBlock(memoryType)) return created;
     return standalone();
+}
+
+void BufferPool::noteImageAllocation(bool required, bool preferred, bool slabShape, bool largeShape, bool plainOptimal, VkDeviceSize bytes) {
+    static const bool traced = std::getenv("APS5_TRACE_IMAGE_ALLOCATIONS") != nullptr;
+    if (!traced) return;
+    static std::mutex mutex;
+    static std::array<std::uint64_t, 6> counts{};
+    static std::uint64_t total = 0;
+    static VkDeviceSize totalBytes = 0;
+    std::lock_guard lock(mutex);
+    const auto reason = required ? 0u : !plainOptimal ? 1u : preferred && (slabShape || largeShape) ? 2u : slabShape ? 3u : largeShape ? 4u : 5u;
+    ++counts[reason];
+    totalBytes += bytes;
+    if (++total % 1000u != 0u) return;
+    std::fprintf(stderr, "[image-alloc] %llu images, %llu MiB: dedicated required %llu, linear or chained %llu, dedicated preferred %llu, slab-sized %llu, block-sized %llu, larger %llu\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(totalBytes >> 20u),
+        static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]), static_cast<unsigned long long>(counts[4]), static_cast<unsigned long long>(counts[5]));
 }
 
 void BufferPool::releaseImageAllocation(const ImageAllocation& allocation) noexcept {

@@ -120,6 +120,7 @@ private:
     static void markImageRange(ImageBlock& block, std::uint32_t first, std::uint32_t units, bool occupied) noexcept;
     void linkImageBlock(ImageBlock& block) noexcept;
     void unlinkImageBlock(ImageBlock& block) noexcept;
+    static void noteImageAllocation(bool required, bool preferred, bool slabShape, bool largeShape, bool plainOptimal, VkDeviceSize bytes);
     void releaseImageAllocation(const ImageAllocation& allocation) noexcept;
     VkDeviceSize trimImageBlocks(bool hostBlocks = true);
     struct SlabBlock {
