@@ -188,7 +188,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> finishedInBackground(st
             }
             {
                 const auto ms = ElapsedMs(started);
-                if (TraceMaterialize() && ms >= TracedMaterializeMs) std::fprintf(stderr, "[materialize] program 0x%llx: %.0f ms queued, %.0f ms running%s\n", static_cast<unsigned long long>(address), std::chrono::duration<double, std::milli>(started - submitted).count(), ms, failure != nullptr ? ", failed" : "");
+                const auto queued = std::chrono::duration<double, std::milli>(started - submitted).count();
+                if (TraceMaterialize() && (ms >= TracedMaterializeMs || queued >= TracedMaterializeMs)) std::fprintf(stderr, "[materialize] program 0x%llx: %.0f ms queued, %.0f ms running%s\n", static_cast<unsigned long long>(address), queued, ms, failure != nullptr ? ", failed" : "");
                 auto& registry = pendingMaterializes();
                 std::lock_guard lock(registry.mutex);
                 registry.lastMs[address] = ms;
@@ -201,7 +202,12 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> finishedInBackground(st
             }
         });
     }
+    const auto awaited = std::chrono::steady_clock::now();
     AwaitBackgroundJob(job->mutex, job->finished, job->waited);
+    if (TraceMaterialize()) {
+        const auto waitedMs = ElapsedMs(awaited);
+        if (waitedMs >= TracedMaterializeMs) std::fprintf(stderr, "[materialize] program 0x%llx: the dispatching thread waited %.0f ms for its job\n", static_cast<unsigned long long>(address), waitedMs);
+    }
     {
         std::lock_guard lock(job->mutex);
         if (!job->finished) throw DrawCompilePending("the draw's shader is still being specialized in the background");
