@@ -860,12 +860,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         parked.resolvedAt = std::chrono::steady_clock::now();
         ++groupStats.resolved;
         if (cached) ++groupStats.resolvedHits;
-        if (prebuildingAhead() && AsyncDrawCompile()) {
+        if (AsyncDrawCompile()) {
             StartComputePipelineAhead(localDevice, compiledResult, address);
         } else if (!cached && compiledResult != nullptr && !localDevice->HasComputePipeline(*compiledResult)) {
             SubmitComputePrebuild([localDevice, compiledResult, address] {
-                try { localDevice->PrebuildComputePipeline(*compiledResult, address); } catch (const std::exception&) {}
-            });
+                try { localDevice->PrebuildComputePipeline(*compiledResult, address, true); } catch (const std::exception&) {}
+            }, true);
         }
         return;
     }

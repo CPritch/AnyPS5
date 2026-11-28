@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
@@ -62,6 +63,8 @@ std::uint32_t* Arguments = nullptr;
 std::atomic<std::uint64_t> HeldProgram{0};
 std::atomic<int> HeldBuilds{0};
 std::atomic<bool> BuildReleased{false};
+std::atomic<bool> BlockerStarted{false};
+std::atomic<bool> BlockerReleased{false};
 
 void HoldBuild(std::uint64_t programAddress) {
     if (programAddress != HeldProgram.load(std::memory_order_acquire)) return;
@@ -71,6 +74,10 @@ void HoldBuild(std::uint64_t programAddress) {
 
 void ReleaseBuild() {
     BuildReleased.store(true, std::memory_order_release);
+}
+
+void ReleaseBlocker() {
+    BlockerReleased.store(true, std::memory_order_release);
 }
 
 std::uint32_t Low(const volatile void* pointer) {
@@ -154,7 +161,8 @@ int main(int argc, char** argv) {
         }
         const bool indirect = argc == 2 && std::string_view(argv[1]) == "indirect";
         const bool unprebuilt = argc == 2 && std::string_view(argv[1]) == "unprebuilt";
-        Require(argc == 1 || indirect || unprebuilt, "unknown fixture mode");
+        const bool computeQueue = argc == 2 && std::string_view(argv[1]) == "compute-queue-wait";
+        Require(argc == 1 || indirect || unprebuilt || computeQueue, "unknown fixture mode");
         Constants = NewBlock();
         Input = NewBlock();
         Output = NewBlock();
@@ -179,14 +187,27 @@ int main(int argc, char** argv) {
         Require(Slots[1].output[0] == 0x9abcu, "the warm-up dispatch stored " + std::to_string(Slots[1].output[0]));
 
         std::vector<std::uint32_t> words;
-        DispatchSlot(words, Slots[0], 0x1234u);
-        words.insert(words.end(), {0xc0053c00u, 0x13u, Low(&Gate), High(&Gate), 1u, 0xffffffffu, 0x19u});
-        DispatchAddress(words, indirect);
-        Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
-        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the graphics queue submit failed");
-        Require(WaitFor([] { return Slots[0].done != 0; }, std::chrono::seconds(60)), "the dispatch before the wait did not finish");
-        Require(Slots[0].output[0] == 0x1234u, "the dispatch before the wait stored " + std::to_string(Slots[0].output[0]));
+        if (computeQueue) {
+            AgcDriver::DriverDetail::SubmitComputePrebuild([] {
+                BlockerStarted.store(true, std::memory_order_release);
+                while (!BlockerReleased.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            });
+            Require(WaitFor([] { return BlockerStarted.load(std::memory_order_acquire); }, std::chrono::seconds(20)), "the prebuild pool did not start the compute prebuild that no dispatch waits for");
+            words.insert(words.end(), {0xc0053c00u, 0x13u, Low(&Gate), High(&Gate), 1u, 0xffffffffu, 0x19u});
+            DispatchAddress(words, false);
+            Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+            Require(sceAgcDriverSubmitAcb(0x28, &packet) == 0, "the compute queue submit failed");
+        } else {
+            DispatchSlot(words, Slots[0], 0x1234u);
+            words.insert(words.end(), {0xc0053c00u, 0x13u, Low(&Gate), High(&Gate), 1u, 0xffffffffu, 0x19u});
+            DispatchAddress(words, indirect);
+            Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+            Require(sceAgcDriverSubmitDcb(&packet) == 0, "the graphics queue submit failed");
+            Require(WaitFor([] { return Slots[0].done != 0; }, std::chrono::seconds(60)), "the dispatch before the wait did not finish");
+            Require(Slots[0].output[0] == 0x1234u, "the dispatch before the wait stored " + std::to_string(Slots[0].output[0]));
+        }
         if (unprebuilt) Require(HeldBuilds.load(std::memory_order_acquire) == 0, "the pipeline of the dispatch behind the wait was built ahead with the queue 0 prebuild off");
+        else if (computeQueue) Require(WaitFor([] { return HeldBuilds.load(std::memory_order_acquire) != 0; }, std::chrono::seconds(20)), "the compute pipeline of a dispatch behind a compute queue's unsatisfied wait did not start building on the prebuild pool while the queue waited, with an unawaited compute prebuild holding the pool's other budgeted slot");
         else Require(WaitFor([] { return HeldBuilds.load(std::memory_order_acquire) != 0; }, std::chrono::seconds(20)), "the prebuild pool did not start building the pipeline of the dispatch behind the wait");
 
         const auto before = VulkanDevice::ComputePipelineCounts();
@@ -216,13 +237,15 @@ int main(int argc, char** argv) {
         Require(after.awaitedUnderGpuMutex == before.awaitedUnderGpuMutex, std::to_string(after.awaitedUnderGpuMutex - before.awaitedUnderGpuMutex) + " waits for another thread's compute pipeline build were made under the GPU mutex");
         Require(after.underGpuMutex == before.underGpuMutex, "a compute pipeline was created under the GPU mutex");
         Require(HeldBuilds.load(std::memory_order_acquire) == 1, "the pipeline of the dispatch behind the wait was built " + std::to_string(HeldBuilds.load()) + " times");
+        ReleaseBlocker();
         VulkanDevice::SetComputePipelineBuildHookForTest(nullptr);
-        std::cout << "compute build wait outside GPU mutex test passed (" << (indirect ? "indirect" : unprebuilt ? "unprebuilt" : "direct") << " dispatch, GPU-resolved images " << (AgcDriver::Graphics::DescriptorHeapEnabled() ? "on" : "off") << ")\n";
+        std::cout << "compute build wait outside GPU mutex test passed (" << (indirect ? "indirect" : unprebuilt ? "unprebuilt" : computeQueue ? "compute queue" : "direct") << " dispatch, GPU-resolved images " << (AgcDriver::Graphics::DescriptorHeapEnabled() ? "on" : "off") << ")\n";
         AgcDriverShutdown_nid_postfix();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         ReleaseBuild();
+        ReleaseBlocker();
         Gate = 1;
         if (locker.joinable()) locker.join();
         VulkanDevice::SetComputePipelineBuildHookForTest(nullptr);

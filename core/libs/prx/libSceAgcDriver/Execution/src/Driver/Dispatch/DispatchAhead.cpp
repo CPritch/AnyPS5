@@ -132,12 +132,14 @@ bool OverlapsLabel(std::span<const ShaderRecompiler::MemoryRegion> regions, cons
 
 }
 
-void Driver::resolveGroupAhead(const Submission& submission, const QueueState& live, std::size_t from) {
+void Driver::resolveGroupAhead(const Submission& submission, const QueueState& live, std::size_t from, bool waiting) {
     static const bool allQueues = std::getenv("APS5_GROUP_CAPTURE_ALL_QUEUES") != nullptr;
     static const bool prebuildGraphicsQueue = std::getenv("APS5_NO_GRAPHICS_QUEUE_PIPELINE_PREBUILD") == nullptr;
-    const bool prebuildOnly = submission.queue == 0 && (!allQueues || pipelineDispatch());
+    static const bool prebuildWhileWaiting = std::getenv("APS5_NO_WAIT_PIPELINE_PREBUILD") == nullptr;
+    if (waiting && !prebuildWhileWaiting) return;
+    const bool prebuildOnly = waiting || (submission.queue == 0 && (!allQueues || pipelineDispatch()));
     static const bool probing = std::getenv("APS5_PROBE_DISPATCH") != nullptr;
-    if (prebuildOnly && (!prebuildGraphicsQueue || probing || from < PrebuiltUntil())) return;
+    if (prebuildOnly && ((submission.queue == 0 && !prebuildGraphicsQueue) || probing || from < PrebuiltUntil())) return;
     if (!prebuildOnly && submission.queue == 0 && DrawPipeline::Depth() != 0 && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (submission.commands[from] >> 8u) & 0xffu, "group_ahead");
     auto& resolved = resolvedAhead();
     const auto localDevice = device.Load();

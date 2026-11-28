@@ -532,6 +532,7 @@ void Driver::execute(Submission& submission) {
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);
         } else if (opcode == 0x3c || opcode == 0x93) {
+            if (!Pm4::WaitSatisfiedUnchecked(packet)) timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor + count, true); });
             static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
             const auto waitStart = traceGpu ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received, submission.heldAtSubmit.contains(cursor), false, std::span<const std::uint32_t>(submission.commands).subspan(cursor + packet.size())); });
