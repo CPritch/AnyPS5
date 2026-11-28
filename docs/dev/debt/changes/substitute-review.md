@@ -1,0 +1,5 @@
+# libSceAgcDriver
+
+## change [placeholder image]
+
+- On a device without VK_EXT_robustness2's `nullDescriptor`, such as MoltenVK, a null image descriptor in a typed heap is a [placeholder image](../../../core/libs/prx/libSceAgcDriver/Graphics/src/PlaceholderImages.cpp) of that heap's type, 1×1 and cleared to zero, which every null descriptor of the heap shares. Reads give zeros, as `nullDescriptor` allows, except a sample outside the image through a border-clamped S#, which returns the border colour (opaque white on an RTX 5060 Laptop GPU) where the console returns 0 for a SEL_0 null T#. Stores and atomics to it are kept, so a later read of a null storage image can return them, and a depth comparison compares against depth 0. A heap whose placeholder the device cannot create, for example 1D or 3D depth, or multisampled storage without `shaderStorageImageMultisample`, throws when a null descriptor reaches it. Without 64-bit image atomics, the placeholder of the 64-bit atomic heap is R32G32_UINT, the view its images take there.
