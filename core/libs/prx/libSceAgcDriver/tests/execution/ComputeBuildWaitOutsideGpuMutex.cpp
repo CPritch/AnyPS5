@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -20,9 +21,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <initializer_list>
 #include <iostream>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -78,6 +81,14 @@ void ReleaseBuild() {
 
 void ReleaseBlocker() {
     BlockerReleased.store(true, std::memory_order_release);
+}
+
+void SetEnvironment(const char* name, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
 }
 
 std::uint32_t Low(const volatile void* pointer) {
@@ -154,6 +165,21 @@ bool WaitFor(Ready ready, std::chrono::milliseconds limit) {
 int main(int argc, char** argv) {
     using AgcDriver::VulkanDevice;
     std::thread locker;
+    const bool journal = argc == 2 && std::string_view(argv[1]) == "compute-queue-journal";
+    struct Cleanup {
+        std::filesystem::path directory;
+        ~Cleanup() {
+            std::error_code error;
+            if (!directory.empty()) std::filesystem::remove_all(directory, error);
+        }
+    } cleanup;
+    if (journal) {
+        cleanup.directory = std::filesystem::temp_directory_path() / ("aps5-compute-build-wait-journal-" + std::to_string(std::random_device{}()));
+        std::filesystem::create_directories(cleanup.directory);
+        SetEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
+        SetEnvironment("ANYPS5_SHADER_CACHE_DIR", cleanup.directory.string());
+        SetEnvironment("APS5_NO_PIPELINE_JOURNAL", "0");
+    }
     try {
         {
             const auto device = OpenVulkanTestDevice();
@@ -161,7 +187,7 @@ int main(int argc, char** argv) {
         }
         const bool indirect = argc == 2 && std::string_view(argv[1]) == "indirect";
         const bool unprebuilt = argc == 2 && std::string_view(argv[1]) == "unprebuilt";
-        const bool computeQueue = argc == 2 && std::string_view(argv[1]) == "compute-queue-wait";
+        const bool computeQueue = journal || (argc == 2 && std::string_view(argv[1]) == "compute-queue-wait");
         Require(argc == 1 || indirect || unprebuilt || computeQueue, "unknown fixture mode");
         Constants = NewBlock();
         Input = NewBlock();
@@ -187,6 +213,8 @@ int main(int argc, char** argv) {
         Require(Slots[1].output[0] == 0x9abcu, "the warm-up dispatch stored " + std::to_string(Slots[1].output[0]));
 
         std::vector<std::uint32_t> words;
+        if (journal) AgcDriver::Graphics::FlushPipelineJournal();
+        const auto journalBefore = AgcDriver::Graphics::PipelineJournalTotals().recordedCompute;
         if (computeQueue) {
             AgcDriver::DriverDetail::SubmitComputePrebuild([] {
                 BlockerStarted.store(true, std::memory_order_release);
@@ -209,6 +237,12 @@ int main(int argc, char** argv) {
         if (unprebuilt) Require(HeldBuilds.load(std::memory_order_acquire) == 0, "the pipeline of the dispatch behind the wait was built ahead with the queue 0 prebuild off");
         else if (computeQueue) Require(WaitFor([] { return HeldBuilds.load(std::memory_order_acquire) != 0; }, std::chrono::seconds(20)), "the compute pipeline of a dispatch behind a compute queue's unsatisfied wait did not start building on the prebuild pool while the queue waited, with an unawaited compute prebuild holding the pool's other budgeted slot");
         else Require(WaitFor([] { return HeldBuilds.load(std::memory_order_acquire) != 0; }, std::chrono::seconds(20)), "the prebuild pool did not start building the pipeline of the dispatch behind the wait");
+        if (journal) {
+            Require(AgcDriver::Graphics::PipelineJournalEnabled(), "the pipeline journal is off in the journal fixture");
+            AgcDriver::Graphics::FlushPipelineJournal();
+            const auto recorded = AgcDriver::Graphics::PipelineJournalTotals().recordedCompute - journalBefore;
+            Require(recorded != 0, "the compute pipeline of a dispatch resolved ahead was not recorded in the pipeline journal before its build ran");
+        }
 
         const auto before = VulkanDevice::ComputePipelineCounts();
         Gate = 1;
@@ -239,7 +273,7 @@ int main(int argc, char** argv) {
         Require(HeldBuilds.load(std::memory_order_acquire) == 1, "the pipeline of the dispatch behind the wait was built " + std::to_string(HeldBuilds.load()) + " times");
         ReleaseBlocker();
         VulkanDevice::SetComputePipelineBuildHookForTest(nullptr);
-        std::cout << "compute build wait outside GPU mutex test passed (" << (indirect ? "indirect" : unprebuilt ? "unprebuilt" : computeQueue ? "compute queue" : "direct") << " dispatch, GPU-resolved images " << (AgcDriver::Graphics::DescriptorHeapEnabled() ? "on" : "off") << ")\n";
+        std::cout << "compute build wait outside GPU mutex test passed (" << (indirect ? "indirect" : unprebuilt ? "unprebuilt" : journal ? "compute queue, journal" : computeQueue ? "compute queue" : "direct") << " dispatch, GPU-resolved images " << (AgcDriver::Graphics::DescriptorHeapEnabled() ? "on" : "off") << ")\n";
         AgcDriverShutdown_nid_postfix();
         return 0;
     } catch (const std::exception& error) {

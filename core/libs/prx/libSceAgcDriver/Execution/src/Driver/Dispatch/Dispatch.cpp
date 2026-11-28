@@ -79,6 +79,7 @@ bool AwaitPipelineAhead(VulkanDevice& device, const ShaderRecompiler::RecompileR
 
 void StartComputePipelineAhead(const std::shared_ptr<VulkanDevice>& device, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, std::uint64_t address) {
     if (device == nullptr || result == nullptr) return;
+    device->RecordComputePipelineAhead(*result);
     if (result->spirv.size() < AsyncComputePipelineWords()) {
         if (!device->HasComputePipeline(*result)) {
             SubmitComputePrebuild([device, result, address] {
@@ -863,6 +864,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (AsyncDrawCompile()) {
             StartComputePipelineAhead(localDevice, compiledResult, address);
         } else if (!cached && compiledResult != nullptr && !localDevice->HasComputePipeline(*compiledResult)) {
+            localDevice->RecordComputePipelineAhead(*compiledResult);
             SubmitComputePrebuild([localDevice, compiledResult, address] {
                 try { localDevice->PrebuildComputePipeline(*compiledResult, address, true); } catch (const std::exception&) {}
             }, true);

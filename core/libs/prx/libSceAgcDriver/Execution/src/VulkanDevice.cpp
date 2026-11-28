@@ -3340,6 +3340,12 @@ bool VulkanDevice::ReplayComputePipeline(const ShaderRecompiler::RecompileResult
     return true;
 }
 
+void VulkanDevice::RecordComputePipelineAhead(const ShaderRecompiler::RecompileResult& shader) const {
+    if (!Graphics::PipelineJournalEnabled() || state->probingFloatControls || HasComputePipeline(shader)) return;
+    const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
+    Graphics::RecordComputePipeline(shader, Graphics::PushConstantStages(shaders) != 0);
+}
+
 bool VulkanDevice::HasComputePipeline(const ShaderRecompiler::RecompileResult& shader) const {
     const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
     const auto key = ComputePipelineKey::Of(shader, Graphics::PushConstantStages(shaders) != 0);
