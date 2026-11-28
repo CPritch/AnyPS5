@@ -257,6 +257,8 @@ function(add_shader_recompiler target runtimeTarget)
     endif()
     set(shaderCacheReviewedNames
             GpuModeImageStage
+            ResourcePlanTotals
+            ResultMemoBytes
             HeapCache
             HeapCacheEnabled
             HeapCacheLegacyBypassed
