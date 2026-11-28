@@ -347,6 +347,42 @@ void DispatchSample(AgcDriver::VulkanDevice& device, const char* what) {
     RequireSampled(SampleOutput.data(), SampleTexel, what);
 }
 
+void StorePagesVariantTests() {
+    using namespace NarrowConstantStoreFixture;
+    Block compute(BlockBytes);
+    const auto computeCode = ComputeCode(0);
+    const auto address = reinterpret_cast<std::uintptr_t>(computeCode.data());
+    const auto run = [&](AgcDriver::VulkanDevice& device, const char* what) {
+        std::memset(compute.data, Fill, compute.bytes);
+        const auto words = AddressWords(compute);
+        const auto result = CompileCompute(device, computeCode, words, 32);
+        auto prepared = device.PrepareDispatch(result, {}, Threads, address);
+        Require(prepared != nullptr, std::string(what) + ": the constant store dispatch was not prepared");
+        device.Dispatch(result, 1, 1, 1, {}, address, std::move(prepared));
+        device.WaitIdle();
+        ExpectConstantStore(compute, what);
+    };
+    {
+        const auto device = OpenVulkanTestDevice();
+        Require(device != nullptr, "the first device is required once the second opened");
+        device->WaitForPipelineJournalReplay();
+        run(*device, "first run: the prepared constant store dispatch");
+        Require(device->ComputePipelinesCreated() == 2, "the first run's prepared store dispatch built " + std::to_string(device->ComputePipelinesCreated()) + " compute pipelines, expected its own and its store-page variant");
+        AgcDriver::Graphics::FlushPipelineJournal();
+        Require(Snapshot().journal.recordedCompute == 2, "the first run did not record the compute pipeline and its store-page variant");
+    }
+    {
+        const auto device = OpenVulkanTestDevice();
+        Require(device != nullptr, "the second device could not be opened");
+        device->WaitForPipelineJournalReplay();
+        const auto replayed = Snapshot();
+        Require(replayed.journal.replayFailed == 0 && replayed.journal.replayRejected == 0, "the replay of the compute pipeline and its store-page variant failed");
+        Require(device->ComputePipelinesCreated() == 2, "the replay built " + std::to_string(device->ComputePipelinesCreated()) + " compute pipelines, expected the recorded pipeline and its store-page variant");
+        run(*device, "second run: the prepared constant store dispatch");
+        Require(device->ComputePipelinesCreated() == 2, "the second run's prepared store dispatch built a compute pipeline or store-page variant the replay had built");
+    }
+}
+
 void HeapJournalTests() {
     FillTexels(SampleTexture, SampleTexel);
     {
@@ -1099,6 +1135,11 @@ int main(int argc, char** argv) {
             if (AgcDriver::Graphics::GpuHeapEnabled() && SkipWithoutDescriptorHeap()) return VulkanTestSkipped;
             HeapJournalTests();
             std::puts("pipeline journal record and replay of a GPU-mode compute stage passed");
+            return 0;
+        }
+        if (argc >= 2 && std::string(argv[1]) == "--store-pages-variant") {
+            StorePagesVariantTests();
+            std::puts("pipeline journal record and replay of a store-page variant passed");
             return 0;
         }
         if (argc >= 2 && std::string(argv[1]) == "--undecodable-module") {

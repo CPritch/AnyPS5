@@ -582,6 +582,7 @@ struct LoadedEntry {
     GraphicsPipelineRecipe graphics;
     ShaderRecompiler::PipelineIdentity compute;
     bool pushConstants = false;
+    bool storePagesVariant = false;
 };
 
 struct LoadedJournal {
@@ -848,7 +849,7 @@ public:
         enqueue(std::move(pending));
     }
 
-    void RecordCompute(const ShaderRecompiler::RecompileResult& shader, bool pushConstants) {
+    void RecordCompute(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, bool storePagesVariant) {
         if (!Enabled() || !bound.load(std::memory_order_acquire)) return;
         const auto identity = DescribedPipelineIdentity(shader);
         if (identity.Empty()) return;
@@ -859,6 +860,7 @@ public:
         writer.U64(identity.low);
         writer.U64(identity.high);
         writer.Bool(pushConstants);
+        if (storePagesVariant) writer.Bool(true);
         enqueue(std::move(pending));
     }
 
@@ -1003,6 +1005,7 @@ private:
                             entry.compute.low = reader.U64();
                             entry.compute.high = reader.U64();
                             entry.pushConstants = reader.Bool();
+                            if (!reader.Done()) entry.storePagesVariant = reader.Bool();
                             decoded = reader.Done();
                         }
                         if (decoded) loaded.entries.push_back(std::move(entry));
@@ -1523,7 +1526,7 @@ private:
                 counters.rejected.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
-            (hooks.compute(*result, entry.pushConstants) ? counters.compute : counters.present).fetch_add(1, std::memory_order_relaxed);
+            (hooks.compute(*result, entry.pushConstants, entry.storePagesVariant) ? counters.compute : counters.present).fetch_add(1, std::memory_order_relaxed);
             return;
         }
         std::vector<const std::pair<const ShaderRecompiler::PipelineIdentity, LoadedModule>*> modules;
@@ -1725,8 +1728,8 @@ void RecordGraphicsPipeline(const GraphicsPipelineRecipe& recipe, std::span<cons
     Journal::Instance().RecordGraphics(recipe, shaders);
 }
 
-void RecordComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants) {
-    Journal::Instance().RecordCompute(shader, pushConstants);
+void RecordComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, bool storePagesVariant) {
+    Journal::Instance().RecordCompute(shader, pushConstants, storePagesVariant);
 }
 
 void FlushPipelineJournal() {

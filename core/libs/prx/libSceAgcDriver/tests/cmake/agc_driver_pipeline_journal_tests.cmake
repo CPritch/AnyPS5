@@ -15,6 +15,8 @@ if(BUILD_TESTING)
     endif()
     agc_add_env_test(agc_driver_pipeline_journal_gpu_heap agc_driver_pipeline_journal_tests
             ARGS --gpu-heap ENV APS5_GPU_HEAP=1 TIMEOUT 30)
+    agc_add_env_test(agc_driver_pipeline_journal_store_pages_variant agc_driver_pipeline_journal_tests
+            ARGS --store-pages-variant ENV ANYPS5_NO_SHADER_CACHE=1 TIMEOUT 60)
     add_test(NAME agc_driver_pipeline_journal_build_trace COMMAND agc_driver_pipeline_journal_tests --build-trace)
     set_tests_properties(agc_driver_pipeline_journal_build_trace PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TRACE_PIPELINE_BUILDS=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
             FAIL_REGULAR_EXPRESSION "SYNC-HAZARD-|VUID-|was not found but was requested by env var VK_INSTANCE_LAYERS")

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirror.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -587,6 +588,34 @@ void StorePagesOutsideMutexTest(AgcDriver::VulkanDevice& device) {
     Require(after.underGpuMutex == before.underGpuMutex, "BDA store heap mirror: recording a prepared store into a heap mirror created " + std::to_string(after.underGpuMutex - before.underGpuMutex) + " compute pipeline(s) under the GPU mutex");
 }
 
+void StorePagesAheadTest(AgcDriver::VulkanDevice& device, bool replayed) {
+    GuestHeap heap(true);
+    const ImportBudget budget(AgcDriver::Graphics::HostImportLiveBytes() + Block);
+    const auto userData = AddressData(heap.Address() + StoreOffset);
+    const auto result = Compile(device, StoreCode, userData);
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(StoreCode.data()));
+    const auto start = AgcDriver::VulkanDevice::ComputePipelineCounts();
+    const char* how = replayed ? "replayed from the pipeline journal" : "built ahead on the prebuild pool";
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &result, 0}}};
+    if (replayed) Require(device.ReplayComputePipeline(result, AgcDriver::Graphics::PushConstantStages(shaders) != 0, true), std::string("BDA store heap mirror: the store pipeline was not ") + how);
+    else device.PrebuildComputePipeline(result, address, true);
+    const auto ahead = AgcDriver::VulkanDevice::ComputePipelineCounts();
+    Require(ahead.created - start.created == 2, std::string("BDA store heap mirror: the store pipeline ") + how + " created " + std::to_string(ahead.created - start.created) + " compute pipeline(s), expected its own and its store-page variant");
+    auto prepared = device.PrepareDispatch(result, {}, Threads, address);
+    Require(prepared != nullptr, "BDA store heap mirror: the store dispatch was not prepared outside the GPU mutex");
+    StderrCapture log;
+    {
+        std::unique_lock gpuLock(AgcDriver::GuestMemory::GpuMutex());
+        device.Dispatch(result, 1, 1, 1, {}, address, std::move(prepared));
+    }
+    device.WaitIdle();
+    const auto text = log.Finish();
+    const auto after = AgcDriver::VulkanDevice::ComputePipelineCounts();
+    RequireAccepted(text, "a store into a heap mirror whose pipeline was built ahead");
+    for (std::uint32_t thread = 0; thread < Threads; ++thread) Require(heap.Load(StoreOffset + thread * sizeof(std::uint32_t)) == Stored(thread), "BDA store heap mirror: the store of thread " + std::to_string(thread) + " did not reach guest memory");
+    Require(after.created == ahead.created, std::string("BDA store heap mirror: a store whose pipeline was ") + how + " created " + std::to_string(after.created - ahead.created) + " more compute pipeline(s) when it was prepared and recorded");
+}
+
 void StorePageTests(AgcDriver::VulkanDevice& device) {
     const auto slots = AgcDriver::Graphics::BdaResources::StorePageSlots();
     Require(slots == Threads, "BDA store heap mirror: the store page test needs " + std::to_string(Threads) + " store pages (APS5_BDA_STORE_PAGES), the driver has " + std::to_string(slots));
@@ -746,6 +775,8 @@ int main(int argc, char** argv) {
         const bool storePages = argc > 1 && std::string_view(argv[1]) == "--store-pages";
         const bool storePagesDefault = argc > 1 && std::string_view(argv[1]) == "--store-pages-default";
         const bool outsideMutex = argc > 1 && std::string_view(argv[1]) == "--store-pages-outside-mutex";
+        const bool prebuilt = argc > 1 && std::string_view(argv[1]) == "--store-pages-prebuilt";
+        const bool replayed = argc > 1 && std::string_view(argv[1]) == "--store-pages-replayed";
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
 #ifdef _WIN32
@@ -776,6 +807,11 @@ int main(int argc, char** argv) {
         if (outsideMutex) {
             StorePagesOutsideMutexTest(*device);
             std::puts("BDA store heap mirror store pages outside the GPU mutex test passed");
+            return 0;
+        }
+        if (prebuilt || replayed) {
+            StorePagesAheadTest(*device, replayed);
+            std::puts(replayed ? "BDA store heap mirror store pages replayed test passed" : "BDA store heap mirror store pages prebuilt test passed");
             return 0;
         }
         if (storePagesDefault) {
