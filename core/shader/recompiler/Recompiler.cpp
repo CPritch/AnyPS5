@@ -26,6 +26,7 @@
 #include "ShaderDiskCache.hpp"
 #include <list>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <set>
@@ -36,6 +37,7 @@
 #include <shared_mutex>
 #include <system_error>
 #include <thread>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include "ControlFlow/include/ControlFlow/GraphBuilder.hpp"
@@ -1652,9 +1654,11 @@ bool persistedSubstitutesEnabled() {
     return enabled;
 }
 
+constexpr std::size_t BufferSubstituteWords = 5;
+
 std::vector<std::uint32_t> encodeSubstitutes(std::span<const BufferSubstitute> slots) {
     std::vector<std::uint32_t> words;
-    words.reserve(slots.size() * 5u);
+    words.reserve(slots.size() * BufferSubstituteWords);
     for (const auto& slot : slots) {
         for (const auto word : {slot.word1, slot.word3, slot.misalignment, slot.tail, slot.known ? 1u : 0u}) words.push_back(word);
     }
@@ -1662,10 +1666,10 @@ std::vector<std::uint32_t> encodeSubstitutes(std::span<const BufferSubstitute> s
 }
 
 std::optional<std::vector<BufferSubstitute>> decodeSubstitutes(std::span<const std::uint32_t> words, std::size_t slots) {
-    if (words.size() != slots * 5u) return std::nullopt;
+    if (words.size() != slots * BufferSubstituteWords) return std::nullopt;
     std::vector<BufferSubstitute> decoded(slots);
     for (std::size_t slot = 0; slot < slots; ++slot) {
-        const auto at = words.subspan(slot * 5u, 5u);
+        const auto at = words.subspan(slot * BufferSubstituteWords, BufferSubstituteWords);
         if (at[4] > 1u) return std::nullopt;
         decoded[slot] = {at[0], at[1], at[2], at[3], at[4] != 0u};
     }
@@ -1678,8 +1682,70 @@ void persistSubstitutes(const BufferSubstituteTable& table) {
     ShaderDiskCache::StoreSubstitutes(table.DiskKey(), encodeSubstitutes(slots));
 }
 
+bool imageSubstitutesEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_IMAGE_SUBSTITUTES") == nullptr;
+    return enabled;
+}
+
+bool persistedImageSubstitutesEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_PERSISTED_IMAGE_SUBSTITUTES") == nullptr;
+    return enabled;
+}
+
+constexpr std::size_t ImageSubstituteWords = 9;
+
+std::vector<std::uint32_t> encodeImageSubstitutes(std::span<const ImageSubstitute> slots) {
+    std::vector<std::uint32_t> words;
+    words.reserve(slots.size() * ImageSubstituteWords);
+    for (const auto& slot : slots) {
+        words.insert(words.end(), slot.words.begin(), slot.words.end());
+        words.push_back(slot.known ? 1u : 0u);
+    }
+    return words;
+}
+
+std::vector<ImageSubstitute> decodeImageSubstitutes(std::span<const std::uint32_t> words, const ShaderInfo& info) {
+    const auto slots = info.images.size();
+    std::vector<ImageSubstitute> decoded(slots);
+    if (words.size() != slots * ImageSubstituteWords) return decoded;
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        const auto at = words.subspan(slot * ImageSubstituteWords, ImageSubstituteWords);
+        if (at[8] != 1u) continue;
+        DescriptorValue descriptor;
+        std::copy_n(at.begin(), descriptor.dwords.size(), descriptor.dwords.begin());
+        descriptor.dwordCount = 8u;
+        descriptor.availableDwordMask = 0xffu;
+        if (auto learned = LearnedImageSubstitute(info, slot, descriptor)) decoded[slot] = *learned;
+    }
+    return decoded;
+}
+
+void persistImageSubstitutes(const ImageSubstituteTable& table) {
+    if (table.DiskKey().empty()) return;
+    const auto slots = table.Slots();
+    ShaderDiskCache::StoreSubstitutes(table.DiskKey(), encodeImageSubstitutes(slots));
+}
+
+std::vector<ImageSubstitute> imageSubstituteSlots(const CompiledVariant& variant) {
+    if (!imageSubstitutesEnabled() || variant.imageSubstitutes == nullptr || variant.artifact.registrationModule || variant.imageSubstitutes->Learned() == 0u) return {};
+    return variant.imageSubstitutes->Slots();
+}
+
+void learnImageSubstitutes(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const ImageSubstitute> known) {
+    auto* table = variant.imageSubstitutes.get();
+    const auto& images = variant.info.info.images;
+    if (table == nullptr || !imageSubstitutesEnabled() || variant.artifact.registrationModule || table->Learned() >= images.size()) return;
+    for (std::size_t index = 0; index < images.size() && index < snapshot.images.size(); ++index) {
+        if (index < known.size() && known[index].known) continue;
+        const auto& descriptor = snapshot.images[index];
+        if (descriptor.dwordCount != 8u || (descriptor.dwords[3] & 04444u) != 04444u) continue;
+        const auto learned = LearnedImageSubstitute(variant.info.info, index, descriptor);
+        if (learned && table->Learn(index, *learned)) persistImageSubstitutes(*table);
+    }
+}
+
 template<typename TVisit>
-void visitBindingPlanKey(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, std::span<const BufferSubstitute> substitutes, TVisit&& visit) {
+void visitBindingPlanKey(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, std::span<const BufferSubstitute> substitutes, std::span<const ImageSubstitute> imageSubstitutes, TVisit&& visit) {
     visit(variant.artifact.variantId);
     for (std::size_t index = 0; index < variant.info.info.buffers.size(); ++index) {
         const auto& descriptor = snapshot.buffers.at(index);
@@ -1695,6 +1761,12 @@ void visitBindingPlanKey(const CompiledVariant& variant, const ResourceSnapshot&
         visit(descriptor.dwords[0] != 0u || (descriptor.dwords[1] & 0xffu) != 0u);
         visit(descriptor.dwords[1] & ~0xffu);
         for (std::size_t word = 2; word < 8; ++word) visit(descriptor.dwords[word]);
+        const auto* substitute = AppliedImageSubstitute(imageSubstitutes, index, descriptor);
+        visit(substitute != nullptr);
+        if (substitute == nullptr) continue;
+        visit(substitute->words[0] != 0u || (substitute->words[1] & 0xffu) != 0u);
+        visit(substitute->words[1] & ~0xffu);
+        for (std::size_t word = 2; word < 8; ++word) visit(substitute->words[word]);
     }
     for (std::size_t index = 0; index < variant.info.info.samplers.size(); ++index) {
         const auto& descriptor = snapshot.samplers.at(index);
@@ -1705,15 +1777,15 @@ void visitBindingPlanKey(const CompiledVariant& variant, const ResourceSnapshot&
     for (const auto mapping : exports) visit(mapping);
 }
 
-void bindingPlanKey(std::vector<std::uint64_t>& key, const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, std::span<const BufferSubstitute> substitutes) {
+void bindingPlanKey(std::vector<std::uint64_t>& key, const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, std::span<const BufferSubstitute> substitutes, std::span<const ImageSubstitute> imageSubstitutes) {
     key.clear();
-    visitBindingPlanKey(variant, snapshot, exports, substitutes, [&](std::uint64_t word) { key.push_back(word); });
+    visitBindingPlanKey(variant, snapshot, exports, substitutes, imageSubstitutes, [&](std::uint64_t word) { key.push_back(word); });
 }
 
-std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet, std::span<const BufferSubstitute> substitutes, bool shaderImageMinLod) {
+std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet, std::span<const BufferSubstitute> substitutes, bool shaderImageMinLod, std::span<const ImageSubstitute> imageSubstitutes) {
     struct BindingPlanKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, BindingPlanKeyStorage>();
-    bindingPlanKey(key, variant, snapshot, exports, substitutes);
+    bindingPlanKey(key, variant, snapshot, exports, substitutes, imageSubstitutes);
     static PrimedSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
@@ -1728,7 +1800,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     runOnce(*plan, [&] {
         try {
-            plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports, variant.artifact.registrationModule, fragmentDescriptorSet, substitutes, shaderImageMinLod);
+            plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports, variant.artifact.registrationModule, fragmentDescriptorSet, substitutes, shaderImageMinLod, imageSubstitutes);
         } catch (...) {
             plan->failure = std::current_exception();
         }
@@ -1738,6 +1810,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
         const auto& descriptor = snapshot.buffers.at(index);
         if (!substitutes[index].known && BufferDescriptorPresent(descriptor) && variant.substitutes->Learn(index, BufferSpecializationFields(descriptor, {}, index))) persistSubstitutes(*variant.substitutes);
     }
+    learnImageSubstitutes(variant, snapshot, imageSubstitutes);
     return plan;
 }
 
@@ -1845,9 +1918,11 @@ bool declaresAtomicLockTable(std::span<const std::uint32_t> words) {
     return false;
 }
 
-RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& captured, bool registrationDefaults = false, UsedBindingPlan* usedPlan = nullptr, MemoPatch* patch = nullptr, const std::vector<BufferSubstitute>* substituteSnapshot = nullptr) {
+RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& captured, bool registrationDefaults = false, UsedBindingPlan* usedPlan = nullptr, MemoPatch* patch = nullptr, const std::vector<BufferSubstitute>* substituteSnapshot = nullptr, const std::vector<ImageSubstitute>* imageSubstituteSnapshot = nullptr) {
     const auto localSubstitutes = substituteSnapshot == nullptr && bufferSubstitutesEnabled() && variant.substitutes != nullptr ? variant.substitutes->Slots() : std::vector<BufferSubstitute>{};
     const auto substitutes = substituteSnapshot != nullptr ? std::span<const BufferSubstitute>(*substituteSnapshot) : std::span<const BufferSubstitute>(localSubstitutes);
+    const auto localImageSubstitutes = imageSubstituteSnapshot == nullptr ? imageSubstituteSlots(variant) : std::vector<ImageSubstitute>{};
+    const auto imageSubstitutes = imageSubstituteSnapshot != nullptr ? std::span<const ImageSubstitute>(*imageSubstituteSnapshot) : std::span<const ImageSubstitute>(localImageSubstitutes);
     ResourceSnapshot merged;
     const auto& snapshot = mergeTargetImage(variant, request, captured, registrationDefaults, merged);
     RecompileResult result;
@@ -1903,7 +1978,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         const auto index = reg - request.context.userDataBaseRegister;
         result.userDataRegisterReads |= reg >= request.context.userDataBaseRegister && index < 64u ? std::uint64_t{1} << index : ~std::uint64_t{0};
     }
-    const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules, substitutes, request.target.shaderImageMinLod);
+    const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules, substitutes, request.target.shaderImageMinLod, imageSubstitutes);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
     struct LocalModuleKeyStorage {};
@@ -2110,7 +2185,49 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
 
+std::vector<std::byte> substituteDiskKey(std::string_view tag, std::initializer_list<std::uint64_t> values) {
+    std::vector<std::byte> diskKey(tag.size());
+    std::memcpy(diskKey.data(), tag.data(), tag.size());
+    for (const auto value : values) {
+        const auto offset = diskKey.size();
+        diskKey.resize(offset + sizeof(value));
+        std::memcpy(diskKey.data() + offset, &value, sizeof(value));
+    }
+    return diskKey;
+}
+
+void attachImageSubstitutes(CompiledVariant& variant) {
+    const auto& info = variant.info.info;
+    const auto slots = info.images.size();
+    if (slots == 0u || variant.artifact.spirv.empty() || variant.artifact.registrationModule || !imageSubstitutesEnabled()) return;
+    std::uint64_t eligible = 0xcbf29ce484222325ull;
+    bool any = false;
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        const bool slotEligible = ImageSubstituteEligible(info, slot);
+        any |= slotEligible;
+        eligible = (eligible ^ (slotEligible ? slot + 1u : 0u)) * 0x100000001b3ull;
+    }
+    if (!any) return;
+    const auto hash = variant.artifact.spirv.ContentHash();
+    static std::mutex mutex;
+    static std::map<std::tuple<std::uint64_t, std::uint64_t, std::size_t, std::uint64_t>, std::shared_ptr<ImageSubstituteTable>> tables;
+    std::lock_guard lock(mutex);
+    auto& table = tables[{hash.low, hash.high, slots, eligible}];
+    if (table == nullptr) {
+        std::vector<ImageSubstitute> initial(slots);
+        std::vector<std::byte> diskKey;
+        if (persistedImageSubstitutesEnabled() && ShaderDiskCache::Enabled()) {
+            diskKey = substituteDiskKey("image-substitutes", {hash.low, hash.high, static_cast<std::uint64_t>(slots), eligible});
+            std::vector<std::uint32_t> words;
+            if (ShaderDiskCache::LoadSubstitutes(diskKey, ImageSubstituteWords, words)) initial = decodeImageSubstitutes(words, info);
+        }
+        table = std::make_shared<ImageSubstituteTable>(std::move(initial), std::move(diskKey));
+    }
+    variant.imageSubstitutes = table;
+}
+
 void attachSubstitutes(CompiledVariant& variant) {
+    attachImageSubstitutes(variant);
     const auto slots = variant.info.info.buffers.size();
     if (slots == 0u || variant.artifact.spirv.empty()) return;
     const auto hash = variant.artifact.spirv.ContentHash();
@@ -2122,16 +2239,9 @@ void attachSubstitutes(CompiledVariant& variant) {
         std::vector<BufferSubstitute> initial(slots);
         std::vector<std::byte> diskKey;
         if (persistedSubstitutesEnabled() && bufferSubstitutesEnabled() && ShaderDiskCache::Enabled()) {
-            constexpr std::string_view tag = "buffer-substitutes";
-            diskKey.resize(tag.size());
-            std::memcpy(diskKey.data(), tag.data(), tag.size());
-            for (const std::uint64_t value : {hash.low, hash.high, static_cast<std::uint64_t>(slots)}) {
-                const auto offset = diskKey.size();
-                diskKey.resize(offset + sizeof(value));
-                std::memcpy(diskKey.data() + offset, &value, sizeof(value));
-            }
+            diskKey = substituteDiskKey("buffer-substitutes", {hash.low, hash.high, static_cast<std::uint64_t>(slots)});
             std::vector<std::uint32_t> words;
-            if (ShaderDiskCache::LoadSubstitutes(diskKey, words)) {
+            if (ShaderDiskCache::LoadSubstitutes(diskKey, BufferSubstituteWords, words)) {
                 if (auto decoded = decodeSubstitutes(words, slots)) initial = std::move(*decoded);
             }
         }
@@ -2594,7 +2704,7 @@ struct SnapshotHashScope {
     bool descriptors = true;
 };
 
-std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot, SnapshotHashScope scope = {}, std::span<const BufferSubstitute> substitutes = {}) {
+std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot, SnapshotHashScope scope = {}, std::span<const BufferSubstitute> substitutes = {}, std::span<const ImageSubstitute> imageSubstitutes = {}) {
     std::uint64_t hash = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
         hash ^= value;
@@ -2635,6 +2745,12 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
             }
         }
         mixDescriptors(snapshot.images);
+        for (std::size_t index = 0; index < imageSubstitutes.size() && index < snapshot.images.size(); ++index) {
+            const auto* substitute = AppliedImageSubstitute(imageSubstitutes, index, snapshot.images[index]);
+            if (substitute == nullptr) continue;
+            mix(index);
+            for (const auto word : substitute->words) mix(word);
+        }
         mixDescriptors(snapshot.samplers);
     }
     mix(snapshot.registeredImages.size());
@@ -2749,7 +2865,8 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto variantId = variant->artifact.variantId;
     const auto substitutes = bufferSubstitutesEnabled() && variant->substitutes != nullptr ? variant->substitutes->Slots() : std::vector<BufferSubstitute>{};
-    const auto hash = snapshotHash(request, snapshot, {}, substitutes);
+    const auto imageSubstitutes = imageSubstituteSlots(*variant);
+    const auto hash = snapshotHash(request, snapshot, {}, substitutes, imageSubstitutes);
     const auto index = (variantId * 0x9e3779b97f4a7c15ull) ^ hash;
     auto& counters = resultMemoCounters();
     const auto acquire = [&](std::unique_lock<std::mutex>& lock) {
@@ -2777,7 +2894,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         }
     }
     const bool masking = MaskedResultMemo();
-    const auto maskedHash = masking ? snapshotHash(request, snapshot, {.masked = true}, substitutes) : 0u;
+    const auto maskedHash = masking ? snapshotHash(request, snapshot, {.masked = true}, substitutes, imageSubstitutes) : 0u;
     const auto maskedIndex = (variantId * 0x9e3779b97f4a7c15ull) ^ maskedHash;
     std::shared_ptr<const RecompileResult> donor;
     std::shared_ptr<const MemoPatch> donorPatch;
@@ -2802,12 +2919,12 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     if (donor != nullptr) {
         result = std::make_shared<RecompileResult>(*donor);
         applyMemoPatch(*result, *donorPatch, snapshot);
-        if (VerifyMaskedResultMemo()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot, false, nullptr, nullptr, &substitutes), variantId);
+        if (VerifyMaskedResultMemo()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot, false, nullptr, nullptr, &substitutes, &imageSubstitutes), variantId);
         if (profile) counters.patchNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         counters.patched.fetch_add(1, std::memory_order_relaxed);
     } else {
         if (masking) patch = std::make_shared<MemoPatch>();
-        result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, nullptr, patch.get(), &substitutes));
+        result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, nullptr, patch.get(), &substitutes, &imageSubstitutes));
         if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         counters.misses.fetch_add(1, std::memory_order_relaxed);
     }
@@ -3127,10 +3244,10 @@ bool AllEmpty(const std::vector<std::vector<std::uint32_t>>& words) {
     return std::all_of(words.begin(), words.end(), [](const std::vector<std::uint32_t>& descriptor) { return descriptor.empty(); });
 }
 
-std::uint64_t HeapTemplateKey(const RecompileRequest& request, const CompiledVariant& variant, const ResourceSnapshot& snapshot, bool perDrawBindings, std::span<const BufferSubstitute> substitutes) {
-    std::uint64_t key = snapshotHash(request, snapshot, {.perDrawData = false, .descriptors = !perDrawBindings}, substitutes) ^ variant.artifact.variantId * 0x9e3779b97f4a7c15ull;
+std::uint64_t HeapTemplateKey(const RecompileRequest& request, const CompiledVariant& variant, const ResourceSnapshot& snapshot, bool perDrawBindings, std::span<const BufferSubstitute> substitutes, std::span<const ImageSubstitute> imageSubstitutes) {
+    std::uint64_t key = snapshotHash(request, snapshot, {.perDrawData = false, .descriptors = !perDrawBindings}, substitutes, imageSubstitutes) ^ variant.artifact.variantId * 0x9e3779b97f4a7c15ull;
     if (perDrawBindings) {
-        visitBindingPlanKey(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, substitutes, [&](std::uint64_t word) { key = (key ^ word) * 0x100000001b3ull; });
+        visitBindingPlanKey(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, substitutes, imageSubstitutes, [&](std::uint64_t word) { key = (key ^ word) * 0x100000001b3ull; });
     }
     return key;
 }
@@ -3219,9 +3336,10 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeHeap
     static thread_local std::vector<BufferSubstitute> substitutes;
     substitutes.clear();
     if (bufferSubstitutesEnabled() && variant->substitutes != nullptr) variant->substitutes->CopySlots(substitutes);
+    const auto imageSubstitutes = imageSubstituteSlots(*variant);
     ResourceSnapshot mergedStorage;
     const auto& merged = mergeTargetImage(*variant, request, snapshot, false, mergedStorage);
-    const std::uint64_t key = HeapTemplateKey(request, *variant, merged, perDrawBindings, substitutes);
+    const std::uint64_t key = HeapTemplateKey(request, *variant, merged, perDrawBindings, substitutes, imageSubstitutes);
     const auto complete = [&](const std::shared_ptr<const HeapTemplate>& shared) {
         HeapVertexAttributes(request, *shared->result, words);
         if (perDrawBindings) HeapBindingWords(request, *variant, merged, *shared, words);
@@ -3257,7 +3375,7 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeHeap
         return nullptr;
     }
     UsedBindingPlan usedPlan;
-    auto built = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, &usedPlan, nullptr, &substitutes));
+    auto built = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, &usedPlan, nullptr, &substitutes, &imageSubstitutes));
     built->cacheHit = true;
     if (built->deviceImageTables) built->deviceImagePlan = capture.plan;
     for (const auto reg : layout.userDataRegisters) built->heapUserWords.push_back(reg - userDataBase);
@@ -3342,7 +3460,8 @@ PreparedShaderInvocation PreparedShaderInvocation::Rebound(const RecompileReques
 std::uint64_t PreparedShaderInvocation::SnapshotKey(const ResourceCapture& capture) const {
     if (capture.source != handle->source) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     const auto substitutes = bufferSubstitutesEnabled() && handle->artifact->substitutes != nullptr ? handle->artifact->substitutes->Slots() : std::vector<BufferSubstitute>{};
-    std::uint64_t key = snapshotHash(request, capture.snapshot, {}, substitutes);
+    const auto imageSubstitutes = imageSubstituteSlots(*handle->artifact);
+    std::uint64_t key = snapshotHash(request, capture.snapshot, {}, substitutes, imageSubstitutes);
     for (const std::uint64_t value : {static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handle.get())), static_cast<std::uint64_t>(handle->artifact->artifact.variantId), static_cast<std::uint64_t>(request.layout.descriptorSet), static_cast<std::uint64_t>(request.layout.pushConstantSizeBytes)}) {
         key ^= value;
         key *= 0x100000001b3ull;

@@ -1602,6 +1602,148 @@ void verifySubstitutesAcrossProcesses(const std::filesystem::path& self) {
     require(RunSelf(self, "--learned-substitutes") == 0, "the process that reads the persisted buffer substitute failed");
 }
 
+constexpr std::uint32_t ImageSwizzleXyzw = 0xfacu;
+constexpr std::uint32_t ImageSwizzleXyz1 = 0x3acu;
+constexpr std::uint32_t ImageFormat8888UNorm = 56u;
+constexpr std::uint32_t ImageFormat32UInt = 20u;
+constexpr std::array<std::uint32_t, 8> NullImage{};
+
+std::array<std::uint32_t, 8> ImageDescriptor(std::uint32_t swizzle, std::uint32_t format = ImageFormat8888UNorm) {
+    return {0x00100000u, format << 20u, 0u, swizzle | (9u << 28u), 0u, 0u, 0u, 0u};
+}
+
+struct ImageRequest {
+    std::vector<std::uint32_t> code;
+    std::array<std::uint32_t, 16> userData{};
+    std::array<std::uint32_t, 6> capabilities{1u, 11u, 5347u, 4448u, 43u, 50u};
+    std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    RecompileRequest request{};
+
+    ImageRequest(std::uint32_t marker, bool load) {
+        if (load) code = {0x7e020280u, 0x7e040280u, 0xf0001f08u, 0x00000401u};
+        else code = {0x7e0202f0u, 0x7e0402f0u, 0xf09c0f08u, 0x00400401u};
+        code.insert(code.end(), {0xbf8c3f70u, 0x34060084u, 0xe0781000u + marker * 16u, 0x80030403u, 0xbf810000u});
+        const std::array<std::uint32_t, 8> samplerAndOutput{0u, 0x00fff000u, 0u, 0u, 0x10000000u, 0x00000000u, 0x1000u, 0x00027facu};
+        std::copy(samplerAndOutput.begin(), samplerAndOutput.end(), userData.begin() + 8);
+        request.shader = {ShaderStage::Compute, 0x30000u + marker * 0x100u, code, 0, {}};
+        request.context.waveSize = 64;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {true, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.supportedExtensions = extensions;
+        request.target.bdaAbiVersion = 1u;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = true;
+    }
+
+    RecompileResult Bind(const std::array<std::uint32_t, 8>& image, std::uint32_t sampler0 = 0u) {
+        std::copy(image.begin(), image.end(), userData.begin());
+        userData[8] = sampler0;
+        return Recompile(request);
+    }
+};
+
+bool sameModule(const RecompileResult& left, const RecompileResult& right) {
+    return left.spirv.data() == right.spirv.data() && left.PipelineVariantId() == right.PipelineVariantId();
+}
+
+std::vector<std::uint32_t> boundImageWords(const RecompileResult& result) {
+    std::vector<std::uint32_t> words;
+    for (const auto& binding : result.bindings) {
+        if (binding.role == DescriptorRole::GuestImages) words.insert(words.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
+    }
+    return words;
+}
+
+void verifyImageSubstitutes() {
+    {
+        ImageRequest request(0u, false);
+        const auto unlearned = request.Bind(NullImage);
+        const auto bound = request.Bind(ImageDescriptor(ImageSwizzleXyzw));
+        require(!sameModule(unlearned, bound), "a null T# of a slot never bound took another slot's module");
+        const auto learned = request.Bind(NullImage);
+        require(sameModule(learned, bound), "a null T# after a bound XYZW T# of the same slot did not reuse the bound module");
+        const auto words = boundImageWords(learned);
+        require(!words.empty() && std::ranges::all_of(words, [](std::uint32_t word) { return word == 0u; }), "a null T# that took the substitute did not bind its own null descriptor");
+        auto addressless = ImageDescriptor(0u);
+        addressless[0] = 0u;
+        require(sameModule(request.Bind(addressless), bound), "an addressless T# with SEL_0 selectors did not take the substitute");
+        addressless[3] |= ImageSwizzleXyzw;
+        require(!sameModule(request.Bind(addressless), bound), "an addressless T# whose selectors read texels took the substitute");
+        require(sameModule(request.Bind(ImageDescriptor(ImageSwizzleXyzw)), bound), "the bound slot changed modules after a null T#");
+    }
+    {
+        ImageRequest request(1u, false);
+        const auto constant = request.Bind(ImageDescriptor(ImageSwizzleXyz1));
+        require(!sameModule(request.Bind(NullImage), constant), "a null T# took the module of a T# whose W selector is the constant 1");
+        const auto bound = request.Bind(ImageDescriptor(ImageSwizzleXyzw));
+        require(sameModule(request.Bind(NullImage), bound), "a null T# did not take the first XYZW T# of its slot after an XYZ1 one");
+    }
+    {
+        ImageRequest request(2u, true);
+        const auto bound = request.Bind(ImageDescriptor(ImageSwizzleXyzw));
+        require(!sameModule(request.Bind(NullImage), bound), "a null T# read by image_load took the bound module");
+    }
+    {
+        ImageRequest request(3u, false);
+        const auto integer = request.Bind(ImageDescriptor(ImageSwizzleXyzw, ImageFormat32UInt));
+        require(!sameModule(request.Bind(NullImage), integer), "a null T# took the module of an integer T#");
+        const auto bound = request.Bind(ImageDescriptor(ImageSwizzleXyzw));
+        require(sameModule(request.Bind(NullImage), bound), "a null T# did not take the first float T# of its slot after an integer one");
+    }
+    {
+        constexpr std::uint32_t unnormalized = 1u << 15u;
+        ImageRequest request(6u, false);
+        static_cast<void>(request.Bind(ImageDescriptor(ImageSwizzleXyzw)));
+        const auto bound = request.Bind(ImageDescriptor(ImageSwizzleXyzw), unnormalized);
+        require(!sameModule(request.Bind(NullImage, unnormalized), bound), "a null T# sampled through an unnormalized S# took the substitute");
+    }
+    std::cout << "image substitutes are taken only from eligible XYZW T#s of direct sampled images\n";
+}
+
+int runWithoutImageSubstitutes() {
+    ImageRequest request(5u, false);
+    const auto bound = request.Bind(ImageDescriptor(ImageSwizzleXyzw));
+    require(!sameModule(request.Bind(NullImage), bound), "a null T# took the substitute while APS5_NO_IMAGE_SUBSTITUTES was set");
+    std::cout << "APS5_NO_IMAGE_SUBSTITUTES keeps a null T# on its own module\n";
+    return 0;
+}
+
+int runSeedImageSubstitutes() {
+    ImageRequest request(4u, false);
+    static_cast<void>(request.Bind(ImageDescriptor(ImageSwizzleXyzw)));
+    ShaderRecompiler::ShaderDiskCache::Flush();
+    std::cout << "a bound T# was specialized and its slot's image substitute stored\n";
+    return 0;
+}
+
+int runLearnedImageSubstitutes(bool persisted) {
+    ImageRequest request(4u, false);
+    const auto null = request.Bind(NullImage);
+    const auto bound = request.Bind(ImageDescriptor(ImageSwizzleXyzw));
+    require(sameModule(null, bound) == persisted, persisted ? "a null T# seen before its slot's bound T# in this process did not take the image substitute an earlier process learned" : "a null T# took the image substitute an earlier process learned while APS5_NO_PERSISTED_IMAGE_SUBSTITUTES was set");
+    ShaderRecompiler::ShaderDiskCache::Flush();
+    std::cout << (persisted ? "a null T# took the image substitute an earlier process learned\n" : "a null T# kept its own module without the persisted image substitute\n");
+    return 0;
+}
+
+void verifyImageSubstitutesAcrossProcesses(const std::filesystem::path& self) {
+    setEnvironment("APS5_NO_IMAGE_SUBSTITUTES", "1");
+    const auto disabled = RunSelf(self, "--no-image-substitutes");
+    clearEnvironment("APS5_NO_IMAGE_SUBSTITUTES");
+    require(disabled == 0, "the process without image substitutes failed");
+    require(RunSelf(self, "--seed-image-substitutes") == 0, "the process that learns an image substitute failed");
+    setEnvironment("APS5_NO_PERSISTED_IMAGE_SUBSTITUTES", "1");
+    const auto unlearned = RunSelf(self, "--unlearned-image-substitutes");
+    clearEnvironment("APS5_NO_PERSISTED_IMAGE_SUBSTITUTES");
+    require(unlearned == 0, "the process without persisted image substitutes failed");
+    require(RunSelf(self, "--learned-image-substitutes") == 0, "the process that reads the persisted image substitute failed");
+}
+
 void verifyInvocationIsolation() {
     ComputeRequest request(true);
     const auto first = Recompile(request.request);
@@ -3255,6 +3397,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--seed-substitutes") return runSeedSubstitutes();
         if (argc == 2 && std::string_view(argv[1]) == "--learned-substitutes") return runLearnedSubstitutes(true);
         if (argc == 2 && std::string_view(argv[1]) == "--unlearned-substitutes") return runLearnedSubstitutes(false);
+        if (argc == 2 && std::string_view(argv[1]) == "--no-image-substitutes") return runWithoutImageSubstitutes();
+        if (argc == 2 && std::string_view(argv[1]) == "--seed-image-substitutes") return runSeedImageSubstitutes();
+        if (argc == 2 && std::string_view(argv[1]) == "--learned-image-substitutes") return runLearnedImageSubstitutes(true);
+        if (argc == 2 && std::string_view(argv[1]) == "--unlearned-image-substitutes") return runLearnedImageSubstitutes(false);
         if (argc == 2 && std::string_view(argv[1]).starts_with("--load-plan")) return runPlanLoadingProcess(argv[1]);
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);
@@ -3287,6 +3433,8 @@ int main(int argc, char** argv) {
         verifyFailureMemoSwitch(ArgumentPath(argv, 0));
         verifyInvocationIsolation();
         verifySubstitutesAcrossProcesses(ArgumentPath(argv, 0));
+        verifyImageSubstitutes();
+        verifyImageSubstitutesAcrossProcesses(ArgumentPath(argv, 0));
         verifyBufferAlignmentSpecialization();
         verifyBindingPlanSelection();
         verifyVertexTypeSpecialization();

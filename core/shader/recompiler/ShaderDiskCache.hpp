@@ -84,7 +84,7 @@ void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> va
 void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan);
 [[nodiscard]] bool LoadSpecialized(std::span<const std::byte> key, std::vector<std::uint32_t>& words);
 void StoreSpecialized(std::vector<std::byte> key, std::vector<std::uint32_t> words);
-[[nodiscard]] bool LoadSubstitutes(std::span<const std::byte> key, std::vector<std::uint32_t>& words);
+[[nodiscard]] bool LoadSubstitutes(std::span<const std::byte> key, std::size_t recordWords, std::vector<std::uint32_t>& words);
 void StoreSubstitutes(std::vector<std::byte> key, std::vector<std::uint32_t> words);
 void Flush();
 void ReleaseMapped(const SharedSpirv& spirv) noexcept;

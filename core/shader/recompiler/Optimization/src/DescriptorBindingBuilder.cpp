@@ -91,10 +91,9 @@ bool NormalizedImageFormat(IrBufferFormat format) {
     }
 }
 
-std::uint32_t SampledImageFlags(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::size_t index, const ImageResource& mode) {
+std::uint32_t SampledImageFlags(const ShaderInfo& info, const ResourceSnapshot& snapshot, const DescriptorValue& descriptor, std::size_t index, const ImageResource& mode) {
     if (mode.resourceClass != ImageResourceClass::Sampled || mode.packed || mode.r128 || mode.depthCompare || mode.depthBits || mode.depthUnorm16 || mode.srgbDecode || (mode.emulatedCompare & EmulatedCompare::Enabled) != 0u || mode.byElements != 0u || mode.byComponents != 0u || mode.conversionFormat != IrBufferFormat::Invalid || mode.packedFormat != IrBufferFormat::Invalid) return 0u;
     if (mode.numericClass != IrTextureNumericClass::Float && mode.numericClass != IrTextureNumericClass::Uint && mode.numericClass != IrTextureNumericClass::Sint) return 0u;
-    const auto& descriptor = snapshot.images.at(index);
     if (descriptor.dwords[0] == 0u && (descriptor.dwords[1] & 0xffu) == 0u) return 0u;
     using Component = PipelineSpecialization::ImageComponentConstant;
     std::uint32_t components = 0u;
@@ -451,9 +450,63 @@ BufferSubstitute BufferSpecializationFields(const DescriptorValue& descriptor, s
     return {descriptor.dwords[1] & 0xffff0000u, descriptor.dwords[3], present ? descriptor.dwords[0] & 3u : 0u, present ? tail : 0u, present};
 }
 
-DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet, std::span<const BufferSubstitute> substitutes, bool shaderImageMinLod) const {
+bool ImageSubstituteEligible(const ShaderInfo& info, std::size_t index) {
+    if (index >= info.images.size() || index >= info.runtimeImageModes.size()) return false;
+    const auto& image = info.images[index];
+    if (image.table != NoTable || image.resourceClass != ImageResourceClass::Sampled || !image.read || image.written || image.atomic || !image.sampledOnly) return false;
+    if (image.depthCompare || image.volumeGather || image.targetMerge || image.r128 || image.packed || image.byElements != 0u || image.byComponents != 0u || image.mipMode != ImageMipMode::None) return false;
+    const auto& modes = info.runtimeImageModes[index];
+    if (std::ranges::any_of(modes, [](const ImageResource& mode) { return mode.conversionFormat == FmaskExpansion; })) return false;
+    if (!image.srgbDecodeCompatible && std::ranges::any_of(modes, [](const ImageResource& mode) { return IsConvertedUnormTextureFormat(mode.conversionFormat); })) return false;
+    for (const auto& pair : info.sampledPairs) {
+        if (pair.image != index) continue;
+        if (pair.volumeGather || pair.sampler >= info.samplers.size() || info.samplers[pair.sampler].table != NoTable || (info.samplers[pair.sampler].uses & SamplerUseQueryLod) != 0u) return false;
+    }
+    return true;
+}
+
+std::optional<ImageSubstitute> LearnedImageSubstitute(const ShaderInfo& info, std::size_t index, const DescriptorValue& descriptor) {
+    if (!ImageSubstituteEligible(info, index) || descriptor.dwordCount != 8u) return std::nullopt;
+    const auto& image = info.images[index];
+    if (ResourceMaterializer::NullImageDescriptor(image, descriptor)) return std::nullopt;
+    for (std::uint32_t component = 0; component < 4u; ++component) {
+        if (((descriptor.dwords[3] >> (component * 3u)) & 7u) < 4u) return std::nullopt;
+    }
+    const auto& modes = info.runtimeImageModes[index];
+    const auto match = ResourceMaterializer::TryRuntimeImageMode(image, descriptor, modes, false);
+    if (!match.mode.has_value() || *match.mode >= modes.size()) return std::nullopt;
+    const auto& mode = modes[*match.mode];
+    if (mode.constantSwizzle || mode.resourceClass != ImageResourceClass::Sampled || mode.numericClass != IrTextureNumericClass::Float) return std::nullopt;
+    if (mode.conversionFormat != IrBufferFormat::Invalid || mode.packedFormat != IrBufferFormat::Invalid || mode.packed || mode.r128 || mode.depthBits || mode.depthUnorm16 || mode.srgbDecode || mode.depthCompare) return std::nullopt;
+    if ((mode.emulatedCompare & EmulatedCompare::Enabled) != 0u || mode.byElements != 0u || mode.byComponents != 0u) return std::nullopt;
+    return ImageSubstitute{descriptor.dwords, true};
+}
+
+const ImageSubstitute* AppliedImageSubstitute(std::span<const ImageSubstitute> substitutes, std::size_t index, const DescriptorValue& descriptor) {
+    if (index >= substitutes.size() || !substitutes[index].known || descriptor.dwordCount != 8u || (descriptor.dwords[3] & 0xfffu) != 0u) return nullptr;
+    const auto type = (descriptor.dwords[3] >> 28u) & 0xfu;
+    const auto format = (descriptor.dwords[1] >> 20u) & 0x1ffu;
+    const bool addressless = descriptor.dwords[0] == 0u && (descriptor.dwords[1] & 0xffu) == 0u;
+    const bool formatless = type >= static_cast<std::uint32_t>(ImageType::Color1D) && type <= static_cast<std::uint32_t>(ImageType::Color2DMsaa) && (format == 0u || format == 0x1ffu);
+    return addressless || formatless || type <= 1u ? &substitutes[index] : nullptr;
+}
+
+DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet, std::span<const BufferSubstitute> substitutes, bool shaderImageMinLod, std::span<const ImageSubstitute> imageSubstitutes) const {
     if (stage == IrShaderStage::Pixel && exportMappings.size() != 8u) fail("fragment runtime export mappings are missing");
     if (info.images.size() > ShaderInfo::MaxImages) fail("runtime image count exceeds the static capacity (" + std::to_string(info.images.size()) + " of " + std::to_string(ShaderInfo::MaxImages) + ")");
+    std::vector<DescriptorValue> substitutedImages;
+    std::vector<bool> substituted(info.images.size(), false);
+    const auto unnormalizedPair = [&](std::size_t index) {
+        return std::ranges::any_of(info.sampledPairs, [&](const SampledResourcePair& pair) { return pair.image == index && (snapshot.samplers.at(pair.sampler).dwords[0] & ForceUnnormalizedBit) != 0u; });
+    };
+    for (std::size_t index = 0; index < info.images.size() && index < snapshot.images.size() && !registrationModules; ++index) {
+        const auto* substitute = AppliedImageSubstitute(imageSubstitutes, index, snapshot.images[index]);
+        if (substitute == nullptr || unnormalizedPair(index)) continue;
+        if (substitutedImages.empty()) substitutedImages = snapshot.images;
+        substitutedImages[index] = {substitute->words, 8u, 0xffu};
+        substituted[index] = true;
+    }
+    const auto imageWords = [&](std::size_t index) -> const DescriptorValue& { return substituted.at(index) ? substitutedImages[index] : snapshot.images.at(index); };
     DescriptorBindingPlan plan;
     plan.addressedBuffers = layout.bufferAddressDwords != 0u;
     plan.addressedData = layout.UsesDataAddress();
@@ -481,7 +534,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     }
     for (const auto& pair : info.sampledPairs) {
         if ((info.samplers.at(pair.sampler).uses & SamplerUseGatherLod) == 0u || info.images.at(pair.image).table != NoTable) continue;
-        const auto& words = snapshot.images.at(pair.image).dwords;
+        const auto& words = imageWords(pair.image).dwords;
         const auto minLod = (words[1] >> 8u) & 0xfffu;
         const auto base = ((words[3] >> 12u) & 0xfu) * 256u;
         const PipelineSpecializationConstant constant{PipelineSpecialization::GatherImageMinLodBase + pair.image, minLod > base ? minLod - base : 0u};
@@ -517,7 +570,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     for (std::size_t index = 0; index < info.images.size(); ++index) {
         if (info.images[index].table != NoTable) continue;
         const auto& modes = info.runtimeImageModes.at(index);
-        imageModes[index] = ResourceMaterializer::RuntimeImageMode(info.images[index], snapshot.images.at(index), modes);
+        imageModes[index] = ResourceMaterializer::RuntimeImageMode(info.images[index], imageWords(index), modes);
         if (registrationModules && modes.size() > 1u) plan.specialization.push_back({PipelineSpecialization::ImageBase + static_cast<std::uint32_t>(index) * PipelineSpecialization::ImageWords, imageModes[index]});
     }
     for (std::uint32_t index = 0; index < info.buffers.size(); ++index) {
@@ -555,15 +608,15 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if (std::ranges::any_of(modes, [](const ImageResource& mode) { return mode.conversionFormat == FmaskExpansion; })) plan.specialization.push_back({PipelineSpecialization::FmaskFormatBase + index, modes.at(imageModes[index]).conversionFormat == FmaskExpansion ? (snapshot.images.at(index).dwords[1] >> 20u) & 0x1ffu : 0u});
         const auto first = PipelineSpecialization::ImageBase + index * PipelineSpecialization::ImageWords;
         plan.specialization.push_back({first, imageModes[index]});
-        for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, (snapshot.images.at(index).dwords[3] >> (component * 3u)) & 7u});
+        for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, (imageWords(index).dwords[3] >> (component * 3u)) & 7u});
         if (!info.images[index].depthBitsCompatible) {
-            const auto texelFormat = (snapshot.images.at(index).dwords[1] >> 20u) & 0x1ffu;
+            const auto texelFormat = (imageWords(index).dwords[1] >> 20u) & 0x1ffu;
             plan.specialization.push_back({PipelineSpecialization::D16TowardZeroBase + index, texelFormat == 22u || texelFormat == 64u || texelFormat == 74u || texelFormat == 77u ? 1u : 0u});
         }
         if (shaderImageMinLod) {
-            const auto& words = snapshot.images.at(index).dwords;
+            const auto& words = imageWords(index).dwords;
             const auto clamp = RelativeMinLod(words)[0];
-            if (clamp != 0u) RequireShaderMinLod(info, snapshot, index, modes.at(imageModes[index]), clamp);
+            if (clamp != 0u && !substituted[index]) RequireShaderMinLod(info, snapshot, index, modes.at(imageModes[index]), clamp);
             plan.specialization.push_back({PipelineSpecialization::MinLodBase + index, std::bit_cast<std::uint32_t>(static_cast<float>(clamp) / 256.0f)});
         }
         const auto& image = info.images[index];
@@ -610,7 +663,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     for (std::uint32_t index = 0; index < info.images.size(); ++index) {
         if (info.images[index].table == NoTable) {
             const auto& mode = info.runtimeImageModes.at(index).at(imageModes[index]);
-            const auto flags = SampledImageFlags(info, snapshot, index, mode);
+            const auto flags = SampledImageFlags(info, snapshot, imageWords(index), index, mode);
             plan.specialization.push_back({PipelineSpecialization::ImageComponentBase + index, flags & ~PipelineSpecialization::ImageNormalizedValues});
             plan.specialization.push_back({PipelineSpecialization::NormalizedImageBase + index, (flags & PipelineSpecialization::ImageNormalizedValues) != 0u ? 1u : 0u});
         }

@@ -2884,8 +2884,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &queriedLimits);
         state->exactRobustLoads = robustnessLimits.robustStorageBufferAccessSizeAlignment == 1u;
     }
-    if (robustness2.nullDescriptor == VK_TRUE || state->robustBufferAccess2) {
-        const bool nullDescriptor = robustness2.nullDescriptor == VK_TRUE;
+    const bool nullDescriptor = robustness2.nullDescriptor == VK_TRUE && std::getenv("APS5_NO_NULL_DESCRIPTOR") == nullptr;
+    if (nullDescriptor || state->robustBufferAccess2) {
         robustness2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
         robustness2.nullDescriptor = nullDescriptor ? VK_TRUE : VK_FALSE;
         robustness2.robustBufferAccess2 = state->robustBufferAccess2 ? VK_TRUE : VK_FALSE;
@@ -2896,7 +2896,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
     if (Graphics::BindlessImagesRequested()) {
-        const Graphics::BindlessFeatureSupport support{true, robustness2.nullDescriptor == VK_TRUE, state->runtimeDescriptorArray, state->descriptorBindingPartiallyBound, state->descriptorIndexing, state->descriptorIndexing, state->sampledImageUpdateAfterBind, state->storageImageUpdateAfterBind, state->updateUnusedWhilePending, state->properties.limits.maxBoundDescriptorSets};
+        const Graphics::BindlessFeatureSupport support{true, nullDescriptor, state->runtimeDescriptorArray, state->descriptorBindingPartiallyBound, state->descriptorIndexing, state->descriptorIndexing, state->sampledImageUpdateAfterBind, state->storageImageUpdateAfterBind, state->updateUnusedWhilePending, state->properties.limits.maxBoundDescriptorSets};
         if (const auto missing = Graphics::BindlessUnsupported(support)) {
             std::fprintf(stderr, "[bindless] APS5_BINDLESS_IMAGES=1 is ignored: the device lacks %s\n", missing->c_str());
         } else {

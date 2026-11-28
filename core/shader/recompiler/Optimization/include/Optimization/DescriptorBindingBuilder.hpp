@@ -5,7 +5,9 @@
 #include "Optimization/BindingAllocator.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Recompiler.hpp"
+#include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace ShaderRecompiler {
@@ -42,6 +44,17 @@ struct BufferSubstitute {
 bool BufferDescriptorPresent(const DescriptorValue& descriptor);
 BufferSubstitute BufferSpecializationFields(const DescriptorValue& descriptor, std::span<const BufferSubstitute> substitutes, std::size_t index);
 
+struct ImageSubstitute {
+    std::array<std::uint32_t, 8> words{};
+    bool known = false;
+
+    bool operator==(const ImageSubstitute&) const = default;
+};
+
+bool ImageSubstituteEligible(const ShaderInfo& info, std::size_t index);
+std::optional<ImageSubstitute> LearnedImageSubstitute(const ShaderInfo& info, std::size_t index, const DescriptorValue& descriptor);
+const ImageSubstitute* AppliedImageSubstitute(std::span<const ImageSubstitute> substitutes, std::size_t index, const DescriptorValue& descriptor);
+
 struct DescriptorBindingPlan {
     std::vector<PreparedDescriptorBinding> bindings;
     std::vector<PreparedImageMetadata> imageMetadata;
@@ -55,7 +68,7 @@ struct DescriptorBindingPlan {
 
 class DescriptorBindingBuilder {
 public:
-    DescriptorBindingPlan Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings = {}, bool registrationModules = false, bool fragmentDescriptorSet = false, std::span<const BufferSubstitute> substitutes = {}, bool shaderImageMinLod = false) const;
+    DescriptorBindingPlan Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings = {}, bool registrationModules = false, bool fragmentDescriptorSet = false, std::span<const BufferSubstitute> substitutes = {}, bool shaderImageMinLod = false, std::span<const ImageSubstitute> imageSubstitutes = {}) const;
     DescriptorBindingPlan Select(const DescriptorBindingPlan& plan, std::span<const std::uint32_t> bindings) const;
     void Populate(BindingAllocationResult& allocation, const CompiledBindingLayout& compiled, const DescriptorBindingPlan& plan, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, const ResolvedImageTables* tables = nullptr) const;
     void PopulateGuestWords(std::vector<std::vector<std::uint32_t>>& words, const CompiledBindingLayout& compiled, const DescriptorBindingPlan& plan, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, const ResolvedImageTables* tables = nullptr) const;

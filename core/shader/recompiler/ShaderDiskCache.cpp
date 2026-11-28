@@ -163,7 +163,6 @@ static_assert(fieldCount<UniformFill>() == 5, "UniformFill changed: update the p
 static_assert(fieldCount<UniformFillPlan>() == 2, "UniformFillPlan changed: update the plan encoder");
 
 constexpr std::uint32_t FileMagic = 0x43535041u;
-constexpr std::size_t SubstituteWords = 5;
 
 struct FileHeader {
     std::uint32_t magic;
@@ -1583,6 +1582,8 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_ITERATION_SELECTION",
     "APS5_NO_PERF_LAYOUT_PAIR",
     "APS5_NO_BUFFER_SUBSTITUTES",
+    "APS5_NO_IMAGE_SUBSTITUTES",
+    "APS5_NO_PERSISTED_IMAGE_SUBSTITUTES",
     "APS5_NO_RESULT_MEMO",
     "APS5_NO_SPECIALIZED_CACHE",
     "APS5_HEAP_NO_CACHE",
@@ -1707,12 +1708,12 @@ public:
         enqueue({std::move(key), nullptr, nullptr, std::move(words)});
     }
 
-    bool LoadSubstitutes(std::span<const std::byte> key, std::vector<std::uint32_t>& words) {
+    bool LoadSubstitutes(std::span<const std::byte> key, std::size_t recordWords, std::vector<std::uint32_t>& words) {
         return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) {
             std::span<const std::byte> payload;
             const auto status = unwrapEntry(file, key, payload);
             if (status != LoadStatus::Loaded) return status;
-            if (payload.empty() || payload.size() % (SubstituteWords * sizeof(std::uint32_t)) != 0) return LoadStatus::Rejected;
+            if (recordWords == 0u || payload.empty() || payload.size() % (recordWords * sizeof(std::uint32_t)) != 0) return LoadStatus::Rejected;
             words.resize(payload.size() / sizeof(std::uint32_t));
             std::memcpy(words.data(), payload.data(), payload.size());
             return LoadStatus::Loaded;
@@ -1734,6 +1735,7 @@ public:
         persisted->layout = variant.layout;
         persisted->artifact.variantId = variant.artifact.variantId;
         persisted->substitutes = variant.substitutes;
+        persisted->imageSubstitutes = variant.imageSubstitutes;
         return persisted;
     }
 
@@ -2284,13 +2286,13 @@ void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan>
     if (instance.Enabled() && plan != nullptr) instance.StorePlan(std::move(key), std::move(plan));
 }
 
-bool LoadSubstitutes(std::span<const std::byte> key, std::vector<std::uint32_t>& words) {
+bool LoadSubstitutes(std::span<const std::byte> key, std::size_t recordWords, std::vector<std::uint32_t>& words) {
     auto& instance = store();
     if (!instance.Enabled()) return false;
     const auto& switches = switchKey();
     std::vector<std::byte> full(key.begin(), key.end());
     full.insert(full.end(), switches.begin(), switches.end());
-    return instance.LoadSubstitutes(full, words);
+    return instance.LoadSubstitutes(full, recordWords, words);
 }
 
 void StoreSubstitutes(std::vector<std::byte> key, std::vector<std::uint32_t> words) {
