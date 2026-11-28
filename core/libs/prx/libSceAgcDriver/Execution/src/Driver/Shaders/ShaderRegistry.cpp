@@ -2323,7 +2323,8 @@ public:
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
                 const auto sequence = ++submitted;
-                if (awaited || (prepared != nullptr && prepared->demanded.load())) tasks.push_front({std::move(task), prepared, sequence, budgeted, program, awaited});
+                if (awaited) tasks.insert(std::ranges::find_if(tasks, [](const Task& queued) { return !queued.awaited; }), {std::move(task), prepared, sequence, budgeted, program, awaited});
+                else if (prepared != nullptr && prepared->demanded.load()) tasks.push_front({std::move(task), prepared, sequence, budgeted, program, awaited});
                 else tasks.push_back({std::move(task), prepared, sequence, budgeted, program, awaited});
                 if (program != 0) waitingPrograms.fetch_add(1, std::memory_order_relaxed);
                 unfinished.insert(sequence);
