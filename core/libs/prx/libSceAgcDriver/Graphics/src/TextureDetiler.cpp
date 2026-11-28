@@ -679,9 +679,9 @@ void TextureDetiler::DispatchDepthConvert(VkCommandBuffer commands, VkBuffer sou
         if (failed != 0) throw std::runtime_error("AGC graphics: a nonfinite D32 depth value cannot be converted to D16");
     });
     context.BindComputePipeline(commands, depthConvertPipeline);
-    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, depthConvertPipelineLayout, 0, 1, &set, 0, nullptr);
+    CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_COMPUTE, depthConvertPipelineLayout, 0, 1, &set, SetBindSite::Detiler);
     const std::array<std::uint32_t, 8> push{static_cast<std::uint32_t>(sourceBase), static_cast<std::uint32_t>(destinationBase), pairCount, rows, sourceWordsPerRow, destinationWordsPerRow, width, mode};
-    context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, depthConvertPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push.data());
+    CmdPushConstants(context, commands, depthConvertPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push.data());
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groupsX, groupsY, 1);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
