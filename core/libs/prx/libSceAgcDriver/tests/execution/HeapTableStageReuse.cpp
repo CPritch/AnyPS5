@@ -255,6 +255,19 @@ void SamplerHeapNeedsDynamicIndexing(const AgcDriver::VulkanDevice& device, cons
 
 }
 
+void DeferredEntriesUnreusable(const AgcDriver::VulkanDevice& device, const GuestBlock& block) {
+    if (std::getenv("APS5_TABLE_IMAGE_BUDGET") == nullptr) return;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const auto result = Compile(device, block);
+    RequireHeapTable(result);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const CompiledShader built{ShaderStage::Compute, &result, 0};
+    const auto resources = std::make_shared<ShaderResources>(context, built);
+    Require(resources->HeapStage(), "deferred table entries: the set was not built on the heap");
+    Require(!resources->Reusable() && resources->UnreusableReason() == ShaderResources::Unreusable::DeferredTableEntries, std::string("deferred table entries: a build that left table entries for a later resolve is ") + (resources->Reusable() ? "reusable" : std::string("unreusable for ") + ShaderResources::UnreusableReasonName(resources->UnreusableReason())) + ", so a reuse could keep sampling the absent image");
+    std::puts("deferred table entries: the build that deferred them is not reusable");
+}
+
 int main() {
     SetTestEnvironment("APS5_GPU_HEAP", "1");
     SetTestEnvironment("APS5_VERIFY_GPU_HEAP", "1");
@@ -264,6 +277,7 @@ int main() {
         GuestBlock block(BlockBytes, true);
         GuestBlock surfaces(SurfaceBlockBytes, false);
         Prepare(block, surfaces);
+        DeferredEntriesUnreusable(*device, block);
         RefreshAfterOriginalDestroyed(*device, block, false);
         RefreshAfterOriginalDestroyed(*device, block, true);
         RefreshAfterSlotReleased(*device, block);

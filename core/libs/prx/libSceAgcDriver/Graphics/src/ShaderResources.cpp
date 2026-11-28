@@ -4147,6 +4147,10 @@ void ShaderResources::noteReusable() {
         unreusableReason = Unreusable::BorderColorTable;
         return;
     }
+    if (deferredTableEntries) {
+        unreusableReason = Unreusable::DeferredTableEntries;
+        return;
+    }
     if (!spaceReusable) {
         if (htileClear.has_value()) unreusableReason = Unreusable::HtileClear;
         else if (guestMemory.HasCopiedWrites()) unreusableReason = Unreusable::CopiedWrites;
@@ -4207,7 +4211,7 @@ void ShaderResources::noteReusable() {
 }
 
 const char* ShaderResources::UnreusableReasonName(Unreusable reason) {
-    constexpr std::array<const char*, static_cast<std::size_t>(Unreusable::Count)> names{"unchecked", "htile clear", "copied writes", "lease", "bda", "multisample source", "loop guard", "texture refreshed per use", "template data refresh", "no direct regions", "region not served", "border color table"};
+    constexpr std::array<const char*, static_cast<std::size_t>(Unreusable::Count)> names{"unchecked", "htile clear", "copied writes", "lease", "bda", "multisample source", "loop guard", "texture refreshed per use", "template data refresh", "no direct regions", "region not served", "border color table", "image table entries deferred past APS5_TABLE_IMAGE_BUDGET"};
     const auto index = static_cast<std::size_t>(reason);
     return index < names.size() ? names[index] : "unknown";
 }
@@ -8179,7 +8183,10 @@ void ShaderResources::resolveImageTables() {
             if (item != nullptr) item->imageAllocations[static_cast<std::size_t>(table.elementBase) + element] = index;
             counters.variantSubstituted.fetch_add(1, std::memory_order_relaxed);
         }
-        if (deferred != 0u) NoteDeferredTableEntries(table.program->imageTableShader, deferred, binding.count);
+        if (deferred != 0u) {
+            deferredTableEntries = true;
+            NoteDeferredTableEntries(table.program->imageTableShader, deferred, binding.count);
+        }
         counters.tablesResolved.fetch_add(1, std::memory_order_relaxed);
         if (reusable) {
             fresh.device = context.device;

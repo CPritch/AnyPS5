@@ -417,7 +417,7 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
-    enum class Unreusable : std::uint8_t { Unchecked, HtileClear, CopiedWrites, Lease, Bda, MultisampleSource, LoopGuard, TextureRefreshedPerUse, TemplateDataRefresh, NoDirectRegions, RegionNotServed, BorderColorTable, Count };
+    enum class Unreusable : std::uint8_t { Unchecked, HtileClear, CopiedWrites, Lease, Bda, MultisampleSource, LoopGuard, TextureRefreshedPerUse, TemplateDataRefresh, NoDirectRegions, RegionNotServed, BorderColorTable, DeferredTableEntries, Count };
     Unreusable UnreusableReason() const { return unreusableReason; }
     static const char* UnreusableReasonName(Unreusable reason);
     void KeepStorageImageBytes(Recorder& recorder) const;
@@ -1028,6 +1028,7 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool readsBorderColorTable = false;
+    bool deferredTableEntries = false;
     bool reusable = false;
     bool perUseTextures = false;
     Unreusable unreusableReason = Unreusable::Unchecked;
