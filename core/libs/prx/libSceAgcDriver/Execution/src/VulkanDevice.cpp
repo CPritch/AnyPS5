@@ -3367,7 +3367,7 @@ struct PipelineWaitClockPause {
 };
 }
 
-void VulkanDevice::PrebuildComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress) {
+void VulkanDevice::PrebuildComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress, bool awaited) {
     std::optional<ComputePipelineKey> key;
     const auto settle = [&](bool failed) {
         if (!key || key->identity.Empty()) return;
@@ -3393,7 +3393,8 @@ void VulkanDevice::PrebuildComputePipeline(const ShaderRecompiler::RecompileResu
             settle(false);
             return;
         }
-        const CompileBudget::Hold hold(BackgroundCompileBudget(), shader.spirv.size() * sizeof(std::uint32_t));
+        std::optional<CompileBudget::Hold> hold;
+        if (!awaited) hold.emplace(BackgroundCompileBudget(), shader.spirv.size() * sizeof(std::uint32_t));
         if (HasComputePipeline(shader)) {
             settle(false);
             return;

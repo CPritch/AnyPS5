@@ -75,7 +75,7 @@ public:
     // replay's hook, on its threads): false when the device already holds a pipeline for the module.
     bool ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants);
     bool HasComputePipeline(const ShaderRecompiler::RecompileResult& shader) const;
-    void PrebuildComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress = 0);
+    void PrebuildComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress = 0, bool awaited = false);
     enum class PipelineAhead { Built, Building, Start, Unavailable };
     PipelineAhead ComputePipelineAhead(const ShaderRecompiler::RecompileResult& shader);
     void AbandonComputePipelineAhead(const ShaderRecompiler::RecompileResult& shader);

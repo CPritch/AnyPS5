@@ -71,8 +71,8 @@ void StartComputePipelineAhead(const std::shared_ptr<VulkanDevice>& device, cons
     if (result->spirv.size() < AsyncComputePipelineWords()) {
         if (!device->HasComputePipeline(*result)) {
             SubmitComputePrebuild([device, result, address] {
-                try { device->PrebuildComputePipeline(*result, address); } catch (...) {}
-            });
+                try { device->PrebuildComputePipeline(*result, address, true); } catch (...) {}
+            }, true);
         }
         return;
     }

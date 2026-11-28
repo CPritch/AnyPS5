@@ -2318,12 +2318,12 @@ private:
 
 public:
 
-    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr, bool budgeted = false, std::uint64_t program = 0) {
+    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr, bool budgeted = false, std::uint64_t program = 0, bool front = false) {
         {
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
                 const auto sequence = ++submitted;
-                if (prepared != nullptr && prepared->demanded.load()) tasks.push_front({std::move(task), prepared, sequence, budgeted, program});
+                if (front || (prepared != nullptr && prepared->demanded.load())) tasks.push_front({std::move(task), prepared, sequence, budgeted, program});
                 else tasks.push_back({std::move(task), prepared, sequence, budgeted, program});
                 if (program != 0) waitingPrograms.fetch_add(1, std::memory_order_relaxed);
                 unfinished.insert(sequence);
@@ -2661,8 +2661,8 @@ void PrioritizeLibraryPrebuilds(std::span<const std::uint64_t> programs) {
     if (auto* pool = RegistrationPreparePool::ExistingPrebuild(); pool != nullptr && !programs.empty()) pool->Prioritize(programs);
 }
 
-void SubmitComputePrebuild(std::function<void()> task) {
-    RegistrationPreparePool::Prebuild().Submit(std::move(task), nullptr, true);
+void SubmitComputePrebuild(std::function<void()> task, bool awaited) {
+    RegistrationPreparePool::Prebuild().Submit(std::move(task), nullptr, !awaited, 0, awaited);
 }
 
 void AwaitLibraryPrebuilds() {
