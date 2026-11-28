@@ -524,15 +524,18 @@ PipelineBinaryStore::RestoreResult PipelineBinaryStore::restoreFile(const VkComp
     return RestoreResult::Missing;
 }
 
-bool PipelineBinaryStore::capture(VkPipeline pipeline, std::span<const std::byte> key) const {
+PipelineBinaryStore::CaptureResult PipelineBinaryStore::capture(VkPipeline pipeline, std::span<const std::byte> key) const {
+    const auto failed = [](VkResult result) { return OutOfMemory(result) ? CaptureResult::Transient : CaptureResult::Refused; };
     VkPipelineBinaryCreateInfoKHR info{VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR};
     info.pipeline = pipeline;
     VkPipelineBinaryHandlesInfoKHR output{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
-    if (PreservedCall(createBinaries, context.device, &info, nullptr, &output) != VK_SUCCESS || output.pipelineBinaryCount == 0 || output.pipelineBinaryCount > MaximumBinaries) return false;
+    if (const auto counted = PreservedCall(createBinaries, context.device, &info, nullptr, &output); counted != VK_SUCCESS) return failed(counted);
+    if (output.pipelineBinaryCount == 0 || output.pipelineBinaryCount > MaximumBinaries) return CaptureResult::Refused;
     BinaryHandles binaries{context.device, destroyBinary, std::vector<VkPipelineBinaryKHR>(output.pipelineBinaryCount)};
     const auto count = output.pipelineBinaryCount;
     output.pPipelineBinaries = binaries.handles.data();
-    if (PreservedCall(createBinaries, context.device, &info, nullptr, &output) != VK_SUCCESS || output.pipelineBinaryCount != count || std::ranges::find(binaries.handles, VK_NULL_HANDLE) != binaries.handles.end()) return false;
+    if (const auto created = PreservedCall(createBinaries, context.device, &info, nullptr, &output); created != VK_SUCCESS) return failed(created);
+    if (output.pipelineBinaryCount != count || std::ranges::find(binaries.handles, VK_NULL_HANDLE) != binaries.handles.end()) return CaptureResult::Refused;
     std::vector<std::byte> file;
     number(file, FileMagic);
     bytes(file, key);
@@ -541,11 +544,13 @@ bool PipelineBinaryStore::capture(VkPipeline pipeline, std::span<const std::byte
         VkPipelineBinaryDataInfoKHR dataInfo{VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR, nullptr, binary};
         VkPipelineBinaryKeyKHR binaryId{VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
         std::size_t size = 0;
-        if (PreservedCall(getData, context.device, &dataInfo, &binaryId, &size, nullptr) != VK_SUCCESS || !validKey(binaryId) || size == 0 || size > MaximumFileBytes) return false;
+        if (const auto sized = PreservedCall(getData, context.device, &dataInfo, &binaryId, &size, nullptr); sized != VK_SUCCESS) return failed(sized);
+        if (!validKey(binaryId) || size == 0 || size > MaximumFileBytes) return CaptureResult::Refused;
         std::vector<std::byte> data(size);
-        if (PreservedCall(getData, context.device, &dataInfo, &binaryId, &size, data.data()) != VK_SUCCESS || !validKey(binaryId) || size == 0 || size > data.size()) return false;
+        if (const auto read = PreservedCall(getData, context.device, &dataInfo, &binaryId, &size, data.data()); read != VK_SUCCESS) return failed(read);
+        if (!validKey(binaryId) || size == 0 || size > data.size()) return CaptureResult::Refused;
         data.resize(size);
-        if (file.size() > MaximumFileBytes - data.size() || MaximumFileBytes - file.size() - data.size() < 64) return false;
+        if (file.size() > MaximumFileBytes - data.size() || MaximumFileBytes - file.size() - data.size() < 64) return CaptureResult::Refused;
         binaryKey(file, binaryId);
         bytes(file, data);
     }
@@ -554,7 +559,7 @@ bool PipelineBinaryStore::capture(VkPipeline pipeline, std::span<const std::byte
     const bool stored = ShaderRecompiler::WriteFileAtomically(path, file);
     if (stored) std::fprintf(stderr, "[pipeline-binary] saved key=%016llx bytes=%zu path=%s\n", static_cast<unsigned long long>(ShaderRecompiler::HashBytes(key)), file.size(), path.string().c_str());
     else std::fprintf(stderr, "[pipeline-binary] cannot save key=%016llx path=%s\n", static_cast<unsigned long long>(ShaderRecompiler::HashBytes(key)), path.string().c_str());
-    return stored;
+    return stored ? CaptureResult::Stored : CaptureResult::Transient;
 }
 
 void PipelineBinaryStore::rememberThreshold(std::span<const std::byte> key, bool captureFailed) const try {
@@ -611,8 +616,9 @@ PipelineBinaryOutcome PipelineBinaryStore::CreateComputePipeline(const VkCompute
                 static_cast<unsigned long long>(parts[0]), static_cast<unsigned long long>(parts[1]), static_cast<unsigned long long>(parts[2]), static_cast<unsigned long long>(parts[3]), static_cast<unsigned long long>(parts[4]), static_cast<unsigned long long>(parts[5]));
             try {
                 if (milliseconds >= static_cast<double>(minimumMilliseconds)) {
-                    if (capture(*pipeline, key)) return PipelineBinaryOutcome::Captured;
-                    rememberThreshold(key, true);
+                    const auto captured = capture(*pipeline, key);
+                    if (captured == CaptureResult::Stored) return PipelineBinaryOutcome::Captured;
+                    if (captured == CaptureResult::Refused) rememberThreshold(key, true);
                 }
                 else rememberThreshold(key);
             } catch (const std::bad_alloc&) {
@@ -624,7 +630,7 @@ PipelineBinaryOutcome PipelineBinaryStore::CreateComputePipeline(const VkCompute
         if (*pipeline != VK_NULL_HANDLE) destroyPipeline(context.device, *pipeline, nullptr);
         *pipeline = VK_NULL_HANDLE;
         std::fprintf(stderr, "[pipeline-binary] capture build rejected key=%016llx result=%d; rebuilding without capture\n", static_cast<unsigned long long>(ShaderRecompiler::HashBytes(key)), static_cast<int>(result));
-        rememberThreshold(key, true);
+        if (!OutOfMemory(result)) rememberThreshold(key, true);
     }
     auto lock = synchronization != nullptr ? synchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
     Check(create(context.device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");

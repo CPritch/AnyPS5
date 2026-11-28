@@ -27,6 +27,9 @@ unsigned captures = 0;
 bool reject = false;
 VkResult rejectResult = VK_PIPELINE_COMPILE_REQUIRED;
 bool captureFailure = false;
+VkResult captureFailureResult = VK_ERROR_UNKNOWN;
+bool captureBinaryFailure = false;
+VkResult captureBinaryResult = VK_ERROR_OUT_OF_DEVICE_MEMORY;
 bool missing = false;
 bool unsupported = false;
 bool oversized = false;
@@ -205,7 +208,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Create(VkDevice, VkPipelineCache cache, std::uint
         duringCapture = {};
         callback();
     }
-    if (capture && captureFailure) return VK_ERROR_UNKNOWN;
+    if (capture && captureFailure) return captureFailureResult;
     if (restore) ++restored;
     else ++cold;
     *pipeline = reinterpret_cast<VkPipeline>(next++);
@@ -214,6 +217,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Create(VkDevice, VkPipelineCache cache, std::uint
 
 VKAPI_ATTR VkResult VKAPI_CALL Binary(VkDevice, const VkPipelineBinaryCreateInfoKHR* info, const VkAllocationCallbacks*, VkPipelineBinaryHandlesInfoKHR* output) {
     ++otherBinaryCalls;
+    if (captureBinaryFailure && info->pipeline != VK_NULL_HANDLE) return captureBinaryResult;
     if (missing) return VK_PIPELINE_BINARY_MISSING_KHR;
     if (output->pPipelineBinaries == nullptr) {
         output->pipelineBinaryCount = 2;
@@ -526,6 +530,44 @@ int main(int argc, char** argv) try {
     store.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
     Check(cold == 6, "failed capture did not retry without capture");
     captureFailure = false;
+    {
+        const auto saved = std::array{cold, restored, released, captures, legacyCreates};
+        const auto markers = [&] {
+            std::size_t count = 0;
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+                if (entry.path().extension() == ".threshold") ++count;
+            }
+            return count;
+        };
+        for (const auto transient : {VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_OUT_OF_HOST_MEMORY}) {
+            for (const bool build : {true, false}) {
+                ++spirv[2];
+                const auto markersBefore = markers();
+                if (build) {
+                    captureFailure = true;
+                    captureFailureResult = transient;
+                } else {
+                    captureBinaryFailure = true;
+                    captureBinaryResult = transient;
+                }
+                store.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
+                captureFailure = false;
+                captureFailureResult = VK_ERROR_UNKNOWN;
+                captureBinaryFailure = false;
+                const std::string what = build ? "a capture build" : "a capture of the built pipeline's binaries";
+                Check(markers() == markersBefore && binaries.empty(), (what + " that ran out of memory marked its pipeline for driver cache builds").c_str());
+                const auto capturesBefore = captures;
+                PipelineBinaryStore retry(context, properties, driverId);
+                retry.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
+                Check(captures == capturesBefore + 1 && binaries.empty(), (what + " that ran out of memory was not captured again by a later process").c_str());
+            }
+        }
+        cold = saved[0];
+        restored = saved[1];
+        released = saved[2];
+        captures = saved[3];
+        legacyCreates = saved[4];
+    }
     ++spirv[2];
     Environment("APS5_NO_PIPELINE_BINARIES", "1");
     PipelineBinaryStore disabled(context, properties, driverId);
