@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -489,34 +490,93 @@ inline std::vector<std::string> DeviceFaultResidencyLines(std::uint64_t va, std:
 }
 
 inline constexpr std::size_t HungBatchTokensListed = 24;
+inline constexpr std::size_t HungBatchProgramsListed = 16;
+inline constexpr std::size_t HungBatchUnfinishedListed = 4;
 
-inline std::vector<std::string> HungBatchLines(std::uint64_t submitSerial, const FaultTokenRing& ring) noexcept {
+inline std::vector<FaultTokenEntry> HungBatchEntries(std::uint64_t submitSerial, const FaultTokenRing& ring) {
+    std::vector<FaultTokenEntry> held;
+    const FaultToken newest = ring.Newest();
+    const FaultToken span = newest < FaultTokenRing::Capacity ? newest : static_cast<FaultToken>(FaultTokenRing::Capacity);
+    for (FaultToken offset = span; offset > 0; --offset) {
+        const auto found = ring.Find(newest - offset + 1u);
+        if (found.has_value() && found->submitSerial == submitSerial) held.push_back(*found);
+    }
+    return held;
+}
+
+inline std::vector<FaultTokenEntry> HungBatchUnfinished(const std::vector<FaultTokenEntry>& held, FaultToken lastFinished, std::size_t count) {
+    std::size_t first = 0;
+    for (std::size_t index = 0; index < held.size(); ++index) {
+        if (held[index].token == lastFinished) first = index + 1;
+    }
+    const std::size_t last = std::min(held.size(), first + count);
+    return {held.begin() + static_cast<std::ptrdiff_t>(first), held.begin() + static_cast<std::ptrdiff_t>(last)};
+}
+
+inline std::string HungBatchTokenText(const FaultTokenEntry& entry) {
+    char line[320];
+    const std::size_t descLength = strnlen(entry.desc, sizeof(entry.desc));
+    int used = std::snprintf(line, sizeof(line), "token %u %s program 0x%llx variant %llu %.*s", static_cast<unsigned>(entry.token), DeviceFaultStageName(entry.stage), static_cast<unsigned long long>(entry.programAddress), static_cast<unsigned long long>(entry.variantId), static_cast<int>(descLength), entry.desc);
+    const std::uint32_t words = entry.argCount < DeviceFaultMaxIndirectWords ? entry.argCount : DeviceFaultMaxIndirectWords;
+    if (words != 0 && used > 0 && static_cast<std::size_t>(used) < sizeof(line)) used += std::snprintf(line + used, sizeof(line) - static_cast<std::size_t>(used), " args from 0x%llx+%u:", static_cast<unsigned long long>(entry.argBuffer), static_cast<unsigned>(entry.argOffset));
+    for (std::uint32_t word = 0; word < words && used > 0 && static_cast<std::size_t>(used) < sizeof(line); ++word) used += std::snprintf(line + used, sizeof(line) - static_cast<std::size_t>(used), " %u", static_cast<unsigned>(entry.argWords[word]));
+    return line;
+}
+
+inline std::vector<std::string> HungBatchLines(std::uint64_t submitSerial, const FaultTokenRing& ring, std::optional<FaultToken> lastFinished = std::nullopt) noexcept {
     std::vector<std::string> lines;
     try {
-        std::vector<FaultTokenEntry> held;
-        const FaultToken newest = ring.Newest();
-        const FaultToken span = newest < FaultTokenRing::Capacity ? newest : static_cast<FaultToken>(FaultTokenRing::Capacity);
-        for (FaultToken offset = span; offset > 0; --offset) {
-            const auto found = ring.Find(newest - offset + 1u);
-            if (found.has_value() && found->submitSerial == submitSerial) held.push_back(*found);
-        }
+        const auto held = HungBatchEntries(submitSerial, ring);
         char line[320];
         if (held.empty()) {
             std::snprintf(line, sizeof(line), "[gpu-hang] batch %llu: none of its guest commands is in the fault token ring (APS5_GPU_CHECKPOINTS records them)", static_cast<unsigned long long>(submitSerial));
             lines.emplace_back(line);
             return lines;
         }
-        const std::size_t listed = std::min(held.size(), HungBatchTokensListed);
-        std::snprintf(line, sizeof(line), "[gpu-hang] batch %llu holds %zu guest commands in the fault token ring; the last %zu:", static_cast<unsigned long long>(submitSerial), held.size(), listed);
+        std::snprintf(line, sizeof(line), "[gpu-hang] batch %llu holds %zu guest commands in the fault token ring", static_cast<unsigned long long>(submitSerial), held.size());
         lines.emplace_back(line);
-        for (std::size_t index = held.size() - listed; index < held.size(); ++index) {
-            const auto& entry = held[index];
-            const std::size_t descLength = strnlen(entry.desc, sizeof(entry.desc));
-            int used = std::snprintf(line, sizeof(line), "[gpu-hang] token %u %s program 0x%llx variant %llu %.*s", static_cast<unsigned>(entry.token), DeviceFaultStageName(entry.stage), static_cast<unsigned long long>(entry.programAddress), static_cast<unsigned long long>(entry.variantId), static_cast<int>(descLength), entry.desc);
-            const std::uint32_t words = entry.argCount < DeviceFaultMaxIndirectWords ? entry.argCount : DeviceFaultMaxIndirectWords;
-            if (words != 0 && used > 0 && static_cast<std::size_t>(used) < sizeof(line)) used += std::snprintf(line + used, sizeof(line) - static_cast<std::size_t>(used), " args from 0x%llx+%u:", static_cast<unsigned long long>(entry.argBuffer), static_cast<unsigned>(entry.argOffset));
-            for (std::uint32_t word = 0; word < words && used > 0 && static_cast<std::size_t>(used) < sizeof(line); ++word) used += std::snprintf(line + used, sizeof(line) - static_cast<std::size_t>(used), " %u", static_cast<unsigned>(entry.argWords[word]));
+        struct Program {
+            std::uint32_t stage;
+            std::uint64_t address;
+            std::uint64_t variant;
+            std::size_t count;
+            FaultToken first;
+            FaultToken last;
+        };
+        std::vector<Program> programs;
+        for (const auto& entry : held) {
+            const auto found = std::find_if(programs.begin(), programs.end(), [&](const Program& program) { return program.stage == entry.stage && program.address == entry.programAddress && program.variant == entry.variantId; });
+            if (found == programs.end()) programs.push_back({entry.stage, entry.programAddress, entry.variantId, 1, entry.token, entry.token});
+            else {
+                ++found->count;
+                found->last = entry.token;
+            }
+        }
+        for (std::size_t index = 0; index < programs.size() && index < HungBatchProgramsListed; ++index) {
+            const auto& program = programs[index];
+            std::snprintf(line, sizeof(line), "[gpu-hang]   %s program 0x%llx variant %llu: %zu %s, tokens %u-%u", DeviceFaultStageName(program.stage), static_cast<unsigned long long>(program.address), static_cast<unsigned long long>(program.variant), program.count, program.count == 1 ? "command" : "commands", static_cast<unsigned>(program.first), static_cast<unsigned>(program.last));
             lines.emplace_back(line);
+        }
+        if (programs.size() > HungBatchProgramsListed) {
+            std::snprintf(line, sizeof(line), "[gpu-hang]   %zu more programs", programs.size() - HungBatchProgramsListed);
+            lines.emplace_back(line);
+        }
+        if (!lastFinished.has_value()) {
+            const std::size_t listed = std::min(held.size(), HungBatchTokensListed);
+            std::snprintf(line, sizeof(line), "[gpu-hang] the last %zu:", listed);
+            lines.emplace_back(line);
+            for (std::size_t index = held.size() - listed; index < held.size(); ++index) lines.push_back("[gpu-hang] " + HungBatchTokenText(held[index]));
+            return lines;
+        }
+        const auto finished = std::find_if(held.begin(), held.end(), [&](const FaultTokenEntry& entry) { return entry.token == *lastFinished; });
+        if (finished == held.end()) lines.emplace_back("[gpu-hang] the GPU finished none of its checkpointed guest dispatches");
+        else lines.push_back("[gpu-hang] the GPU finished its guest dispatches up to " + HungBatchTokenText(*finished));
+        for (const auto& entry : HungBatchUnfinished(held, *lastFinished, HungBatchUnfinishedListed)) {
+            lines.push_back("[gpu-hang] not finished: " + HungBatchTokenText(entry));
+            for (std::uint32_t range = 0; range < entry.rangeCount && range < 4u; ++range) {
+                std::snprintf(line, sizeof(line), "[gpu-hang]   guest 0x%llx-0x%llx %s", static_cast<unsigned long long>(entry.rangeBegin[range]), static_cast<unsigned long long>(entry.rangeEnd[range]), (entry.rangeWritten & (1u << range)) != 0 ? "written" : "read");
+                lines.emplace_back(line);
+            }
         }
     } catch (...) {
     }

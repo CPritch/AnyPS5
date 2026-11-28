@@ -29,7 +29,23 @@ struct FaultTokenEntry {
     std::uint32_t argStride = 0;
     std::uint32_t argWords[4] = {};
     std::uint32_t argCount = 0;
+    std::uint32_t rangeCount = 0;
+    std::uint32_t rangeWritten = 0;
+    std::uint64_t rangeBegin[4] = {};
+    std::uint64_t rangeEnd[4] = {};
 };
+
+inline constexpr std::size_t CompletionMarkerSlots = 64;
+
+inline std::atomic<const volatile std::uint32_t*>& CompletionMarkers() noexcept {
+    static std::atomic<const volatile std::uint32_t*> mapping{nullptr};
+    return mapping;
+}
+
+inline FaultToken LastFinishedToken(std::uint64_t submitSerial) noexcept {
+    const auto* mapping = CompletionMarkers().load(std::memory_order_acquire);
+    return mapping != nullptr ? mapping[submitSerial % CompletionMarkerSlots] : 0u;
+}
 
 struct SubmitBracket {
     std::uint64_t submitSerial = 0;
@@ -53,6 +69,7 @@ public:
             FaultToken candidate = next.fetch_add(1, std::memory_order_relaxed);
             if (candidate == 0) continue;
             std::atomic_ref<FaultToken>(entries[static_cast<std::size_t>(candidate) % Capacity].token).store(0, std::memory_order_release);
+            entries[static_cast<std::size_t>(candidate) % Capacity].rangeCount = 0;
             return candidate;
         }
     }
@@ -79,6 +96,12 @@ public:
             copy.argStride = slot.argStride;
             for (std::size_t i = 0; i < 4; ++i) copy.argWords[i] = slot.argWords[i];
             copy.argCount = slot.argCount;
+            copy.rangeCount = slot.rangeCount < 4u ? slot.rangeCount : 4u;
+            copy.rangeWritten = slot.rangeWritten;
+            for (std::size_t i = 0; i < copy.rangeCount; ++i) {
+                copy.rangeBegin[i] = slot.rangeBegin[i];
+                copy.rangeEnd[i] = slot.rangeEnd[i];
+            }
             if (std::atomic_ref<FaultToken>(slot.token).load(std::memory_order_acquire) != token) return std::nullopt;
             copy.token = token;
             return copy;

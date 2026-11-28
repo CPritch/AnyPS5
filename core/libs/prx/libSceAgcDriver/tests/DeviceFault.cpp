@@ -630,31 +630,91 @@ void HungBatchListsItsCommands() {
     ClaimBracketTokenWithArgs(ring, second, 41, 0x106fadb000ull, 13, "dispatch indirect", static_cast<std::uint32_t>(AgcDriver::FaultStage::compute), 0x9000ull, 8, 12, indirect, 3);
     Require(ring.Newest() == second, "the ring's newest token is not the last one claimed");
     const auto lines = AgcDriver::HungBatchLines(41, ring);
-    Require(lines.size() == 3, "a hung batch does not report its count and both of its commands");
-    Require(lines[0] == "[gpu-hang] batch 41 holds 2 guest commands in the fault token ring; the last 2:", "the hung batch summary changed");
+    Require(lines.size() == 6, "a hung batch does not report its count, its two programs and both of its commands");
+    Require(lines[0] == "[gpu-hang] batch 41 holds 2 guest commands in the fault token ring", "the hung batch summary changed");
     char expected[320];
+    std::snprintf(expected, sizeof(expected), "[gpu-hang]   compute program 0x106fd68a00 variant 11: 1 command, tokens %u-%u", static_cast<unsigned>(first), static_cast<unsigned>(first));
+    Require(lines[1] == expected, "the first program of the hung batch changed");
+    std::snprintf(expected, sizeof(expected), "[gpu-hang]   compute program 0x106fadb000 variant 13: 1 command, tokens %u-%u", static_cast<unsigned>(second), static_cast<unsigned>(second));
+    Require(lines[2] == expected, "the second program of the hung batch changed");
+    Require(lines[3] == "[gpu-hang] the last 2:", "the hung batch listing header changed");
     std::snprintf(expected, sizeof(expected), "[gpu-hang] token %u compute program 0x106fd68a00 variant 11 dispatch 64x2x1 args from 0x5000+0: 64 2 1", static_cast<unsigned>(first));
-    Require(lines[1] == expected, "the first command of the hung batch changed");
+    Require(lines[4] == expected, "the first command of the hung batch changed");
     std::snprintf(expected, sizeof(expected), "[gpu-hang] token %u compute program 0x106fadb000 variant 13 dispatch indirect args from 0x9000+8: 4096 1 1", static_cast<unsigned>(second));
-    Require(lines[2] == expected, "the second command of the hung batch changed");
+    Require(lines[5] == expected, "the second command of the hung batch changed");
     const auto none = AgcDriver::HungBatchLines(4141, ring);
     Require(none.size() == 1 && none[0] == "[gpu-hang] batch 4141: none of its guest commands is in the fault token ring (APS5_GPU_CHECKPOINTS records them)", "a batch without ring entries was not reported as such");
 }
 
 void HungBatchListsOnlyTheLastCommands() {
     AgcDriver::FaultTokenRing& ring = AgcDriver::FaultTokenRing::Instance();
+    AgcDriver::FaultToken first = 0;
     AgcDriver::FaultToken last = 0;
     for (std::size_t index = 0; index < AgcDriver::HungBatchTokensListed + 5; ++index) {
         last = ring.Claim();
-        ClaimBracketToken(ring, last, 43, 0x1000ull + index, index, "draw");
+        if (first == 0) first = last;
+        ClaimBracketToken(ring, last, 43, 0x1000ull, 7, "draw");
     }
     const auto lines = AgcDriver::HungBatchLines(43, ring);
-    Require(lines.size() == AgcDriver::HungBatchTokensListed + 1, "a long hung batch was not trimmed to its last commands");
+    Require(lines.size() == AgcDriver::HungBatchTokensListed + 3, "a long hung batch was not trimmed to its last commands");
     char expected[160];
-    std::snprintf(expected, sizeof(expected), "[gpu-hang] batch 43 holds %zu guest commands in the fault token ring; the last %zu:", AgcDriver::HungBatchTokensListed + 5, AgcDriver::HungBatchTokensListed);
+    std::snprintf(expected, sizeof(expected), "[gpu-hang] batch 43 holds %zu guest commands in the fault token ring", AgcDriver::HungBatchTokensListed + 5);
     Require(lines[0] == expected, "the trimmed hung batch summary changed");
-    std::snprintf(expected, sizeof(expected), "[gpu-hang] token %u unknown program 0x%llx variant %zu draw", static_cast<unsigned>(last), static_cast<unsigned long long>(0x1000ull + AgcDriver::HungBatchTokensListed + 4), AgcDriver::HungBatchTokensListed + 4);
+    std::snprintf(expected, sizeof(expected), "[gpu-hang]   unknown program 0x1000 variant 7: %zu commands, tokens %u-%u", AgcDriver::HungBatchTokensListed + 5, static_cast<unsigned>(first), static_cast<unsigned>(last));
+    Require(lines[1] == expected, "a repeated program was not counted once");
+    std::snprintf(expected, sizeof(expected), "[gpu-hang] the last %zu:", AgcDriver::HungBatchTokensListed);
+    Require(lines[2] == expected, "the trimmed listing header changed");
+    std::snprintf(expected, sizeof(expected), "[gpu-hang] token %u unknown program 0x1000 variant 7 draw", static_cast<unsigned>(last));
     Require(lines.back() == expected, "the trimmed hung batch did not end with its newest command");
+}
+
+void HungBatchNamesTheUnfinishedDispatch() {
+    AgcDriver::FaultTokenRing& ring = AgcDriver::FaultTokenRing::Instance();
+    const std::uint32_t groups[3] = {5, 1, 1};
+    const AgcDriver::FaultToken done = ring.Claim();
+    ClaimBracketTokenWithArgs(ring, done, 44, 0xa936000ull, 21, "dispatch 1x1x1", static_cast<std::uint32_t>(AgcDriver::FaultStage::compute), 0, 0, 12, groups, 0);
+    const AgcDriver::FaultToken stuck = ring.Claim();
+    ClaimBracketTokenWithArgs(ring, stuck, 44, 0xa937b00ull, 22, "dispatch 5x1x1", static_cast<std::uint32_t>(AgcDriver::FaultStage::compute), 0xc000ull, 0, 12, groups, 3);
+    auto* slot = ring.Mutable(stuck);
+    Require(slot != nullptr, "the stuck token has no slot");
+    slot->rangeCount = 2;
+    slot->rangeWritten = 2;
+    slot->rangeBegin[0] = 0x10a4623fa0ull;
+    slot->rangeEnd[0] = 0x10a4623fb0ull;
+    slot->rangeBegin[1] = 0x10a4623fc0ull;
+    slot->rangeEnd[1] = 0x10a4623fd8ull;
+    const AgcDriver::FaultToken after = ring.Claim();
+    ClaimBracketToken(ring, after, 44, 0xa82b600ull, 23, "dispatch 1x1x1");
+    const auto lines = AgcDriver::HungBatchLines(44, ring, done);
+    Require(lines.size() == 9, "a hung batch with a finished dispatch does not report its programs, the finished one and what follows");
+    char expected[320];
+    std::snprintf(expected, sizeof(expected), "[gpu-hang] the GPU finished its guest dispatches up to token %u compute program 0xa936000 variant 21 dispatch 1x1x1", static_cast<unsigned>(done));
+    Require(lines[4] == expected, "the last finished dispatch was not named");
+    std::snprintf(expected, sizeof(expected), "[gpu-hang] not finished: token %u compute program 0xa937b00 variant 22 dispatch 5x1x1 args from 0xc000+0: 5 1 1", static_cast<unsigned>(stuck));
+    Require(lines[5] == expected, "the first unfinished dispatch was not named");
+    Require(lines[6] == "[gpu-hang]   guest 0x10a4623fa0-0x10a4623fb0 read", "the unfinished dispatch's read range changed");
+    Require(lines[7] == "[gpu-hang]   guest 0x10a4623fc0-0x10a4623fd8 written", "the unfinished dispatch's written range changed");
+    std::snprintf(expected, sizeof(expected), "[gpu-hang] not finished: token %u unknown program 0xa82b600 variant 23 dispatch 1x1x1", static_cast<unsigned>(after));
+    Require(lines[8] == expected, "the command after the unfinished dispatch was not listed");
+    const auto unfinished = AgcDriver::HungBatchUnfinished(AgcDriver::HungBatchEntries(44, ring), done, 1);
+    Require(unfinished.size() == 1 && unfinished[0].token == stuck && unfinished[0].rangeCount == 2, "the first unfinished dispatch was not returned with its ranges");
+    const AgcDriver::FaultToken otherBatchToken = ring.Claim();
+    ClaimBracketToken(ring, otherBatchToken, 45, 0x2000ull, 24, "dispatch 1x1x1");
+    const auto none = AgcDriver::HungBatchLines(44, ring, otherBatchToken);
+    Require(none.size() == 10 && none[4] == "[gpu-hang] the GPU finished none of its checkpointed guest dispatches", "a batch none of whose dispatches finished was not reported as such");
+    std::snprintf(expected, sizeof(expected), "[gpu-hang] not finished: token %u compute program 0xa936000 variant 21 dispatch 1x1x1", static_cast<unsigned>(done));
+    Require(none[5] == expected, "a batch none of whose dispatches finished did not start with its first command");
+}
+
+void CompletionMarkerSlots() {
+    Require(AgcDriver::LastFinishedToken(7) == 0, "a token was read without completion markers");
+    std::array<std::uint32_t, AgcDriver::CompletionMarkerSlots> slots{};
+    slots[7] = 1234;
+    slots[(7 + AgcDriver::CompletionMarkerSlots) % AgcDriver::CompletionMarkerSlots] = 1234;
+    AgcDriver::CompletionMarkers().store(slots.data(), std::memory_order_release);
+    const auto read = AgcDriver::LastFinishedToken(7 + AgcDriver::CompletionMarkerSlots);
+    AgcDriver::CompletionMarkers().store(nullptr, std::memory_order_release);
+    Require(read == 1234, "a batch serial did not select its completion marker slot");
 }
 
 void MeshStageLine() {
@@ -810,6 +870,8 @@ int main() {
         IndirectRoundTrip();
         HungBatchListsItsCommands();
         HungBatchListsOnlyTheLastCommands();
+        HungBatchNamesTheUnfinishedDispatch();
+        CompletionMarkerSlots();
         MeshStageLine();
         ResidencyNeverBound();
         ResidencyNoHistory();

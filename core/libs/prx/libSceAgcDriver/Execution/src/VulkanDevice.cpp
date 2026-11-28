@@ -692,6 +692,9 @@ struct VulkanDevice::State {
     VkBuffer markerBuffer = VK_NULL_HANDLE;
     VkDeviceMemory markerMemory = VK_NULL_HANDLE;
     void* markerMapping = nullptr;
+    VkBuffer completionBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory completionMemory = VK_NULL_HANDLE;
+    void* completionMapping = nullptr;
     bool deviceLostHook = false;
     std::atomic<bool> hookRetired{false};
     std::atomic<unsigned> hookActive{0};
@@ -1138,13 +1141,22 @@ struct VulkanDevice::State {
 
     void CreateMarkerBuffer() {
         bufferMarker = DeviceFunction<PFN_vkCmdWriteBufferMarkerAMD>("vkCmdWriteBufferMarkerAMD");
+        CreateHostMarkerBuffer(2 * sizeof(std::uint32_t), markerBuffer, markerMemory, markerMapping, "buffer markers");
+    }
+
+    void CreateCompletionBuffer() {
+        CreateHostMarkerBuffer(AgcDriver::CompletionMarkerSlots * sizeof(std::uint32_t), completionBuffer, completionMemory, completionMapping, "completion markers");
+        AgcDriver::CompletionMarkers().store(static_cast<const volatile std::uint32_t*>(completionMapping), std::memory_order_release);
+    }
+
+    void CreateHostMarkerBuffer(VkDeviceSize size, VkBuffer& target, VkDeviceMemory& memory, void*& mapping, const char* category) {
         VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        buffer.size = 2 * sizeof(std::uint32_t);
+        buffer.size = size;
         buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        check(DeviceFunction<PFN_vkCreateBuffer>("vkCreateBuffer")(device, &buffer, nullptr, &markerBuffer), "vkCreateBuffer buffer markers");
+        check(DeviceFunction<PFN_vkCreateBuffer>("vkCreateBuffer")(device, &buffer, nullptr, &target), "vkCreateBuffer buffer markers");
         VkMemoryRequirements requirements{};
-        DeviceFunction<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(device, markerBuffer, &requirements);
+        DeviceFunction<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(device, target, &requirements);
         std::uint32_t memoryType = memoryProperties.memoryTypeCount;
         const auto flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         for (std::uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
@@ -1157,11 +1169,11 @@ struct VulkanDevice::State {
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = memoryType;
-        check(DeviceFunction<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocation, nullptr, &markerMemory), "vkAllocateMemory buffer markers");
-        Graphics::MemoryAccounting::Record(device, markerMemory, allocation, memoryProperties, "buffer markers");
-        check(DeviceFunction<PFN_vkBindBufferMemory>("vkBindBufferMemory")(device, markerBuffer, markerMemory, 0), "vkBindBufferMemory buffer markers");
-        check(DeviceFunction<PFN_vkMapMemory>("vkMapMemory")(device, markerMemory, 0, buffer.size, 0, &markerMapping), "vkMapMemory buffer markers");
-        std::memset(markerMapping, 0, buffer.size);
+        check(DeviceFunction<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocation, nullptr, &memory), "vkAllocateMemory buffer markers");
+        Graphics::MemoryAccounting::Record(device, memory, allocation, memoryProperties, category);
+        check(DeviceFunction<PFN_vkBindBufferMemory>("vkBindBufferMemory")(device, target, memory, 0), "vkBindBufferMemory buffer markers");
+        check(DeviceFunction<PFN_vkMapMemory>("vkMapMemory")(device, memory, 0, buffer.size, 0, &mapping), "vkMapMemory buffer markers");
+        std::memset(mapping, 0, buffer.size);
     }
 
     void Upload(std::span<const std::byte> pixels) {
@@ -1458,6 +1470,12 @@ struct VulkanDevice::State {
             if (markerMapping) reinterpret_cast<PFN_vkUnmapMemory>(deviceProc(device, "vkUnmapMemory"))(device, markerMemory);
             if (markerBuffer) reinterpret_cast<PFN_vkDestroyBuffer>(deviceProc(device, "vkDestroyBuffer"))(device, markerBuffer, nullptr);
             if (markerMemory) Graphics::MemoryAccounting::Free(reinterpret_cast<PFN_vkFreeMemory>(deviceProc(device, "vkFreeMemory")), device, markerMemory);
+            if (completionMapping) {
+                AgcDriver::CompletionMarkers().store(nullptr, std::memory_order_release);
+                reinterpret_cast<PFN_vkUnmapMemory>(deviceProc(device, "vkUnmapMemory"))(device, completionMemory);
+            }
+            if (completionBuffer) reinterpret_cast<PFN_vkDestroyBuffer>(deviceProc(device, "vkDestroyBuffer"))(device, completionBuffer, nullptr);
+            if (completionMemory) Graphics::MemoryAccounting::Free(reinterpret_cast<PFN_vkFreeMemory>(deviceProc(device, "vkFreeMemory")), device, completionMemory);
             Graphics::TeardownCheckpointMarkers();
             if (swapchain) reinterpret_cast<PFN_vkDestroySwapchainKHR>(deviceProc(device, "vkDestroySwapchainKHR"))(device, swapchain, nullptr);
             const auto destroyPool = reinterpret_cast<PFN_vkDestroyCommandPool>(deviceProc(device, "vkDestroyCommandPool"));
@@ -2927,6 +2945,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->sparseFamily != VK_QUEUE_FAMILY_IGNORED) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->sparseFamily, state->sparseIndex, &state->sparseQueue);
     if (checkpoints) state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
     if (bufferMarkers) state->CreateMarkerBuffer();
+    if (checkpoints && AgcDriver::CompletionMarkers().load(std::memory_order_acquire) == nullptr) state->CreateCompletionBuffer();
     const bool queueCheckpoints = checkpoints || diagnosticCheckpoints;
     if (deviceFault || queueCheckpoints || bufferMarkers) {
         const auto faultInfo = deviceFault ? state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT") : nullptr;
@@ -6865,11 +6884,13 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (reportingDispatch) recorder.NoteGuestWork(commands);
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     AgcDriver::FaultToken faultToken = 0;
+    std::uint64_t faultTokenSerial = 0;
     if (state->checkpointMarker != nullptr || state->bufferMarker != nullptr) {
         faultToken = AgcDriver::FaultTokenRing::Instance().Claim();
         if (faultToken != 0) {
             if (auto* entry = AgcDriver::FaultTokenRing::Instance().Mutable(faultToken)) {
                 entry->submitSerial = recorder.OpenSerial();
+                faultTokenSerial = entry->submitSerial;
                 entry->programAddress = record.programAddress;
                 entry->variantId = record.shader != nullptr && record.shader->program != nullptr ? record.shader->program->variantId : 0;
                 entry->stage = static_cast<std::uint32_t>(AgcDriver::FaultStage::compute);
@@ -6906,6 +6927,18 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
                 else if (record.arguments != 0) std::snprintf(entry->desc, sizeof(entry->desc), "dispatch indirect");
                 else std::snprintf(entry->desc, sizeof(entry->desc), "dispatch %ux%ux%u", record.x, record.y, record.z);
                 recorder.NoteFaultToken(faultToken);
+                std::vector<Graphics::Recorder::RunAccess> guestRanges;
+                resources.RunAccesses(guestRanges, false);
+                entry->rangeCount = 0;
+                entry->rangeWritten = 0;
+                for (const auto& [begin, end, flags] : guestRanges) {
+                    if (entry->rangeCount == 4u) break;
+                    if ((flags & (Graphics::Recorder::RunAccessImage | Graphics::Recorder::RunAccessBuffer)) != 0 || (begin == 0 && end == std::numeric_limits<std::uint64_t>::max())) continue;
+                    if ((flags & Graphics::Recorder::RunAccessWritten) != 0) entry->rangeWritten |= 1u << entry->rangeCount;
+                    entry->rangeBegin[entry->rangeCount] = begin;
+                    entry->rangeEnd[entry->rangeCount] = end;
+                    ++entry->rangeCount;
+                }
                 std::atomic_ref<AgcDriver::FaultToken>(entry->token).store(faultToken, std::memory_order_release);
             }
         }
@@ -6978,6 +7011,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.EndGpuTiming(gpuTiming);
         recorder.EndGpuTiming(trailingTiming);
         recorder.MarkCovered(dispatchedAccess);
+        if (faultToken != 0 && state->completionBuffer != VK_NULL_HANDLE) context.Resolved(&Graphics::DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, state->completionBuffer, (faultTokenSerial % AgcDriver::CompletionMarkerSlots) * sizeof(std::uint32_t), sizeof(std::uint32_t), faultToken);
     }
     recordStep(PhaseRecordBind);
     const auto htileDispatch = record.htileClear.has_value() ? std::make_shared<Graphics::HtileClearDispatch>() : nullptr;

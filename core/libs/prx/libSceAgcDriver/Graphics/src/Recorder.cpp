@@ -58,6 +58,8 @@
 #include <map>
 #include <mutex>
 #include <new>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -5202,7 +5204,30 @@ struct RestoreSyncSite {
 // the recorder may be torn down meanwhile (its destructor waits for the registered waiters to
 // leave after completing every batch, so the handles stay valid until this returns).
 void ReportHungBatch(std::uint64_t serial) noexcept {
-    for (const auto& line : AgcDriver::HungBatchLines(serial, AgcDriver::FaultTokenRing::Instance())) std::fprintf(stderr, "%s\n", line.c_str());
+    const auto& ring = AgcDriver::FaultTokenRing::Instance();
+    std::optional<AgcDriver::FaultToken> finished;
+    if (AgcDriver::CompletionMarkers().load(std::memory_order_acquire) != nullptr) finished = AgcDriver::LastFinishedToken(serial);
+    for (const auto& line : AgcDriver::HungBatchLines(serial, ring, finished)) std::fprintf(stderr, "%s\n", line.c_str());
+    if (!finished.has_value()) return;
+    try {
+        for (const auto& entry : AgcDriver::HungBatchUnfinished(AgcDriver::HungBatchEntries(serial, ring), *finished, 1)) {
+            for (std::uint32_t range = 0; range < entry.rangeCount && range < 4u; ++range) {
+                constexpr std::size_t HeadBytes = 96;
+                const auto bytes = static_cast<std::size_t>(std::min<std::uint64_t>(HeadBytes, entry.rangeEnd[range] - entry.rangeBegin[range])) & ~std::size_t{3};
+                if (bytes == 0) continue;
+                std::array<std::uint32_t, HeadBytes / 4> words{};
+                GuestMemory::ReadCommittedUnsynced(entry.rangeBegin[range], std::as_writable_bytes(std::span(words)).first(bytes));
+                std::string text;
+                for (std::size_t word = 0; word < bytes / 4; ++word) {
+                    char value[12];
+                    std::snprintf(value, sizeof(value), " %08x", words[word]);
+                    text += value;
+                }
+                std::fprintf(stderr, "[gpu-hang]   guest 0x%llx now holds%s\n", static_cast<unsigned long long>(entry.rangeBegin[range]), text.c_str());
+            }
+        }
+    } catch (...) {
+    }
 }
 
 VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial) {
