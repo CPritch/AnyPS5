@@ -7189,6 +7189,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     objects->descriptorHeap = heapDevice && Graphics::BindlessHeap::For(context).DescriptorHeapMappings(spirv, heapMappings, {.workgroupAddress = workgroupAddress, .gdsAddress = shader.dataAddressPush, .scratchPool = scratchPool}, &objects->pushPlacements.front(), &shader.bindings, workgroupAddressOffset);
     require(!gpuMode || objects->descriptorHeap, "a GPU-mode compute stage does not map onto VK_EXT_descriptor_heap");
     Graphics::PipelineBuildTrace trace(context.pipelineCreationFeedback);
+    if (Graphics::PipelineBuildStartLogging()) Graphics::LogComputePipelineBuildStart(shader);
     const auto createPipelines = state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
     const auto* binaries = state->probingFloatControls ? nullptr : state->pipelineBinaryStore.get();
     if (objects->descriptorHeap) CreateComputeHeapPipeline(state->device, createPipelines, context.pipelineCache, objects->module, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, heapMappings, &objects->pipeline, context.pipelineCacheSynchronization, &trace, binaries, spirv, objects->binaryLayoutKey);
@@ -7227,6 +7228,7 @@ VkPipeline VulkanDevice::specializedComputePipeline(const Graphics::Context& con
     Graphics::PipelineBuildTrace trace(context.pipelineCreationFeedback);
     const VkPipelineCreateFlags splitFlags = computePipelineFlags() | (DriverDetail::CompilesUnoptimized(shader.spirv.size(), DriverDetail::UnoptimizedComputePipelineWords()) ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0);
     try {
+        if (Graphics::PipelineBuildStartLogging()) Graphics::LogComputePipelineBuildStart(shader);
         const auto createPipelines = state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
         const std::span<const std::uint32_t> spirv(shader.spirv.data(), shader.spirv.size());
         if (objects.descriptorHeap) CreateComputeHeapPipeline(state->device, createPipelines, context.pipelineCache, module, splitFlags, computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), objects.heapMappings, &pipeline, context.pipelineCacheSynchronization, &trace, state->pipelineBinaryStore.get(), spirv, objects.binaryLayoutKey);
