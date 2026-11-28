@@ -67,7 +67,15 @@ void NotePipelineReady(std::uint64_t address) {
 }
 
 void StartComputePipelineAhead(const std::shared_ptr<VulkanDevice>& device, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, std::uint64_t address) {
-    if (device == nullptr || result == nullptr || result->spirv.size() < AsyncComputePipelineWords()) return;
+    if (device == nullptr || result == nullptr) return;
+    if (result->spirv.size() < AsyncComputePipelineWords()) {
+        if (!device->HasComputePipeline(*result)) {
+            SubmitComputePrebuild([device, result, address] {
+                try { device->PrebuildComputePipeline(*result, address); } catch (...) {}
+            });
+        }
+        return;
+    }
     if (device->ComputePipelineAhead(*result) != VulkanDevice::PipelineAhead::Start) return;
     try {
         SubmitComputePrebuild([device, result, address] {
