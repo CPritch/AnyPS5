@@ -519,7 +519,11 @@ int main(int argc, char** argv) try {
     Check(cold == 12 && released == 7 && binaries.empty(), "lowering the time threshold did not retry capture");
     const auto beforePipelineKey = store.Key(info, spirv, layout);
     ++pipelineKey;
-    Check(store.Key(info, spirv, layout) != beforePipelineKey, "Vulkan pipeline key is absent");
+    Check(store.Key(info, spirv, layout) == beforePipelineKey, "a per-pipeline driver key that differs between processes changed the store key");
+    const auto restoredBeforeNewProcess = restored;
+    PipelineBinaryStore newProcess(context, properties, driverId);
+    newProcess.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
+    Check(restored == restoredBeforeNewProcess + 1, "a binary stored under another process's per-pipeline driver key was not restored");
     properties.vendorID += 1;
     PipelineBinaryStore newVendor(context, properties, driverId);
     Check(newVendor.Key(info, spirv, layout) != fast.Key(info, spirv, layout), "vendor fingerprint is absent");

@@ -15,7 +15,7 @@ namespace AgcDriver::Graphics {
 namespace {
 
 constexpr std::uint64_t FileMagic = 0x3259425035535041ull;
-constexpr std::uint64_t KeyFormat = 2;
+constexpr std::uint64_t KeyFormat = 3;
 constexpr std::size_t MaximumFileBytes = 256u * 1024u * 1024u;
 constexpr std::uint32_t MaximumBinaries = 64;
 constexpr std::uint64_t CaptureFailureMarker = 1;
@@ -390,7 +390,6 @@ std::vector<std::byte> PipelineBinaryStore::Key(const VkComputePipelineCreateInf
     number(key, properties.driverVersion);
     bytes(key, std::as_bytes(std::span(properties.pipelineCacheUUID)));
     binaryKey(key, globalKey);
-    binaryKey(key, pipelineKey);
     bytes(key, std::as_bytes(spirv));
     bytes(key, std::as_bytes(layout));
     number(key, info.flags);
