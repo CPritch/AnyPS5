@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
+#include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include <algorithm>
@@ -189,6 +190,9 @@ void MemoryAccounting::Report(const Context& context, const VkPhysicalDeviceMemo
                 static_cast<unsigned long long>(storage.sampledBytes), static_cast<unsigned long long>(storage.storageBytes), static_cast<unsigned long long>(storage.reserved),
                 static_cast<unsigned long long>(storage.available), static_cast<unsigned long long>(storage.ceiling), static_cast<unsigned long long>(storage.selectedBudget));
         }
+        const auto plans = ShaderRecompiler::ResourcePlanTotals();
+        std::fprintf(stderr, "[host-memory] resource plans held=%llu bytes=%llu evictions=%llu reloads=%llu result_memo_bytes=%llu\n", static_cast<unsigned long long>(plans.heldPlans), static_cast<unsigned long long>(plans.heldBytes),
+            static_cast<unsigned long long>(plans.evictions), static_cast<unsigned long long>(plans.reloads), static_cast<unsigned long long>(ShaderRecompiler::ResultMemoBytes()));
     } catch (...) {
         accounting().complete = false;
         std::fprintf(stderr, "[gpu-memory] allocation report unavailable\n");
