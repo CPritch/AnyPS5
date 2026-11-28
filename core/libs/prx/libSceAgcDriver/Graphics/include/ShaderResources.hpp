@@ -201,7 +201,7 @@ enum class ContentKeyComponent : std::size_t { Layout, BufferWord0, BufferWord1,
 
 using ContentKeyDiff = std::array<bool, static_cast<std::size_t>(ContentKeyComponent::Count)>;
 
-enum class ImageTableUnremembered : std::size_t { NoEpoch, ArrayPartners, Capacity, StoredElements, NoSampledBinding, RejectedVariant, NothingKept, Pending, Count };
+enum class ImageTableUnremembered : std::size_t { NoEpoch, ArrayPartners, Capacity, StoredElements, NoSampledBinding, RejectedVariant, NothingKept, Pending, Deferred, Count };
 enum class ImageTableUnreused : std::size_t { NoEpoch, StoredElements, NoSampledBinding, NotRemembered, NotRememberedShapes, NotRememberedEvicted, Variants, DepthSurfaces, MultisampleTargets, StateBound, MappingUntracked, MappingDropped, MappingAhead, MappingWhole, MappingOverHalf, Collect, Pending, Changed, Evicted, Count };
 
 struct ImageTableReuseCounts {

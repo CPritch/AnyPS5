@@ -75,6 +75,7 @@ public:
     static constexpr std::chrono::milliseconds RefusedCeilingWindow{500};
     VkDeviceSize RefusedHeapCeiling(std::uint32_t heap, VkDeviceSize bytes) const;
     ImageAllocation AllocateImage(const Context& context, VkImage image, const VkImageCreateInfo& imageInfo, const char* operation, bool newImage, bool budgeted);
+    static std::uint64_t ImageAllocationsOnThisThread() noexcept;
     std::size_t ImageSlabBlocks();
     static VkDeviceSize ImageBudget(VkDeviceSize deviceBudget);
     VkDeviceMemory TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -944,8 +945,19 @@ ImageAllocation BufferPool::takeImageRange(const std::shared_ptr<BufferPool>& po
     return {};
 }
 
+namespace {
+
+struct ImageAllocationsTag {};
+
+}
+
+std::uint64_t BufferPool::ImageAllocationsOnThisThread() noexcept {
+    return HostThreadSlot<std::uint64_t, ImageAllocationsTag>::Get();
+}
+
 ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image, const VkImageCreateInfo& imageInfo, const char* operation, bool newImage, bool budgeted) {
     Require(image != VK_NULL_HANDLE, "an image allocation requires an image");
+    HostThreadSlot<std::uint64_t, ImageAllocationsTag>::Set(HostThreadSlot<std::uint64_t, ImageAllocationsTag>::Get() + 1u);
     constexpr auto unsupported = VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT | VK_IMAGE_CREATE_DISJOINT_BIT | VK_IMAGE_CREATE_PROTECTED_BIT;
     Require((imageInfo.flags & unsupported) == 0, "sparse, disjoint and protected images require separate image memory binding");
     for (auto* next = static_cast<const VkBaseInStructure*>(imageInfo.pNext); next != nullptr; next = next->pNext) {

@@ -623,6 +623,25 @@ TextureCounters& TextureCounts() {
     return counters;
 }
 
+std::uint64_t TableImageBudget() {
+    static const std::uint64_t budget = [] {
+        const char* text = std::getenv("APS5_TABLE_IMAGE_BUDGET");
+        if (text == nullptr) return std::uint64_t{0};
+        char* end = nullptr;
+        const auto value = std::strtoull(text, &end, 10);
+        if (end == text || *end != '\0') throw std::runtime_error("AGC graphics: APS5_TABLE_IMAGE_BUDGET must be a whole number of image allocations");
+        return static_cast<std::uint64_t>(value);
+    }();
+    return budget;
+}
+
+void NoteDeferredTableEntries(std::uint64_t program, std::uint32_t deferred, std::uint32_t entries) {
+    static std::atomic<std::uint64_t> resolves{0};
+    const auto resolve = resolves.fetch_add(1, std::memory_order_relaxed);
+    if (resolve >= 20u && resolve % 100u != 0u) return;
+    std::fprintf(stderr, "[image-table] program 0x%llx deferred %u of %u sampled entries past APS5_TABLE_IMAGE_BUDGET=%llu image allocations; a later resolve creates them (%llu resolves deferred so far)\n", static_cast<unsigned long long>(program), deferred, entries, static_cast<unsigned long long>(TableImageBudget()), static_cast<unsigned long long>(resolve + 1u));
+}
+
 thread_local std::uint64_t sampledLookupKeyScans = 0;
 thread_local std::uint64_t sampledLookupKeyProofs = 0;
 
@@ -638,7 +657,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    static constexpr std::array<const char*, static_cast<std::size_t>(ImageTableUnremembered::Count)> unrememberedNames{"no collect epoch", "array partners", "past the table capacity", "stored elements", "no sampled table binding", "rejected variant", "nothing kept", "pending results over more than half the entries"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(ImageTableUnremembered::Count)> unrememberedNames{"no collect epoch", "array partners", "past the table capacity", "stored elements", "no sampled table binding", "rejected variant", "nothing kept", "pending results over more than half the entries", "entries deferred past APS5_TABLE_IMAGE_BUDGET"};
     static constexpr std::array<const char*, static_cast<std::size_t>(ImageTableUnreused::Count)> unreusedNames{"no collect epoch", "stored elements", "no sampled table binding", "not remembered (new records)", "not remembered (records remembered with other image shapes)", "not remembered (evicted from the remembered tables)", "variants moved", "depth surfaces moved", "multisample targets moved", "rejections bound to their state", "mapping changed (change log incomplete)", "mapping changed (change log overflowed)", "mapping changed (proof ahead of the change log)", "mapping changed (no partial resolve)", "mapping changed under over half the entries", "collect refused", "pending results", "memory changed", "textures evicted"};
     const auto reasons = [&](const auto& counts, const auto& names) {
         std::string text;
@@ -7973,6 +7992,10 @@ void ShaderResources::resolveImageTables() {
         }
         std::unordered_map<std::uint32_t, GuestTextureResource> representativeSources;
         std::vector<std::uint32_t> substitutes;
+        const auto imageBudget = table.heap ? TableImageBudget() : 0u;
+        const auto allocationsBefore = BufferPool::ImageAllocationsOnThisThread();
+        std::vector<bool> deferredElements(imageBudget != 0u ? binding.count : 0u, false);
+        std::uint32_t deferred = 0;
         const auto partners = binding.count > 1 ? arrayPartners(binding, table.imageWords, table.elementBase, context.imageTableCapacity) : std::vector<std::uint32_t>{};
         std::vector<std::uint32_t> order;
         if (!partners.empty()) {
@@ -8077,6 +8100,12 @@ void ShaderResources::resolveImageTables() {
                 forget(ImageTableUnremembered::NoSampledBinding);
                 continue;
             }
+            if (imageBudget != 0u && BufferPool::ImageAllocationsOnThisThread() - allocationsBefore >= imageBudget) {
+                deferredElements[element] = true;
+                ++deferred;
+                forget(ImageTableUnremembered::Deferred);
+                continue;
+            }
             const auto sampled = prepareSampled(element, words, decoded);
             std::shared_ptr<Texture> texture;
             try {
@@ -8095,6 +8124,10 @@ void ShaderResources::resolveImageTables() {
         }
         for (const auto element : substitutes) {
             const auto representative = representatives[element];
+            if (!deferredElements.empty() && deferredElements[representative]) {
+                ++deferred;
+                continue;
+            }
             const auto words = table.imageWords.subspan(static_cast<std::size_t>(representative) * 8u, 8u);
             const auto index = table.elementTextures[representative];
             const auto source = representativeSources.find(representative);
@@ -8112,6 +8145,7 @@ void ShaderResources::resolveImageTables() {
             if (item != nullptr) item->imageAllocations[static_cast<std::size_t>(table.elementBase) + element] = index;
             counters.variantSubstituted.fetch_add(1, std::memory_order_relaxed);
         }
+        if (deferred != 0u) NoteDeferredTableEntries(table.program->imageTableShader, deferred, binding.count);
         counters.tablesResolved.fetch_add(1, std::memory_order_relaxed);
         if (reusable) {
             fresh.device = context.device;
