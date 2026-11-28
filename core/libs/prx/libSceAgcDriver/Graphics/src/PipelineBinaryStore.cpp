@@ -367,7 +367,7 @@ PipelineBinaryStore::PipelineBinaryStore(const Context& context, const VkPhysica
     directory = root / "driver" / "binaries";
 }
 
-std::vector<std::byte> PipelineBinaryStore::Key(const VkComputePipelineCreateInfo& info, std::span<const std::uint32_t> spirv, std::span<const std::uint32_t> layout) const {
+std::vector<std::byte> PipelineBinaryStore::Key(const VkComputePipelineCreateInfo& info, std::span<const std::uint32_t> spirv, std::span<const std::uint32_t> layout, std::array<std::uint64_t, 6>* parts) const {
     if (directory.empty() || spirv.empty() || layout.empty() || info.stage.pName == nullptr || info.basePipelineHandle != VK_NULL_HANDLE ||
         (info.flags & (VK_PIPELINE_CREATE_DERIVATIVE_BIT | VK_PIPELINE_CREATE_ALLOW_DERIVATIVES_BIT)) != 0) return {};
     const auto chain = pipelineChain(info.pNext);
@@ -415,6 +415,16 @@ std::vector<std::byte> PipelineBinaryStore::Key(const VkComputePipelineCreateInf
             number(key, entry.size);
         }
         bytes(key, {static_cast<const std::byte*>(specialization->pData), specialization->dataSize});
+    }
+    if (parts != nullptr) {
+        std::vector<std::byte> driverKey;
+        binaryKey(driverKey, pipelineKey);
+        std::vector<std::byte> flagWords;
+        number(flagWords, info.flags);
+        number(flagWords, flags);
+        number(flagWords, info.stage.flags);
+        *parts = {ShaderRecompiler::HashBytes(driverKey), ShaderRecompiler::HashBytes(std::as_bytes(spirv)), ShaderRecompiler::HashBytes(std::as_bytes(layout)), ShaderRecompiler::HashBytes(stage),
+            specialization != nullptr ? ShaderRecompiler::HashBytes({static_cast<const std::byte*>(specialization->pData), specialization->dataSize}) : 0u, ShaderRecompiler::HashBytes(flagWords)};
     }
     return key;
 }
@@ -556,8 +566,9 @@ PipelineBinaryOutcome PipelineBinaryStore::CreateComputePipeline(const VkCompute
     *pipeline = VK_NULL_HANDLE;
     const auto create = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
     std::vector<std::byte> key;
+    std::array<std::uint64_t, 6> parts{};
     try {
-        if (spirv.size() >= minimumWords) key = Key(info, spirv, layout);
+        if (spirv.size() >= minimumWords) key = Key(info, spirv, layout, &parts);
         if (!key.empty()) {
             const auto result = restore(info, key, pipeline);
             if (result == RestoreResult::Restored) return PipelineBinaryOutcome::Restored;
@@ -584,7 +595,8 @@ PipelineBinaryOutcome PipelineBinaryStore::CreateComputePipeline(const VkCompute
                     PreservedCall(store.releaseData, store.context.device, &release, nullptr);
                 }
             } release{*this, *pipeline};
-            std::fprintf(stderr, "[pipeline-binary] built key=%016llx words=%zu build_ms=%.3f\n", static_cast<unsigned long long>(ShaderRecompiler::HashBytes(key)), spirv.size(), milliseconds);
+            std::fprintf(stderr, "[pipeline-binary] built key=%016llx words=%zu build_ms=%.3f driver=%016llx spirv=%016llx layout=%016llx stage=%016llx specialization=%016llx flags=%016llx\n", static_cast<unsigned long long>(ShaderRecompiler::HashBytes(key)), spirv.size(), milliseconds,
+                static_cast<unsigned long long>(parts[0]), static_cast<unsigned long long>(parts[1]), static_cast<unsigned long long>(parts[2]), static_cast<unsigned long long>(parts[3]), static_cast<unsigned long long>(parts[4]), static_cast<unsigned long long>(parts[5]));
             try {
                 if (milliseconds >= static_cast<double>(minimumMilliseconds)) {
                     if (capture(*pipeline, key)) return PipelineBinaryOutcome::Captured;

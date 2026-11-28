@@ -30,7 +30,7 @@ public:
     PipelineBinaryStore(const Context& context, const VkPhysicalDeviceProperties& properties, VkDriverId driverId, bool preservedCalls = PreservedCallsAvailable);
     PipelineBinaryPolicy PolicyStatus() const { return policy; }
     bool IsReady() const { return !directory.empty(); }
-    std::vector<std::byte> Key(const VkComputePipelineCreateInfo& info, std::span<const std::uint32_t> spirv, std::span<const std::uint32_t> layout) const;
+    std::vector<std::byte> Key(const VkComputePipelineCreateInfo& info, std::span<const std::uint32_t> spirv, std::span<const std::uint32_t> layout, std::array<std::uint64_t, 6>* parts = nullptr) const;
     PipelineBinaryOutcome CreateComputePipeline(const VkComputePipelineCreateInfo& info, std::span<const std::uint32_t> spirv, std::span<const std::uint32_t> layout, VkPipelineCache cache, PipelineCacheSynchronization* synchronization, VkPipeline* pipeline) const;
 
 private:
