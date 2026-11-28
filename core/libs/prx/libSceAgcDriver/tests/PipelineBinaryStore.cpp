@@ -492,20 +492,22 @@ int main(int argc, char** argv) try {
     released = countersBeforeTransient[2];
     captures = countersBeforeTransient[3];
     legacyCreates = countersBeforeTransient[4];
-    const auto legacyBeforeRefusal = legacyCreates;
-    const auto capturesBeforeRefusal = captures;
+    const auto countersBeforeRefusal = std::array{cold, restored, released, captures, legacyCreates};
     reject = true;
     store.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
-    Check(cold == 2 && binaries.empty(), "rejected binary did not fall back");
-    Check(legacyCreates == legacyBeforeRefusal + 1 && captures == capturesBeforeRefusal, "a binary the driver refused was not rebuilt through the driver cache");
     reject = false;
-    PipelineBinaryStore afterRefusal(context, properties, driverId);
-    afterRefusal.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
-    Check(cold == 3 && legacyCreates == legacyBeforeRefusal + 2 && captures == capturesBeforeRefusal, "a pipeline whose binary the driver refused was captured again in a later process");
+    Check(cold == countersBeforeRefusal[0] + 1 && captures == countersBeforeRefusal[3] + 1 && legacyCreates == countersBeforeRefusal[4] && binaries.empty(), "a binary the driver refused was not rebuilt and captured again");
+    std::size_t markersAfterRefusal = 0;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
-        if (entry.path().extension() == ".threshold" && std::ranges::find(markersBeforeRefusal, entry.path()) == markersBeforeRefusal.end()) std::filesystem::remove(entry.path());
+        if (entry.path().extension() == ".threshold") ++markersAfterRefusal;
     }
-    cold = 2;
+    Check(markersAfterRefusal == markersBeforeRefusal.size(), "a binary the driver refused marked its pipeline for driver cache builds");
+    {
+        PipelineBinaryStore afterRefusal(context, properties, driverId);
+        afterRefusal.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
+    }
+    Check(restored == countersBeforeRefusal[1] + 1 && cold == countersBeforeRefusal[0] + 1 && binaries.empty(), "the binary recaptured after a refusal was not restored by a later process");
+    restored = countersBeforeRefusal[1];
     missing = true;
     store.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
     Check(cold == 3 && binaries.empty(), "missing binary did not fall back");
@@ -582,23 +584,23 @@ int main(int argc, char** argv) try {
     Environment("APS5_PIPELINE_BINARY_MIN_WORDS", "100");
     PipelineBinaryStore small(context, properties, driverId);
     small.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
-    Check(cold == 9 && released == 4, "size threshold captured a small pipeline");
+    Check(cold == 9 && released == 5, "size threshold captured a small pipeline");
     Environment("APS5_PIPELINE_BINARY_MIN_WORDS", "0");
     Environment("APS5_PIPELINE_BINARY_MIN_MS", "100000");
     PipelineBinaryStore fast(context, properties, driverId);
     fast.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
-    Check(cold == 10 && released == 5 && binaries.empty(), "time threshold did not release capture data");
+    Check(cold == 10 && released == 6 && binaries.empty(), "time threshold did not release capture data");
     const auto filesBefore = std::distance(std::filesystem::recursive_directory_iterator(root), std::filesystem::recursive_directory_iterator{});
     const auto legacyBefore = legacyCreates;
     PipelineBinaryStore fastReopened(context, properties, driverId);
     fastReopened.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
-    Check(legacyCreates == legacyBefore + 1 && released == 5, "time-threshold rejection did not survive recreation and use the driver cache");
+    Check(legacyCreates == legacyBefore + 1 && released == 6, "time-threshold rejection did not survive recreation and use the driver cache");
     const auto filesAfter = std::distance(std::filesystem::recursive_directory_iterator(root), std::filesystem::recursive_directory_iterator{});
     Check(cold == 11 && filesBefore == filesAfter, "time threshold persisted a fast pipeline");
     Environment("APS5_PIPELINE_BINARY_MIN_MS", "0");
     PipelineBinaryStore retryThreshold(context, properties, driverId);
     retryThreshold.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
-    Check(cold == 12 && released == 6 && binaries.empty(), "lowering the time threshold did not retry capture");
+    Check(cold == 12 && released == 7 && binaries.empty(), "lowering the time threshold did not retry capture");
     const auto beforePipelineKey = store.Key(info, spirv, layout);
     ++pipelineKey;
     Check(store.Key(info, spirv, layout) == beforePipelineKey, "a per-pipeline driver key that differs between processes changed the store key");
