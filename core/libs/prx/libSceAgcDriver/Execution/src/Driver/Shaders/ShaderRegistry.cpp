@@ -2662,7 +2662,7 @@ void PrioritizeLibraryPrebuilds(std::span<const std::uint64_t> programs) {
 }
 
 void SubmitComputePrebuild(std::function<void()> task, bool awaited) {
-    RegistrationPreparePool::Prebuild().Submit(std::move(task), nullptr, !awaited, 0, awaited);
+    RegistrationPreparePool::Prebuild().Submit(std::move(task), nullptr, true, 0, awaited);
 }
 
 void AwaitLibraryPrebuilds() {
