@@ -155,7 +155,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> timedAt(std::uint64_t a
     return result;
 }
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> finishedInBackground(std::uint64_t address, std::uint64_t snapshotKey, const std::function<MaterializeWork()>& makeWork, bool* created = nullptr) {
+std::shared_ptr<const ShaderRecompiler::RecompileResult> finishedInBackground(std::uint64_t address, std::uint64_t snapshotKey, const std::function<MaterializeWork()>& makeWork, bool* created = nullptr, std::function<void(const std::shared_ptr<const ShaderRecompiler::RecompileResult>&)> materialized = {}) {
     auto& pending = pendingMaterializes();
     const std::pair key{address, snapshotKey};
     std::shared_ptr<PendingMaterialize> job;
@@ -177,7 +177,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> finishedInBackground(st
     }
     if (created != nullptr) *created = started;
     if (started) {
-        SubmitLibraryPrebuild([job, work = makeWork(), address, submitted = std::chrono::steady_clock::now()] {
+        SubmitLibraryPrebuild([job, work = makeWork(), address, submitted = std::chrono::steady_clock::now(), materialized = std::move(materialized)] {
             std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
             std::exception_ptr failure;
             const auto started = std::chrono::steady_clock::now();
@@ -194,11 +194,18 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> finishedInBackground(st
                 std::lock_guard lock(registry.mutex);
                 registry.lastMs[address] = ms;
             }
+            const auto finished = result;
             {
                 std::lock_guard lock(job->mutex);
                 job->result = std::move(result);
                 job->failure = failure;
                 job->finished = true;
+            }
+            if (materialized && finished != nullptr) {
+                try {
+                    materialized(finished);
+                } catch (const std::exception&) {
+                }
             }
         });
     }
@@ -240,12 +247,12 @@ constexpr std::uint64_t HeapTemplateJob = std::uint64_t{1} << 63u;
 
 }
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeInBackground(const ShaderRecompiler::PreparedShaderInvocation& invocation, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, ShaderRecompiler::MemoryRegionView memory, std::uint64_t address) {
+std::shared_ptr<const ShaderRecompiler::RecompileResult> MaterializeInBackground(const ShaderRecompiler::PreparedShaderInvocation& invocation, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, ShaderRecompiler::MemoryRegionView memory, std::uint64_t address, std::function<void(const std::shared_ptr<const ShaderRecompiler::RecompileResult>&)> materialized) {
     if (!AsyncDrawCompile()) return invocation.Materialize(*capture);
     bool contended = false;
     if (auto memoized = invocation.MaterializeIfMemoized(*capture, &contended)) return memoized;
     if (cheapAt(address, contended)) return timedAt(address, [&] { return invocation.Materialize(*capture); });
-    return finishedInBackground(address, invocation.SnapshotKey(*capture), reboundWork(invocation, memory, [capture](const ShaderRecompiler::PreparedShaderInvocation& rebound) { return rebound.Materialize(*capture); }));
+    return finishedInBackground(address, invocation.SnapshotKey(*capture), reboundWork(invocation, memory, [capture](const ShaderRecompiler::PreparedShaderInvocation& rebound) { return rebound.Materialize(*capture); }), nullptr, std::move(materialized));
 }
 
 std::uint64_t HeapTemplatesBuiltInBackground() {

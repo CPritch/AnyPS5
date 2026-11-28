@@ -26,6 +26,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -63,6 +64,19 @@ void NotePipelineReady(std::uint64_t address) {
     skips.pending.fetch_sub(1, std::memory_order_relaxed);
     std::fprintf(stderr, "[dispatch] compute shader 0x%llx: its pipeline is ready after %llu skipped dispatches\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(found->second));
     skips.skipped.erase(found);
+}
+
+void StartComputePipelineAhead(const std::shared_ptr<VulkanDevice>& device, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result, std::uint64_t address) {
+    if (device == nullptr || result == nullptr || result->spirv.size() < AsyncComputePipelineWords()) return;
+    if (device->ComputePipelineAhead(*result) != VulkanDevice::PipelineAhead::Start) return;
+    try {
+        SubmitComputePrebuild([device, result, address] {
+            try { device->PrebuildComputePipeline(*result, address); } catch (...) {}
+        });
+    } catch (...) {
+        device->AbandonComputePipelineAhead(*result);
+        throw;
+    }
 }
 
 constexpr std::uint32_t computeStartX = 0x204;
@@ -726,7 +740,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         try {
-            const BackgroundWaitScope backgroundWait;
+            std::optional<BackgroundWaitScope> backgroundWait;
+            backgroundWait.emplace();
             auto invocation = InvocationFor(snapshot, codeOffset, request, AsyncDrawCompile(), &linking);
             timing.Mark("prepared_invocation");
 
@@ -746,7 +761,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
 
             timing.Mark("capture_resources");
-            compiledResult = MaterializeInBackground(invocation, capture, request.context.memory, address);
+            std::function<void(const std::shared_ptr<const ShaderRecompiler::RecompileResult>&)> materialized;
+            if (prebuildingAhead() && AsyncDrawCompile()) {
+                backgroundWait.reset();
+                materialized = [localDevice, address](const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result) { StartComputePipelineAhead(localDevice, result, address); };
+            }
+            compiledResult = MaterializeInBackground(invocation, capture, request.context.memory, address, std::move(materialized));
             if (compiledResult->gpuResolvedImages) RequireHeapStageMappable(*compiledResult, compiledResult->workgroupMemoryDwords != 0);
             timing.Mark("materialize");
             if (AsyncDrawCompile()) NoteDispatchRecorded(address);
@@ -760,7 +780,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (const auto limit = MaxComputeSpirvWords(); limit != 0 && compiledResult->spirv.size() > limit)
                 throw std::runtime_error(std::to_string(compiledResult->spirv.size()) + " SPIR-V words, above APS5_MAX_COMPUTE_SPIRV_WORDS (" + std::to_string(limit) + ")");
         } catch (const DrawCompilePending&) {
-            NoteDispatchDropped(address);
+            if (!prebuildingAhead()) NoteDispatchDropped(address);
             return;
         } catch (const std::exception& error) {
             std::string dump;
@@ -815,7 +835,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         parked.resolvedAt = std::chrono::steady_clock::now();
         ++groupStats.resolved;
         if (cached) ++groupStats.resolvedHits;
-        if (!cached && compiledResult != nullptr && !localDevice->HasComputePipeline(*compiledResult)) {
+        if (prebuildingAhead() && AsyncDrawCompile()) {
+            StartComputePipelineAhead(localDevice, compiledResult, address);
+        } else if (!cached && compiledResult != nullptr && !localDevice->HasComputePipeline(*compiledResult)) {
             SubmitComputePrebuild([localDevice, compiledResult, address] {
                 try { localDevice->PrebuildComputePipeline(*compiledResult, address); } catch (const std::exception&) {}
             });

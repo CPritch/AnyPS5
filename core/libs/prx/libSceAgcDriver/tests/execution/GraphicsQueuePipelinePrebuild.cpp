@@ -1,5 +1,6 @@
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -14,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -108,6 +110,35 @@ void WriteData(std::vector<std::uint32_t>& words, volatile std::uint32_t* target
 
 alignas(256) volatile std::uint32_t Gate = 0;
 
+struct Header {
+    Shader shader{};
+    ShaderUserData userData{};
+};
+
+alignas(8) Header ReaderHeader{};
+alignas(8) Header NewReaderHeader{};
+
+void Registered(Header& header, std::span<const std::uint32_t> code) {
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18u;
+    header.shader.header_size = sizeof(Header);
+    header.shader.shader_size = static_cast<std::uint32_t>(code.size_bytes());
+    header.shader.code = code.data();
+    header.shader.type = 0;
+    header.shader.user_data = &header.userData;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+}
+
+void AwaitRegistrationPreparations() {
+    const auto start = std::chrono::steady_clock::now();
+    while (true) {
+        const auto pending = AgcDriver::DriverDetail::RegistrationPreparationsPending();
+        if (!pending.has_value() || *pending == 0) return;
+        Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(60), "the registered shaders were not prepared");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 void Prepare(Slot& slot, std::uint32_t value) {
     slot.value[0] = value;
     slot.table = {Low(slot.value.data()), High(slot.value.data())};
@@ -145,12 +176,23 @@ int main(int argc, char** argv) {
             AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
         }
         const bool prebuild = std::getenv("APS5_NO_GRAPHICS_QUEUE_PIPELINE_PREBUILD") == nullptr;
-        Prepare(Slots[2], 0x9abcu);
-        std::vector<std::uint32_t> warm;
-        DispatchSlot(warm, Slots[2], ReaderCode.data());
-        Packet warmPacket{warm.data(), static_cast<std::uint32_t>(warm.size()), 0, {}};
-        Require(sceAgcDriverSubmitAcb(0x28, &warmPacket) == 0, "the warm-up submit failed");
-        WaitDone(Slots[2], "the warm-up dispatch did not finish");
+        const bool asyncCompile = std::getenv("APS5_ASYNC_DRAW_COMPILE") != nullptr;
+        if (asyncCompile) {
+            Registered(ReaderHeader, ReaderCode);
+            Registered(NewReaderHeader, NewReaderCode);
+            AwaitRegistrationPreparations();
+        }
+        for (int attempt = 0;; ++attempt) {
+            Prepare(Slots[2], 0x9abcu);
+            Slots[2].done = 0;
+            std::vector<std::uint32_t> warm;
+            DispatchSlot(warm, Slots[2], ReaderCode.data());
+            Packet warmPacket{warm.data(), static_cast<std::uint32_t>(warm.size()), 0, {}};
+            Require(sceAgcDriverSubmitAcb(0x28, &warmPacket) == 0, "the warm-up submit failed");
+            WaitDone(Slots[2], "the warm-up dispatch did not finish");
+            if (Slots[2].output[0] == 0x9abcu || !asyncCompile || attempt >= 3000) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
         Require(Slots[2].output[0] == 0x9abcu, "the warm-up dispatch stored " + std::to_string(Slots[2].output[0]));
         Prepare(Slots[0], 0x1234u);
         Prepare(Slots[1], 0x5678u);

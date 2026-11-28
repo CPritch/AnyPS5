@@ -35,6 +35,11 @@ bool& Driver::resolvingAhead() {
     return resolving;
 }
 
+bool& Driver::prebuildingAhead() {
+    static thread_local bool prebuilding = false;
+    return prebuilding;
+}
+
 bool& Driver::gateOpened() {
     static thread_local bool opened = false;
     return opened;
@@ -132,7 +137,7 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
     static const bool prebuildGraphicsQueue = std::getenv("APS5_NO_GRAPHICS_QUEUE_PIPELINE_PREBUILD") == nullptr;
     const bool prebuildOnly = submission.queue == 0 && (!allQueues || pipelineDispatch());
     static const bool probing = std::getenv("APS5_PROBE_DISPATCH") != nullptr;
-    if (prebuildOnly && (!prebuildGraphicsQueue || probing || AsyncDrawCompile() || from < PrebuiltUntil())) return;
+    if (prebuildOnly && (!prebuildGraphicsQueue || probing || from < PrebuiltUntil())) return;
     if (!prebuildOnly && submission.queue == 0 && DrawPipeline::Depth() != 0 && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (submission.commands[from] >> 8u) & 0xffu);
     auto& resolved = resolvedAhead();
     const auto localDevice = device.Load();
@@ -277,6 +282,10 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
             if (count < (opcode == 0x15 ? 5u : 3u) || resolved.contains(cursor)) break;
             if (prebuildOnly) {
                 currentPacketOffset() = cursor;
+                struct Prebuilding {
+                    Prebuilding() { prebuildingAhead() = true; }
+                    ~Prebuilding() { prebuildingAhead() = false; }
+                } prebuilding;
                 try {
                     if (opcode == 0x15) dispatch(scratch, packet, submission);
                     else dispatchIndirect(scratch, packet, submission);

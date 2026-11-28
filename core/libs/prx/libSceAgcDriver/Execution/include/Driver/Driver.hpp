@@ -428,6 +428,7 @@ private:
     static GroupCaptureStats& groupCaptureStats();
     static std::size_t& currentPacketOffset();
     static bool& resolvingAhead();
+    static bool& prebuildingAhead();
     static bool& gateOpened();
     void resolveGroupAhead(const Submission& submission, const QueueState& live, std::size_t from);
     static void clearResolvedAhead();
