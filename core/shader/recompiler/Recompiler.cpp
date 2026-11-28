@@ -1676,10 +1676,15 @@ std::optional<std::vector<BufferSubstitute>> decodeSubstitutes(std::span<const s
     return decoded;
 }
 
+template<typename TSlot>
+std::uint64_t knownSlots(std::span<const TSlot> slots) {
+    return static_cast<std::uint64_t>(std::ranges::count_if(slots, [](const TSlot& slot) { return slot.known; }));
+}
+
 void persistSubstitutes(const BufferSubstituteTable& table) {
     if (table.DiskKey().empty()) return;
     const auto slots = table.Slots();
-    ShaderDiskCache::StoreSubstitutes(table.DiskKey(), encodeSubstitutes(slots));
+    ShaderDiskCache::StoreSubstitutes(table.DiskKey(), encodeSubstitutes(slots), knownSlots<BufferSubstitute>(slots));
 }
 
 bool imageSubstitutesEnabled() {
@@ -1723,7 +1728,7 @@ std::vector<ImageSubstitute> decodeImageSubstitutes(std::span<const std::uint32_
 void persistImageSubstitutes(const ImageSubstituteTable& table) {
     if (table.DiskKey().empty()) return;
     const auto slots = table.Slots();
-    ShaderDiskCache::StoreSubstitutes(table.DiskKey(), encodeImageSubstitutes(slots));
+    ShaderDiskCache::StoreSubstitutes(table.DiskKey(), encodeImageSubstitutes(slots), knownSlots<ImageSubstitute>(slots));
 }
 
 std::vector<ImageSubstitute> imageSubstituteSlots(const CompiledVariant& variant) {

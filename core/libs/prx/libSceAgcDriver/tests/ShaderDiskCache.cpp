@@ -1602,6 +1602,64 @@ void verifySubstitutesAcrossProcesses(const std::filesystem::path& self) {
     require(RunSelf(self, "--learned-substitutes") == 0, "the process that reads the persisted buffer substitute failed");
 }
 
+struct TwoBufferRequest {
+    std::vector<std::uint32_t> code{SubstituteStoreWord, 0x80000000u, SubstituteStoreWord, 0x80010000u, 0xbf810000u};
+    std::array<std::uint32_t, 8> bound{0x10000000u, 0x00000000u, 0x40u, 0x00027facu, 0x10000100u, 0x00000000u, 0x40u, 0x00027facu};
+    std::array<std::uint32_t, 8> userData = bound;
+    ComputeRequest base{true};
+    RecompileRequest request{};
+
+    TwoBufferRequest() {
+        request = base.request;
+        request.shader = {ShaderStage::Compute, 0x21000u, code, 0, {}};
+        request.context.userData = userData;
+    }
+};
+
+int runSeedTwoSlotSubstitutes() {
+    TwoBufferRequest request;
+    static_cast<void>(Recompile(request.request));
+    ShaderRecompiler::ShaderDiskCache::Flush();
+    std::cout << "two bound V#s were specialized and both slots' substitutes stored\n";
+    return 0;
+}
+
+int runLearnedTwoSlotSubstitutes() {
+    TwoBufferRequest request;
+    request.userData.fill(0u);
+    const auto null = Recompile(request.request);
+    request.userData = request.bound;
+    const auto specialized = Recompile(request.request);
+    require(null.spirv.data() == specialized.spirv.data() && null.PipelineVariantId() == specialized.PipelineVariantId(), "two null V#s did not both take the substitutes an earlier process learned for their slots in one dispatch");
+    std::cout << "two null V#s took the substitutes an earlier process learned for both slots\n";
+    return 0;
+}
+
+void verifyTwoSlotSubstitutesAcrossProcesses(const std::filesystem::path& self) {
+    require(RunSelf(self, "--seed-two-slot-substitutes") == 0, "the process that learns two buffer substitutes failed");
+    require(RunSelf(self, "--learned-two-slot-substitutes") == 0, "the process that reads two persisted buffer substitutes failed");
+}
+
+void verifySubstituteStoreOrder() {
+    require(ShaderDiskCache::Enabled(), "the disk cache is not enabled");
+    const std::vector<std::byte> key{std::byte{0x73}, std::byte{0x75}, std::byte{0x62}, std::byte{0x01}};
+    const std::vector<std::uint32_t> first{0x00010000u, 0x00027facu, 0u, 0u, 1u, 0u, 0u, 0u, 0u, 0u};
+    const std::vector<std::uint32_t> both{0x00010000u, 0x00027facu, 0u, 0u, 1u, 0x00020000u, 0x00027facu, 0u, 0u, 1u};
+    const auto before = ShaderDiskCache::Totals();
+    ShaderDiskCache::StoreSubstitutes(key, both, 2u);
+    ShaderDiskCache::StoreSubstitutes(key, first, 1u);
+    ShaderDiskCache::Flush();
+    std::vector<std::uint32_t> loaded;
+    require(ShaderDiskCache::LoadSubstitutes(key, 5u, loaded) && loaded == both, "a substitute table with one learned slot, enqueued after the table with both, replaced it");
+    ShaderDiskCache::StoreSubstitutes(key, both, 2u);
+    ShaderDiskCache::Flush();
+    const auto after = ShaderDiskCache::Totals();
+    require(after.substituteWrites == before.substituteWrites + 1u, "an older or repeated substitute table was written (" + std::to_string(after.substituteWrites - before.substituteWrites) + " writes)");
+    require(after.specializedWrites == before.specializedWrites && after.writes == before.writes && after.planWrites == before.planWrites, "a substitute table was counted as another entry kind");
+    require(after.substituteHits == before.substituteHits + 1u && after.specializedHits == before.specializedHits, "the substitute table load was not counted as a substitute hit");
+    std::cout << "the newest substitute table of a key stays on disk whatever order its writes were enqueued in\n";
+}
+
 constexpr std::uint32_t ImageSwizzleXyzw = 0xfacu;
 constexpr std::uint32_t ImageSwizzleXyz1 = 0x3acu;
 constexpr std::uint32_t ImageFormat8888UNorm = 56u;
@@ -3397,6 +3455,8 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--seed-substitutes") return runSeedSubstitutes();
         if (argc == 2 && std::string_view(argv[1]) == "--learned-substitutes") return runLearnedSubstitutes(true);
         if (argc == 2 && std::string_view(argv[1]) == "--unlearned-substitutes") return runLearnedSubstitutes(false);
+        if (argc == 2 && std::string_view(argv[1]) == "--seed-two-slot-substitutes") return runSeedTwoSlotSubstitutes();
+        if (argc == 2 && std::string_view(argv[1]) == "--learned-two-slot-substitutes") return runLearnedTwoSlotSubstitutes();
         if (argc == 2 && std::string_view(argv[1]) == "--no-image-substitutes") return runWithoutImageSubstitutes();
         if (argc == 2 && std::string_view(argv[1]) == "--seed-image-substitutes") return runSeedImageSubstitutes();
         if (argc == 2 && std::string_view(argv[1]) == "--learned-image-substitutes") return runLearnedImageSubstitutes(true);
@@ -3433,6 +3493,8 @@ int main(int argc, char** argv) {
         verifyFailureMemoSwitch(ArgumentPath(argv, 0));
         verifyInvocationIsolation();
         verifySubstitutesAcrossProcesses(ArgumentPath(argv, 0));
+        verifyTwoSlotSubstitutesAcrossProcesses(ArgumentPath(argv, 0));
+        verifySubstituteStoreOrder();
         verifyImageSubstitutes();
         verifyImageSubstitutesAcrossProcesses(ArgumentPath(argv, 0));
         verifyBufferAlignmentSpecialization();
