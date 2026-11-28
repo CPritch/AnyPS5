@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "RuntimeAbi.hpp"
 #include "VulkanTestDevice.hpp"
+#include "tests/TemporaryFile.hpp"
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -12,6 +13,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -77,6 +83,43 @@ void CheckFailedBuildAhead() {
 
 static_assert(!AgcDriver::DriverDetail::CompilesUnoptimized(1u << 20u, 0u) && !AgcDriver::DriverDetail::CompilesUnoptimized(99u, 100u) && AgcDriver::DriverDetail::CompilesUnoptimized(100u, 100u) && AgcDriver::DriverDetail::CompilesUnoptimized(1u << 20u, 100u), "APS5_UNOPTIMIZED_COMPUTE_WORDS selects every compute module of at least its word count, and none when it is 0");
 
+class StderrCapture {
+public:
+    StderrCapture() {
+        std::fflush(stderr);
+        file = TemporaryFile::Open();
+        Require(file != nullptr, "cannot open a temporary file for stderr");
+#ifdef _WIN32
+        saved = _dup(_fileno(stderr));
+        _dup2(_fileno(file), _fileno(stderr));
+#else
+        saved = dup(fileno(stderr));
+        dup2(fileno(file), fileno(stderr));
+#endif
+    }
+    std::string Finish() {
+        std::fflush(stderr);
+#ifdef _WIN32
+        _dup2(saved, _fileno(stderr));
+        _close(saved);
+#else
+        dup2(saved, fileno(stderr));
+        close(saved);
+#endif
+        std::rewind(file);
+        std::string text;
+        char buffer[4096];
+        for (std::size_t read = 0; (read = std::fread(buffer, 1, sizeof(buffer), file)) != 0;) text.append(buffer, read);
+        std::fclose(file);
+        std::fwrite(text.data(), 1, text.size(), stderr);
+        return text;
+    }
+
+private:
+    std::FILE* file = nullptr;
+    int saved = -1;
+};
+
 int main() {
     try {
         CheckFailedBuildAhead();
@@ -89,6 +132,7 @@ int main() {
         const auto before = AgcDriver::VulkanDevice::ComputePipelineCounts();
         std::size_t attempts = 0;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        StderrCapture log;
         do {
             Dispatch();
             ++attempts;
@@ -97,6 +141,7 @@ int main() {
             Require(async, "a dispatch without APS5_ASYNC_DRAW_COMPILE was skipped");
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         } while (std::chrono::steady_clock::now() < deadline);
+        const auto logged = log.Finish();
         Require(Done(), "the dispatch never stored after its shader was prepared and specialized in the background");
         Require(async || attempts == 1, "a dispatch without APS5_ASYNC_DRAW_COMPILE needed more than one attempt");
         const bool waits = async && AgcDriver::DriverDetail::AsyncDispatchWait().count() > 0 && AgcDriver::DriverDetail::AsyncComputePipelineWords() != 0;
@@ -104,6 +149,7 @@ int main() {
         const auto after = AgcDriver::VulkanDevice::ComputePipelineCounts();
         Require(after.created > before.created, "the dispatch stored without creating a compute pipeline");
         const bool ahead = async && AgcDriver::DriverDetail::AsyncComputePipelineWords() == 0;
+        if (ahead) Require(logged.find("skipping the dispatches of compute shader") != std::string::npos && logged.find("its pipeline is ready after") != std::string::npos, "a dispatch skipped while its pipeline built ahead was not reported without APS5_PROFILE_DRAW");
         if (ahead) Require(after.created - before.created == after.ahead - before.ahead, "a dispatch with APS5_ASYNC_DRAW_COMPILE and APS5_ASYNC_COMPUTE_WORDS=0 created its compute pipeline itself (" + std::to_string(after.created - before.created) + " created, " + std::to_string(after.ahead - before.ahead) + " on the library prebuild pool)");
         else Require(after.ahead == before.ahead, "a dispatch whose compute pipeline is below APS5_ASYNC_COMPUTE_WORDS, or without APS5_ASYNC_DRAW_COMPILE, built its pipeline on the library prebuild pool");
         AgcDriverShutdown_nid_postfix();

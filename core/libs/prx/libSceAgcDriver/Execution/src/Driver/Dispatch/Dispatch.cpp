@@ -37,6 +37,7 @@ namespace {
 struct PipelineSkips {
     std::mutex mutex;
     std::map<std::uint64_t, std::uint64_t> skipped;
+    std::atomic<std::size_t> pending{0};
 };
 
 PipelineSkips& pipelineSkips() {
@@ -47,14 +48,19 @@ PipelineSkips& pipelineSkips() {
 void NotePipelineSkip(std::uint64_t address, std::size_t words) {
     auto& skips = pipelineSkips();
     std::lock_guard lock(skips.mutex);
-    if (skips.skipped[address]++ == 0) std::fprintf(stderr, "[dispatch] skipping the dispatches of compute shader 0x%llx while its pipeline builds (%zu SPIR-V words)\n", static_cast<unsigned long long>(address), words);
+    if (skips.skipped[address]++ == 0) {
+        skips.pending.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr, "[dispatch] skipping the dispatches of compute shader 0x%llx while its pipeline builds (%zu SPIR-V words)\n", static_cast<unsigned long long>(address), words);
+    }
 }
 
 void NotePipelineReady(std::uint64_t address) {
     auto& skips = pipelineSkips();
+    if (skips.pending.load(std::memory_order_relaxed) == 0) return;
     std::lock_guard lock(skips.mutex);
     const auto found = skips.skipped.find(address);
     if (found == skips.skipped.end()) return;
+    skips.pending.fetch_sub(1, std::memory_order_relaxed);
     std::fprintf(stderr, "[dispatch] compute shader 0x%llx: its pipeline is ready after %llu skipped dispatches\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(found->second));
     skips.skipped.erase(found);
 }
@@ -830,10 +836,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             }
         }
         if (ahead == VulkanDevice::PipelineAhead::Start || ahead == VulkanDevice::PipelineAhead::Building) {
-            if (profile) NotePipelineSkip(address, compiledResult->spirv.size());
+            NotePipelineSkip(address, compiledResult->spirv.size());
             return;
         }
-        if (profile) NotePipelineReady(address);
+        NotePipelineReady(address);
     }
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
