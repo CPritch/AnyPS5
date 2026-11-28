@@ -7,6 +7,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -16,7 +17,7 @@ void Require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-std::array<std::atomic<bool>, 5> Released{};
+std::array<std::atomic<bool>, 8> Released{};
 std::atomic<int> Started{0};
 std::atomic<int> Finished{0};
 std::atomic<bool> LibraryRan{false};
@@ -51,10 +52,39 @@ void ReleaseAll() {
     for (auto& released : Released) released.store(true);
 }
 
+void CheckWidePool() {
+    using AgcDriver::DriverDetail::SubmitComputePrebuild;
+    SubmitComputePrebuild([] { Blocking(0); });
+    Require(WaitFor(Started, 1, std::chrono::seconds(10)), "the prebuild pool did not start a compute prebuild");
+    for (int index = 1; index <= 6; ++index) SubmitComputePrebuild([index] { Blocking(index); }, true);
+    const bool wide = WaitFor(Started, 6, std::chrono::seconds(10));
+    AgcDriver::DriverDetail::SubmitLibraryPrebuild([] { LibraryRan.store(true); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!LibraryRan.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool libraryRan = LibraryRan.load();
+    SubmitComputePrebuild([] { Blocking(7); });
+    const bool capHeld = !WaitFor(Started, 7, std::chrono::milliseconds(300));
+    const auto whileFull = Started.load();
+    Released[1].store(true);
+    const bool freed = WaitFor(Started, 7, std::chrono::seconds(10));
+    const auto order = OrderNow();
+    ReleaseAll();
+    Require(WaitFor(Finished, 8, std::chrono::seconds(10)), "the compute prebuilds did not finish");
+    Require(wide, "compute prebuilds a dispatch waits for ran on " + std::to_string(whileFull) + " of the 8 prebuild threads beside one that no dispatch waits for, not 6");
+    Require(libraryRan, "a library prebuild did not run while compute prebuilds held all but two prebuild threads");
+    Require(capHeld && whileFull == 6, "the prebuild pool ran " + std::to_string(whileFull) + " compute prebuilds at once with APS5_PREBUILD_THREADS=8, past all but two of its threads");
+    Require(freed && order.size() >= 7 && order[6] == 6, "a freed slot went to a compute prebuild that no dispatch waits for while one a dispatch waits for was queued");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "wide") {
+            CheckWidePool();
+            std::cout << "compute prebuild priority tests passed (wide pool)\n";
+            return 0;
+        }
         using AgcDriver::DriverDetail::SubmitComputePrebuild;
         SubmitComputePrebuild([] { Blocking(0); });
         SubmitComputePrebuild([] { Blocking(1); });

@@ -2467,6 +2467,7 @@ private:
         pthread_attr_destroy(&attributes);
 #endif
         budgetedLimit = std::max(1u, threads / 2u);
+        awaitedLimit = std::max(budgetedLimit, threads > 2u ? threads - 2u : 1u);
     }
 
 #ifdef _WIN32
@@ -2545,8 +2546,9 @@ private:
 
     bool startable(const Task& queued) const {
         if (!queued.budgeted) return true;
+        if (queued.awaited) return budgetedRunning < awaitedLimit;
         if (budgetedRunning >= budgetedLimit) return false;
-        return queued.awaited || budgetedLimit == 1 || budgetedRunning - awaitedRunning + 1 < budgetedLimit;
+        return budgetedLimit == 1 || budgetedRunning - awaitedRunning + 1 < budgetedLimit;
     }
 
     std::mutex mutex;
@@ -2563,6 +2565,7 @@ private:
     unsigned budgetedRunning = 0;
     unsigned awaitedRunning = 0;
     unsigned budgetedLimit = 1;
+    unsigned awaitedLimit = 1;
     std::uint64_t submitted = 0;
     std::set<std::uint64_t> unfinished;
     std::unordered_multimap<const PreparedShaders*, std::uint64_t> owned;
