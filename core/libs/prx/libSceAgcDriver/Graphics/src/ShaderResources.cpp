@@ -945,6 +945,21 @@ std::size_t storageEntries() {
     return entries;
 }
 
+std::size_t storageEntryCeiling() {
+    constexpr std::size_t factor = 8u;
+    const auto entries = storageEntries();
+    return entries > std::numeric_limits<std::size_t>::max() / factor ? std::numeric_limits<std::size_t>::max() : entries * factor;
+}
+
+std::chrono::steady_clock::duration storageIdleAge() {
+    static const std::chrono::steady_clock::duration age = [] {
+        const char* text = std::getenv("APS5_STORAGE_CACHE_IDLE_MS");
+        if (text == nullptr || *text == '\0') return std::chrono::steady_clock::duration(std::chrono::seconds(10));
+        return std::chrono::steady_clock::duration(std::chrono::milliseconds(std::strtoull(text, nullptr, 10)));
+    }();
+    return age;
+}
+
 std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
     const bool queryable = context.memoryProperties2 != nullptr && context.physical != VK_NULL_HANDLE;
     const auto now = std::chrono::steady_clock::now();
@@ -1605,6 +1620,7 @@ struct CachedStorageTexture {
     std::shared_ptr<StorageTexture> texture;
     std::uint64_t accounted = 0;
     std::uint64_t lastPresent = 0;
+    std::chrono::steady_clock::duration lastUse{};
 };
 
 // As TextureCache: use order with a hash index by key, plus one by image for StorageImageCached.
@@ -1614,7 +1630,16 @@ struct StorageTextureCache {
     std::unordered_map<StorageKey, std::list<CachedStorageTexture>::iterator, StorageKeyHash> index;
     std::unordered_map<const StorageTexture*, std::list<CachedStorageTexture>::iterator> byImage;
     std::atomic<std::uint64_t> bytes{0};
+    std::chrono::steady_clock::time_point lastLookup{};
+    std::chrono::steady_clock::duration activeTime{};
 };
+
+std::chrono::steady_clock::duration advanceActiveTime(StorageTextureCache& cache) {
+    const auto now = std::chrono::steady_clock::now();
+    if (cache.lastLookup != std::chrono::steady_clock::time_point{}) cache.activeTime += std::min<std::chrono::steady_clock::duration>(now - cache.lastLookup, std::chrono::seconds(1));
+    cache.lastLookup = now;
+    return cache.activeTime;
+}
 
 StorageTextureCache& StorageTextures() {
     static auto& cache = *new StorageTextureCache();
@@ -1833,6 +1858,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     {
         std::lock_guard lock(cache.mutex);
         const CacheHold held(storageCacheHeld);
+        const auto active = advanceActiveTime(cache);
         if (resource.mipCount > AllocatedLevels(resource)) {
             auto allocated = resource;
             allocated.mipCount = AllocatedLevels(resource);
@@ -1850,6 +1876,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             else it->texture->Refresh();
             cache.entries.splice(cache.entries.begin(), cache.entries, it);
             it->lastPresent = Recorder::Presents();
+            it->lastUse = active;
             texture = it->texture;
             if (TextureCountersReported()) counters.storageHits.fetch_add(1, std::memory_order_relaxed);
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
@@ -1866,6 +1893,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             created->AdoptHandOver(std::move(handOver));
             CachedStorageTexture entry{key, mip, std::move(created)};
             entry.lastPresent = Recorder::Presents();
+            entry.lastUse = active;
             static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
             if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
             entry.accounted = heldBytes(*entry.texture);
@@ -1874,8 +1902,14 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
                 const bool overBudget = cache.bytes + entry.accounted > budget;
                 if (!overBudget && cache.entries.size() < storageEntries()) break;
                 const auto back = std::prev(cache.entries.end());
-                if (back->texture->TakeUsed()) cache.entries.splice(cache.entries.begin(), cache.entries, back);
-                else evicted.push_back(evictStorage(cache, back, true, overBudget ? "cache eviction" : "entry cap"));
+                if (back->texture->TakeUsed()) {
+                    back->lastUse = active;
+                    cache.entries.splice(cache.entries.begin(), cache.entries, back);
+                } else if (!overBudget && cache.entries.size() < storageEntryCeiling() && active - back->lastUse < storageIdleAge()) {
+                    break;
+                } else {
+                    evicted.push_back(evictStorage(cache, back, true, overBudget ? "cache eviction" : "entry cap"));
+                }
             }
             cache.bytes += entry.accounted;
             texture = entry.texture;
