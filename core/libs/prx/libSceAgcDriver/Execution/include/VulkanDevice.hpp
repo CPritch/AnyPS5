@@ -249,9 +249,10 @@ public:
     };
     static CopyAliasing CopyAliasCounts();
     struct ComputePipelineCreation {
-        std::uint64_t created, underGpuMutex, ahead;
+        std::uint64_t created, underGpuMutex, ahead, awaited, awaitedUnderGpuMutex;
     };
     static ComputePipelineCreation ComputePipelineCounts();
+    static void SetComputePipelineBuildHookForTest(void (*hook)(std::uint64_t programAddress));
     struct DispatchMoveCount {
         std::uint64_t checked, exact, moved, refused, filtered, rebuilt, kept, served, inPlace;
     };
@@ -462,6 +463,7 @@ private:
     // The stage-A pre-sync over `surfaces` (see PrepareDispatch): the serial waited for, 0 none.
     std::uint64_t presync(std::span<const Graphics::PresyncSurface> surfaces);
     std::shared_ptr<ComputePipelineObjects> computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress);
+    std::shared_ptr<ComputePipelineObjects> awaitComputePipelineBuild(const ShaderRecompiler::RecompileResult& shader, VkShaderStageFlags pushStages);
     // A DISPATCH_INDIRECT's argument path (see DispatchIndirect): GPU-side from the host import, or
     // the counts read on the CPU (the record then continues as a direct dispatch).
     void decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText);

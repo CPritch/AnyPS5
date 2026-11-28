@@ -4016,10 +4016,23 @@ namespace {
 std::atomic<std::uint64_t> computePipelinesCreated{0};
 std::atomic<std::uint64_t> computePipelinesCreatedLocked{0};
 std::atomic<std::uint64_t> computePipelinesCreatedAhead{0};
+std::atomic<std::uint64_t> computePipelineBuildsAwaited{0};
+std::atomic<std::uint64_t> computePipelineBuildsAwaitedLocked{0};
+std::atomic<void (*)(std::uint64_t)> computePipelineBuildHook{nullptr};
+
+std::shared_ptr<ComputePipelineObjects> AwaitBuild(const std::shared_future<std::shared_ptr<ComputePipelineObjects>>& build) {
+    computePipelineBuildsAwaited.fetch_add(1, std::memory_order_relaxed);
+    if (GuestMemory::GpuMutex().HeldByThisThread()) computePipelineBuildsAwaitedLocked.fetch_add(1, std::memory_order_relaxed);
+    return build.get();
+}
 }
 
 VulkanDevice::ComputePipelineCreation VulkanDevice::ComputePipelineCounts() {
-    return {computePipelinesCreated.load(std::memory_order_relaxed), computePipelinesCreatedLocked.load(std::memory_order_relaxed), computePipelinesCreatedAhead.load(std::memory_order_relaxed)};
+    return {computePipelinesCreated.load(std::memory_order_relaxed), computePipelinesCreatedLocked.load(std::memory_order_relaxed), computePipelinesCreatedAhead.load(std::memory_order_relaxed), computePipelineBuildsAwaited.load(std::memory_order_relaxed), computePipelineBuildsAwaitedLocked.load(std::memory_order_relaxed)};
+}
+
+void VulkanDevice::SetComputePipelineBuildHookForTest(void (*hook)(std::uint64_t programAddress)) {
+    computePipelineBuildHook.store(hook, std::memory_order_release);
 }
 
 VulkanDevice::CopyAliasing VulkanDevice::CopyAliasCounts() {
@@ -6425,6 +6438,8 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         const auto described = Graphics::DescribeSetLayouts(context, shaders);
         prepared->describedLayoutKey = described.mainKey;
         prepared->objects = computePipeline(context, shader, described.layouts.main, described.mainKey, pushStages, programAddress);
+    } else {
+        prepared->objects = awaitComputePipelineBuild(shader, pushStages);
     }
     return prepared;
 }
@@ -7211,7 +7226,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         else state->computePipelinesBuilding.emplace(pipelineKey, building.get_future().share());
     }
     const PipelineWaitClockPause pause;
-    if (other.valid()) return other.get();
+    if (other.valid()) return AwaitBuild(other);
     const auto finish = [&](std::shared_ptr<ComputePipelineObjects> built, std::exception_ptr error) {
         if (pipelineKey.identity.Empty()) return built;
         {
@@ -7225,6 +7240,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
     };
     std::shared_ptr<ComputePipelineObjects> objects;
     try {
+        if (const auto hook = computePipelineBuildHook.load(std::memory_order_acquire)) hook(programAddress);
         if (Graphics::PipelineJournalEnabled() && !state->probingFloatControls) Graphics::RecordComputePipeline(shader, pushStages != 0);
         objects = createComputePipeline(context, shader, setLayout, layoutKey, pushStages, programAddress);
     } catch (...) {
@@ -7232,6 +7248,20 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
         throw;
     }
     return finish(std::move(objects), nullptr);
+}
+
+std::shared_ptr<ComputePipelineObjects> VulkanDevice::awaitComputePipelineBuild(const ShaderRecompiler::RecompileResult& shader, VkShaderStageFlags pushStages) {
+    const auto pipelineKey = ComputePipelineKey::Of(shader, pushStages != 0);
+    if (pipelineKey.identity.Empty()) return nullptr;
+    std::shared_future<std::shared_ptr<ComputePipelineObjects>> building;
+    {
+        std::lock_guard pipelines(state->computePipelinesMutex);
+        const auto pending = state->computePipelinesBuilding.find(pipelineKey);
+        if (pending == state->computePipelinesBuilding.end()) return nullptr;
+        building = pending->second;
+    }
+    const PipelineWaitClockPause pause;
+    return AwaitBuild(building);
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews, std::optional<std::uint64_t> borderColorTable) {
@@ -7465,7 +7495,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (profile && std::chrono::steady_clock::now() - d.cacheReport > std::chrono::seconds(10)) {
         d.cacheReport = std::chrono::steady_clock::now();
         AgcDriver::ProfilePrint_nid_no_patch("[rescache] (cumulative): %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words, %llu paired their data bindings by number (no image table binding of their own); Find calls %llu, Touch calls %llu\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), state->resourceCache.Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(d.templateByNumber), static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()));
-        AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call (cumulative): %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu; compute pipelines created %llu (%llu under the GPU mutex)\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped), static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelinesCreatedLocked.load(std::memory_order_relaxed)));
+        AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call (cumulative): %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu; compute pipelines created %llu (%llu under the GPU mutex), waits for another thread's build %llu (%llu under the GPU mutex)\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped), static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelinesCreatedLocked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelineBuildsAwaited.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelineBuildsAwaitedLocked.load(std::memory_order_relaxed)));
         reportRecipes();
         reportDispatchMove();
     }
