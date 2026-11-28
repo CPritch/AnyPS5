@@ -80,7 +80,8 @@ void CheckPrebuildsRunOnThreadsOfTheirOwnName() {
 
 void CheckLibraryPrebuildRunsBesideBlockedComputePrebuilds() {
     const unsigned threads = PrebuildThreads();
-    const unsigned limit = std::max(1u, threads / 2u);
+    const unsigned budgeted = std::max(1u, threads / 2u);
+    const unsigned limit = budgeted > 1u ? budgeted - 1u : budgeted;
     const auto gate = std::make_shared<Gate>();
     const OpenOnExit release{gate};
     for (unsigned index = 0; index < threads; ++index) {
@@ -96,7 +97,8 @@ void CheckLibraryPrebuildRunsBesideBlockedComputePrebuilds() {
         });
     }
     std::unique_lock lock(gate->mutex);
-    Require(gate->changed.wait_for(lock, std::chrono::seconds(10), [&] { return gate->running == limit; }), std::to_string(gate->running) + " of " + std::to_string(threads) + " blocked compute prebuilds started, not " + std::to_string(limit));
+    const bool started = gate->changed.wait_for(lock, std::chrono::seconds(10), [&] { return gate->running == limit; });
+    Require(started, std::to_string(gate->running) + " of " + std::to_string(threads) + " blocked compute prebuilds that no dispatch waits for started, not " + std::to_string(limit) + " (one budgeted slot is kept for a prebuild a dispatch waits for)");
     lock.unlock();
     AgcDriver::DriverDetail::SubmitLibraryPrebuild([gate] {
         std::lock_guard built(gate->mutex);

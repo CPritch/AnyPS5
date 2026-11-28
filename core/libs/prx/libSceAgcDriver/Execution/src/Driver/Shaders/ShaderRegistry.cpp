@@ -2318,13 +2318,13 @@ private:
 
 public:
 
-    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr, bool budgeted = false, std::uint64_t program = 0, bool front = false) {
+    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr, bool budgeted = false, std::uint64_t program = 0, bool awaited = false) {
         {
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
                 const auto sequence = ++submitted;
-                if (front || (prepared != nullptr && prepared->demanded.load())) tasks.push_front({std::move(task), prepared, sequence, budgeted, program});
-                else tasks.push_back({std::move(task), prepared, sequence, budgeted, program});
+                if (awaited || (prepared != nullptr && prepared->demanded.load())) tasks.push_front({std::move(task), prepared, sequence, budgeted, program, awaited});
+                else tasks.push_back({std::move(task), prepared, sequence, budgeted, program, awaited});
                 if (program != 0) waitingPrograms.fetch_add(1, std::memory_order_relaxed);
                 unfinished.insert(sequence);
                 if (prepared != nullptr) owned.emplace(prepared, sequence);
@@ -2487,7 +2487,7 @@ private:
                 auto next = pool.tasks.end();
                 bool fromBackground = false;
                 pool.ready.wait(lock, [&] {
-                    next = std::ranges::find_if(pool.tasks, [&](const Task& queued) { return !queued.budgeted || pool.budgetedRunning < pool.budgetedLimit; });
+                    next = std::ranges::find_if(pool.tasks, [&](const Task& queued) { return pool.startable(queued); });
                     fromBackground = !pool.background.empty() && (next == pool.tasks.end() || pool.foregroundRun >= ForegroundBeforeBackground);
                     return fromBackground || next != pool.tasks.end() || (pool.closed && pool.tasks.empty());
                 });
@@ -2506,9 +2506,11 @@ private:
                 }
                 ++pool.running;
                 if (task.budgeted) ++pool.budgetedRunning;
+                if (task.budgeted && task.awaited) ++pool.awaitedRunning;
             }
             const auto sequence = task.sequence;
             const bool budgeted = task.budgeted;
+            const bool awaited = task.awaited;
             const auto* const prepared = task.prepared;
             task.function();
             task = {};
@@ -2517,6 +2519,7 @@ private:
                 std::lock_guard lock(pool.mutex);
                 --pool.running;
                 if (budgeted) --pool.budgetedRunning;
+                if (budgeted && awaited) --pool.awaitedRunning;
                 pool.unfinished.erase(sequence);
                 pool.disown(prepared, sequence);
                 drained = pool.tasks.empty() && pool.background.empty() && pool.running == 0;
@@ -2536,7 +2539,14 @@ private:
         std::uint64_t sequence = 0;
         bool budgeted = false;
         std::uint64_t program = 0;
+        bool awaited = false;
     };
+
+    bool startable(const Task& queued) const {
+        if (!queued.budgeted) return true;
+        if (budgetedRunning >= budgetedLimit) return false;
+        return queued.awaited || budgetedLimit == 1 || budgetedRunning - awaitedRunning + 1 < budgetedLimit;
+    }
 
     std::mutex mutex;
     std::condition_variable ready;
@@ -2550,6 +2560,7 @@ private:
     inline static std::atomic<unsigned> liveWorkers{0};
     unsigned running = 0;
     unsigned budgetedRunning = 0;
+    unsigned awaitedRunning = 0;
     unsigned budgetedLimit = 1;
     std::uint64_t submitted = 0;
     std::set<std::uint64_t> unfinished;
