@@ -163,6 +163,7 @@ static_assert(fieldCount<UniformFill>() == 5, "UniformFill changed: update the p
 static_assert(fieldCount<UniformFillPlan>() == 2, "UniformFillPlan changed: update the plan encoder");
 
 constexpr std::uint32_t FileMagic = 0x43535041u;
+constexpr std::size_t SubstituteWords = 5;
 
 struct FileHeader {
     std::uint32_t magic;
@@ -1706,6 +1707,18 @@ public:
         enqueue({std::move(key), nullptr, nullptr, std::move(words)});
     }
 
+    bool LoadSubstitutes(std::span<const std::byte> key, std::vector<std::uint32_t>& words) {
+        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) {
+            std::span<const std::byte> payload;
+            const auto status = unwrapEntry(file, key, payload);
+            if (status != LoadStatus::Loaded) return status;
+            if (payload.empty() || payload.size() % (SubstituteWords * sizeof(std::uint32_t)) != 0) return LoadStatus::Rejected;
+            words.resize(payload.size() / sizeof(std::uint32_t));
+            std::memcpy(words.data(), payload.data(), payload.size());
+            return LoadStatus::Loaded;
+        }, substituteHits, substituteMisses, substituteLoadFailures);
+    }
+
     std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, const CompiledVariant& variant) {
         const auto path = directory / EntryName(key);
         const auto file = EncodeEntry(key, variant);
@@ -2072,6 +2085,7 @@ private:
     std::atomic<std::uint64_t> hits{0}, misses{0}, writes{0}, loadFailures{0}, writeFailures{0}, bytesRead{0}, bytesWritten{0}, loadNanoseconds{0};
     std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0};
     std::atomic<std::uint64_t> specializedHits{0}, specializedMisses{0}, specializedWrites{0}, specializedLoadFailures{0};
+    std::atomic<std::uint64_t> substituteHits{0}, substituteMisses{0}, substituteLoadFailures{0};
     std::atomic<std::uint64_t> prebuiltHits{0}, prebuiltMisses{0}, prebuiltRejected{0}, lookupNanoseconds{0}, readNanoseconds{0}, decodeNanoseconds{0}, maxLoadNanoseconds{0}, prebuiltBytesRead{0}, prebuiltLoadNanoseconds{0};
     std::atomic<std::int64_t> lastReport{0};
     std::mutex reportMutex;
@@ -2268,6 +2282,23 @@ std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> 
 void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan) {
     auto& instance = store();
     if (instance.Enabled() && plan != nullptr) instance.StorePlan(std::move(key), std::move(plan));
+}
+
+bool LoadSubstitutes(std::span<const std::byte> key, std::vector<std::uint32_t>& words) {
+    auto& instance = store();
+    if (!instance.Enabled()) return false;
+    const auto& switches = switchKey();
+    std::vector<std::byte> full(key.begin(), key.end());
+    full.insert(full.end(), switches.begin(), switches.end());
+    return instance.LoadSubstitutes(full, words);
+}
+
+void StoreSubstitutes(std::vector<std::byte> key, std::vector<std::uint32_t> words) {
+    auto& instance = store();
+    if (!instance.Enabled() || words.empty()) return;
+    const auto& switches = switchKey();
+    key.insert(key.end(), switches.begin(), switches.end());
+    instance.StoreSpecialized(std::move(key), std::move(words));
 }
 
 bool LoadSpecialized(std::span<const std::byte> key, std::vector<std::uint32_t>& words) {

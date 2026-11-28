@@ -1567,6 +1567,41 @@ void verifyFailureMemoSwitch(const std::filesystem::path& self) {
     require(RunSelf(self, "--no-failure-memo") == 0, "the process with APS5_NO_FAILURE_MEMO=1 failed");
 }
 
+constexpr std::uint32_t SubstituteStoreWord = 0xe0700008u;
+
+int runSeedSubstitutes() {
+    ComputeRequest request(true);
+    request.code[0] = SubstituteStoreWord;
+    static_cast<void>(Recompile(request.request));
+    ShaderRecompiler::ShaderDiskCache::Flush();
+    std::cout << "a bound V# was specialized and its slot's substitute stored\n";
+    return 0;
+}
+
+int runLearnedSubstitutes(bool persisted) {
+    ComputeRequest request(true);
+    request.code[0] = SubstituteStoreWord;
+    const auto bound = request.userData;
+    request.userData = {0u, 0u, 0u, 0u};
+    const auto null = Recompile(request.request);
+    request.userData = bound;
+    const auto specialized = Recompile(request.request);
+    const bool shared = null.spirv.data() == specialized.spirv.data() && null.PipelineVariantId() == specialized.PipelineVariantId();
+    require(shared == persisted, persisted ? "a null V# seen before its slot's bound V# in this process did not take the substitute an earlier process learned" : "a null V# took the substitute an earlier process learned while APS5_NO_PERSISTED_BUFFER_SUBSTITUTES was set");
+    ShaderRecompiler::ShaderDiskCache::Flush();
+    std::cout << (persisted ? "a null V# took the substitute an earlier process learned\n" : "a null V# kept its own module without the persisted substitute\n");
+    return 0;
+}
+
+void verifySubstitutesAcrossProcesses(const std::filesystem::path& self) {
+    require(RunSelf(self, "--seed-substitutes") == 0, "the process that learns a buffer substitute failed");
+    setEnvironment("APS5_NO_PERSISTED_BUFFER_SUBSTITUTES", "1");
+    const auto unlearned = RunSelf(self, "--unlearned-substitutes");
+    clearEnvironment("APS5_NO_PERSISTED_BUFFER_SUBSTITUTES");
+    require(unlearned == 0, "the process without persisted buffer substitutes failed");
+    require(RunSelf(self, "--learned-substitutes") == 0, "the process that reads the persisted buffer substitute failed");
+}
+
 void verifyInvocationIsolation() {
     ComputeRequest request(true);
     const auto first = Recompile(request.request);
@@ -3217,6 +3252,9 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--load-prebuilt") return runPrebuiltLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
         if (argc == 2 && std::string_view(argv[1]) == "--specialized-switch") return runSwitchedSpecialized();
+        if (argc == 2 && std::string_view(argv[1]) == "--seed-substitutes") return runSeedSubstitutes();
+        if (argc == 2 && std::string_view(argv[1]) == "--learned-substitutes") return runLearnedSubstitutes(true);
+        if (argc == 2 && std::string_view(argv[1]) == "--unlearned-substitutes") return runLearnedSubstitutes(false);
         if (argc == 2 && std::string_view(argv[1]).starts_with("--load-plan")) return runPlanLoadingProcess(argv[1]);
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);
@@ -3248,6 +3286,7 @@ int main(int argc, char** argv) {
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(ArgumentPath(argv, 0));
         verifyInvocationIsolation();
+        verifySubstitutesAcrossProcesses(ArgumentPath(argv, 0));
         verifyBufferAlignmentSpecialization();
         verifyBindingPlanSelection();
         verifyVertexTypeSpecialization();

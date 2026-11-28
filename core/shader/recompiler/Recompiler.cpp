@@ -1647,6 +1647,37 @@ bool bufferSubstitutesEnabled() {
     return enabled;
 }
 
+bool persistedSubstitutesEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_PERSISTED_BUFFER_SUBSTITUTES") == nullptr;
+    return enabled;
+}
+
+std::vector<std::uint32_t> encodeSubstitutes(std::span<const BufferSubstitute> slots) {
+    std::vector<std::uint32_t> words;
+    words.reserve(slots.size() * 5u);
+    for (const auto& slot : slots) {
+        for (const auto word : {slot.word1, slot.word3, slot.misalignment, slot.tail, slot.known ? 1u : 0u}) words.push_back(word);
+    }
+    return words;
+}
+
+std::optional<std::vector<BufferSubstitute>> decodeSubstitutes(std::span<const std::uint32_t> words, std::size_t slots) {
+    if (words.size() != slots * 5u) return std::nullopt;
+    std::vector<BufferSubstitute> decoded(slots);
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        const auto at = words.subspan(slot * 5u, 5u);
+        if (at[4] > 1u) return std::nullopt;
+        decoded[slot] = {at[0], at[1], at[2], at[3], at[4] != 0u};
+    }
+    return decoded;
+}
+
+void persistSubstitutes(const BufferSubstituteTable& table) {
+    if (table.DiskKey().empty()) return;
+    const auto slots = table.Slots();
+    ShaderDiskCache::StoreSubstitutes(table.DiskKey(), encodeSubstitutes(slots));
+}
+
 template<typename TVisit>
 void visitBindingPlanKey(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, std::span<const BufferSubstitute> substitutes, TVisit&& visit) {
     visit(variant.artifact.variantId);
@@ -1705,7 +1736,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     if (plan->failure) std::rethrow_exception(plan->failure);
     for (std::size_t index = 0; index < substitutes.size(); ++index) {
         const auto& descriptor = snapshot.buffers.at(index);
-        if (!substitutes[index].known && BufferDescriptorPresent(descriptor)) variant.substitutes->Learn(index, BufferSpecializationFields(descriptor, {}, index));
+        if (!substitutes[index].known && BufferDescriptorPresent(descriptor) && variant.substitutes->Learn(index, BufferSpecializationFields(descriptor, {}, index))) persistSubstitutes(*variant.substitutes);
     }
     return plan;
 }
@@ -2087,7 +2118,25 @@ void attachSubstitutes(CompiledVariant& variant) {
     static std::map<std::tuple<std::uint64_t, std::uint64_t, std::size_t>, std::shared_ptr<BufferSubstituteTable>> tables;
     std::lock_guard lock(mutex);
     auto& table = tables[{hash.low, hash.high, slots}];
-    if (table == nullptr) table = std::make_shared<BufferSubstituteTable>(std::vector<BufferSubstitute>(slots));
+    if (table == nullptr) {
+        std::vector<BufferSubstitute> initial(slots);
+        std::vector<std::byte> diskKey;
+        if (persistedSubstitutesEnabled() && bufferSubstitutesEnabled() && ShaderDiskCache::Enabled()) {
+            constexpr std::string_view tag = "buffer-substitutes";
+            diskKey.resize(tag.size());
+            std::memcpy(diskKey.data(), tag.data(), tag.size());
+            for (const std::uint64_t value : {hash.low, hash.high, static_cast<std::uint64_t>(slots)}) {
+                const auto offset = diskKey.size();
+                diskKey.resize(offset + sizeof(value));
+                std::memcpy(diskKey.data() + offset, &value, sizeof(value));
+            }
+            std::vector<std::uint32_t> words;
+            if (ShaderDiskCache::LoadSubstitutes(diskKey, words)) {
+                if (auto decoded = decodeSubstitutes(words, slots)) initial = std::move(*decoded);
+            }
+        }
+        table = std::make_shared<BufferSubstituteTable>(std::move(initial), std::move(diskKey));
+    }
     variant.substitutes = table;
 }
 

@@ -15,7 +15,7 @@ namespace ShaderRecompiler {
 
 class BufferSubstituteTable {
 public:
-    explicit BufferSubstituteTable(std::vector<BufferSubstitute> slots) : slots(std::move(slots)) {}
+    explicit BufferSubstituteTable(std::vector<BufferSubstitute> slots, std::vector<std::byte> diskKey = {}) : slots(std::move(slots)), diskKey(std::move(diskKey)) {}
 
     [[nodiscard]] std::vector<BufferSubstitute> Slots() const {
         std::lock_guard lock(mutex);
@@ -27,16 +27,22 @@ public:
         out.assign(slots.begin(), slots.end());
     }
 
-    void Learn(std::size_t slot, const BufferSubstitute& value) {
+    bool Learn(std::size_t slot, const BufferSubstitute& value) {
         std::lock_guard lock(mutex);
-        if (slot >= slots.size() || slots[slot].known) return;
+        if (slot >= slots.size() || slots[slot].known) return false;
         slots[slot] = value;
         slots[slot].known = true;
+        return true;
+    }
+
+    [[nodiscard]] const std::vector<std::byte>& DiskKey() const {
+        return diskKey;
     }
 
 private:
     mutable std::mutex mutex;
     std::vector<BufferSubstitute> slots;
+    const std::vector<std::byte> diskKey;
 };
 
 struct CompiledVariant {
