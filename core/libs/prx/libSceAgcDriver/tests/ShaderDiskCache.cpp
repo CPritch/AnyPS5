@@ -2847,6 +2847,16 @@ void verifyPlanReleaseOffTrimmingThread() {
     require(!evicted.expired(), "plan release: the trimming thread destroyed an evicted plan");
     entered.get_future().wait();
     require(!evicted.expired(), "plan release: an evicted plan was destroyed before the releaser ran");
+    auto second = fixture;
+    second.code.insert(second.code.begin(), 0xbf80000cu);
+    second.codeAddress += 0x1000u;
+    SetResourcePlanBudget(0u);
+    std::weak_ptr<const IrResourcePlan> pastBacklog = GetResourcePlan(second.Request(true));
+    require(!pastBacklog.expired(), "plan release: the second fixture plan is not held by its source");
+    ShaderDiskCache::Flush();
+    SetResourcePlanBudget(1u);
+    require(pastBacklog.expired(), "plan release: a trim past the release backlog left its plan to the busy releaser");
+    require(!evicted.expired(), "plan release: the busy releaser's plan was destroyed by a later trim");
     resume.set_value();
     FlushResourcePlanReleases();
     SetResourcePlanReleaseHook(nullptr);

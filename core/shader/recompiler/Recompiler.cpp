@@ -1,3 +1,4 @@
+#include "prx/libc/include/HostThread.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "HeapCacheSwitch.hpp"
 #include "Recompiler.hpp"
@@ -814,6 +815,8 @@ struct PlanReleaser {
     std::condition_variable wake;
     std::condition_variable drained;
     std::vector<std::shared_ptr<const IrResourcePlan>> pending;
+    std::uint64_t pendingBytes = 0;
+    std::uint64_t inflightBytes = 0;
     std::function<void()> hook;
     bool releasing = false;
     bool started = false;
@@ -829,31 +832,36 @@ void runPlanReleaser(PlanReleaser& releaser) {
     for (;;) {
         releaser.wake.wait(lock, [&] { return !releaser.pending.empty(); });
         auto batch = std::exchange(releaser.pending, {});
+        const auto batchBytes = std::exchange(releaser.pendingBytes, 0);
         const auto hook = releaser.hook;
         releaser.releasing = true;
         lock.unlock();
         if (hook) hook();
         batch.clear();
         lock.lock();
+        releaser.inflightBytes -= batchBytes;
         releaser.releasing = false;
         if (releaser.pending.empty()) releaser.drained.notify_all();
     }
 }
 
-void releasePlans(std::vector<std::shared_ptr<const IrResourcePlan>> plans) {
+void releasePlans(std::vector<std::shared_ptr<const IrResourcePlan>> plans, std::uint64_t bytes, std::uint64_t pendingLimit) {
     if (plans.empty()) return;
     auto& releaser = planReleaser();
     {
         std::lock_guard lock(releaser.mutex);
+        if (releaser.inflightBytes != 0 && releaser.inflightBytes + bytes > pendingLimit) return;
         if (!releaser.started) {
             try {
-                std::thread([&releaser] { runPlanReleaser(releaser); }).detach();
+                Libc::StartHostThread([&releaser] { runPlanReleaser(releaser); }).detach();
             } catch (const std::system_error&) {
                 return;
             }
             releaser.started = true;
         }
         std::ranges::move(plans, std::back_inserter(releaser.pending));
+        releaser.pendingBytes += bytes;
+        releaser.inflightBytes += bytes;
     }
     releaser.wake.notify_one();
 }
@@ -895,6 +903,7 @@ void trimResourcePlans(std::uint64_t budget) {
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) { return left.used < right.used; });
     const auto target = budget / 4u * 3u;
     std::vector<std::shared_ptr<const IrResourcePlan>> released;
+    std::uint64_t releasedBytes = 0;
     for (const auto& candidate : candidates) {
         if (plans.heldBytes.load(std::memory_order_relaxed) <= target) break;
         std::vector<std::unique_lock<std::mutex>> locks;
@@ -905,11 +914,14 @@ void trimResourcePlans(std::uint64_t budget) {
             locks.push_back(std::move(lock));
         }
         if (locks.size() != candidate.owners.size() || candidate.owners.front().source->plan.use_count() != static_cast<long>(candidate.owners.size())) continue;
-        for (const auto& owner : candidate.owners) released.push_back(takePlan(*owner.source));
+        for (const auto& owner : candidate.owners) {
+            releasedBytes += owner.source->planBytes;
+            released.push_back(takePlan(*owner.source));
+        }
         plans.evictions.fetch_add(candidate.owners.size(), std::memory_order_relaxed);
     }
     plans.trimmedTo.store(plans.heldBytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    releasePlans(std::move(released));
+    releasePlans(std::move(released), releasedBytes, budget / 4u);
 }
 
 void trimResourcePlansOverBudget() {
