@@ -25,6 +25,7 @@ unsigned released = 0;
 unsigned legacyCreates = 0;
 unsigned captures = 0;
 bool reject = false;
+VkResult rejectResult = VK_PIPELINE_COMPILE_REQUIRED;
 bool captureFailure = false;
 bool missing = false;
 bool unsupported = false;
@@ -197,7 +198,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Create(VkDevice, VkPipelineCache cache, std::uint
         ++legacyCreates;
     }
     lastRestore = restore;
-    if (restore && reject) return VK_ERROR_UNKNOWN;
+    if (restore && reject) return rejectResult;
     if (capture) ++captures;
     if (capture && duringCapture) {
         auto callback = std::move(duringCapture);
@@ -462,6 +463,31 @@ int main(int argc, char** argv) try {
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
         if (entry.path().extension() == ".threshold") markersBeforeRefusal.push_back(entry.path());
     }
+    const auto countersBeforeTransient = std::array{cold, restored, released, captures, legacyCreates};
+    for (const auto transient : {VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_OUT_OF_HOST_MEMORY}) {
+        const auto capturesBeforeTransient = captures;
+        const auto legacyBeforeTransient = legacyCreates;
+        reject = true;
+        rejectResult = transient;
+        store.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
+        reject = false;
+        rejectResult = VK_PIPELINE_COMPILE_REQUIRED;
+        Check(captures == capturesBeforeTransient + 1 && legacyCreates == legacyBeforeTransient && binaries.empty(), "a restore that ran out of memory did not rebuild and capture its binary again");
+        std::size_t markers = 0;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+            if (entry.path().extension() == ".threshold") ++markers;
+        }
+        Check(markers == markersBeforeRefusal.size(), "a restore that ran out of memory marked its binary as refused");
+        const auto restoredBeforeTransient = restored;
+        PipelineBinaryStore afterTransient(context, properties, driverId);
+        afterTransient.CreateComputePipeline(info, spirv, layout, context.pipelineCache, nullptr, &pipeline);
+        Check(restored == restoredBeforeTransient + 1 && legacyCreates == legacyBeforeTransient, "a binary whose restore ran out of memory was not restored by a later process");
+    }
+    cold = countersBeforeTransient[0];
+    restored = countersBeforeTransient[1];
+    released = countersBeforeTransient[2];
+    captures = countersBeforeTransient[3];
+    legacyCreates = countersBeforeTransient[4];
     const auto legacyBeforeRefusal = legacyCreates;
     const auto capturesBeforeRefusal = captures;
     reject = true;
