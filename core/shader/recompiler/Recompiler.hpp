@@ -1185,6 +1185,8 @@ struct ResourcePlanInterval {
 };
 [[nodiscard]] ResourcePlanInterval TakeResourcePlanInterval();
 void SetResourcePlanReportHook(std::function<void()> hook);
+void SetResourcePlanReleaseHook(std::function<void()> hook);
+void FlushResourcePlanReleases();
 
 // Debug aid (see DebugProbe in Translation/TranslationContext.hpp): the APS5_PROBE register probe is
 // only applied while a driver has it active, so it can be limited to one dispatch; the recompile

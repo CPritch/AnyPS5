@@ -13,6 +13,7 @@
 #include <cstring>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
 #include "CacheKey.hpp"
@@ -28,9 +29,12 @@
 #include <memory>
 #include <set>
 #include <mutex>
+#include <iterator>
 #include <optional>
 #include <new>
 #include <shared_mutex>
+#include <system_error>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include "ControlFlow/include/ControlFlow/GraphBuilder.hpp"
@@ -805,6 +809,55 @@ bool evictablePlan(const SourceEntry& source) {
     return source.plan != nullptr && !source.planKey.empty();
 }
 
+struct PlanReleaser {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable drained;
+    std::vector<std::shared_ptr<const IrResourcePlan>> pending;
+    std::function<void()> hook;
+    bool releasing = false;
+    bool started = false;
+};
+
+PlanReleaser& planReleaser() {
+    static auto* releaser = new PlanReleaser();
+    return *releaser;
+}
+
+void runPlanReleaser(PlanReleaser& releaser) {
+    std::unique_lock lock(releaser.mutex);
+    for (;;) {
+        releaser.wake.wait(lock, [&] { return !releaser.pending.empty(); });
+        auto batch = std::exchange(releaser.pending, {});
+        const auto hook = releaser.hook;
+        releaser.releasing = true;
+        lock.unlock();
+        if (hook) hook();
+        batch.clear();
+        lock.lock();
+        releaser.releasing = false;
+        if (releaser.pending.empty()) releaser.drained.notify_all();
+    }
+}
+
+void releasePlans(std::vector<std::shared_ptr<const IrResourcePlan>> plans) {
+    if (plans.empty()) return;
+    auto& releaser = planReleaser();
+    {
+        std::lock_guard lock(releaser.mutex);
+        if (!releaser.started) {
+            try {
+                std::thread([&releaser] { runPlanReleaser(releaser); }).detach();
+            } catch (const std::system_error&) {
+                return;
+            }
+            releaser.started = true;
+        }
+        std::ranges::move(plans, std::back_inserter(releaser.pending));
+    }
+    releaser.wake.notify_one();
+}
+
 void trimResourcePlans(std::uint64_t budget) {
     auto& plans = resourcePlans();
     if (budget == 0 || plans.heldBytes.load(std::memory_order_relaxed) <= budget || !diskPlans()) return;
@@ -856,6 +909,7 @@ void trimResourcePlans(std::uint64_t budget) {
         plans.evictions.fetch_add(candidate.owners.size(), std::memory_order_relaxed);
     }
     plans.trimmedTo.store(plans.heldBytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    releasePlans(std::move(released));
 }
 
 void trimResourcePlansOverBudget() {
@@ -3339,6 +3393,18 @@ void SetResourcePlanReportHook(std::function<void()> hook) {
     auto& plans = resourcePlans();
     std::lock_guard lock(plans.reportMutex);
     plans.reportHook = std::move(hook);
+}
+
+void SetResourcePlanReleaseHook(std::function<void()> hook) {
+    auto& releaser = planReleaser();
+    std::lock_guard lock(releaser.mutex);
+    releaser.hook = std::move(hook);
+}
+
+void FlushResourcePlanReleases() {
+    auto& releaser = planReleaser();
+    std::unique_lock lock(releaser.mutex);
+    releaser.drained.wait(lock, [&] { return releaser.pending.empty() && !releaser.releasing; });
 }
 
 ResourcePlanCounters ResourcePlanTotals() {
