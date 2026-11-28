@@ -415,6 +415,8 @@ private:
         append(key, value.bindlessImages);
         append(key, value.deviceImageTables);
         append(key, value.twoLaneSpanReadInline);
+        append(key, value.spannedUnreachableStays);
+        append(key, value.spannedUnreachableVerify);
     }
 };
 

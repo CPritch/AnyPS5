@@ -417,6 +417,8 @@ struct SpirvTarget {
     bool bindlessImages = false;
     bool deviceImageTables = false;
     bool twoLaneSpanReadInline = false;
+    bool spannedUnreachableStays = false;
+    bool spannedUnreachableVerify = false;
 };
 
 struct BindingLayout {
